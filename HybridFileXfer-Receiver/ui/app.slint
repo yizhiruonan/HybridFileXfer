@@ -1,11 +1,20 @@
 // 多轨快传 · 电脑接收器（Slint / fluent 样式）
 import { Button, LineEdit, CheckBox, ComboBox, TextEdit } from "std-widgets.slint";
 
+// 卡片：白底 + 细边 + 轻投影，高度由内容决定（不要写死，否则中间会空一大块）
 component Card inherits Rectangle {
     background: #FFFFFF;
-    border-radius: 8px;
+    border-radius: 10px;
     border-width: 1px;
-    border-color: #E4E6EB;
+    border-color: #E6E8EC;
+    drop-shadow-blur: 10px;
+    drop-shadow-offset-y: 2px;
+    drop-shadow-color: #10182812;
+}
+
+component Divider inherits Rectangle {
+    height: 1px;
+    background: #ECEEF2;
 }
 
 component FieldLabel inherits Text {
@@ -15,10 +24,11 @@ component FieldLabel inherits Text {
 
 export component AppWindow inherits Window {
     title: "多轨快传 · 电脑接收器";
+    icon: @image-url("logo-mark.png");
     preferred-width: 900px;
-    preferred-height: 830px;
+    preferred-height: 820px;
     min-width: 760px;
-    min-height: 640px;
+    min-height: 620px;
     background: #F3F4F7;
 
     in property <string> app-version: "1.2.0";
@@ -31,7 +41,7 @@ export component AppWindow inherits Window {
     in-out property <string> dir-text: "";
     in-out property <string> port-text: "5740";
     in-out property <string> ip-text: "192.168.1.5";
-    in-out property <int> mode-index: 0;    // 0 自动发现 / 1 指定 IP
+    in-out property <int> mode-index: 0;
     in-out property <bool> autostart: false;
 
     in-out property <string> message: "";
@@ -47,34 +57,40 @@ export component AppWindow inherits Window {
     callback open-log();
     callback clear-log();
 
-    private property <color> accent: root.status-kind == 2 ? #16A34A : root.status-kind == 3 ? #C26A05 : #6B7280;
-    private property <color> accent-soft: root.status-kind == 2 ? #E9F8EF : root.status-kind == 3 ? #FEF6E7 : #EEF1F5;
+    private property <color> accent: root.status-kind == 2 ? #107C41 : root.status-kind == 3 ? #C26A05 : #8A9099;
+    private property <color> accent-soft: root.status-kind == 2 ? #E7F5EC : root.status-kind == 3 ? #FDF3E3 : #F0F1F4;
+    private property <color> status-card-bg: root.status-kind == 2 ? #EFF9F2 : #FFFFFF;
+    private property <string> status-glyph: root.status-kind == 2 ? "✓" : root.status-kind == 3 ? "!" : "•";
     private property <string> pill-text: root.status-kind == 2 ? "已连接" : root.status-kind == 3 ? "重试中" : root.status-kind == 1 ? "等待中" : "未启动";
 
     VerticalLayout {
-        padding: 16px;
-        spacing: 12px;
+        padding: 20px;
+        spacing: 14px;
 
         // ---------------- 顶部 ----------------
         HorizontalLayout {
-            height: 46px;
-            spacing: 10px;
+            height: 48px;
+            spacing: 12px;
 
             Rectangle {
-                width: 40px;
-                height: 40px;
-                border-radius: 10px;
-                background: #16A34A;
-                Rectangle { x: 9px; y: 11px; width: 9px; height: 9px; border-radius: 5px; background: #FFFFFF; }
-                Rectangle { x: 22px; y: 11px; width: 9px; height: 9px; border-radius: 5px; background: #CFEBD9; }
-                Rectangle { x: 12px; y: 24px; width: 16px; height: 3px; border-radius: 2px; background: #BFE6CE; }
+                width: 42px;
+                height: 42px;
+                border-radius: 11px;
+                background: #E9F7EF;
+                Image {
+                    source: @image-url("logo-brand.png");
+                    width: 30px;
+                    height: 30px;
+                    x: 6px;
+                    y: 6px;
+                }
             }
 
             VerticalLayout {
                 alignment: start;
                 spacing: 2px;
-                Text { text: "多轨快传"; font-size: 19px; font-weight: 700; color: #101828; }
-                Text { text: "电脑接收器  ·  v" + root.app-version; font-size: 11px; color: #6B7280; }
+                Text { text: "多轨快传"; font-size: 20px; font-weight: 700; color: #17191C; }
+                Text { text: "电脑接收器  ·  v" + root.app-version; font-size: 11px; color: #7A8089; }
             }
 
             Rectangle { horizontal-stretch: 1; }
@@ -85,46 +101,50 @@ export component AppWindow inherits Window {
 
         // ---------------- 状态卡 ----------------
         Card {
-            height: 92px;
+            vertical-stretch: 0;
+            background: root.status-card-bg;
             HorizontalLayout {
-                padding: 18px;
-                spacing: 14px;
+                padding: 20px;
+                spacing: 16px;
 
                 Rectangle {
-                    width: 44px;
-                    height: 44px;
-                    border-radius: 22px;
+                    width: 50px;
+                    height: 50px;
+                    border-radius: 25px;
                     background: root.accent-soft;
-                    Rectangle {
-                        x: 11px;
-                        y: 11px;
-                        width: 22px;
-                        height: 22px;
-                        border-radius: 11px;
-                        background: root.accent;
+                    Text {
+                        width: parent.width;
+                        height: parent.height;
+                        text: root.status-glyph;
+                        color: root.accent;
+                        font-size: 24px;
+                        font-weight: 700;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
                     }
                 }
 
                 VerticalLayout {
                     alignment: center;
-                    spacing: 3px;
-                    Text { text: root.status-title; font-size: 20px; font-weight: 600; color: #101828; }
-                    Text { text: root.status-sub; font-size: 12px; color: #6B7280; overflow: elide; }
+                    spacing: 4px;
+                    Text { text: root.status-title; font-size: 21px; font-weight: 600; color: #17191C; }
+                    Text { text: root.status-sub; font-size: 12px; color: #7A8089; overflow: elide; }
                 }
 
                 Rectangle { horizontal-stretch: 1; }
 
                 Rectangle {
-                    width: 68px;
+                    width: 70px;
                     height: 26px;
-                    border-radius: 6px;
+                    border-radius: 13px;
                     background: root.accent;
                     Text {
                         width: parent.width;
                         height: parent.height;
                         text: root.pill-text;
                         color: #FFFFFF;
-                        font-size: 12px;
+                        font-size: 11px;
+                        font-weight: 600;
                         horizontal-alignment: center;
                         vertical-alignment: center;
                     }
@@ -134,76 +154,98 @@ export component AppWindow inherits Window {
 
         // ---------------- 设置卡 ----------------
         Card {
-            height: 292px;
+            vertical-stretch: 0;
             VerticalLayout {
                 padding: 18px;
-                spacing: 8px;
+                spacing: 6px;
 
-                Text { text: "接收设置"; font-size: 15px; font-weight: 600; color: #101828; }
-                Text { text: "电脑端监听参数，改完点「开始接收」生效"; font-size: 11px; color: #6B7280; }
+                Text { text: "接收设置"; font-size: 15px; font-weight: 600; color: #17191C; }
+                Text { text: "电脑端监听参数，改完点「开始接收」生效"; font-size: 11.5px; color: #7A8089; }
+                Rectangle { height: 4px; }
 
-                Rectangle { height: 2px; }
+                Divider { }
 
-                FieldLabel { text: "接收文件夹"; }
+                // 行：接收文件夹
                 HorizontalLayout {
-                    height: 32px;
-                    spacing: 8px;
+                    height: 46px;
+                    vertical-stretch: 0;
+                    spacing: 10px;
+                    Text { text: "接收文件夹"; width: 96px; vertical-alignment: center; color: #303540; font-size: 13px; }
+                    Rectangle { horizontal-stretch: 1; }
                     LineEdit {
+                        width: 340px;
                         text <=> root.dir-text;
-                        horizontal-stretch: 1;
                         placeholder-text: "D:\\接收文件夹";
                     }
                     Button { text: "浏览…"; clicked => { root.browse-clicked(); } }
                 }
 
-                Rectangle { height: 2px; }
+                Divider { }
 
+                // 行：端口
                 HorizontalLayout {
-                    spacing: 24px;
+                    height: 46px;
+                    vertical-stretch: 0;
+                    spacing: 10px;
+                    Text { text: "端口"; width: 96px; vertical-alignment: center; color: #303540; font-size: 13px; }
+                    Rectangle { horizontal-stretch: 1; }
+                    Text { text: "默认 5740，需与手机端一致"; vertical-alignment: center; font-size: 10.5px; color: #9AA3AF; }
+                    LineEdit { width: 120px; text <=> root.port-text; }
+                }
 
-                    VerticalLayout {
-                        width: 190px;
-                        spacing: 4px;
-                        FieldLabel { text: "端口"; }
-                        LineEdit { text <=> root.port-text; }
-                        Text { text: "默认 5740，需与手机端一致"; font-size: 10px; color: #9AA3AF; }
+                Divider { }
+
+                // 行：连接方式
+                HorizontalLayout {
+                    height: 46px;
+                    vertical-stretch: 0;
+                    spacing: 10px;
+                    Text { text: "连接方式"; width: 96px; vertical-alignment: center; color: #303540; font-size: 13px; }
+                    Rectangle { horizontal-stretch: 1; }
+                    LineEdit {
+                        width: 180px;
+                        text <=> root.ip-text;
+                        visible: root.mode-index == 1;
+                        placeholder-text: "192.168.1.5";
                     }
-
-                    VerticalLayout {
-                        horizontal-stretch: 1;
-                        spacing: 4px;
-                        FieldLabel { text: "连接方式"; }
-                        HorizontalLayout {
-                            spacing: 10px;
-                            ComboBox {
-                                model: ["自动发现（USB / 局域网）", "指定 IP"];
-                                current-index <=> root.mode-index;
-                            }
-                            LineEdit {
-                                text <=> root.ip-text;
-                                visible: root.mode-index == 1;
-                                horizontal-stretch: 1;
-                            }
-                        }
-                        CheckBox {
-                            text: "开机自动启动（最小化运行）";
-                            checked <=> root.autostart;
-                            toggled => { root.autostart-toggled(root.autostart); }
-                        }
+                    ComboBox {
+                        width: 300px;
+                        model: ["自动发现（USB / 局域网）", "指定 IP"];
+                        current-index <=> root.mode-index;
                     }
                 }
+
+                Divider { }
+
+                // 行：开机自启
+                HorizontalLayout {
+                    height: 46px;
+                    vertical-stretch: 0;
+                    spacing: 10px;
+                    Text { text: "开机自动启动"; width: 96px; vertical-alignment: center; color: #303540; font-size: 13px; }
+                    Text { text: "登录后最小化运行"; vertical-alignment: center; font-size: 10.5px; color: #9AA3AF; }
+                    Rectangle { horizontal-stretch: 1; }
+                    CheckBox {
+                        text: "";
+                        checked <=> root.autostart;
+                        toggled => { root.autostart-toggled(root.autostart); }
+                    }
+                }
+
+                Divider { }
 
                 Text {
                     text: root.message;
                     visible: root.message != "";
-                    font-size: 11px;
+                    font-size: 11.5px;
                     color: #C26A05;
                 }
 
-                Rectangle { vertical-stretch: 1; }
+                Rectangle { height: 8px; }
 
                 HorizontalLayout {
-                    height: 34px;
+                    height: 36px;
+                    vertical-stretch: 0;
                     spacing: 10px;
                     Button {
                         text: "开始接收";
@@ -232,23 +274,33 @@ export component AppWindow inherits Window {
         Card {
             vertical-stretch: 1;
             VerticalLayout {
-                padding: 14px;
-                spacing: 8px;
+                padding: 16px;
+                spacing: 10px;
 
                 HorizontalLayout {
                     height: 24px;
                     spacing: 8px;
-                    Text { text: "运行日志"; font-size: 14px; font-weight: 600; color: #101828; vertical-alignment: center; }
+                    Text { text: "运行日志"; font-size: 14px; font-weight: 600; color: #17191C; vertical-alignment: center; }
                     Text { text: root.log-count + " 行"; font-size: 10px; color: #9AA3AF; vertical-alignment: center; }
                     Rectangle { horizontal-stretch: 1; }
                     Button { text: "清空"; clicked => { root.clear-log(); } }
                 }
 
-                TextEdit {
-                    text: root.log-text;
-                    read-only: true;
+                Rectangle {
+                    border-radius: 8px;
+                    border-width: 1px;
+                    border-color: #E6E8EC;
+                    background: #FAFBFC;
                     vertical-stretch: 1;
-                    font-size: 11px;
+
+                    TextEdit {
+                        text: root.log-text;
+                        read-only: true;
+                        vertical-stretch: 1;
+                        font-size: 11px;
+                        font-family: "Cascadia Mono, Consolas, Microsoft YaHei UI";
+                        placeholder-text: "还没有日志，点「开始接收」试试";
+                    }
                 }
             }
         }
