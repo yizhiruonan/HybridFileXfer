@@ -35,8 +35,5 @@ HybridFileXfer-Receiver/config.ini
 /*.svg
 /*.jpeg
 
-# ================= 文档截图目录（本项目 README 不使用图片） =================
-/docs/
-
 # ================= 内部资料（含设备序列号 / 内网 IP，不公开） =================
 HANDOFF.md
