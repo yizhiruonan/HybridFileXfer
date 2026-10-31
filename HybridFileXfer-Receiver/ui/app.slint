@@ -1,20 +1,74 @@
 // 多轨快传 · 电脑接收器（Slint / fluent 样式）
+// 配色只用一套：灰白表面 + 单一强调色（Windows 蓝），绿色仅用于 logo 与"已连接"状态点
 import { Button, LineEdit, CheckBox, ComboBox, TextEdit } from "std-widgets.slint";
 
-// 卡片：白底 + 细边 + 轻投影，高度由内容决定（不要写死，否则中间会空一大块）
 component Card inherits Rectangle {
     background: #FFFFFF;
     border-radius: 10px;
     border-width: 1px;
-    border-color: #E6E8EC;
+    border-color: #E5E5E5;
     drop-shadow-blur: 10px;
     drop-shadow-offset-y: 2px;
-    drop-shadow-color: #10182812;
+    drop-shadow-color: #10182810;
 }
 
 component Divider inherits Rectangle {
     height: 1px;
-    background: #ECEEF2;
+    background: #EDEDED;
+}
+
+// 主按钮：Win11 强调色，14px 半粗
+component PrimaryButton inherits Rectangle {
+    in property <string> label;
+    in property <bool> enabled: true;
+    callback clicked;
+
+    width: 116px;
+    height: 34px;
+    border-radius: 4px;
+    background: !enabled ? #E6E9ED : (ta.has-hover ? #1A6FC4 : #005FB8);
+
+    Text {
+        width: parent.width;
+        height: parent.height;
+        text: root.label;
+        color: enabled ? #FFFFFF : #9AA4AE;
+        font-size: 14px;
+        font-weight: 600;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    ta := TouchArea {
+        clicked => { if (root.enabled) { root.clicked(); } }
+    }
+}
+
+component SecondaryButton inherits Rectangle {
+    in property <string> label;
+    callback clicked;
+
+    width: 100px;
+    height: 34px;
+    border-radius: 4px;
+    border-width: 1px;
+    border-color: #D7D7D7;
+    background: ta.has-hover ? #F5F5F5 : #FFFFFF;
+
+    Text {
+        width: parent.width;
+        height: parent.height;
+        text: root.label;
+        color: #1A1A1A;
+        font-size: 14px;
+        font-weight: 500;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    ta := TouchArea {
+        clicked => { root.clicked(); }
+    }
 }
 
 export component AppWindow inherits Window {
@@ -23,11 +77,12 @@ export component AppWindow inherits Window {
     // 中文必须显式指定字体族：默认字体的 CJK 回退常缺半粗体，600 会被合成为"假粗体"发糊
     default-font-family: "Microsoft YaHei UI";
     default-font-size: 13px;
+
     preferred-width: 900px;
     preferred-height: 820px;
     min-width: 760px;
     min-height: 620px;
-    background: #F3F4F7;
+    background: #F3F3F3;
 
     in property <string> app-version: "1.2.0";
 
@@ -55,11 +110,10 @@ export component AppWindow inherits Window {
     callback open-log();
     callback clear-log();
 
-    private property <color> accent: root.status-kind == 2 ? #107C41 : root.status-kind == 3 ? #C26A05 : #8A9099;
-    private property <color> accent-soft: root.status-kind == 2 ? #E7F5EC : root.status-kind == 3 ? #FDF3E3 : #F0F1F4;
-    private property <color> status-card-bg: root.status-kind == 2 ? #EFF9F2 : #FFFFFF;
+    // 状态色只用于小圆点/图标，不做大面积填充
+    private property <color> status-color: root.status-kind == 2 ? #0F7B0F : root.status-kind == 3 ? #9D5D00 : #8A8A8A;
     private property <string> status-glyph: root.status-kind == 2 ? "✓" : root.status-kind == 3 ? "!" : "•";
-    private property <string> pill-text: root.status-kind == 2 ? "已连接" : root.status-kind == 3 ? "重试中" : root.status-kind == 1 ? "等待中" : "未启动";
+    private property <string> status-text: root.status-kind == 2 ? "已连接" : root.status-kind == 3 ? "重试中" : root.status-kind == 1 ? "等待中" : "未启动";
 
     VerticalLayout {
         padding: 20px;
@@ -74,7 +128,9 @@ export component AppWindow inherits Window {
                 width: 42px;
                 height: 42px;
                 border-radius: 11px;
-                background: #E9F7EF;
+                background: #FFFFFF;
+                border-width: 1px;
+                border-color: #E5E5E5;
                 Image {
                     source: @image-url("logo-brand.png");
                     width: 30px;
@@ -87,8 +143,8 @@ export component AppWindow inherits Window {
             VerticalLayout {
                 alignment: start;
                 spacing: 2px;
-                Text { text: "多轨快传"; font-size: 20px; font-weight: 700; color: #17191C; }
-                Text { text: "电脑接收器  ·  v" + root.app-version; font-size: 11px; color: #7A8089; }
+                Text { text: "多轨快传"; font-size: 20px; font-weight: 700; color: #1A1A1A; }
+                Text { text: "电脑接收器  ·  v" + root.app-version; font-size: 11px; color: #616161; }
             }
 
             Rectangle { horizontal-stretch: 1; }
@@ -100,7 +156,6 @@ export component AppWindow inherits Window {
         // ---------------- 状态卡 ----------------
         Card {
             vertical-stretch: 0;
-            background: root.status-card-bg;
             HorizontalLayout {
                 padding: 22px;
                 spacing: 18px;
@@ -109,13 +164,13 @@ export component AppWindow inherits Window {
                     width: 56px;
                     height: 56px;
                     border-radius: 28px;
-                    background: root.accent-soft;
+                    background: #F3F3F3;
                     Text {
                         width: parent.width;
                         height: parent.height;
                         text: root.status-glyph;
-                        color: root.accent;
-                        font-size: 27px;
+                        color: root.status-color;
+                        font-size: 26px;
                         font-weight: 700;
                         horizontal-alignment: center;
                         vertical-alignment: center;
@@ -125,27 +180,19 @@ export component AppWindow inherits Window {
                 VerticalLayout {
                     alignment: center;
                     spacing: 5px;
-                    Text { text: root.status-title; font-size: 23px; font-weight: 600; color: #17191C; }
-                    Text { text: root.status-sub; font-size: 12.5px; color: #7A8089; overflow: elide; }
+                    Text { text: root.status-title; font-size: 23px; font-weight: 600; color: #1A1A1A; }
+                    Text { text: root.status-sub; font-size: 12.5px; color: #616161; overflow: elide; }
                 }
 
                 Rectangle { horizontal-stretch: 1; }
 
-                Rectangle {
-                    width: 70px;
-                    height: 26px;
-                    border-radius: 13px;
-                    background: root.accent;
-                    Text {
-                        width: parent.width;
-                        height: parent.height;
-                        text: root.pill-text;
-                        color: #FFFFFF;
-                        font-size: 11px;
-                        font-weight: 600;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                    }
+                // 右侧状态文字：整段用状态色，不再做彩色胶囊
+                Text {
+                    text: root.status-text;
+                    font-size: 12.5px;
+                    font-weight: 600;
+                    color: root.status-color;
+                    vertical-alignment: center;
                 }
             }
         }
@@ -157,18 +204,17 @@ export component AppWindow inherits Window {
                 padding: 18px;
                 spacing: 6px;
 
-                Text { text: "接收设置"; font-size: 15px; font-weight: 600; color: #17191C; }
-                Text { text: "电脑端监听参数，改完点「开始接收」生效"; font-size: 11.5px; color: #7A8089; }
+                Text { text: "接收设置"; font-size: 15px; font-weight: 600; color: #1A1A1A; }
+                Text { text: "电脑端监听参数，改完点「开始接收」生效"; font-size: 11.5px; color: #616161; }
                 Rectangle { height: 4px; }
 
                 Divider { }
 
-                // 行：接收文件夹
                 HorizontalLayout {
                     height: 46px;
                     vertical-stretch: 0;
                     spacing: 10px;
-                    Text { text: "接收文件夹"; width: 96px; vertical-alignment: center; color: #303540; font-size: 13px; }
+                    Text { text: "接收文件夹"; width: 96px; vertical-alignment: center; color: #1A1A1A; font-size: 13px; }
                     Rectangle { horizontal-stretch: 1; }
                     LineEdit {
                         width: 340px;
@@ -180,25 +226,23 @@ export component AppWindow inherits Window {
 
                 Divider { }
 
-                // 行：端口
                 HorizontalLayout {
                     height: 46px;
                     vertical-stretch: 0;
                     spacing: 10px;
-                    Text { text: "端口"; width: 96px; vertical-alignment: center; color: #303540; font-size: 13px; }
+                    Text { text: "端口"; width: 96px; vertical-alignment: center; color: #1A1A1A; font-size: 13px; }
                     Rectangle { horizontal-stretch: 1; }
-                    Text { text: "默认 5740，需与手机端一致"; vertical-alignment: center; font-size: 10.5px; color: #9AA3AF; }
+                    Text { text: "默认 5740，需与手机端一致"; vertical-alignment: center; font-size: 10.5px; color: #8A8A8A; }
                     LineEdit { width: 120px; text <=> root.port-text; }
                 }
 
                 Divider { }
 
-                // 行：连接方式
                 HorizontalLayout {
                     height: 46px;
                     vertical-stretch: 0;
                     spacing: 10px;
-                    Text { text: "连接方式"; width: 96px; vertical-alignment: center; color: #303540; font-size: 13px; }
+                    Text { text: "连接方式"; width: 96px; vertical-alignment: center; color: #1A1A1A; font-size: 13px; }
                     Rectangle { horizontal-stretch: 1; }
                     LineEdit {
                         width: 180px;
@@ -215,13 +259,12 @@ export component AppWindow inherits Window {
 
                 Divider { }
 
-                // 行：开机自启
                 HorizontalLayout {
                     height: 46px;
                     vertical-stretch: 0;
                     spacing: 10px;
-                    Text { text: "开机自动启动"; width: 96px; vertical-alignment: center; color: #303540; font-size: 13px; }
-                    Text { text: "登录后最小化运行"; vertical-alignment: center; font-size: 10.5px; color: #9AA3AF; }
+                    Text { text: "开机自动启动"; width: 96px; vertical-alignment: center; color: #1A1A1A; font-size: 13px; }
+                    Text { text: "登录后最小化运行"; vertical-alignment: center; font-size: 10.5px; color: #8A8A8A; }
                     Rectangle { horizontal-stretch: 1; }
                     CheckBox {
                         text: "";
@@ -236,7 +279,7 @@ export component AppWindow inherits Window {
                     text: root.message;
                     visible: root.message != "";
                     font-size: 11.5px;
-                    color: #C26A05;
+                    color: #9D5D00;
                 }
 
                 Rectangle { height: 8px; }
@@ -248,19 +291,18 @@ export component AppWindow inherits Window {
                     Text {
                         text: root.config-path;
                         font-size: 10px;
-                        color: #9AA3AF;
+                        color: #8A8A8A;
                         vertical-alignment: center;
                         overflow: elide;
                         horizontal-stretch: 1;
                     }
-                    Button {
-                        text: "停止接收";
+                    SecondaryButton {
+                        label: "停止接收";
                         visible: root.running;
                         clicked => { root.stop-clicked(); }
                     }
-                    Button {
-                        text: "开始接收";
-                        primary: true;
+                    PrimaryButton {
+                        label: "开始接收";
                         enabled: !root.running;
                         clicked => { root.start-clicked(); }
                     }
@@ -278,8 +320,8 @@ export component AppWindow inherits Window {
                 HorizontalLayout {
                     height: 24px;
                     spacing: 8px;
-                    Text { text: "运行日志"; font-size: 14px; font-weight: 600; color: #17191C; vertical-alignment: center; }
-                    Text { text: root.log-count + " 行"; font-size: 10px; color: #9AA3AF; vertical-alignment: center; }
+                    Text { text: "运行日志"; font-size: 14px; font-weight: 600; color: #1A1A1A; vertical-alignment: center; }
+                    Text { text: root.log-count + " 行"; font-size: 10px; color: #8A8A8A; vertical-alignment: center; }
                     Rectangle { horizontal-stretch: 1; }
                     Button { text: "清空"; clicked => { root.clear-log(); } }
                 }
@@ -287,8 +329,8 @@ export component AppWindow inherits Window {
                 Rectangle {
                     border-radius: 8px;
                     border-width: 1px;
-                    border-color: #E6E8EC;
-                    background: #FAFBFC;
+                    border-color: #EDEDED;
+                    background: #FAFAFA;
                     vertical-stretch: 1;
 
                     TextEdit {
