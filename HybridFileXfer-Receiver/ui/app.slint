@@ -1,0 +1,256 @@
+// 多轨快传 · 电脑接收器（Slint / fluent 样式）
+import { Button, LineEdit, CheckBox, ComboBox, TextEdit } from "std-widgets.slint";
+
+component Card inherits Rectangle {
+    background: #FFFFFF;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: #E4E6EB;
+}
+
+component FieldLabel inherits Text {
+    color: #5B6472;
+    font-size: 12px;
+}
+
+export component AppWindow inherits Window {
+    title: "多轨快传 · 电脑接收器";
+    preferred-width: 900px;
+    preferred-height: 830px;
+    min-width: 760px;
+    min-height: 640px;
+    background: #F3F4F7;
+
+    in property <string> app-version: "1.2.0";
+
+    in-out property <string> status-title: "未开始接收";
+    in-out property <string> status-sub: "点「开始接收」等待手机连接";
+    in-out property <int> status-kind: 0;   // 0 停止 / 1 等待 / 2 已连接 / 3 重试中
+    in-out property <bool> running: false;
+
+    in-out property <string> dir-text: "";
+    in-out property <string> port-text: "5740";
+    in-out property <string> ip-text: "192.168.1.5";
+    in-out property <int> mode-index: 0;    // 0 自动发现 / 1 指定 IP
+    in-out property <bool> autostart: false;
+
+    in-out property <string> message: "";
+    in-out property <string> log-text: "";
+    in-out property <int> log-count: 0;
+    in-out property <string> config-path: "";
+
+    callback browse-clicked();
+    callback start-clicked();
+    callback stop-clicked();
+    callback autostart-toggled(bool);
+    callback open-dir();
+    callback open-log();
+    callback clear-log();
+
+    private property <color> accent: root.status-kind == 2 ? #16A34A : root.status-kind == 3 ? #C26A05 : #6B7280;
+    private property <color> accent-soft: root.status-kind == 2 ? #E9F8EF : root.status-kind == 3 ? #FEF6E7 : #EEF1F5;
+    private property <string> pill-text: root.status-kind == 2 ? "已连接" : root.status-kind == 3 ? "重试中" : root.status-kind == 1 ? "等待中" : "未启动";
+
+    VerticalLayout {
+        padding: 16px;
+        spacing: 12px;
+
+        // ---------------- 顶部 ----------------
+        HorizontalLayout {
+            height: 46px;
+            spacing: 10px;
+
+            Rectangle {
+                width: 40px;
+                height: 40px;
+                border-radius: 10px;
+                background: #16A34A;
+                Rectangle { x: 9px; y: 11px; width: 9px; height: 9px; border-radius: 5px; background: #FFFFFF; }
+                Rectangle { x: 22px; y: 11px; width: 9px; height: 9px; border-radius: 5px; background: #CFEBD9; }
+                Rectangle { x: 12px; y: 24px; width: 16px; height: 3px; border-radius: 2px; background: #BFE6CE; }
+            }
+
+            VerticalLayout {
+                alignment: start;
+                spacing: 2px;
+                Text { text: "多轨快传"; font-size: 19px; font-weight: 700; color: #101828; }
+                Text { text: "电脑接收器  ·  v" + root.app-version; font-size: 11px; color: #6B7280; }
+            }
+
+            Rectangle { horizontal-stretch: 1; }
+
+            Button { text: "接收文件夹"; clicked => { root.open-dir(); } }
+            Button { text: "打开日志"; clicked => { root.open-log(); } }
+        }
+
+        // ---------------- 状态卡 ----------------
+        Card {
+            height: 92px;
+            HorizontalLayout {
+                padding: 18px;
+                spacing: 14px;
+
+                Rectangle {
+                    width: 44px;
+                    height: 44px;
+                    border-radius: 22px;
+                    background: root.accent-soft;
+                    Rectangle {
+                        x: 11px;
+                        y: 11px;
+                        width: 22px;
+                        height: 22px;
+                        border-radius: 11px;
+                        background: root.accent;
+                    }
+                }
+
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 3px;
+                    Text { text: root.status-title; font-size: 20px; font-weight: 600; color: #101828; }
+                    Text { text: root.status-sub; font-size: 12px; color: #6B7280; overflow: elide; }
+                }
+
+                Rectangle { horizontal-stretch: 1; }
+
+                Rectangle {
+                    width: 68px;
+                    height: 26px;
+                    border-radius: 6px;
+                    background: root.accent;
+                    Text {
+                        width: parent.width;
+                        height: parent.height;
+                        text: root.pill-text;
+                        color: #FFFFFF;
+                        font-size: 12px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+        }
+
+        // ---------------- 设置卡 ----------------
+        Card {
+            height: 292px;
+            VerticalLayout {
+                padding: 18px;
+                spacing: 8px;
+
+                Text { text: "接收设置"; font-size: 15px; font-weight: 600; color: #101828; }
+                Text { text: "电脑端监听参数，改完点「开始接收」生效"; font-size: 11px; color: #6B7280; }
+
+                Rectangle { height: 2px; }
+
+                FieldLabel { text: "接收文件夹"; }
+                HorizontalLayout {
+                    height: 32px;
+                    spacing: 8px;
+                    LineEdit {
+                        text <=> root.dir-text;
+                        horizontal-stretch: 1;
+                        placeholder-text: "D:\\接收文件夹";
+                    }
+                    Button { text: "浏览…"; clicked => { root.browse-clicked(); } }
+                }
+
+                Rectangle { height: 2px; }
+
+                HorizontalLayout {
+                    spacing: 24px;
+
+                    VerticalLayout {
+                        width: 190px;
+                        spacing: 4px;
+                        FieldLabel { text: "端口"; }
+                        LineEdit { text <=> root.port-text; }
+                        Text { text: "默认 5740，需与手机端一致"; font-size: 10px; color: #9AA3AF; }
+                    }
+
+                    VerticalLayout {
+                        horizontal-stretch: 1;
+                        spacing: 4px;
+                        FieldLabel { text: "连接方式"; }
+                        HorizontalLayout {
+                            spacing: 10px;
+                            ComboBox {
+                                model: ["自动发现（USB / 局域网）", "指定 IP"];
+                                current-index <=> root.mode-index;
+                            }
+                            LineEdit {
+                                text <=> root.ip-text;
+                                visible: root.mode-index == 1;
+                                horizontal-stretch: 1;
+                            }
+                        }
+                        CheckBox {
+                            text: "开机自动启动（最小化运行）";
+                            checked <=> root.autostart;
+                            toggled => { root.autostart-toggled(root.autostart); }
+                        }
+                    }
+                }
+
+                Text {
+                    text: root.message;
+                    visible: root.message != "";
+                    font-size: 11px;
+                    color: #C26A05;
+                }
+
+                Rectangle { vertical-stretch: 1; }
+
+                HorizontalLayout {
+                    height: 34px;
+                    spacing: 10px;
+                    Button {
+                        text: "开始接收";
+                        primary: true;
+                        enabled: !root.running;
+                        clicked => { root.start-clicked(); }
+                    }
+                    Button {
+                        text: "停止接收";
+                        visible: root.running;
+                        clicked => { root.stop-clicked(); }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    Text {
+                        text: root.config-path;
+                        font-size: 10px;
+                        color: #9AA3AF;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                }
+            }
+        }
+
+        // ---------------- 日志卡 ----------------
+        Card {
+            vertical-stretch: 1;
+            VerticalLayout {
+                padding: 14px;
+                spacing: 8px;
+
+                HorizontalLayout {
+                    height: 24px;
+                    spacing: 8px;
+                    Text { text: "运行日志"; font-size: 14px; font-weight: 600; color: #101828; vertical-alignment: center; }
+                    Text { text: root.log-count + " 行"; font-size: 10px; color: #9AA3AF; vertical-alignment: center; }
+                    Rectangle { horizontal-stretch: 1; }
+                    Button { text: "清空"; clicked => { root.clear-log(); } }
+                }
+
+                TextEdit {
+                    text: root.log-text;
+                    read-only: true;
+                    vertical-stretch: 1;
+                    font-size: 11px;
+                }
+            }
+        }
+    }
+}

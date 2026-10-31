@@ -8,10 +8,10 @@ description = "Receiver for HybridFileXfer / 多轨快传, with a GUI"
 name = "hfx_receiver"
 path = "src/lib.rs"
 
-# 图形界面版（给普通用户）
+# 图形界面版（Slint + fluent 样式，Win11 观感）
 [[bin]]
 name = "HybridFileXfer-Receiver"
-path = "src/bin/gui.rs"
+path = "src/bin/gui_slint.rs"
 
 # 命令行版（无界面，便于自动化/开机后台运行）
 [[bin]]
@@ -19,7 +19,10 @@ name = "HybridFileXfer-Receiver-cli"
 path = "src/main.rs"
 
 [dependencies]
-eframe = "0.29.1"
+slint = "1.18"
+
+[build-dependencies]
+slint-build = "1.18"
 
 [profile.release]
 opt-level = 3
