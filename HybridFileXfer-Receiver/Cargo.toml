@@ -1,6 +1,6 @@
 [package]
 name = "hybridfilexfer-receiver"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2021"
 description = "Receiver for HybridFileXfer / 多轨快传, with a GUI"
 

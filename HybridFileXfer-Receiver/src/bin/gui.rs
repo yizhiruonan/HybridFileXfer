@@ -21,16 +21,22 @@ use hfx_receiver::i18n::{self, Lang};
 use hfx_receiver::log;
 
 // ---------- 配色 ----------
-const BG: Color32 = Color32::from_rgb(0xF4, 0xF6, 0xF9);
+const BG: Color32 = Color32::from_rgb(0xF3, 0xF5, 0xF9);
 const CARD: Color32 = Color32::from_rgb(0xFF, 0xFF, 0xFF);
-const TEXT: Color32 = Color32::from_rgb(0x10, 0x14, 0x18);
-const SUBTLE: Color32 = Color32::from_rgb(0x6B, 0x72, 0x80);
+const BORDER: Color32 = Color32::from_rgb(0xE3, 0xE8, 0xEF);
+const TEXT: Color32 = Color32::from_rgb(0x0F, 0x17, 0x2A);
+const SUBTLE: Color32 = Color32::from_rgb(0x64, 0x74, 0x8B);
 const GREEN: Color32 = Color32::from_rgb(0x16, 0xA3, 0x4A);
-const GREEN_SOFT: Color32 = Color32::from_rgb(0xE8, 0xF7, 0xEE);
-const GRAY_SOFT: Color32 = Color32::from_rgb(0xEC, 0xEF, 0xF4);
-const WARN: Color32 = Color32::from_rgb(0xD9, 0x77, 0x06);
-const RED: Color32 = Color32::from_rgb(0xEF, 0x44, 0x44);
-const FIELD: Color32 = Color32::from_rgb(0xEE, 0xF1, 0xF5);
+const GREEN_SOFT: Color32 = Color32::from_rgb(0xEA, 0xF8, 0xF0);
+const GRAY_SOFT: Color32 = Color32::from_rgb(0xF4, 0xF6, 0xFA);
+const WARN: Color32 = Color32::from_rgb(0xC2, 0x6A, 0x05);
+const WARN_SOFT: Color32 = Color32::from_rgb(0xFE, 0xF6, 0xE7);
+const RED: Color32 = Color32::from_rgb(0xDC, 0x26, 0x26);
+const FIELD: Color32 = Color32::from_rgb(0xF5, 0xF7, 0xFA);
+/// 输入框底色（比卡片白略深，能看出是输入框）
+const FIELD_BG: Color32 = Color32::from_rgb(0xE9, 0xEF, 0xF8);
+const CONSOLE_BG: Color32 = Color32::from_rgb(0x10, 0x18, 0x2A);
+const CONSOLE_TEXT: Color32 = Color32::from_rgb(0xA3, 0xB4, 0xC9);
 
 fn main() -> eframe::Result<()> {
     let exe_dir = std::env::current_exe()
@@ -49,8 +55,8 @@ fn main() -> eframe::Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([800.0, 760.0])
-            .with_min_inner_size([680.0, 620.0])
+            .with_inner_size([880.0, 820.0])
+            .with_min_inner_size([720.0, 640.0])
             .with_title("多轨快传 · 电脑接收器"),
         ..Default::default()
     };
@@ -218,66 +224,73 @@ impl ReceiverApp {
 
     fn header(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.label(RichText::new("多轨快传").size(26.0).strong().color(TEXT));
-            ui.label(RichText::new("电脑接收器").size(13.0).color(SUBTLE));
+            // 品牌标：圆角方块 + 两条通道 + 底座
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(40.0, 40.0), egui::Sense::hover());
+            let p = ui.painter();
+            p.rect_filled(rect, Rounding::same(12.0), GREEN);
+            let c = rect.center();
+            p.circle_filled(c + egui::vec2(-5.5, -5.0), 3.4, Color32::WHITE);
+            p.circle_filled(c + egui::vec2(5.5, -5.0), 3.4, Color32::from_white_alpha(160));
+            p.rect_filled(
+                egui::Rect::from_center_size(c + egui::vec2(0.0, 6.5), egui::vec2(15.0, 3.2)),
+                Rounding::same(1.6),
+                Color32::from_white_alpha(180),
+            );
+
+            ui.add_space(11.0);
+            ui.vertical(|ui| {
+                ui.label(RichText::new("多轨快传").size(21.0).strong().color(TEXT));
+                ui.label(
+                    RichText::new(format!("电脑接收器 · v{}", env!("CARGO_PKG_VERSION")))
+                        .size(11.5)
+                        .color(SUBTLE),
+                );
+            });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .add(
-                        egui::Button::new(RichText::new("打开日志").size(12.0).color(SUBTLE))
-                            .fill(Color32::TRANSPARENT)
-                            .rounding(Rounding::same(8.0)),
-                    )
-                    .clicked()
-                {
+                if ghost_button(ui, "打开日志").clicked() {
                     let _ = std::process::Command::new("notepad")
                         .arg(self.exe_dir.join("receiver.log"))
                         .spawn();
                 }
-                if ui
-                    .add(
-                        egui::Button::new(RichText::new("接收文件夹").size(12.0).color(SUBTLE))
-                            .fill(Color32::TRANSPARENT)
-                            .rounding(Rounding::same(8.0)),
-                    )
-                    .clicked()
-                {
+                ui.add_space(8.0);
+                if ghost_button(ui, "接收文件夹").clicked() {
                     open_in_explorer(&self.dir_text);
                 }
             });
         });
-        ui.add_space(10.0);
+        ui.add_space(16.0);
     }
 
     fn status_card(&mut self, ui: &mut egui::Ui) {
-        let (fill, dot, title, subtitle) = match &self.state {
+        let (fill, dot, pill, title, subtitle) = match &self.state {
             EngineState::Connected(names) => (
                 GREEN_SOFT,
                 GREEN,
+                "已连接",
                 i18n::tr("已连接电脑", "connected"),
-                format!(
-                    "{} {}",
-                    i18n::tr("通道：", "channels: "),
-                    names.join(", ")
-                ),
+                format!("{} {}", i18n::tr("通道：", "channels: "), names.join(", ")),
             ),
             EngineState::Waiting(reason) => (
                 GRAY_SOFT,
                 SUBTLE,
+                "等待中",
                 i18n::tr("等待手机连接", "waiting for the phone"),
                 reason.clone(),
             ),
             EngineState::Retrying(reason) => (
-                GRAY_SOFT,
+                WARN_SOFT,
                 WARN,
+                "重试中",
                 i18n::tr("连接有问题，正在重试", "retrying"),
                 reason.clone(),
             ),
             EngineState::Stopped => (
                 GRAY_SOFT,
                 SUBTLE,
+                "未启动",
                 i18n::tr("未开始接收", "not running"),
                 i18n::tr(
-                    "点下面的按钮开始等待手机",
+                    "点「开始接收」等待手机连接",
                     "press start to wait for the phone",
                 )
                 .to_string(),
@@ -286,151 +299,190 @@ impl ReceiverApp {
         let connected = matches!(self.state, EngineState::Connected(_));
         card(ui, fill, |ui| {
             ui.horizontal(|ui| {
-                status_badge(ui, dot, connected);
-                ui.add_space(12.0);
+                status_ring(ui, dot, connected);
+                ui.add_space(14.0);
                 ui.vertical(|ui| {
-                    ui.label(RichText::new(title).size(21.0).strong().color(TEXT));
-                    ui.label(RichText::new(subtitle).size(13.0).color(SUBTLE));
+                    ui.label(RichText::new(title).size(22.0).strong().color(TEXT));
+                    ui.add_space(2.0);
+                    ui.label(RichText::new(subtitle).size(12.5).color(SUBTLE));
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    egui::Frame::none()
+                        .fill(dot)
+                        .rounding(Rounding::same(8.0))
+                        .inner_margin(Margin::symmetric(12.0, 4.0))
+                        .show(ui, |ui| {
+                            ui.label(RichText::new(pill).size(11.5).strong().color(Color32::WHITE));
+                        });
                 });
             });
         });
     }
 
     fn settings_card(&mut self, ui: &mut egui::Ui) {
+        let mut config_text = self.config_path.display().to_string();
+        if config_text.chars().count() > 58 {
+            let tail: String = config_text
+                .chars()
+                .skip(config_text.chars().count() - 55)
+                .collect();
+            config_text = format!("…{}", tail);
+        }
         card(ui, CARD, |ui| {
-            ui.label(RichText::new("接收设置").size(16.0).strong().color(TEXT));
-            ui.add_space(6.0);
-            egui::Grid::new("settings")
-                .num_columns(3)
-                .spacing([10.0, 10.0])
-                .show(ui, |ui| {
-                    ui.label(RichText::new("接收文件夹").color(TEXT));
-                    ui.add_sized(
-                        [360.0, 26.0],
-                        egui::TextEdit::singleline(&mut self.dir_text)
-                            .hint_text("C:\\Users\\你\\Downloads\\HybridFileXfer"),
-                    );
-                    if ui.button("浏览…").clicked() {
-                        if let Some(dir) = pick_folder() {
-                            self.dir_text = dir.to_string_lossy().to_string();
-                        }
-                    }
-                    ui.end_row();
+            section_title(ui, "接收设置", "电脑端监听参数，改完点「开始接收」生效");
+            ui.add_space(14.0);
 
-                    ui.label(RichText::new("端口").color(TEXT));
-                    ui.add_sized(
-                        [100.0, 26.0],
-                        egui::TextEdit::singleline(&mut self.port_text),
-                    );
-                    ui.label(RichText::new("默认 5740，需与手机端一致").size(11.0).color(SUBTLE));
-                    ui.end_row();
-                });
-
-            ui.add_space(8.0);
+            field_label(ui, "接收文件夹");
             ui.horizontal(|ui| {
-                ui.radio_value(&mut self.mode_auto, true, "自动（USB / 局域网发现）");
-                ui.radio_value(&mut self.mode_auto, false, "指定 IP");
-                if !self.mode_auto {
-                    ui.add_sized(
-                        [150.0, 26.0],
-                        egui::TextEdit::singleline(&mut self.ip_text).hint_text("192.168.1.5"),
-                    );
+                let browse_w = 66.0;
+                let width = (ui.available_width() - browse_w - 8.0).max(150.0);
+                ui.add_sized(
+                    [width, 32.0],
+                    egui::TextEdit::singleline(&mut self.dir_text)
+                        .hint_text("D:\\接收文件夹"),
+                );
+                if ghost_button(ui, "浏览…").clicked() {
+                    if let Some(dir) = pick_folder() {
+                        self.dir_text = dir.to_string_lossy().to_string();
+                    }
                 }
             });
-            ui.add_space(6.0);
-            if ui
-                .checkbox(&mut self.autostart, "开机自动启动（最小化运行）")
-                .changed()
-            {
-                let result = set_autostart(self.autostart, &self.exe_dir);
-                if let Err(e) = result {
-                    self.message = format!("设置开机自启失败：{}", e);
-                }
-            }
+            ui.add_space(14.0);
+
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    field_label(ui, "端口");
+                    ui.add_sized([104.0, 32.0], egui::TextEdit::singleline(&mut self.port_text));
+                    ui.label(
+                        RichText::new("默认 5740，需与手机端一致")
+                            .size(10.5)
+                            .color(SUBTLE),
+                    );
+                });
+                ui.add_space(20.0);
+                ui.vertical(|ui| {
+                    field_label(ui, "连接方式");
+                    ui.horizontal(|ui| {
+                        ui.radio_value(&mut self.mode_auto, true, "自动发现（USB / 局域网）");
+                        ui.radio_value(&mut self.mode_auto, false, "指定 IP");
+                        if !self.mode_auto {
+                            ui.add_sized(
+                                [148.0, 28.0],
+                                egui::TextEdit::singleline(&mut self.ip_text)
+                                    .hint_text("192.168.1.5"),
+                            );
+                        }
+                    });
+                    if ui
+                        .checkbox(&mut self.autostart, "开机自动启动（最小化运行）")
+                        .changed()
+                    {
+                        if let Err(e) = set_autostart(self.autostart, &self.exe_dir) {
+                            self.message = format!("设置开机自启失败：{}", e);
+                        }
+                    }
+                });
+            });
+
             if !self.message.is_empty() {
-                ui.add_space(4.0);
-                ui.label(RichText::new(&self.message).size(12.0).color(WARN));
+                ui.add_space(12.0);
+                egui::Frame::none()
+                    .fill(WARN_SOFT)
+                    .rounding(Rounding::same(10.0))
+                    .inner_margin(Margin::symmetric(12.0, 8.0))
+                    .show(ui, |ui| {
+                        ui.label(RichText::new(&self.message).size(12.0).color(WARN));
+                    });
             }
 
-            ui.add_space(12.0);
+            ui.add_space(16.0);
             ui.horizontal(|ui| {
                 let running = self.running();
                 let start = ui.add_enabled(
                     !running,
-                    egui::Button::new(RichText::new("开始接收").size(15.0).color(Color32::WHITE))
-                        .fill(GREEN)
-                        .rounding(Rounding::same(12.0))
-                        .min_size(egui::vec2(150.0, 40.0)),
+                    egui::Button::new(
+                        RichText::new("开始接收").size(14.5).strong().color(Color32::WHITE),
+                    )
+                    .fill(GREEN)
+                    .rounding(Rounding::same(11.0))
+                    .min_size(egui::vec2(148.0, 40.0)),
                 );
                 if start.clicked() {
                     self.start_engine();
                 }
                 if running {
-                    if ui
-                        .add(
-                            egui::Button::new(RichText::new("停止").size(15.0).color(RED))
-                                .fill(GRAY_SOFT)
-                                .rounding(Rounding::same(12.0))
-                                .min_size(egui::vec2(110.0, 40.0)),
-                        )
-                        .clicked()
-                    {
+                    let stop = ui.add(
+                        egui::Button::new(RichText::new("停止接收").size(14.5).color(RED))
+                            .fill(CARD)
+                            .stroke(egui::Stroke::new(1.0_f32, BORDER))
+                            .rounding(Rounding::same(11.0))
+                            .min_size(egui::vec2(116.0, 40.0)),
+                    );
+                    if stop.clicked() {
                         self.stop_engine();
                     }
                 }
+                ui.add_space(12.0);
+                ui.label(
+                    RichText::new(format!("配置文件：{}", config_text))
+                        .size(10.5)
+                        .color(SUBTLE),
+                );
             });
-            ui.add_space(4.0);
-            let mut config_text = self.config_path.display().to_string();
-            if config_text.chars().count() > 62 {
-                let tail: String = config_text
-                    .chars()
-                    .skip(config_text.chars().count() - 59)
-                    .collect();
-                config_text = format!("…{}", tail);
-            }
-            ui.label(
-                RichText::new(format!("配置文件：{}", config_text))
-                    .size(11.0)
-                    .color(SUBTLE),
-            );
         });
     }
 
     fn log_card(&mut self, ui: &mut egui::Ui) {
+        // 日志区吃掉窗口剩下的高度，避免底部留一大片空白
+        let body_h = (ui.available_height() - 66.0).max(150.0);
         card(ui, CARD, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("运行日志").size(16.0).strong().color(TEXT));
+                ui.label(RichText::new("运行日志").size(15.0).strong().color(TEXT));
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(format!("{} 行", self.log_lines.len()))
+                        .size(11.0)
+                        .color(SUBTLE),
+                );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(
-                        RichText::new(format!("{} 行", self.log_lines.len()))
-                            .size(11.0)
-                            .color(SUBTLE),
-                    );
+                    if ghost_button(ui, "清空").clicked() {
+                        self.log_lines.clear();
+                    }
                 });
             });
-            ui.add_space(4.0);
-            egui::ScrollArea::vertical()
-                .max_height(220.0)
-                .stick_to_bottom(true)
+            ui.add_space(10.0);
+            egui::Frame::none()
+                .fill(CONSOLE_BG)
+                .rounding(Rounding::same(12.0))
+                .inner_margin(Margin::same(12.0))
                 .show(ui, |ui| {
-                    if self.log_lines.is_empty() {
-                        ui.label(
-                            RichText::new(i18n::tr(
-                                "还没有日志，点开始接收试试",
-                                "no logs yet, press start",
-                            ))
-                            .size(12.0)
-                            .color(SUBTLE),
-                        );
-                    }
-                    for line in &self.log_lines {
-                        ui.label(
-                            RichText::new(line)
-                                .monospace()
-                                .size(12.0)
-                                .color(SUBTLE),
-                        );
-                    }
+                    ui.set_min_width(ui.available_width());
+                    ui.set_min_height(body_h);
+                    egui::ScrollArea::vertical()
+                        .max_height(body_h)
+                        .auto_shrink([false, false])
+                        .stick_to_bottom(true)
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            if self.log_lines.is_empty() {
+                                ui.label(
+                                    RichText::new(i18n::tr(
+                                        "还没有日志，点「开始接收」试试",
+                                        "no logs yet, press start",
+                                    ))
+                                    .size(11.5)
+                                    .color(CONSOLE_TEXT.gamma_multiply(0.75)),
+                                );
+                            }
+                            for line in &self.log_lines {
+                                ui.label(
+                                    RichText::new(line)
+                                        .monospace()
+                                        .size(11.5)
+                                        .color(CONSOLE_TEXT),
+                                );
+                            }
+                        });
                 });
         });
     }
@@ -448,16 +500,21 @@ impl eframe::App for ReceiverApp {
             let overflow = self.log_lines.len() - 500;
             self.log_lines.drain(..overflow);
         }
+        // eframe 会在启动时按系统主题再 set 一次 visuals，把我们的样式冲掉，
+        // 这里每帧检查一次（只是比较一个颜色，开销可忽略），被覆盖就重新应用。
+        if ctx.style().visuals.extreme_bg_color != FIELD_BG {
+            setup_style(ctx);
+        }
         ctx.request_repaint_after(Duration::from_millis(250));
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(BG).inner_margin(Margin::same(18.0)))
+            .frame(egui::Frame::none().fill(BG).inner_margin(Margin::same(20.0)))
             .show(ctx, |ui| {
                 self.header(ui);
                 self.status_card(ui);
-                ui.add_space(10.0);
+                ui.add_space(12.0);
                 self.settings_card(ui);
-                ui.add_space(10.0);
+                ui.add_space(12.0);
                 self.log_card(ui);
             });
     }
@@ -474,27 +531,50 @@ impl Drop for ReceiverApp {
 fn card<R>(ui: &mut egui::Ui, fill: Color32, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     egui::Frame::none()
         .fill(fill)
-        .rounding(Rounding::same(16.0))
-        .inner_margin(Margin::same(16.0))
+        .rounding(Rounding::same(18.0))
+        .stroke(egui::Stroke::new(1.0_f32, BORDER))
+        .inner_margin(Margin::same(18.0))
         .show(ui, add)
         .inner
 }
 
-fn status_badge(ui: &mut egui::Ui, color: Color32, connected: bool) {
-    let size = egui::vec2(36.0, 36.0);
-    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
-    let center = rect.center();
+/// 卡片里的小节标题 + 一行说明
+fn section_title(ui: &mut egui::Ui, title: &str, hint: &str) {
+    ui.label(RichText::new(title).size(15.0).strong().color(TEXT));
+    ui.add_space(3.0);
+    ui.label(RichText::new(hint).size(11.5).color(SUBTLE));
+}
+
+/// 字段上方的小标签
+fn field_label(ui: &mut egui::Ui, text: &str) {
+    ui.label(RichText::new(text).size(11.5).color(SUBTLE));
+    ui.add_space(5.0);
+}
+
+/// 白底描边的次级按钮
+fn ghost_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    ui.add(
+        egui::Button::new(RichText::new(text).size(12.0).color(SUBTLE))
+            .fill(CARD)
+            .stroke(egui::Stroke::new(1.0_f32, BORDER))
+            .rounding(Rounding::same(9.0)),
+    )
+}
+
+/// 状态环：外圈淡色光晕 + 内圈图标
+fn status_ring(ui: &mut egui::Ui, color: Color32, connected: bool) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(46.0, 46.0), egui::Sense::hover());
+    let painter = ui.painter();
+    let c = rect.center();
+    painter.circle_filled(c, 23.0, color.gamma_multiply(0.16));
     if connected {
-        ui.painter().circle_filled(center, 17.0, color);
-        let stroke = egui::Stroke::new(2.6_f32, Color32::WHITE);
-        let p1 = center + egui::vec2(-7.5, 0.5);
-        let p2 = center + egui::vec2(-2.5, 6.0);
-        let p3 = center + egui::vec2(8.0, -5.5);
-        ui.painter().line_segment([p1, p2], stroke);
-        ui.painter().line_segment([p2, p3], stroke);
+        painter.circle_filled(c, 15.0, color);
+        let stroke = egui::Stroke::new(2.4_f32, Color32::WHITE);
+        painter.line_segment([c + egui::vec2(-6.2, 0.4), c + egui::vec2(-1.8, 5.0)], stroke);
+        painter.line_segment([c + egui::vec2(-1.8, 5.0), c + egui::vec2(6.4, -4.6)], stroke);
     } else {
-        ui.painter().circle_stroke(center, 15.0, egui::Stroke::new(2.0_f32, color));
-        ui.painter().circle_filled(center, 5.0, color);
+        painter.circle_stroke(c, 13.0, egui::Stroke::new(2.6_f32, color));
+        painter.circle_filled(c, 4.6, color);
     }
 }
 
@@ -507,19 +587,26 @@ fn setup_style(ctx: &egui::Context) {
     visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, TEXT);
     visuals.widgets.inactive.bg_fill = FIELD;
     visuals.widgets.inactive.weak_bg_fill = FIELD;
+    // TextEdit 的描边取的就是这三个 bg_stroke，卡片边框要淡、输入框边框要清楚
     visuals.widgets.inactive.bg_stroke =
-        egui::Stroke::new(1.0_f32, Color32::from_rgb(0xDF, 0xE3, 0xEA));
-    visuals.widgets.hovered.bg_fill = Color32::from_rgb(0xE3, 0xE8, 0xEF);
-    visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(0xE3, 0xE8, 0xEF);
-    visuals.widgets.active.bg_fill = Color32::from_rgb(0xD8, 0xE0, 0xEA);
-    visuals.widgets.active.weak_bg_fill = Color32::from_rgb(0xD8, 0xE0, 0xEA);
+        egui::Stroke::new(1.0_f32, Color32::from_rgb(0xD3, 0xDC, 0xEA));
+    visuals.widgets.hovered.bg_fill = Color32::from_rgb(0xE8, 0xED, 0xF5);
+    visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(0xE8, 0xED, 0xF5);
+    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, Color32::from_rgb(0xCF, 0xD8, 0xE6));
+    visuals.widgets.active.bg_fill = Color32::from_rgb(0xDC, 0xE4, 0xF0);
+    visuals.widgets.active.weak_bg_fill = Color32::from_rgb(0xDC, 0xE4, 0xF0);
     visuals.widgets.inactive.rounding = Rounding::same(10.0);
     visuals.widgets.hovered.rounding = Rounding::same(10.0);
     visuals.widgets.active.rounding = Rounding::same(10.0);
+    // TextEdit 的背景用的是 extreme_bg_color，太浅会和卡片融成一片
+    visuals.extreme_bg_color = FIELD_BG;
+    visuals.selection.bg_fill = GREEN.gamma_multiply(0.20);
+    visuals.selection.stroke = egui::Stroke::new(1.0_f32, GREEN);
     visuals.window_rounding = Rounding::same(16.0);
     style.visuals = visuals;
-    style.spacing.item_spacing = egui::vec2(9.0, 9.0);
-    style.spacing.button_padding = egui::vec2(14.0, 8.0);
+    style.spacing.item_spacing = egui::vec2(10.0, 10.0);
+    style.spacing.button_padding = egui::vec2(14.0, 9.0);
+    style.spacing.interact_size.y = 30.0;
     ctx.set_style(style);
 }
 
