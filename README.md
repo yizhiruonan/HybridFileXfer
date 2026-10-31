@@ -14,7 +14,7 @@
 | 目录 | 说明 |
 | --- | --- |
 | `HybridFileXfer-Android/` | 安卓客户端（Java + Jetpack Compose / Miuix UI） |
-| `HybridFileXfer-Receiver/` | 电脑接收器（Rust + egui，GUI 与 CLI 双入口，不需要 Java） |
+| `HybridFileXfer-Receiver/` | 电脑接收器（Rust + Slint，原生 Windows 风格界面；GUI 与 CLI 双入口，不需要 Java） |
 | `HybridFileXfer-PC/` | 经典 Java 电脑客户端源码（旧版，可选；不含 jar 与 adb.exe） |
 | `script/` | adb 端口转发、一键编译等辅助脚本 |
 
@@ -66,6 +66,7 @@
 
 ### 3.1.0
 
+- 电脑接收器界面改用 **Slint + fluent**，控件是 Windows 11 原生观感
 - 安卓界面迁移到 **Miuix 0.9.4**，设置页改为分组圆角卡片
 - 新增 **主题**：跟随系统 / 浅色 / 深色 / Monet（6 档，写入配置持久化）
 - 界面缩放改用 `SliderPreference`，刻度点用原生 `showKeyPoints`
