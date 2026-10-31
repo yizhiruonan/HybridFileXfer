@@ -1,11 +1,21 @@
 # 多轨快传
-多轨快传（原双轨快传），一个可以同时使用USB和WIFI等多张网卡传输文件到电脑的软件。
 
-用尽手机一切对外可用IO通道，提升传输速度。
+当前版本 **3.1.0** · 界面基于 **Miuix 0.9** · 许可 **GPL-3.0**
 
-USB2.0+WIFI6（千兆网口）可以跑到150MB/s（40+110MB/s）！
+📥 [**下载最新 APK**](https://github.com/yizhiruonan/HybridFileXfer/releases) ｜ 支持 **Android 8.0（API 26）及以上**
 
-USB2.0+WIFI6_5G:160mhz+WIFI6_2.4G:40mhz 可以跑到200+MB/s！
+多轨快传（原双轨快传），一个可以同时使用 USB 和 WiFi 等多张网卡把文件传到电脑的软件。用尽手机一切对外可用 IO 通道来提升传输速度，手机与电脑点对点直连，不经过任何服务器。
+
+原作者实测：USB2.0+WIFI6（千兆网口）可以跑到 150MB/s（40+110MB/s）；USB2.0+WIFI6_5G:160mhz+WIFI6_2.4G:40mhz 可以跑到 200+MB/s。
+
+## 项目结构
+
+| 目录 | 说明 |
+| --- | --- |
+| `HybridFileXfer-Android/` | 安卓客户端（Java + Jetpack Compose / Miuix UI） |
+| `HybridFileXfer-Receiver/` | 电脑接收器（Rust + egui，GUI 与 CLI 双入口，不需要 Java） |
+| `HybridFileXfer-PC/` | 经典 Java 电脑客户端源码（旧版，可选） |
+| `script/` | adb 端口转发、一键编译等辅助脚本 |
 
 ## 速度测试（USB2.0+WIFI6:GbE）
 
@@ -17,7 +27,20 @@ USB2.0（adb 实测约 38 MB/s）+ WiFi6 5GHz（1201 Mbps 协商）聚合，实�
 
 # 获取更新
 
-应用「设置 → 获取更新」会跳到本仓库的 Releases 页面，直接从那里下载最新 APK 即可。
+应用「设置 → 获取更新」会直接跳到[本项目的 Releases 页面](https://github.com/yizhiruonan/HybridFileXfer/releases)，从那里下载最新 APK 覆盖安装即可。
+
+## 更新日志
+
+### 3.1.0
+
+- 界面全面迁移到 **Miuix 0.9.4**：`SwitchPreference` / `ArrowPreference` / `OverlayDropdownPreference` / `SliderPreference` / `Card` / `NavigationBarItem`
+- 新增 **主题设置**：跟随系统 / 浅色 / 深色 / Monet（跟随系统、浅色、深色），共 6 档，写入配置持久化
+- 界面缩放改用 `SliderPreference`，刻度点用原生 `showKeyPoints`，不再手绘圆点
+- 修复圆角分组不可见：卡片改用 `surfaceContainer` + Miuix `Card`
+- 修复应用内深色主题时状态栏 / 导航栏图标不可见
+- 移除「更新来源仓库」设置，获取更新固定指向本项目 Releases
+- 修复 Android 16 预测性返回导致经典界面返回键失效
+- 工具链升级：Gradle 9.6 / AGP 9.4.1 / Kotlin 2.4.20 / compileSdk 37（**minSdk 仍为 26**）
 
 # 使用
 
@@ -57,7 +80,8 @@ USB2.0（adb 实测约 38 MB/s）+ WiFi6 5GHz（1201 Mbps 协商）聚合，实�
 - 支持 USB（adb 自动检测）和 WIFI（`-c 手机IP`）
 - 详细说明见 [HybridFileXfer-Receiver/README.md](HybridFileXfer-Receiver/README.md)
 
-> 原来的 Java 电脑客户端依然可以使用，双栏传输、浏览电脑目录等功能不变。
+> 经典 Java 电脑客户端（源码在 `HybridFileXfer-PC/`）依然可用，双栏传输、浏览电脑目录等功能不变；
+> 仓库不附带编译好的 `adb.exe` 和 jar，请按需自行准备。
 
 ### 从源码编译
 
@@ -102,9 +126,12 @@ USB_ADB的连接比较特殊，它是通过`adb forward tcp:<port> tcp:<port>`�
 
 USB_ADB的连接需要USB调试，请到开发者选项中打开，**如果你因各种原因不能使用ADB，可以改用USB网络共享代替ADB。**
 
-主界面选择好模式后点击按钮`启动服务器并等待连接`，状态显示“等待连接”后，电脑双击运行启动脚本`启动_ADB连接.bat`（或者你根据启动参数自己编写一个）。如果提示没有java，则需要[安装java运行环境](https://www.oracle.com/java/technologies/javase/jdk17-archive-downloads.html)，安装过程不过多阐述，与我的世界安装java环境过程一致。ADB连接方式下，程序首先执行adb转发端口（USB通道），若电脑未授权USB调试，请点击手机上的“允许这台电脑进行调试”。端口转发完成后，启动电脑客户端，客户端先连接控制通道，然后从控制通道获取手机指定的传输通道网卡信息，然后电脑客户端连接到这些传输通道网卡，选择的线路都连接成功后，『传输文件』按钮亮起即可进行文件传输。
+主界面选择好模式后点击按钮`启动服务器并等待连接`，状态显示“等待连接”后，电脑运行 `script/start-by-adb.bat`（或根据下面的参数自己写一个）。如果提示没有java，则需要[安装java运行环境](https://www.oracle.com/java/technologies/javase/jdk17-archive-downloads.html)，安装过程不过多阐述，与我的世界安装java环境过程一致。ADB连接方式下，程序首先执行adb转发端口（USB通道），若电脑未授权USB调试，请点击手机上的“允许这台电脑进行调试”。端口转发完成后，启动电脑客户端，客户端先连接控制通道，然后从控制通道获取手机指定的传输通道网卡信息，然后电脑客户端连接到这些传输通道网卡，选择的线路都连接成功后，『传输文件』按钮亮起即可进行文件传输。
 
 ### 电脑客户端连接
+
+> 这一节讲的是**经典 Java 电脑客户端**（源码在 `HybridFileXfer-PC/`，自行编译得到 jar）。
+> 用 Rust 图形界面接收器的话不需要理会这些参数，直接在界面里点「开始」即可。
 
 通道分为控制通道与传输通道，控制通道用于通知对方发送或接收文件、列出文件夹、创建文件夹等，传输通道用于传输文件。
 
@@ -159,7 +186,7 @@ USB_ADB : 5740 端口转发成功！
 
 ### Linux电脑
 
-v1.1新增对Linux的支持，下载对应的电脑客户端即可，解压后执行对应命令，例如
+经典 Java 客户端是跨平台的，在 Linux 上执行对应命令即可，例如
 
 ```shell
 java -jar HybridFileXfer.jar -c adb
@@ -268,6 +295,16 @@ v1.2.0新增书签功能。
 特别说明：
 - 如果你将本项目进行分发，务必保留 **Dragonwell JDK** 的版权声明和许可证原文。
 - 本项目中的其他部分基于 **GPL-3.0**，这意味着任何对本项目的修改和分发必须符合 GPL-3.0 的条款。
+
+## 来源与致谢
+
+本项目衍生自 **[weixiansen574/HybridFileXfer](https://github.com/weixiansen574/HybridFileXfer)**（原作者 **weixiansen574**），
+在其基础上重做了安卓端界面并新增了 Rust 电脑接收器。依照 **GPL-3.0** 继续开源：
+
+- 保留原作者署名与原始许可证，不分发闭源衍生版本
+- 任何分发本项目的衍生作品，同样需以 GPL-3.0 公开完整源代码
+
+当前维护：[yizhiruonan](https://github.com/yizhiruonan)
 
 ## 声明
 
