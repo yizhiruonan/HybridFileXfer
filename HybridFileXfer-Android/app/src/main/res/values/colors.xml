@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="black">#FF000000</color>
+    <color name="white">#FFFFFFFF</color>
+    <color name="primary">#212121</color>
+    <color name="blue_background_dark">#1E88E5</color>
+    <color name="blue_background_light">#E3F2FD</color>
+    <color name="fond">@color/black</color>
+    <color name="shadow_end">#59000000</color>
+
+    <!-- 系统风格配色 -->
+    <color name="bg">#F2F3F5</color>
+    <color name="card">#FFFFFF</color>
+    <color name="text_primary">#1A1A1A</color>
+    <color name="text_secondary">#8A8A8E</color>
+    <color name="accent">#2F7CF6</color>
+    <color name="accent_soft">#E9F0FF</color>
+    <color name="green">#16A34A</color>
+    <color name="green_soft">#E8F7EE</color>
+    <color name="gray_soft">#F2F3F5</color>
+    <color name="divider">#EBEBED</color>
+    <color name="switch_track_off">#E6E7EB</color>
+    <color name="switch_thumb">#FFFFFF</color>
+    <color name="warn_soft">#FFF4E5</color>
+</resources>

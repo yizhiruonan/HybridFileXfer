@@ -1,0 +1,6 @@
+# 用清华镜像的 sparse 索引，比 git 索引快很多
+[source.crates-io]
+replace-with = "tuna-sparse"
+
+[source.tuna-sparse]
+registry = "sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/"

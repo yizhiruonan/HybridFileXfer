@@ -1,0 +1,42 @@
+# ================= 构建产物 / 缓存 =================
+build/
+out/
+target/
+.cxx/
+.gradle/
+.kotlin/
+captures/
+.externalNativeBuild/
+.idea/
+*.iml
+local.properties
+.DS_Store
+
+# ================= 二进制 / 本机工具链 =================
+*.exe
+*.dll
+*.so
+*.a
+*.dylib
+*.pdb
+*.zip
+*.apk
+*.jks
+*.keystore
+temp_jdk_extract/
+
+# ================= 日志 / 本机运行时配置 =================
+*.log
+HybridFileXfer-Receiver/config.ini
+
+# ================= 根目录杂项截图（不属于文档） =================
+/*.png
+/*.jpg
+/*.svg
+/*.jpeg
+
+# ================= 文档截图目录（本项目 README 不使用图片） =================
+/docs/
+
+# ================= 内部资料（含设备序列号 / 内网 IP，不公开） =================
+HANDOFF.md

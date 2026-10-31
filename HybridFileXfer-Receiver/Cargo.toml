@@ -1,0 +1,28 @@
+[package]
+name = "hybridfilexfer-receiver"
+version = "1.1.0"
+edition = "2021"
+description = "Receiver for HybridFileXfer / 多轨快传, with a GUI"
+
+[lib]
+name = "hfx_receiver"
+path = "src/lib.rs"
+
+# 图形界面版（给普通用户）
+[[bin]]
+name = "HybridFileXfer-Receiver"
+path = "src/bin/gui.rs"
+
+# 命令行版（无界面，便于自动化/开机后台运行）
+[[bin]]
+name = "HybridFileXfer-Receiver-cli"
+path = "src/main.rs"
+
+[dependencies]
+eframe = "0.29.1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

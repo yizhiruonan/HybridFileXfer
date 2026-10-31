@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="fond">@color/white</color>
+    <color name="blue_background_dark">#8AB4F8</color>
+    <color name="blue_background_light">#394456</color>
+
+    <color name="bg">#0E0F12</color>
+    <color name="card">#1A1B1F</color>
+    <color name="text_primary">#F2F2F7</color>
+    <color name="text_secondary">#8E8E93</color>
+    <color name="accent">#5B9DFF</color>
+    <color name="accent_soft">#16233A</color>
+    <color name="green">#34D399</color>
+    <color name="green_soft">#112A1E</color>
+    <color name="gray_soft">#212226</color>
+    <color name="divider">#2C2D33</color>
+    <color name="switch_track_off">#3A3B40</color>
+    <color name="switch_thumb">#FFFFFF</color>
+    <color name="warn_soft">#2A2113</color>
+</resources>

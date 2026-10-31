@@ -1,0 +1,393 @@
+package top.weixiansen574.hybridfilexfer.compose
+
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import top.yukonga.miuix.kmp.basic.Button
+import top.yukonga.miuix.kmp.basic.ButtonDefaults
+import top.yukonga.miuix.kmp.basic.Text
+import top.yukonga.miuix.kmp.basic.TextButton
+import top.yukonga.miuix.kmp.theme.MiuixTheme
+
+internal data class NumberDialogSpec(
+    val title: String,
+    val subtitle: String,
+    val initial: Int,
+    val min: Int,
+    val max: Int,
+    val suffix: String,
+    val onConfirm: (Int) -> Unit,
+)
+
+internal data class TextDialogSpec(
+    val title: String,
+    val subtitle: String,
+    val initial: String,
+    val onConfirm: (String) -> Unit,
+)
+
+private data class PcEntry(val name: String, val isDir: Boolean)
+
+/** 让弹窗窗口铺满整屏（连状态栏/导航栏一起），遮罩才能完整覆盖。 */
+@Composable
+private fun FullScreenWindow() {
+    val view = androidx.compose.ui.platform.LocalView.current
+    androidx.compose.runtime.LaunchedEffect(Unit) {
+        val window = ((view.parent as? androidx.compose.ui.window.DialogWindowProvider)?.window) ?: return@LaunchedEffect
+        window.setLayout(
+            android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+            android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+        )
+        window.addFlags(
+            android.view.WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                android.view.WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+        )
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+            window.setDecorFitsSystemWindows(false)
+        }
+        window.addFlags(android.view.WindowManager.LayoutParams.FLAG_DIM_BEHIND)
+        window.setDimAmount(0.35f)
+    }
+}
+
+private fun httpGet(url: String): String {
+    val connection = (java.net.URL(url).openConnection() as java.net.HttpURLConnection)
+    connection.connectTimeout = 4000
+    connection.readTimeout = 6000
+    try {
+        val stream = if (connection.responseCode in 200..299) connection.inputStream else connection.errorStream
+        return stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() } ?: ""
+    } finally {
+        connection.disconnect()
+    }
+}
+
+private fun parentPath(path: String): String? {
+    val normalized = path.trimEnd('/', '\\')
+    val index = maxOf(normalized.lastIndexOf('/'), normalized.lastIndexOf('\\'))
+    if (index <= 0) return null
+    val parent = normalized.substring(0, index)
+    return if (parent.length == 2 && parent[1] == ':') parent + "/" else parent
+}
+
+@Composable
+internal fun NumberDialog(spec: NumberDialogSpec, onDismiss: () -> Unit, onConfirm: (Int) -> Unit) {
+    val colorScheme = MiuixTheme.colorScheme
+    var input by remember { mutableStateOf(spec.initial.toString()) }
+    Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)) {
+        Box(
+            modifier = Modifier.fillMaxSize().background(Color.Transparent).clickable { onDismiss() },
+            contentAlignment = Alignment.Center,
+        ) {
+            FullScreenWindow()
+            Column(
+                modifier = Modifier.width(320.dp).clip(RoundedCornerShape(24.dp)).background(colorScheme.surfaceContainer).clickable { }.padding(20.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                Text(spec.title, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                Text(spec.subtitle, fontSize = 14.sp, color = colorScheme.onSurfaceVariantSummary, modifier = Modifier.padding(top = 6.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(top = 18.dp).clip(RoundedCornerShape(14.dp))
+                        .background(colorScheme.secondaryContainerVariant).padding(horizontal = 16.dp, vertical = 14.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    BasicTextField(
+                        value = input,
+                        onValueChange = { value -> input = value.filter { it.isDigit() }.take(4) },
+                        singleLine = true,
+                        textStyle = androidx.compose.ui.text.TextStyle(fontSize = 18.sp, color = colorScheme.onSurface),
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        modifier = Modifier.weight(1f),
+                    )
+                    if (spec.suffix.isNotEmpty()) {
+                        Text(spec.suffix, fontSize = 18.sp, color = colorScheme.onSurfaceVariantSummary)
+                    }
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(top = 18.dp),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    Button(onClick = onDismiss, modifier = Modifier.weight(1f)) { Text("取消") }
+                    Button(
+                        onClick = {
+                            val value = (input.toIntOrNull() ?: spec.initial).coerceIn(spec.min, spec.max)
+                            onConfirm(value)
+                        },
+                        modifier = Modifier.weight(1f),
+                        colors = ButtonDefaults.buttonColorsPrimary(),
+                    ) { Text("确定", color = Color.White) }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+internal fun TextDialog(spec: TextDialogSpec, onDismiss: () -> Unit, onConfirm: (String) -> Unit) {
+    val colorScheme = MiuixTheme.colorScheme
+    var input by remember { mutableStateOf(spec.initial) }
+    Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)) {
+        Box(
+            modifier = Modifier.fillMaxSize().background(Color.Transparent).clickable { onDismiss() },
+            contentAlignment = Alignment.Center,
+        ) {
+            Column(
+                modifier = Modifier.width(320.dp).clip(RoundedCornerShape(24.dp)).background(colorScheme.surfaceContainer).clickable { }.padding(20.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                Text(spec.title, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                Text(spec.subtitle, fontSize = 13.sp, color = colorScheme.onSurfaceVariantSummary, modifier = Modifier.padding(top = 6.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(top = 18.dp).clip(RoundedCornerShape(14.dp))
+                        .background(colorScheme.secondaryContainerVariant).padding(horizontal = 16.dp, vertical = 14.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    BasicTextField(
+                        value = input,
+                        onValueChange = { value -> input = value.take(120) },
+                        singleLine = true,
+                        textStyle = androidx.compose.ui.text.TextStyle(fontSize = 16.sp, color = colorScheme.onSurface),
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(top = 18.dp),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    Button(onClick = onDismiss, modifier = Modifier.weight(1f)) { Text("取消") }
+                    Button(onClick = { onConfirm(input) }, modifier = Modifier.weight(1f), colors = ButtonDefaults.buttonColorsPrimary()) {
+                        Text("确定", color = Color.White)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+internal fun PcFolderDialog(
+    initialPath: String,
+    peerIp: String?,
+    onDismiss: () -> Unit,
+    onSelected: (String) -> Unit,
+) {
+    val colorScheme = MiuixTheme.colorScheme
+    var currentPath by remember { mutableStateOf(initialPath) }
+    var entries by remember { mutableStateOf(listOf<PcEntry>()) }
+    var loading by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf("") }
+    var retryTick by remember { mutableStateOf(0) }
+
+    LaunchedEffect(currentPath, peerIp, retryTick) {
+        if (peerIp == null) {
+            error = "adb 连接下无法访问电脑，请用同一 WIFI 连接后再浏览"
+            return@LaunchedEffect
+        }
+        loading = true
+        error = ""
+        val result = withContext(Dispatchers.IO) {
+            try {
+                val encoded = java.net.URLEncoder.encode(currentPath, "UTF-8")
+                val body = httpGet("http://" + peerIp + ":5742/list?path=" + encoded)
+                val list = ArrayList<PcEntry>()
+                body.lineSequence().forEach { line ->
+                    when {
+                        line.startsWith("D\t") -> list.add(PcEntry(line.substring(2), true))
+                        line.startsWith("F\t") -> list.add(PcEntry(line.substring(2), false))
+                        line.startsWith("E\t") -> error = line.substring(2)
+                    }
+                }
+                list
+            } catch (e: Exception) {
+                error = e.message ?: "连接电脑失败"
+                ArrayList()
+            }
+        }
+        entries = result
+        loading = false
+    }
+
+    fun selectDirectory(path: String) {
+        if (peerIp == null) return
+        try {
+            httpGet("http://" + peerIp + ":5742/set?path=" + java.net.URLEncoder.encode(path, "UTF-8"))
+        } catch (_: Exception) {
+        }
+    }
+
+    Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)) {
+        Box(
+            modifier = Modifier.fillMaxSize().background(Color.Transparent).clickable { onDismiss() },
+            contentAlignment = Alignment.Center,
+        ) {
+            FullScreenWindow()
+            Column(
+                modifier = Modifier.width(340.dp).clip(RoundedCornerShape(24.dp)).background(colorScheme.surfaceContainer).clickable { }.padding(vertical = 16.dp),
+            ) {
+                Text("浏览电脑文件夹", modifier = Modifier.fillMaxWidth(), fontSize = 20.sp, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center)
+                Text(currentPath, modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 6.dp), fontSize = 12.sp, color = colorScheme.onSurfaceVariantSummary, maxLines = 2, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+                if (peerIp != null) {
+                    Text("电脑 IP：" + peerIp, modifier = Modifier.padding(horizontal = 20.dp), fontSize = 11.sp, color = colorScheme.onSurfaceVariantSummary)
+                }
+                if (error.isNotEmpty()) {
+                    Text(error, modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp), fontSize = 13.sp, color = colorScheme.primary)
+                    TextButton(text = "重试", onClick = { retryTick++ })
+                }
+                if (loading) {
+                    Text("正在读取电脑目录…", modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp), fontSize = 13.sp, color = colorScheme.onSurfaceVariantSummary)
+                }
+                LazyColumn(modifier = Modifier.fillMaxWidth().height(300.dp)) {
+                    item {
+                        Row(
+                            modifier = Modifier.fillMaxWidth().clickable { parentPath(currentPath)?.let { currentPath = it } }.padding(horizontal = 20.dp, vertical = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text("..", fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                            Spacer(Modifier.width(8.dp))
+                            Text("上一级", fontSize = 13.sp, color = colorScheme.onSurfaceVariantSummary)
+                        }
+                    }
+                    items(entries.filter { it.isDir }) { entry ->
+                        Row(
+                            modifier = Modifier.fillMaxWidth().clickable {
+                                val base = currentPath.trimEnd('/', '\\')
+                                currentPath = base + "/" + entry.name
+                            }.padding(horizontal = 20.dp, vertical = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(entry.name, fontSize = 15.sp)
+                        }
+                    }
+                }
+                Row(modifier = Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 12.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Button(onClick = onDismiss, modifier = Modifier.weight(1f)) { Text("取消") }
+                    Button(
+                        onClick = {
+                            selectDirectory(currentPath)
+                            onSelected(currentPath)
+                        },
+                        modifier = Modifier.weight(1f),
+                        colors = ButtonDefaults.buttonColorsPrimary(),
+                    ) { Text("选定此目录", color = Color.White) }
+                }
+            }
+        }
+    }
+}
+
+private fun formatSpeed(bytesPerSecond: Long): String {
+    if (bytesPerSecond <= 0) {
+        return "无记录"
+    }
+    val mb = bytesPerSecond / 1024.0 / 1024.0
+    return if (mb >= 1) {
+        String.format(java.util.Locale.US, "%.2f MB/s", mb)
+    } else {
+        String.format(java.util.Locale.US, "%.0f KB/s", bytesPerSecond / 1024.0)
+    }
+}
+
+@Composable
+internal fun ConnectionInfoPanel(state: UiState, onDismiss: () -> Unit) {
+    val colorScheme = MiuixTheme.colorScheme
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black.copy(alpha = 0.40f))
+            .clickable(interactionSource = androidx.compose.foundation.interaction.MutableInteractionSource(), indication = null) { onDismiss() },
+        contentAlignment = Alignment.Center,
+    ) {
+        Column(
+            modifier = Modifier
+                .width(330.dp)
+                .clip(RoundedCornerShape(24.dp))
+                .background(colorScheme.surfaceContainer)
+                .clickable(interactionSource = androidx.compose.foundation.interaction.MutableInteractionSource(), indication = null) { }
+                .padding(20.dp),
+        ) {
+            Text("连接详情", fontSize = 20.sp, fontWeight = FontWeight.Bold)
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 460.dp)
+                    .verticalScroll(rememberScrollState()),
+            ) {
+                InfoRow("状态", if (state.connected) "已连接电脑" else "等待电脑连接")
+                InfoRow("模式", modeLabel(state.mode))
+                InfoRow("电脑 IP", state.peerIp ?: "未知（adb 连接）")
+                if (state.channelDetails.isEmpty()) {
+                    InfoRow("已用通道", "无")
+                } else {
+                    state.channelDetails.forEach { detail ->
+                        val parts = detail.split("\t")
+                        val name = parts.getOrNull(0) ?: detail
+                        val address = parts.getOrNull(1) ?: ""
+                        val rate = when {
+                            name.startsWith("wlan") -> state.wifiRate
+                            name.startsWith("USB") -> state.usbSpeed
+                            else -> ""
+                        }
+                        val value = buildString {
+                            append(address.ifEmpty { "已连接" })
+                            if (rate.isNotEmpty()) {
+                                append("\n")
+                                append(rate)
+                            }
+                        }
+                        InfoRow(name, value)
+                    }
+                }
+                InfoRow("接收目录", state.homeDir.ifEmpty { "未连接" })
+                InfoRow("WLAN 协商速率", state.wifiRate.ifEmpty { "未连接 WLAN" })
+                InfoRow("USB 协议", state.usbSpeed.ifEmpty { "无法读取（需要 ROOT 权限）" })
+                InfoRow("ROOT 权限", state.rootState.ifEmpty { "未知" })
+                InfoRow("SHELL（Shizuku）", state.shellState.ifEmpty { "未知" })
+
+            }
+            Button(
+                onClick = onDismiss,
+                modifier = Modifier.fillMaxWidth().padding(top = 16.dp),
+                colors = ButtonDefaults.buttonColorsPrimary(),
+            ) { Text("关闭", color = Color.White) }
+        }
+    }
+}
