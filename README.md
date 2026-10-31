@@ -28,6 +28,22 @@
 - **限速**：按 MB/s 限制发送速率，0 表示不限速
 - **浏览电脑文件夹**：手机端可直接浏览并切换电脑的接收目录
 
+## 界面
+
+安卓端基于 Miuix，浅色 / 深色 / Monet 三套主题。
+
+| 主页（浅色） | 设置（浅色） |
+| --- | --- |
+| ![安卓主页浅色](docs/android-home-light.png) | ![安卓设置浅色](docs/android-settings-light.png) |
+
+| 主页（深色） | 设置（深色） |
+| --- | --- |
+| ![安卓主页深色](docs/android-home-dark.png) | ![安卓设置深色](docs/android-settings-dark.png) |
+
+电脑接收器（Rust + Slint，原生 Windows 风格）：
+
+![电脑接收器](docs/windows-receiver.png)
+
 ## 快速开始
 
 ### 手机端
