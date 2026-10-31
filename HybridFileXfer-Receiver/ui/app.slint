@@ -82,7 +82,7 @@ component SecondaryButton inherits Rectangle {
 }
 
 export component AppWindow inherits Window {
-    title: "多轨快传 · 电脑接收器  v" + root.app-version;
+    title: "多轨快传";
     icon: @image-url("logo-accent.png");
     default-font-family: "Microsoft YaHei UI";
     default-font-size: 13px;
@@ -91,8 +91,6 @@ export component AppWindow inherits Window {
     min-width: 520px;
     min-height: 260px;
     background: #F3F3F3;
-
-    in property <string> app-version: "1.2.0";
 
     in-out property <string> status-title: "未开始接收";
     in-out property <string> status-sub: "点「开始接收」等待手机连接";
@@ -115,6 +113,13 @@ export component AppWindow inherits Window {
     // IDM 式分块：每个元素是该段已完成比例（0..1）
     in-out property <[float]> blocks: [];
 
+    // ---- 更新检查：0 检查中 / 1 已是最新 / 2 有新版 / 3 正在下载 / 4 出错 ----
+    in-out property <int> update-state: 0;
+    in-out property <string> update-text: "";
+    in-out property <bool> update-busy: false;
+
+    callback update-clicked();
+
     callback browse-clicked();
     callback start-clicked();
     callback stop-clicked();
@@ -122,7 +127,6 @@ export component AppWindow inherits Window {
     callback open-dir();
 
     private property <color> status-color: root.status-kind == 2 ? #0F7B0F : root.status-kind == 3 ? #9D5D00 : #8A8A8A;
-    private property <string> status-glyph: root.status-kind == 2 ? "✓" : root.status-kind == 3 ? "!" : "•";
     private property <string> status-text: root.status-kind == 2 ? "已连接" : root.status-kind == 3 ? "重试中" : root.status-kind == 1 ? "等待中" : "未启动";
 
     VerticalLayout {
@@ -144,15 +148,25 @@ export component AppWindow inherits Window {
                     height: 40px;
                     border-radius: 20px;
                     background: #F3F3F3;
-                    Text {
-                        width: parent.width;
-                        height: parent.height;
-                        text: root.status-glyph;
-                        color: root.status-color;
-                        font-size: 20px;
-                        font-weight: 700;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
+
+                    // 已连接用对勾（与手机端一致），其它状态用手机图标
+                    Image {
+                        visible: root.status-kind == 2;
+                        source: @image-url("status-check.png");
+                        colorize: root.status-color;
+                        width: 22px;
+                        height: 22px;
+                        x: 9px;
+                        y: 9px;
+                    }
+                    Image {
+                        visible: root.status-kind != 2;
+                        source: @image-url("status-phone.png");
+                        colorize: root.status-color;
+                        width: 22px;
+                        height: 22px;
+                        x: 9px;
+                        y: 9px;
                     }
                 }
 
@@ -290,6 +304,42 @@ export component AppWindow inherits Window {
                 Text {
                     text: root.message;
                     visible: root.message != "";
+                    font-size: 11px;
+                    color: #9D5D00;
+                }
+
+                // 有新版才出现的一行
+                if root.update-state == 2 : HorizontalLayout {
+                    height: 30px;
+                    vertical-stretch: 0;
+                    spacing: 8px;
+                    Rectangle {
+                        width: 8px;
+                        height: 8px;
+                        border-radius: 4px;
+                        background: #005FB8;
+                    }
+                    Text {
+                        text: root.update-text;
+                        font-size: 11.5px;
+                        color: #005FB8;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                    }
+                    Button {
+                        text: "一键更新";
+                        clicked => { root.update-clicked(); }
+                    }
+                }
+
+                if root.update-state == 3 : Text {
+                    text: root.update-text;
+                    font-size: 11.5px;
+                    color: #005FB8;
+                }
+
+                if root.update-state == 4 : Text {
+                    text: root.update-text;
                     font-size: 11px;
                     color: #9D5D00;
                 }

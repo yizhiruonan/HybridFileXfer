@@ -20,6 +20,9 @@ path = "src/main.rs"
 
 [dependencies]
 slint = "1.18"
+# 更新检测：用 native-tls（走 Windows 证书库），这样系统代理/镜像证书也能校验通过
+ureq = { version = "2", features = ["json", "native-certs"] }
+serde_json = "1"
 
 [build-dependencies]
 slint-build = "1.18"

@@ -98,6 +98,9 @@ fn main() -> Result<(), slint::PlatformError> {
 
     let (state_tx, state_rx) = mpsc::channel();
 
+    // 清理上一次自我更新留下的旧文件
+    let _ = std::fs::remove_file(exe_dir.join("HybridFileXfer-Receiver.exe.old"));
+
     let autostart = autostart_path().map(|p| p.exists()).unwrap_or(false);
     let ip_text = std::env::var("HFX_LAST_IP").unwrap_or_else(|_| "192.168.1.100".to_string());
 
@@ -112,7 +115,6 @@ fn main() -> Result<(), slint::PlatformError> {
     }));
 
     let ui = AppWindow::new()?;
-    ui.set_app_version(env!("CARGO_PKG_VERSION").into());
     ui.set_dir_text(state.lock().unwrap().config.receive_dir.display().to_string().into());
     ui.set_port_text(state.lock().unwrap().config.port.to_string().into());
     ui.set_ip_text(ip_text.into());
@@ -209,6 +211,7 @@ fn main() -> Result<(), slint::PlatformError> {
         let mut last_tick = std::time::Instant::now();
         let mut speed = 0f64;
         let mut last_xfer_visible = false;
+        let mut last_want_h = 0f32;
 
         timer.start(slint::TimerMode::Repeated, Duration::from_millis(150), move || {
             let Some(ui) = ui_weak.upgrade() else { return };
@@ -276,22 +279,195 @@ fn main() -> Result<(), slint::PlatformError> {
                 ui.set_blocks(slint::ModelRc::new(slint::VecModel::from(segs)));
             }
 
-            // 进度卡出现/消失时调整窗口高度（否则底部按钮会被裁掉）
-            let visible_now = ui.get_xfer_visible();
-            if visible_now != last_xfer_visible {
-                last_xfer_visible = visible_now;
+            // 进度卡 / 更新提示出现时调整窗口高度（否则底部按钮会被裁掉）
+            let xfer_now = ui.get_xfer_visible();
+            let want_h = 400.0
+                + if xfer_now { 130.0 } else { 0.0 }
+                + if ui.get_update_state() == 2 { 34.0 } else { 0.0 };
+            if (want_h - last_want_h).abs() > 0.5 {
+                last_want_h = want_h;
+                last_xfer_visible = xfer_now;
                 let scale = ui.window().scale_factor();
                 let current = ui.window().size();
                 let width = current.width as f32 / scale;
-                let height = if visible_now { 530.0 } else { 400.0 };
                 ui.window()
-                    .set_size(slint::LogicalSize::new(width, height));
+                    .set_size(slint::LogicalSize::new(width, want_h));
             }
 
         });
     }
 
+    // ---------- 更新检查 ----------
+    start_update_check(ui.as_weak());
+
+    {
+        let ui_weak = ui.as_weak();
+        ui.on_update_clicked(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            ui.set_update_state(3);
+            ui.set_update_text("正在下载更新，完成后会自动重启…".into());
+            let ui_weak2 = ui_weak.clone();
+            std::thread::spawn(move || {
+                let result = download_and_swap();
+                if let Err(e) = result {
+                    let text = format!("更新失败：{}", e);
+                    post_ui(ui_weak2.clone(), move |ui| {
+                        ui.set_update_state(4);
+                        ui.set_update_text(text.into());
+                    });
+                }
+            });
+        });
+    }
+
     ui.run()
+}
+
+// ---------------- 更新：检查 / 下载 / 自我替换 ----------------
+
+/// Slint 的属性只能在 UI 线程改，后台线程要用这个把更新送回事件循环
+fn post_ui(
+    ui_weak: slint::Weak<AppWindow>,
+    action: impl FnOnce(&AppWindow) + Send + 'static,
+) {
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(ui) = ui_weak.upgrade() {
+            action(&ui);
+        }
+    });
+}
+
+const REPO: &str = "yizhiruonan/HybridFileXfer";
+/// Release 里单独放一个接收器版本号文件，避免和整个项目的 tag（v3.1.0）混在一起
+const VERSION_ASSET: &str = "receiver.version";
+const EXE_ASSET: &str = "HybridFileXfer-Receiver.exe";
+
+fn parse_version(text: &str) -> Option<(u32, u32, u32)> {
+    let t = text.trim();
+    let t = t.strip_prefix('v').unwrap_or(t);
+    let mut parts = t.split('.');
+    let a = parts.next()?.trim().parse().ok()?;
+    let b = parts.next()?.trim().parse().ok()?;
+    let c = parts
+        .next()
+        .and_then(|x| x.trim().parse().ok())
+        .unwrap_or(0);
+    Some((a, b, c))
+}
+
+static UPDATE_EXE_URL: std::sync::LazyLock<Mutex<String>> =
+    std::sync::LazyLock::new(|| Mutex::new(String::new()));
+
+fn start_update_check(ui_weak: slint::Weak<AppWindow>) {
+    std::thread::spawn(move || {
+        let fail = |msg: &str| {
+            let text = msg.to_string();
+            post_ui(ui_weak.clone(), move |ui| {
+                ui.set_update_state(4);
+                ui.set_update_text(text.into());
+            });
+        };
+
+        let api = format!("https://api.github.com/repos/{REPO}/releases/latest");
+        let release: serde_json::Value = match ureq::get(&api)
+            .set("User-Agent", "HybridFileXfer-Receiver")
+            .set("Accept", "application/vnd.github+json")
+            .timeout(Duration::from_secs(15))
+            .call()
+            .and_then(|r| r.into_json::<serde_json::Value>().map_err(Into::into))
+        {
+            Ok(v) => v,
+            Err(_) => return fail("检查更新失败（网络不可用）"),
+        };
+
+        let mut version_url = String::new();
+        let mut exe_url = String::new();
+        if let Some(assets) = release["assets"].as_array() {
+            for asset in assets {
+                let name = asset["name"].as_str().unwrap_or_default();
+                let url = asset["browser_download_url"].as_str().unwrap_or_default();
+                if name == VERSION_ASSET {
+                    version_url = url.to_string();
+                } else if name == EXE_ASSET {
+                    exe_url = url.to_string();
+                }
+            }
+        }
+        if version_url.is_empty() || exe_url.is_empty() {
+            return fail("更新信息不完整（缺少接收器附件）");
+        }
+
+        let latest_text = match ureq::get(&version_url)
+            .timeout(Duration::from_secs(15))
+            .call()
+            .and_then(|r| r.into_string().map_err(Into::into))
+        {
+            Ok(t) => t,
+            Err(_) => return fail("检查更新失败（无法读取版本号）"),
+        };
+
+        let latest = match parse_version(&latest_text) {
+            Some(v) => v,
+            None => return fail("更新信息格式不正确"),
+        };
+        let current = parse_version(env!("CARGO_PKG_VERSION")).unwrap_or((0, 0, 0));
+
+        if latest > current {
+            if let Ok(mut guard) = UPDATE_EXE_URL.lock() {
+                *guard = exe_url;
+            }
+            let text = format!(
+                "发现新版本 v{}.{}.{}（当前 v{}.{}.{}）",
+                latest.0, latest.1, latest.2, current.0, current.1, current.2
+            );
+            post_ui(ui_weak.clone(), move |ui| {
+                ui.set_update_state(2);
+                ui.set_update_text(text.into());
+            });
+        } else {
+            post_ui(ui_weak.clone(), move |ui| ui.set_update_state(1));
+        }
+    });
+}
+
+fn download_and_swap() -> Result<(), String> {
+    let url = UPDATE_EXE_URL
+        .lock()
+        .map(|g| g.clone())
+        .map_err(|_| "内部状态错误".to_string())?;
+    if url.is_empty() {
+        return Err("没有可用的下载地址".into());
+    }
+
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let dir = exe.parent().ok_or("找不到程序目录")?.to_path_buf();
+    let tmp = std::env::temp_dir().join("HybridFileXfer-Receiver.new.exe");
+
+    let response = ureq::get(&url)
+        .timeout(Duration::from_secs(600))
+        .call()
+        .map_err(|e| format!("下载失败：{e}"))?;
+    {
+        let mut reader = response.into_reader();
+        let mut file = std::fs::File::create(&tmp).map_err(|e| format!("创建临时文件失败：{e}"))?;
+        std::io::copy(&mut reader, &mut file).map_err(|e| format!("写入失败：{e}"))?;
+    }
+
+    let old = dir.join("HybridFileXfer-Receiver.exe.old");
+    let _ = std::fs::remove_file(&old);
+    // Windows 允许改名正在运行的 exe，但不能直接覆盖
+    std::fs::rename(&exe, &old).map_err(|e| format!("替换失败（改名）：{e}"))?;
+    if let Err(e) = std::fs::copy(&tmp, &exe) {
+        // 回滚
+        let _ = std::fs::rename(&old, &exe);
+        return Err(format!("替换失败（写入）：{e}"));
+    }
+    let _ = std::fs::remove_file(&tmp);
+
+    std::process::Command::new(&exe)
+        .spawn()
+        .map_err(|e| format!("重启失败：{e}"))?;
+    std::process::exit(0);
 }
 
 /// 字节数 -> 人类可读
