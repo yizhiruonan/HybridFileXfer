@@ -9,7 +9,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::proto::BLOCK_SIZE;
@@ -42,6 +42,119 @@ impl SharedDir {
         }
     }
 }
+
+/// 当前文件的"已收到块"位图，用来画 IDM 那种分块进度
+#[derive(Default)]
+pub struct BlockMap {
+    total_blocks: usize,
+    bits: Vec<u64>,
+}
+
+impl BlockMap {
+    pub fn reset(&mut self) {
+        self.total_blocks = 0;
+        self.bits.clear();
+    }
+
+    pub fn mark(&mut self, index: u32, total_size: u64, block_size: u64) {
+        let total = ((total_size + block_size - 1) / block_size.max(1)).max(1) as usize;
+        if total != self.total_blocks {
+            self.total_blocks = total;
+            self.bits = vec![0u64; (total + 63) / 64];
+        }
+        let i = index as usize;
+        if i < self.total_blocks {
+            self.bits[i / 64] |= 1u64 << (i % 64);
+        }
+    }
+
+    /// 把块聚合成 n 段，每段返回完成比例 0..1
+    pub fn segments(&self, n: usize) -> Vec<f32> {
+        if self.total_blocks == 0 || n == 0 {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(n);
+        for s in 0..n {
+            let start = s * self.total_blocks / n;
+            let end = ((s + 1) * self.total_blocks / n).max(start);
+            if end <= start {
+                out.push(0.0);
+                continue;
+            }
+            let mut got = 0usize;
+            for b in start..end {
+                if self.bits[b / 64] & (1u64 << (b % 64)) != 0 {
+                    got += 1;
+                }
+            }
+            out.push(got as f32 / (end - start) as f32);
+        }
+        out
+    }
+}
+
+/// 传输进度（全局唯一：GUI / CLI 都只有一份接收器实例）
+pub struct ProgressState {
+    /// 当前正在写的文件（显示用短名）
+    pub file_name: RwLock<String>,
+    /// 当前文件已写字节
+    pub file_done: AtomicU64,
+    /// 当前文件总字节
+    pub file_total: AtomicU64,
+    /// 本次会话累计字节
+    pub session_bytes: AtomicU64,
+    /// 本次会话已开始的文件数
+    pub files_started: AtomicU64,
+    /// 当前文件的块位图
+    pub blocks: Mutex<BlockMap>,
+}
+
+impl ProgressState {
+    pub fn reset(&self) {
+        if let Ok(mut guard) = self.file_name.write() {
+            guard.clear();
+        }
+        self.file_done.store(0, Ordering::Relaxed);
+        self.file_total.store(0, Ordering::Relaxed);
+        self.session_bytes.store(0, Ordering::Relaxed);
+        self.files_started.store(0, Ordering::Relaxed);
+        if let Ok(mut b) = self.blocks.lock() {
+            b.reset();
+        }
+    }
+
+    /// 当前文件的 n 段完成比例
+    pub fn segments(&self, n: usize) -> Vec<f32> {
+        self.blocks
+            .lock()
+            .map(|b| b.segments(n))
+            .unwrap_or_default()
+    }
+
+    pub fn snapshot(&self) -> (String, u64, u64, u64, u64) {
+        let name = self
+            .file_name
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        (
+            name,
+            self.file_done.load(Ordering::Relaxed),
+            self.file_total.load(Ordering::Relaxed),
+            self.session_bytes.load(Ordering::Relaxed),
+            self.files_started.load(Ordering::Relaxed),
+        )
+    }
+}
+
+pub static PROGRESS: LazyLock<ProgressState> = LazyLock::new(|| ProgressState {
+    file_name: RwLock::new(String::new()),
+    file_done: AtomicU64::new(0),
+    file_total: AtomicU64::new(0),
+    session_bytes: AtomicU64::new(0),
+    files_started: AtomicU64::new(0),
+    blocks: Mutex::new(BlockMap::default()),
+});
 
 pub struct Receiver {
     dir: SharedDir,
@@ -124,6 +237,40 @@ impl Receiver {
             written += n;
         }
         self.bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
+
+        // ---- 进度上报 ----
+        PROGRESS
+            .file_total
+            .store(total_size, Ordering::Relaxed);
+        let changed = {
+            let mut guard = match PROGRESS.file_name.write() {
+                Ok(g) => g,
+                Err(_) => return Ok(()),
+            };
+            if *guard != raw_path {
+                *guard = raw_path.to_string();
+                true
+            } else {
+                false
+            }
+        };
+        if changed {
+            PROGRESS.file_done.store(0, Ordering::Relaxed);
+            PROGRESS.files_started.fetch_add(1, Ordering::Relaxed);
+            if let Ok(mut blocks) = PROGRESS.blocks.lock() {
+                blocks.reset();
+            }
+        }
+        if let Ok(mut blocks) = PROGRESS.blocks.lock() {
+            blocks.mark(index, total_size, BLOCK_SIZE);
+        }
+        PROGRESS
+            .file_done
+            .fetch_add(data.len() as u64, Ordering::Relaxed);
+        PROGRESS
+            .session_bytes
+            .fetch_add(data.len() as u64, Ordering::Relaxed);
+
         Ok(())
     }
 

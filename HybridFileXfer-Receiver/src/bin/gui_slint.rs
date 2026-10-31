@@ -29,10 +29,7 @@ struct State {
     exe_dir: PathBuf,
     engine: Option<EngineHandle>,
     state: EngineState,
-    log_lines: Vec<String>,
-    log_rx: Receiver<String>,
     state_rx: Receiver<EngineState>,
-    log_tx: Sender<String>,
     state_tx: Sender<EngineState>,
 }
 
@@ -74,7 +71,6 @@ impl State {
                 let _ = sender.send(state);
             }
         });
-        log::set_ui_sink(self.log_tx.clone());
         // engine::run 是阻塞的，必须自己开线程
         let join = std::thread::spawn(move || {
             engine::run(options, stop_for_thread, sink);
@@ -100,9 +96,7 @@ fn main() -> Result<(), slint::PlatformError> {
     log::init(Some(exe_dir.join("receiver.log")), false);
     log::set_console(false);
 
-    let (log_tx, log_rx) = mpsc::channel();
     let (state_tx, state_rx) = mpsc::channel();
-    log::set_ui_sink(log_tx.clone());
 
     let autostart = autostart_path().map(|p| p.exists()).unwrap_or(false);
     let ip_text = std::env::var("HFX_LAST_IP").unwrap_or_else(|_| "192.168.1.100".to_string());
@@ -113,10 +107,7 @@ fn main() -> Result<(), slint::PlatformError> {
         exe_dir: exe_dir.clone(),
         engine: None,
         state: EngineState::Stopped,
-        log_lines: Vec::new(),
-        log_rx,
         state_rx,
-        log_tx,
         state_tx,
     }));
 
@@ -126,7 +117,6 @@ fn main() -> Result<(), slint::PlatformError> {
     ui.set_port_text(state.lock().unwrap().config.port.to_string().into());
     ui.set_ip_text(ip_text.into());
     ui.set_autostart(autostart);
-    ui.set_config_path(format!("配置文件：{}", shorten(&config_path.display().to_string(), 52)).into());
     ui.set_status_kind(0);
 
     // ---------- 回调 ----------
@@ -177,6 +167,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 return;
             }
             ui.set_message("".into());
+            hfx_receiver::receiver::PROGRESS.reset();
             s.start_engine(port, mode, dir);
             ui.set_running(true);
         });
@@ -208,50 +199,20 @@ fn main() -> Result<(), slint::PlatformError> {
             open_in_explorer(&s.config.receive_dir.display().to_string());
         });
     }
-    {
-        let st = Arc::clone(&state);
-        ui.on_open_log(move || {
-            let s = st.lock().unwrap();
-            let _ = std::process::Command::new("notepad")
-                .arg(s.exe_dir.join("receiver.log"))
-                .spawn();
-        });
-    }
-    {
-        let st = Arc::clone(&state);
-        let ui_weak = ui.as_weak();
-        ui.on_clear_log(move || {
-            st.lock().unwrap().log_lines.clear();
-            if let Some(ui) = ui_weak.upgrade() {
-                ui.set_log_text("".into());
-                ui.set_log_count(0);
-            }
-        });
-    }
 
     // ---------- 定时把线程里的状态/日志刷到界面 ----------
     let timer = slint::Timer::default();
     {
         let st = Arc::clone(&state);
         let ui_weak = ui.as_weak();
-        timer.start(slint::TimerMode::Repeated, Duration::from_millis(120), move || {
+        let mut last_bytes = 0u64;
+        let mut last_tick = std::time::Instant::now();
+        let mut speed = 0f64;
+        let mut last_xfer_visible = false;
+
+        timer.start(slint::TimerMode::Repeated, Duration::from_millis(150), move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             let mut s = st.lock().unwrap();
-
-            let mut dirty_log = false;
-            while let Ok(line) = s.log_rx.try_recv() {
-                s.log_lines.push(line);
-                dirty_log = true;
-            }
-            if s.log_lines.len() > 500 {
-                let overflow = s.log_lines.len() - 500;
-                s.log_lines.drain(..overflow);
-                dirty_log = true;
-            }
-            if dirty_log {
-                ui.set_log_text(s.log_lines.join("\n").into());
-                ui.set_log_count(s.log_lines.len() as i32);
-            }
 
             while let Ok(next) = s.state_rx.try_recv() {
                 s.state = next;
@@ -276,24 +237,89 @@ fn main() -> Result<(), slint::PlatformError> {
                 ui.set_status_sub(sub.into());
                 ui.set_running(!matches!(s.state, EngineState::Stopped));
             }
-        });
-    }
 
-    // 开机自启的 vbs 会带 --autostart，直接开始接收
-    if std::env::args().any(|a| a == "--autostart") {
-        ui.invoke_start_clicked();
+            // ---- 传输进度 ----
+            let (path, done, total, session_bytes, files) =
+                hfx_receiver::receiver::PROGRESS.snapshot();
+
+            let now = std::time::Instant::now();
+            let elapsed = now.duration_since(last_tick).as_secs_f64();
+            if elapsed >= 0.4 {
+                let delta = session_bytes.saturating_sub(last_bytes);
+                let instant = delta as f64 / elapsed;
+                // 轻微平滑，避免数字乱跳
+                speed = if speed <= 0.0 { instant } else { speed * 0.6 + instant * 0.4 };
+                last_bytes = session_bytes;
+                last_tick = now;
+            }
+
+            let active = s.running() && total > 0;
+            ui.set_xfer_visible(active);
+            if active {
+                let short = path
+                    .rsplit(['/', '\\'])
+                    .next()
+                    .unwrap_or(&path)
+                    .to_string();
+                ui.set_file_name(short.into());
+                ui.set_file_progress(if total > 0 { done as f32 / total as f32 } else { 0.0 });
+                ui.set_file_text(format!("{} / {}", human(done), human(total)).into());
+                ui.set_session_text(format!(
+                    "已接收 {} · {} · {} 个文件",
+                    human(session_bytes),
+                    human_speed(speed),
+                    files
+                ).into());
+
+                // IDM 式分块：切 96 段，每段填多少由已收到的块决定
+                let segs = hfx_receiver::receiver::PROGRESS.segments(96);
+                ui.set_blocks(slint::ModelRc::new(slint::VecModel::from(segs)));
+            }
+
+            // 进度卡出现/消失时调整窗口高度（否则底部按钮会被裁掉）
+            let visible_now = ui.get_xfer_visible();
+            if visible_now != last_xfer_visible {
+                last_xfer_visible = visible_now;
+                let scale = ui.window().scale_factor();
+                let current = ui.window().size();
+                let width = current.width as f32 / scale;
+                let height = if visible_now { 530.0 } else { 400.0 };
+                ui.window()
+                    .set_size(slint::LogicalSize::new(width, height));
+            }
+
+        });
     }
 
     ui.run()
 }
 
-fn shorten(text: &str, max: usize) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    if chars.len() <= max {
-        return text.to_string();
+/// 字节数 -> 人类可读
+fn human(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    let b = bytes as f64;
+    if b >= KB * KB * KB {
+        format!("{:.2} GB", b / (KB * KB * KB))
+    } else if b >= KB * KB {
+        format!("{:.1} MB", b / (KB * KB))
+    } else if b >= KB {
+        format!("{:.0} KB", b / KB)
+    } else {
+        format!("{} B", bytes)
     }
-    let tail: String = chars[chars.len() - (max - 3)..].iter().collect();
-    format!("…{}", tail)
+}
+
+/// 速度（字节/秒）-> 人类可读
+fn human_speed(bps: f64) -> String {
+    if bps <= 0.0 {
+        return "0 MB/s".to_string();
+    }
+    let mb = bps / (1024.0 * 1024.0);
+    if mb >= 1.0 {
+        format!("{:.1} MB/s", mb)
+    } else {
+        format!("{:.0} KB/s", bps / 1024.0)
+    }
 }
 
 fn detect_lang() -> Lang {
