@@ -344,6 +344,13 @@ export component AppWindow inherits Window {
                     color: #9D5D00;
                 }
 
+                if root.update-state == 5 : Text {
+                    text: root.update-text;
+                    font-size: 10.5px;
+                    color: #0F7B0F;
+                    overflow: elide;
+                }
+
                 Divider { }
 
                 HorizontalLayout {

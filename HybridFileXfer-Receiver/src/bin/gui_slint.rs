@@ -283,7 +283,11 @@ fn main() -> Result<(), slint::PlatformError> {
             let xfer_now = ui.get_xfer_visible();
             let want_h = 400.0
                 + if xfer_now { 130.0 } else { 0.0 }
-                + if ui.get_update_state() == 2 { 34.0 } else { 0.0 };
+                + if ui.get_update_state() == 2 || ui.get_update_state() == 5 {
+                    34.0
+                } else {
+                    0.0
+                };
             if (want_h - last_want_h).abs() > 0.5 {
                 last_want_h = want_h;
                 last_xfer_visible = xfer_now;
@@ -308,13 +312,21 @@ fn main() -> Result<(), slint::PlatformError> {
             ui.set_update_text("正在下载更新，完成后会自动重启…".into());
             let ui_weak2 = ui_weak.clone();
             std::thread::spawn(move || {
-                let result = download_and_swap();
-                if let Err(e) = result {
-                    let text = format!("更新失败：{}", e);
-                    post_ui(ui_weak2.clone(), move |ui| {
-                        ui.set_update_state(4);
-                        ui.set_update_text(text.into());
-                    });
+                match download_update() {
+                    Ok(path) => {
+                        let text = format!("已下载到下载目录，关闭本程序后替换即可：{}", path.display());
+                        post_ui(ui_weak2.clone(), move |ui| {
+                            ui.set_update_state(5);
+                            ui.set_update_text(text.into());
+                        });
+                    }
+                    Err(e) => {
+                        let text = format!("更新失败：{}", e);
+                        post_ui(ui_weak2.clone(), move |ui| {
+                            ui.set_update_state(4);
+                            ui.set_update_text(text.into());
+                        });
+                    }
                 }
             });
         });
@@ -356,6 +368,8 @@ fn parse_version(text: &str) -> Option<(u32, u32, u32)> {
 }
 
 static UPDATE_EXE_URL: std::sync::LazyLock<Mutex<String>> =
+    std::sync::LazyLock::new(|| Mutex::new(String::new()));
+static UPDATE_VERSION: std::sync::LazyLock<Mutex<String>> =
     std::sync::LazyLock::new(|| Mutex::new(String::new()));
 
 fn start_update_check(ui_weak: slint::Weak<AppWindow>) {
@@ -416,6 +430,9 @@ fn start_update_check(ui_weak: slint::Weak<AppWindow>) {
             if let Ok(mut guard) = UPDATE_EXE_URL.lock() {
                 *guard = exe_url;
             }
+            if let Ok(mut guard) = UPDATE_VERSION.lock() {
+                *guard = format!("{}.{}.{}", latest.0, latest.1, latest.2);
+            }
             let text = format!(
                 "发现新版本 v{}.{}.{}（当前 v{}.{}.{}）",
                 latest.0, latest.1, latest.2, current.0, current.1, current.2
@@ -430,7 +447,9 @@ fn start_update_check(ui_weak: slint::Weak<AppWindow>) {
     });
 }
 
-fn download_and_swap() -> Result<(), String> {
+/// 只负责把新版本下载到下载目录，然后定位到该文件；
+/// 不做“替换自身 + 重新启动”，那是杀软眼里的 dropper 行为（会被误报为木马释放器）。
+fn download_update() -> Result<PathBuf, String> {
     let url = UPDATE_EXE_URL
         .lock()
         .map(|g| g.clone())
@@ -438,37 +457,42 @@ fn download_and_swap() -> Result<(), String> {
     if url.is_empty() {
         return Err("没有可用的下载地址".into());
     }
+    let version = UPDATE_VERSION
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_default();
 
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let dir = exe.parent().ok_or("找不到程序目录")?.to_path_buf();
-    let tmp = std::env::temp_dir().join("HybridFileXfer-Receiver.new.exe");
+    let downloads = std::env::var_os("USERPROFILE")
+        .map(|p| PathBuf::from(p).join("Downloads"))
+        .filter(|p| p.is_dir())
+        .unwrap_or_else(std::env::temp_dir);
+    let target = downloads.join(format!(
+        "HybridFileXfer-Receiver{}.exe",
+        if version.is_empty() {
+            String::new()
+        } else {
+            format!("-v{version}")
+        }
+    ));
 
     let response = ureq::get(&url)
         .timeout(Duration::from_secs(600))
         .call()
         .map_err(|e| format!("下载失败：{e}"))?;
-    {
-        let mut reader = response.into_reader();
-        let mut file = std::fs::File::create(&tmp).map_err(|e| format!("创建临时文件失败：{e}"))?;
-        std::io::copy(&mut reader, &mut file).map_err(|e| format!("写入失败：{e}"))?;
-    }
+    let mut reader = response.into_reader();
+    let mut file = std::fs::File::create(&target).map_err(|e| format!("创建文件失败：{e}"))?;
+    std::io::copy(&mut reader, &mut file).map_err(|e| format!("写入失败：{e}"))?;
+    drop(file);
 
-    let old = dir.join("HybridFileXfer-Receiver.exe.old");
-    let _ = std::fs::remove_file(&old);
-    // Windows 允许改名正在运行的 exe，但不能直接覆盖
-    std::fs::rename(&exe, &old).map_err(|e| format!("替换失败（改名）：{e}"))?;
-    if let Err(e) = std::fs::copy(&tmp, &exe) {
-        // 回滚
-        let _ = std::fs::rename(&old, &exe);
-        return Err(format!("替换失败（写入）：{e}"));
-    }
-    let _ = std::fs::remove_file(&tmp);
+    // 在资源管理器里定位到刚下载的文件
+    let _ = std::process::Command::new("explorer")
+        .arg(format!("/select,{}", target.display()))
+        .spawn();
 
-    std::process::Command::new(&exe)
-        .spawn()
-        .map_err(|e| format!("重启失败：{e}"))?;
-    std::process::exit(0);
+    Ok(target)
 }
+
+// ---------------- 工具函数 ----------------
 
 /// 字节数 -> 人类可读
 fn human(bytes: u64) -> String {
@@ -536,7 +560,10 @@ fn autostart_path() -> Option<PathBuf> {
 
 fn set_autostart(enabled: bool, exe_dir: &Path) -> io::Result<()> {
     let path = autostart_path().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::NotFound, "APPDATA environment variable is missing")
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "APPDATA environment variable is missing",
+        )
     })?;
     if enabled {
         let exe = exe_dir.join("HybridFileXfer-Receiver.exe");
