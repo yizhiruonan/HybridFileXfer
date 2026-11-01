@@ -161,6 +161,15 @@ public class Config {
         return preferences.getString("remote_sub_dir", "");
     }
 
+    /** 电脑推送到手机时的保存目录（绝对路径，空表示默认 Downloads/HybridFileXfer） */
+    public String getPushDir() {
+        return preferences.getString("push_dir", "");
+    }
+
+    public void setPushDir(String dir) {
+        preferences.edit().putString("push_dir", dir == null ? "" : dir).apply();
+    }
+
     /** 更新来源仓库，格式 user/repo，默认原项目 */
     public String getUpdateRepo() {
         // 更新固定在项目自己的仓库，不再暴露给用户在设置里改

@@ -96,6 +96,7 @@ internal data class UiState(
     val interfaceNames: List<String> = emptyList(),
     val connectedNames: List<String> = emptyList(),
     // 电脑推送文件的实时进度
+    val pushDir: String = "",
     val xferActive: Boolean = false,
     val xferName: String = "",
     val xferDone: Long = 0,
@@ -140,6 +141,25 @@ internal fun wifiRateText(context: Context): String {
     }
 }
 
+/** 把 SAF 的 tree URI 还原为真实路径（主存储 / SD 卡） */
+internal fun treeUriToPath(uri: android.net.Uri): String? {
+    return try {
+        if (uri.authority != "com.android.externalstorage.documents") return null
+        val docId = android.provider.DocumentsContract.getTreeDocumentId(uri) ?: return null
+        val parts = docId.split(':', limit = 2)
+        val volume = parts[0]
+        val relative = if (parts.size > 1) parts[1] else ""
+        val base = if (volume.equals("primary", ignoreCase = true)) {
+            android.os.Environment.getExternalStorageDirectory().absolutePath
+        } else {
+            "/storage/" + volume
+        }
+        if (relative.isEmpty()) base else base + "/" + relative
+    } catch (e: Exception) {
+        null
+    }
+}
+
 internal fun readState(context: Context): UiState {
     val config = Config.getInstance(context)
     val server = ServerService.getServer()
@@ -148,6 +168,7 @@ internal fun readState(context: Context): UiState {
         connected = ServerService.isConnected(),
         interfaceNames = ServerService.getInterfaceNames(),
         connectedNames = ServerService.getConnectedInterfaceNames(),
+        pushDir = Config.getInstance(context).pushDir,
         xferActive = ServerService.Live.active,
         xferName = ServerService.Live.name,
         xferDone = ServerService.Live.done,
@@ -191,6 +212,17 @@ fun HfxApp(
     var sliderActive by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     val haptic = LocalHapticFeedback.current
+
+    // 选一个目录作为“电脑推送到手机”的保存位置
+    val pickPushDir = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        if (uri != null) {
+            val path = treeUriToPath(uri)
+            if (path != null) {
+                Config.getInstance(activity).pushDir = path
+                state = readState(activity)
+            }
+        }
+    }
 
     val pickFiles = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
         if (!uris.isNullOrEmpty()) {
@@ -407,6 +439,7 @@ fun HfxApp(
                         onOpenNumber = { spec -> numberDialog = spec },
                         onOpenUrl = { url -> openUrl(activity, url) },
                         onBrowsePc = { pcBrowse = true },
+                        onPickPushDir = { pickPushDir.launch(null) },
                     )
                 }
             }
@@ -592,6 +625,7 @@ private fun SettingsPage(
     onOpenNumber: (NumberDialogSpec) -> Unit,
     onOpenUrl: (String) -> Unit,
     onBrowsePc: () -> Unit,
+    onPickPushDir: () -> Unit,
 ) {
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
@@ -665,6 +699,12 @@ private fun SettingsPage(
                         },
                     )
                 }
+                ArrowPreference(
+                    title = "电脑推送保存到",
+                    summary = if (state.pushDir.isNotEmpty()) state.pushDir else "默认：Download/HybridFileXfer",
+                    endActions = { ActionText("选择") },
+                    onClick = onPickPushDir,
+                )
                 ArrowPreference(
                     title = "浏览电脑文件夹",
                     summary = if (state.absDir.isEmpty()) "点此在手机上浏览并选择电脑的接收目录" else state.absDir,
