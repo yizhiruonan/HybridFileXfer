@@ -207,7 +207,9 @@ export component AppWindow inherits Window {
                         text: root.devices-expanded ? root.status-sub-full : root.status-sub;
                         font-size: 11px;
                         color: #616161;
-                        overflow: elide;
+                        // 收起时单行省略；展开后换行显示完整通道列表
+                        wrap: root.devices-expanded ? word-wrap : no-wrap;
+                        overflow: root.devices-expanded ? clip : elide;
                     }
                 }
 
