@@ -155,6 +155,7 @@ export component AppWindow inherits Window {
         // ---------------- 状态（点击展开设备） ----------------
         Card {
             vertical-stretch: 0;
+            VerticalLayout {
             HorizontalLayout {
                 padding-left: 12px;
                 padding-right: 12px;
@@ -213,6 +214,48 @@ export component AppWindow inherits Window {
                     vertical-alignment: center;
                 }
             }
+
+            // 展开后的设备：小卡片（和手机端首页的卡片风格一致）
+            if (root.devices-expanded) : VerticalLayout {
+                spacing: 6px;
+                padding-left: 12px;
+                padding-right: 12px;
+                padding-bottom: 10px;
+                for d[i] in root.devices : Rectangle {
+                    height: 46px;
+                    border-radius: 10px;
+                    background: #F7F7F7;
+                    HorizontalLayout {
+                        padding-left: 10px;
+                        padding-right: 10px;
+                        spacing: 8px;
+                        Text {
+                            text: d.name;
+                            font-size: 12px;
+                            font-weight: 600;
+                            color: #1A1A1A;
+                            width: 92px;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                        Text {
+                            text: d.state;
+                            font-size: 11px;
+                            color: #616161;
+                            horizontal-stretch: 1;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                        Text {
+                            text: d.rate;
+                            font-size: 11px;
+                            color: #005FB8;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+            }
             TouchArea {
                 clicked => {
                     if (root.has-devices) {
@@ -251,59 +294,6 @@ export component AppWindow inherits Window {
                     Button {
                         text: "发送到这台";
                         clicked => { root.device-chosen(i); }
-                    }
-                }
-            }
-        }
-
-        // ---------------- 多设备列表 ----------------
-        if (root.devices-expanded) : Card {
-            vertical-stretch: 0;
-            VerticalLayout {
-                width: parent.width;
-                padding-left: 12px;
-                padding-right: 12px;
-                padding-top: 8px;
-                padding-bottom: 8px;
-                spacing: 3px;
-
-                for d[i] in root.devices : VerticalLayout {
-                    spacing: 2px;
-                    HorizontalLayout {
-                        height: 24px;
-                        spacing: 8px;
-                        width: parent.width;
-                        ta := TouchArea {
-                            clicked => { root.device-clicked(i); }
-                        }
-                        Text {
-                            text: d.name;
-                            font-size: 12px;
-                            color: #1A1A1A;
-                            width: 96px;
-                            vertical-alignment: center;
-                            overflow: elide;
-                        }
-                        Text {
-                            text: d.state;
-                            font-size: 11px;
-                            color: #616161;
-                            horizontal-stretch: 1;
-                            vertical-alignment: center;
-                            overflow: elide;
-                        }
-                        Text {
-                            text: d.rate;
-                            font-size: 11px;
-                            color: #005FB8;
-                            vertical-alignment: center;
-                        }
-                    }
-                    if d.expanded : Text {
-                        text: d.detail;
-                        font-size: 11px;
-                        color: #616161;
-                        wrap: word-wrap;
                     }
                 }
             }
