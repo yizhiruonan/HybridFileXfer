@@ -368,8 +368,13 @@ public class ServerService extends Service implements ServiceConnection {
                         public void onFileUploading(String iName, String path, long targetSize, long totalSize) {
                         }
                         public void onFileDownloading(String iName, String path, long targetSize, long totalSize) {
-                            // 先知道文件多大，分块进度条一开始就是完整的一条
-                            server.blockProgress.beginFile(path, totalSize);
+                            // 记录"哪个通道送了第几块"，进度浮层按它画 IDM 那种动态分段
+                            if (targetSize > 0) {
+                                int index = (int) ((targetSize - 1) / top.weixiansen574.hybridfilexfer.core.FileBlock.BLOCK_SIZE);
+                                server.blockProgress.onBlock(iName, path, index, totalSize);
+                            } else {
+                                server.blockProgress.onBlock(iName, path, 0, totalSize);
+                            }
                             if (!path.equals(live.name)) {
                                 // 换文件了：进度从这一块重新算
                                 live.name = path;

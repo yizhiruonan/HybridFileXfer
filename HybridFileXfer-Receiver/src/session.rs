@@ -366,19 +366,24 @@ impl Session {
             log::warn(crate::i18n::tr("没有可发送的文件", "nothing to send"));
         }
 
-        let queue = Arc::new(Mutex::new(std::collections::VecDeque::from(tasks)));
+        // IDM 式动态分段：一开始按通道数把任务表切成连续区间（一条通道一段），
+        // 谁先传完自己的段，就把剩余最多的一段再切一半过来。手机端的进度条
+        // 按"哪个通道送了第几块"还原这些段，段数会随传输过程变化。
+        let tasks = Arc::new(tasks);
+        let plan = Arc::new(Mutex::new(SendPlan::new(tasks.len(), self.transfers.len())));
         let sent = Arc::new(AtomicU64::new(0));
         let started = Instant::now();
 
         let mut handles = Vec::with_capacity(self.transfers.len());
-        for (name, stream) in &self.transfers {
+        for (index, (name, stream)) in self.transfers.iter().enumerate() {
             let stream = stream.try_clone()?;
-            let queue = Arc::clone(&queue);
+            let tasks = Arc::clone(&tasks);
+            let plan = Arc::clone(&plan);
             let sent = Arc::clone(&sent);
             let name = name.clone();
             handles.push((
                 name,
-                thread::spawn(move || send_channel(stream, queue, sent)),
+                thread::spawn(move || send_channel(stream, index, tasks, plan, sent)),
             ));
         }
 
@@ -1051,76 +1056,203 @@ fn collect_send_tasks(
     }
 }
 
-/// 单个通道：不断从共享队列取任务发出去，发完写 EOF
+/// 一个通道的发送循环：按分段计划不断领任务，全部发完就写 EOF
 fn send_channel(
     mut stream: std::net::TcpStream,
-    queue: Arc<Mutex<std::collections::VecDeque<SendTask>>>,
+    me: usize,
+    tasks: Arc<Vec<SendTask>>,
+    plan: Arc<Mutex<SendPlan>>,
     sent: Arc<AtomicU64>,
 ) -> io::Result<u64> {
     let mut written = 0u64;
     loop {
-        let task = {
-            let mut guard = queue.lock().unwrap();
-            guard.pop_front()
+        let next = {
+            let mut guard = plan.lock().unwrap();
+            guard.take(me)
         };
-        let Some(task) = task else { break };
-        match task {
-            SendTask::Folder {
-                file_index,
-                dest,
-                modified_ms,
-            } => {
-                proto::write_i16(&mut stream, transfer::FOLDER)?;
-                proto::write_i32(&mut stream, file_index)?;
-                proto::write_utf(&mut stream, &dest)?;
-                proto::write_i64(&mut stream, modified_ms)?;
-            }
-            SendTask::Block {
-                file_index,
-                dest,
-                modified_ms,
-                total_size,
-                index,
-                length,
-                host_path,
-            } => {
-                let mut buffer = vec![0u8; length as usize];
-                let mut file = match std::fs::File::open(&host_path) {
-                    Ok(file) => file,
-                    Err(e) => {
-                        log::error(&format!("{}: {}", host_path.display(), e));
-                        let _ = proto::write_i16(&mut stream, transfer::END_OF_READ_ERROR);
-                        return Err(e);
-                    }
-                };
-                use std::io::{Read as _, Seek as _, SeekFrom};
-                if let Err(e) = file.seek(SeekFrom::Start(index as u64 * BLOCK_SIZE)) {
-                    let _ = proto::write_i16(&mut stream, transfer::END_OF_READ_ERROR);
-                    return Err(e);
-                }
-                if let Err(e) = file.read_exact(&mut buffer) {
-                    let _ = proto::write_i16(&mut stream, transfer::END_OF_READ_ERROR);
-                    return Err(e);
-                }
-
-                proto::write_i16(&mut stream, transfer::FILE)?;
-                proto::write_i32(&mut stream, file_index)?;
-                proto::write_utf(&mut stream, &dest)?;
-                proto::write_i64(&mut stream, modified_ms)?;
-                proto::write_i64(&mut stream, total_size as i64)?;
-                proto::write_i32(&mut stream, index as i32)?;
-                proto::write_i32(&mut stream, length as i32)?;
-                use std::io::Write as _;
-                stream.write_all(&buffer)?;
-                stream.flush()?;
-
-                written += length as u64;
-                sent.fetch_add(length as u64, Ordering::Relaxed);
-                crate::receiver::PROGRESS.set_sending(&dest, index as u64 * BLOCK_SIZE + length as u64, total_size, length as u64);
-            }
-        }
+        let Some(index) = next else { break };
+        written += send_task(&mut stream, &tasks[index], &sent)?;
     }
+    use std::io::Write as _;
     proto::write_i16(&mut stream, transfer::EOF)?;
     stream.flush()?;
     Ok(written)
+}
+
+/// 发一条任务（文件夹 / 一个文件块），返回这一块写了多少字节
+fn send_task(stream: &mut std::net::TcpStream, task: &SendTask, sent: &AtomicU64) -> io::Result<u64> {
+    match task {
+        SendTask::Folder {
+            file_index,
+            dest,
+            modified_ms,
+        } => {
+            proto::write_i16(stream, transfer::FOLDER)?;
+            proto::write_i32(stream, *file_index)?;
+            proto::write_utf(stream, dest)?;
+            proto::write_i64(stream, *modified_ms)?;
+            Ok(0)
+        }
+        SendTask::Block {
+            file_index,
+            dest,
+            modified_ms,
+            total_size,
+            index,
+            length,
+            host_path,
+        } => {
+            let mut buffer = vec![0u8; *length as usize];
+            let mut file = match std::fs::File::open(host_path) {
+                Ok(file) => file,
+                Err(e) => {
+                    log::error(&format!("{}: {}", host_path.display(), e));
+                    let _ = proto::write_i16(stream, transfer::END_OF_READ_ERROR);
+                    return Err(e);
+                }
+            };
+            use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+            if let Err(e) = file.seek(SeekFrom::Start(*index as u64 * BLOCK_SIZE)) {
+                let _ = proto::write_i16(stream, transfer::END_OF_READ_ERROR);
+                return Err(e);
+            }
+            if let Err(e) = file.read_exact(&mut buffer) {
+                let _ = proto::write_i16(stream, transfer::END_OF_READ_ERROR);
+                return Err(e);
+            }
+
+            proto::write_i16(stream, transfer::FILE)?;
+            proto::write_i32(stream, *file_index)?;
+            proto::write_utf(stream, dest)?;
+            proto::write_i64(stream, *modified_ms)?;
+            proto::write_i64(stream, *total_size as i64)?;
+            proto::write_i32(stream, *index as i32)?;
+            proto::write_i32(stream, *length as i32)?;
+            stream.write_all(&buffer)?;
+            stream.flush()?;
+
+            sent.fetch_add(*length as u64, Ordering::Relaxed);
+            crate::receiver::PROGRESS.set_sending(dest, *index as u64 * BLOCK_SIZE + *length as u64, *total_size, *length as u64);
+            Ok(*length as u64)
+        }
+    }
+}
+
+/// 发送任务的动态分段计划（IDM 式：一段 = 一条通道负责的连续任务区间）
+struct Segment {
+    #[allow(dead_code)]
+    start: usize,
+    end: usize,
+    cursor: usize,
+    owner: Option<usize>,
+}
+
+struct SendPlan {
+    segments: Vec<Segment>,
+}
+
+impl SendPlan {
+    /// 初始：把任务表按通道数切成连续区间
+    fn new(total: usize, channels: usize) -> Self {
+        let mut segments = Vec::new();
+        if total > 0 && channels > 0 {
+            let per = (total + channels - 1) / channels;
+            let mut start = 0;
+            let mut owner = 0usize;
+            while start < total {
+                let end = (start + per).min(total);
+                // 初始一段对应一条通道：一开始 N 条连接就是 N 段
+                segments.push(Segment {
+                    start,
+                    end,
+                    cursor: start,
+                    owner: Some(owner),
+                });
+                owner += 1;
+                start = end;
+            }
+        }
+        SendPlan { segments }
+    }
+
+    /// 领一个任务：先自己的段，再没人认领的段，最后把剩余最多的一段切一半抢过来
+    fn take(&mut self, me: usize) -> Option<usize> {
+        if let Some(seg) = self
+            .segments
+            .iter_mut()
+            .find(|s| s.owner == Some(me) && s.cursor < s.end)
+        {
+            let index = seg.cursor;
+            seg.cursor += 1;
+            return Some(index);
+        }
+        if let Some(seg) = self
+            .segments
+            .iter_mut()
+            .find(|s| s.owner.is_none() && s.cursor < s.end)
+        {
+            seg.owner = Some(me);
+            let index = seg.cursor;
+            seg.cursor += 1;
+            return Some(index);
+        }
+        let victim = self
+            .segments
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.end.saturating_sub(s.cursor) > 1)
+            .max_by_key(|(_, s)| s.end - s.cursor)
+            .map(|(i, _)| i)?;
+        let (mid, old_end) = {
+            let seg = &mut self.segments[victim];
+            let mid = seg.cursor + (seg.end - seg.cursor) / 2;
+            let old_end = seg.end;
+            seg.end = mid;
+            (mid, old_end)
+        };
+        self.segments.push(Segment {
+            start: mid,
+            end: old_end,
+            cursor: mid + 1,
+            owner: Some(me),
+        });
+        Some(mid)
+    }
+}
+
+#[cfg(test)]
+mod plan_tests {
+    use super::*;
+
+    #[test]
+    fn plan_covers_every_task_once_and_splits() {
+        let mut plan = SendPlan::new(100, 2);
+        let mut seen = vec![false; 100];
+
+        // 通道 0 抢跑，把剩下的段切走一半
+        let mut taken = 0;
+        for _ in 0..60 {
+            if let Some(i) = plan.take(0) {
+                assert!(!seen[i]);
+                seen[i] = true;
+                taken += 1;
+            }
+        }
+        assert_eq!(taken, 60);
+        assert!(
+            plan.segments.len() > 2,
+            "通道 0 抢了别人的段，应该产生新的段"
+        );
+
+        // 两条通道交替把剩下的任务领完
+        for _ in 0..300 {
+            for me in [0usize, 1] {
+                if let Some(i) = plan.take(me) {
+                    assert!(!seen[i], "同一个任务不能发两次");
+                    seen[i] = true;
+                }
+            }
+        }
+        assert!(seen.iter().all(|&x| x), "每个任务都必须被发到");
+    }
 }

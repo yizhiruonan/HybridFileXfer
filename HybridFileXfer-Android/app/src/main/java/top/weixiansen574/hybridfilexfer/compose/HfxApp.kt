@@ -98,6 +98,14 @@ internal data class ChannelStat(
     val finished: Boolean,
 )
 
+/** 进度条上的一段：一个连接负责的文件区间（IDM 式动态分段） */
+internal data class SegInfo(
+    val owner: String,
+    val start: Int,
+    val end: Int,
+    val filled: Float,
+)
+
 /** 一台已连接电脑的界面模型（B 方案：手机同时接多台电脑） */
 internal data class PcConn(
     val id: Int,
@@ -109,8 +117,8 @@ internal data class PcConn(
     val fileName: String = "",
     val done: Long = 0,
     val total: Long = 0,
-    /** 当前文件的分块完成度（96 段，0~1） */
-    val segments: List<Float> = emptyList(),
+    /** 当前文件的分段进度（一段 = 一条连接负责的区间，段数随动态切分变化） */
+    val segments: List<SegInfo> = emptyList(),
     val channelStats: List<ChannelStat> = emptyList(),
 )
 
@@ -133,7 +141,7 @@ internal data class UiState(
     val xferBytes: Long = 0,
     /** 当前展示的那台电脑与它的分块进度 / 通道明细 */
     val xferLabel: String = "",
-    val xferSegments: List<Float> = emptyList(),
+    val xferSegments: List<SegInfo> = emptyList(),
     val xferChannels: List<ChannelStat> = emptyList(),
     val mode: Int = 0,
     val autoConnect: Boolean = true,
@@ -206,9 +214,12 @@ internal fun readState(context: Context): UiState {
             details = server.channelDetails,
             transferring = live.active,
             fileName = live.name,
-            done = live.done,
+            // 分段传输时"最后一块的位置"不能代表进度，按已完成块数算
+            done = server.blockProgress.doneBytes,
             total = live.total,
-            segments = server.blockProgress.segments(96).toList(),
+            segments = server.blockProgress.segments().map { seg ->
+                SegInfo(seg.owner ?: "", seg.start, seg.end, seg.filled)
+            },
             channelStats = live.channelSnapshot().mapNotNull { stat ->
                 stat.name?.let { name -> ChannelStat(name, stat.bytes, stat.speed, stat.finished) }
             },
@@ -227,8 +238,9 @@ internal fun readState(context: Context): UiState {
         pushDir = config.pushDir,
         xferActive = current != null,
         xferName = current?.name ?: "",
-        xferDone = current?.done ?: 0,
-        xferTotal = current?.total ?: 0,
+        // 已完成字节按块数算（分段/乱序到达时，最后一块的位置不等于进度）
+        xferDone = currentConn?.done ?: 0,
+        xferTotal = currentConn?.total ?: 0,
         xferCount = ServerService.transferringCount(),
         xferBytes = ServerService.receivedTotalBytes(),
         xferLabel = currentConn?.label ?: "",

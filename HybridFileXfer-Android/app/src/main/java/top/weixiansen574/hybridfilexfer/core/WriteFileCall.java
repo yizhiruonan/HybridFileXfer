@@ -76,8 +76,6 @@ public abstract class WriteFileCall implements Callable<Void> {
                 data.flip();
                 channel.write(data);
                 cursor += data.position();
-                //这一块真正写进文件了，通知进度条
-                onBlockWritten(block);
                 //回收缓冲区块
                 buffers.add(block.data);
                 lastBlock = block;
@@ -193,10 +191,6 @@ public abstract class WriteFileCall implements Callable<Void> {
         if (!setFileLastModified(file,time)) {
             System.out.println("Warning! file cannot set last modified:" + file);
         }
-    }
-
-    /** 一块数据真正写进文件后回调（进度条用），默认什么都不做 */
-    protected void onBlockWritten(FileBlock block) {
     }
 
     protected abstract void createParentDirIfNotExists(String path) throws Exception;

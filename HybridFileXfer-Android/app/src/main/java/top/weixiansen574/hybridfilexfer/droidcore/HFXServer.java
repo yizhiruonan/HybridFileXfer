@@ -546,7 +546,7 @@ public class HFXServer extends HFXService {
 
     @Override
     protected WriteFileCall createWriteFileCall(LinkedBlockingDeque<ByteBuffer> buffers, int dequeCount) {
-        return new DroidWriteFileCall(buffers, dequeCount, ioService, blockProgress);
+        return new DroidWriteFileCall(buffers, dequeCount, ioService);
     }
 
     @Override
