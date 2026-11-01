@@ -37,8 +37,9 @@ struct State {
     exe_dir: PathBuf,
     engine: Option<EngineHandle>,
     state: EngineState,
-    state_rx: Receiver<EngineState>,
-    state_tx: Sender<EngineState>,
+    state_rx: Receiver<(String, EngineState)>,
+    state_tx: Sender<(String, EngineState)>,
+    devices: std::collections::HashMap<String, EngineState>,
 }
 
 impl State {
@@ -74,14 +75,15 @@ impl State {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_for_thread = Arc::clone(&stop);
         let tx = Arc::new(Mutex::new(self.state_tx.clone()));
-        let sink: engine::StateSink = Arc::new(move |state| {
+        let sink: engine::MultiStateSink = Arc::new(move |device: &str, state| {
             if let Ok(sender) = tx.lock() {
-                let _ = sender.send(state);
+                let _ = sender.send((device.to_string(), state));
             }
         });
-        // engine::run 是阻塞的，必须自己开线程
+        let max_devices = self.config.max_devices;
+        // engine::run_multi 是阻塞的，必须自己开线程
         let join = std::thread::spawn(move || {
-            engine::run(options, stop_for_thread, sink);
+            engine::run_multi(options, stop_for_thread, max_devices, sink);
         });
         self.engine = Some(EngineHandle {
             stop,
@@ -151,6 +153,7 @@ fn main() -> Result<(), slint::PlatformError> {
         exe_dir: exe_dir.clone(),
         engine: None,
         state: EngineState::Stopped,
+        devices: std::collections::HashMap::new(),
         state_rx,
         state_tx,
     }));
@@ -274,28 +277,66 @@ fn main() -> Result<(), slint::PlatformError> {
             let Some(ui) = ui_weak.upgrade() else { return };
             let mut s = st.lock().unwrap();
 
-            while let Ok(next) = s.state_rx.try_recv() {
-                s.state = next;
-                let (kind, title, sub) = match &s.state {
-                    EngineState::Connected(names) => (
-                        2,
-                        "已连接电脑".to_string(),
-                        format!("通道：{}", names.join(", ")),
-                    ),
-                    EngineState::Waiting(reason) => (1, "等待手机连接".to_string(), reason.clone()),
-                    EngineState::Retrying(reason) => {
-                        (3, "连接有问题，正在重试".to_string(), reason.clone())
+            let mut changed = false;
+            while let Ok((device, next)) = s.state_rx.try_recv() {
+                changed = true;
+                if matches!(next, EngineState::Stopped) {
+                    s.devices.remove(&device);
+                } else {
+                    s.devices.insert(device, next);
+                }
+            }
+            if changed {
+                let mut connected: Vec<String> = Vec::new();
+                let mut waiting: Option<String> = None;
+                let mut retrying: Option<String> = None;
+                for (device, state) in &s.devices {
+                    match state {
+                        EngineState::Connected(names) => connected.extend(names.iter().cloned()),
+                        EngineState::Waiting(reason) => {
+                            if waiting.is_none() {
+                                waiting = Some(format!("{device}：{reason}"));
+                            }
+                        }
+                        EngineState::Retrying(reason) => {
+                            if retrying.is_none() {
+                                retrying = Some(format!("{device}：{reason}"));
+                            }
+                        }
+                        EngineState::Stopped => {}
                     }
-                    EngineState::Stopped => (
+                }
+                let count = s.devices.len();
+                let (kind, title, sub) = if !connected.is_empty() {
+                    (
+                        2,
+                        if count > 1 {
+                            format!("已连接 {count} 台设备")
+                        } else {
+                            "已连接电脑".to_string()
+                        },
+                        format!("通道：{}", connected.join(", ")),
+                    )
+                } else if let Some(reason) = retrying {
+                    (3, "连接有问题，正在重试".to_string(), reason)
+                } else if let Some(reason) = waiting {
+                    (1, "等待手机连接".to_string(), reason)
+                } else {
+                    (
                         0,
                         "未开始接收".to_string(),
                         "点「开始接收」等待手机连接".to_string(),
-                    ),
+                    )
+                };
+                s.state = if count > 0 {
+                    EngineState::Connected(connected)
+                } else {
+                    EngineState::Stopped
                 };
                 ui.set_status_kind(kind);
                 ui.set_status_title(title.into());
                 ui.set_status_sub(sub.into());
-                ui.set_running(!matches!(s.state, EngineState::Stopped));
+                ui.set_running(count > 0);
             }
 
             // 开机自启：等窗口真正创建后隐藏到托盘（只做一次）
