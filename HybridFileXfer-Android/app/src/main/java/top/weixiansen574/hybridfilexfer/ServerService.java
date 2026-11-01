@@ -160,6 +160,8 @@ public class ServerService extends Service implements ServiceConnection {
             return;
         }
         try {
+            // 先叫醒可能正停在暂停里的线程，再关 socket
+            target.resumeTransfer();
             // 标记"用户取消"：收尾时不要自动删半成品，交给界面问用户保不保留
             liveFor(connectionId).userCancelled = true;
             // 只关 socket，让传输线程抛异常退出；缓冲区由会话线程收尾时释放，
@@ -168,6 +170,25 @@ public class ServerService extends Service implements ServiceConnection {
             HFXServer.unregister(target);
         } catch (Throwable ignored) {
         }
+    }
+
+    public static void pauseTransfer(int connectionId) {
+        HFXServer target = HFXServer.getById(connectionId);
+        if (target != null) {
+            target.pauseTransfer();
+        }
+    }
+
+    public static void resumeTransfer(int connectionId) {
+        HFXServer target = HFXServer.getById(connectionId);
+        if (target != null) {
+            target.resumeTransfer();
+        }
+    }
+
+    public static boolean isTransferPaused(int connectionId) {
+        HFXServer target = HFXServer.getById(connectionId);
+        return target != null && target.isTransferPaused();
     }
 
     /** 按连接号取指定的那台电脑；那台已经断开时退回任意一台（-1 也表示任意一台）。 */

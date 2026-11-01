@@ -122,6 +122,9 @@ export component AppWindow inherits Window {
 
     // ---- 传输进度 ----
     in-out property <bool> xfer-visible: false;
+    // 手机正在从电脑取文件（显示暂停/中断按钮）
+    in-out property <bool> send-active: false;
+    in-out property <bool> send-paused: false;
     in-out property <string> file-name: "";
     in-out property <float> file-progress: 0.0;
     in-out property <string> file-text: "";
@@ -152,6 +155,8 @@ export component AppWindow inherits Window {
     callback tray-toggled(bool);
     callback device-clicked(int);
     callback device-chosen(int);
+    callback toggle-pause-send();
+    callback cancel-send();
     callback open-dir();
 
     private property <color> status-color: root.status-kind == 2 ? #0F7B0F : root.status-kind == 3 ? #9D5D00 : #8A8A8A;
@@ -383,6 +388,20 @@ export component AppWindow inherits Window {
                     text: root.session-text;
                     font-size: 11px;
                     color: #616161;
+                }
+
+                if root.send-active : HorizontalLayout {
+                    height: 30px;
+                    spacing: 8px;
+                    Rectangle { horizontal-stretch: 1; }
+                    SecondaryButton {
+                        label: root.send-paused ? "继续发送" : "暂停发送";
+                        clicked => { root.toggle-pause-send(); }
+                    }
+                    SecondaryButton {
+                        label: "中断发送";
+                        clicked => { root.cancel-send(); }
+                    }
                 }
             }
         }

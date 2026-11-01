@@ -355,6 +355,8 @@ impl Session {
             "手机开始从电脑取文件",
             "the phone is downloading files from this PC",
         ));
+        // 这次发送期间允许界面暂停 / 中断；离开作用域自动清标志
+        let _sending = crate::control::SendingGuard::begin();
 
         let base = PathBuf::from(&phone_dir);
         let mut tasks: Vec<SendTask> = Vec::new();
@@ -1066,6 +1068,13 @@ fn send_channel(
 ) -> io::Result<u64> {
     let mut written = 0u64;
     loop {
+        // 暂停：原地等（手上的 1MB 写完后停）；中断：直接退出，对端会看到断线
+        while crate::control::paused() && !crate::control::cancelled() {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        if crate::control::cancelled() {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled by user"));
+        }
         let next = {
             let mut guard = plan.lock().unwrap();
             guard.take(me)

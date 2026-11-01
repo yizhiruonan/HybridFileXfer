@@ -4,6 +4,7 @@
 
 pub mod adb;
 pub mod config;
+pub mod control;
 pub mod discovery;
 pub mod engine;
 pub mod i18n;

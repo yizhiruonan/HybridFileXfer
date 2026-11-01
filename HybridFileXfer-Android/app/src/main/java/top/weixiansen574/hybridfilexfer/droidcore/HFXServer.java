@@ -439,6 +439,20 @@ public class HFXServer extends HFXService {
      * 会把正在读写的 native 内存 free 掉（崩溃）。关掉通道后传输线程会抛
      * AsynchronousCloseException，等会话线程收尾时再统一释放。
      */
+    /** 暂停当前传输（传输线程每块检查一次，期间不读不写） */
+    public void pauseTransfer() {
+        pauseGate.pause();
+    }
+
+    /** 继续当前传输 */
+    public void resumeTransfer() {
+        pauseGate.resume();
+    }
+
+    public boolean isTransferPaused() {
+        return pauseGate.isPaused();
+    }
+
     public void abortTransfer() {
         DataByteChannel control = ctChannel;
         if (control != null) {
@@ -617,6 +631,8 @@ public class HFXServer extends HFXService {
 
     /** 会话结束：通知对端、关闭本连接的所有通道并释放缓冲；共享监听套接字保持打开。 */
     public synchronized void disconnect() {
+        // 可能还有线程停在暂停闸门里，先叫醒再关
+        pauseGate.resume();
         unregister(this);
         releaseBuffers();
         DataByteChannel channel = ctChannel;

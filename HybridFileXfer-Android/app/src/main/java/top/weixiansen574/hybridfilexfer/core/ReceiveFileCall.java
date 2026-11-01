@@ -15,8 +15,10 @@ public class ReceiveFileCall implements Callable<Void> {
     private final TransferFileCallback callback;
     private final TransferConnection connection;
     private final String iName;
+    private final TransferPause pause;
 
-    public ReceiveFileCall(int tIndex, TransferConnection connection,WriteFileCall writeFileCall,TransferFileCallback callback) {
+    public ReceiveFileCall(int tIndex, TransferConnection connection,WriteFileCall writeFileCall,TransferFileCallback callback, TransferPause pause) {
+        this.pause = pause;
         this.writeFileCall = writeFileCall;
         this.tIndex = tIndex;
         this.connection = connection;
@@ -32,6 +34,9 @@ public class ReceiveFileCall implements Callable<Void> {
         long startTime = System.currentTimeMillis();
         try {
             while (true) {
+                if (pause != null) {
+                    pause.awaitResume();
+                }
                 short header = channel.readShort();
                 switch (header) {
                     case TransferIdentifiers.FOLDER: {

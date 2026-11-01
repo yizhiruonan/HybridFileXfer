@@ -420,7 +420,11 @@ internal fun ReceiveProgressPanel(state: UiState) {
             Spacer(Modifier.height(10.dp))
             Text(
                 humanSize(animatedDone.toLong()) + " / " + humanSize(state.xferTotal) +
-                    "   ·   " + (if (state.xferCount > 1) "合计 " else "") + formatSpeed(animatedSpeed.toLong()),
+                    "   ·   " + if (state.xferPaused) {
+                    "已暂停"
+                } else {
+                    (if (state.xferCount > 1) "合计 " else "") + formatSpeed(animatedSpeed.toLong())
+                },
                 fontSize = 12.sp,
                 color = colorScheme.onSurfaceVariantSummary,
             )
@@ -476,14 +480,34 @@ internal fun ReceiveProgressPanel(state: UiState) {
                     }
                 }
             }
-            // 电脑推过来的文件也可以中途取消：断开这条连接，电脑会自动重连
+            // 接收中只给「暂停接收」；暂停之后才给「继续 / 取消接收」
             if (state.xferActive) {
                 Spacer(Modifier.height(10.dp))
-                TextButton(
-                    text = "取消接收",
-                    onClick = { ServerService.cancelTransfer(state.xferId) },
-                    modifier = Modifier.fillMaxWidth(),
-                )
+                if (state.xferPaused) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        Button(
+                            onClick = { ServerService.resumeTransfer(state.xferId) },
+                            modifier = Modifier.weight(1f),
+                            colors = ButtonDefaults.buttonColorsPrimary(),
+                        ) {
+                            Text("继续", color = Color.White)
+                        }
+                        TextButton(
+                            text = "取消接收",
+                            onClick = { ServerService.cancelTransfer(state.xferId) },
+                            modifier = Modifier.weight(1f),
+                        )
+                    }
+                } else {
+                    TextButton(
+                        text = "暂停接收",
+                        onClick = { ServerService.pauseTransfer(state.xferId) },
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
             }
         }
     }
