@@ -13,6 +13,12 @@ pub struct Item {
 }
 
 static PENDING: LazyLock<Mutex<Vec<Item>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+/// 暂扣开关：多台设备在线时先不把手里的文件交出去，等用户选好设备
+static HOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_hold(on: bool) {
+    HOLD.store(on, std::sync::atomic::Ordering::Relaxed);
+}
 
 /// 追加一批待发送文件（已存在的去重）
 pub fn push(paths: Vec<PathBuf>) {
@@ -45,6 +51,10 @@ pub fn snapshot_for(device: &str) -> Vec<(PathBuf, u64)> {
     let Ok(guard) = PENDING.lock() else {
         return Vec::new();
     };
+    // 暂扣期间且还没指定目标 → 谁都别拿，等界面里选
+    if HOLD.load(std::sync::atomic::Ordering::Relaxed) && guard.iter().any(|i| i.target.is_none()) {
+        return Vec::new();
+    }
     guard
         .iter()
         .filter(|item| matches(item, device))
@@ -70,6 +80,25 @@ pub fn take_for(device: &str) -> Vec<PathBuf> {
         }
     });
     taken
+}
+
+/// 队列里是否有"未指定目标"的条目（多设备时需要让用户选）
+pub fn needs_target() -> bool {
+    PENDING
+        .lock()
+        .map(|guard| guard.iter().any(|item| item.target.is_none()))
+        .unwrap_or(false)
+}
+
+/// 把未指定目标的条目统一定到某台设备
+pub fn assign_all(target: &str) {
+    if let Ok(mut guard) = PENDING.lock() {
+        for item in guard.iter_mut() {
+            if item.target.is_none() {
+                item.target = Some(target.to_string());
+            }
+        }
+    }
 }
 
 pub fn is_empty() -> bool {

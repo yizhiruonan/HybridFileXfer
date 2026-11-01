@@ -124,6 +124,8 @@ export component AppWindow inherits Window {
     // 多设备列表（点状态卡展开）
     in-out property <[DeviceRow]> devices: [];
     in-out property <bool> devices-expanded: false;
+    // 多台设备时，有文件要推送但没指定目标 → 让用户选一台
+    in-out property <bool> ask-target: false;
     // 有设备可展开时才让状态卡可点
     private property <bool> has-devices: root.devices.length > 0;
 
@@ -140,6 +142,7 @@ export component AppWindow inherits Window {
     callback autostart-toggled(bool);
     callback tray-toggled(bool);
     callback device-clicked(int);
+    callback device-chosen(int);
     callback open-dir();
 
     private property <color> status-color: root.status-kind == 2 ? #0F7B0F : root.status-kind == 3 ? #9D5D00 : #8A8A8A;
@@ -214,6 +217,40 @@ export component AppWindow inherits Window {
                 clicked => {
                     if (root.has-devices) {
                         root.devices-expanded = !root.devices-expanded;
+                    }
+                }
+            }
+        }
+
+        // ---------------- 选择接收设备 ----------------
+        if (root.ask-target) : Card {
+            vertical-stretch: 0;
+            VerticalLayout {
+                width: parent.width;
+                padding-left: 16px;
+                padding-right: 16px;
+                padding-top: 12px;
+                padding-bottom: 12px;
+                spacing: 6px;
+
+                Text {
+                    text: "有文件要推送，选择接收的设备：";
+                    font-size: 12px;
+                    color: #1A1A1A;
+                }
+                for d[i] in root.devices : HorizontalLayout {
+                    height: 28px;
+                    spacing: 8px;
+                    Text {
+                        text: d.name;
+                        font-size: 12px;
+                        color: #1A1A1A;
+                        horizontal-stretch: 1;
+                        vertical-alignment: center;
+                    }
+                    Button {
+                        text: "发送到这台";
+                        clicked => { root.device-chosen(i); }
                     }
                 }
             }
