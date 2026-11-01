@@ -55,6 +55,66 @@ pub struct EngineOptions {
 }
 
 pub type StateSink = Arc<dyn Fn(EngineState) + Send + Sync>;
+/// 多设备：状态回调带上设备串号
+pub type MultiStateSink = Arc<dyn Fn(&str, EngineState) + Send + Sync>;
+
+/// 多设备监督者：为每台就绪设备各起一条独立会话线程（最多 max_devices 台）。
+/// 单台设备的逻辑完全复用 run_auto，避免重写已验证的路径。
+pub fn run_multi(
+    options: EngineOptions,
+    stop: Arc<AtomicBool>,
+    max_devices: usize,
+    on_state: MultiStateSink,
+) {
+    crate::webserve::init(&util::normalize_dir(&options.receive_dir));
+    let limit = max_devices.clamp(1, 8);
+    let mut running: std::collections::HashMap<String, thread::JoinHandle<()>> =
+        std::collections::HashMap::new();
+
+    while !stop.load(Ordering::Relaxed) {
+        // 清掉已经结束的会话
+        running.retain(|_, handle| !handle.is_finished());
+
+        if let Some(adb) = Adb::detect(&options.adb_search_dir, options.adb_path.as_deref()) {
+            if let Ok(devices) = adb.list_devices() {
+                let ready = adb::pick_devices(&devices, options.device.as_deref(), limit);
+                for device in ready {
+                    let serial = device.serial.clone();
+                    if running.contains_key(&serial) {
+                        continue;
+                    }
+                    let mut per_device = options.clone();
+                    per_device.device = Some(serial.clone());
+                    let stop_for_device = Arc::clone(&stop);
+                    let sink = {
+                        let on_state = Arc::clone(&on_state);
+                        let serial = serial.clone();
+                        Arc::new(move |state: EngineState| on_state(&serial, state))
+                            as StateSink
+                    };
+                    log::info(&format!("{} {}", tr("开始连接设备", "connecting device"), serial));
+                    running.insert(
+                        serial,
+                        thread::spawn(move || {
+                            let stop = stop_for_device;
+                            let on_state = sink;
+                            run_auto(&per_device, &stop, &on_state);
+                        }),
+                    );
+                }
+            }
+        }
+
+        if !sleep_unless_stopped(&stop, Duration::from_secs(2)) {
+            break;
+        }
+    }
+
+    for (_, handle) in running {
+        let _ = handle.join();
+    }
+    on_state("", EngineState::Stopped);
+}
 
 /// 阻塞运行接收循环，直到 stop 被置为 true。
 pub fn run(options: EngineOptions, stop: Arc<AtomicBool>, on_state: StateSink) {
