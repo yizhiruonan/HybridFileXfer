@@ -34,6 +34,17 @@ internal fun colorSchemeModeOf(index: Int): ColorSchemeMode =
  * 原来的 MainActivity 保留为"经典界面"，在设置里可以切回去。
  */
 class MiuixMainActivity : ComponentActivity() {
+    override fun onResume() {
+        super.onResume()
+        // 前台时用应用内浮层；退到后台才显示全局悬浮窗
+        top.weixiansen574.hybridfilexfer.ServerService.appVisible = true
+    }
+
+    override fun onPause() {
+        super.onPause()
+        top.weixiansen574.hybridfilexfer.ServerService.appVisible = false
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)

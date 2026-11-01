@@ -39,8 +39,12 @@ public final class NetInterfaces {
             Enumeration<InetAddress> inetAddresses = networkInterface.getInetAddresses();
             while (inetAddresses.hasMoreElements()) {
                 InetAddress address = inetAddresses.nextElement();
-                if (!address.isLoopbackAddress() && address instanceof Inet4Address
-                        && !networkInterface.getDisplayName().startsWith("rmnet_data"/*数据流量除外*/)) {
+                String ifName = networkInterface.getDisplayName();
+                // 数据流量（运营商 NAT）在电脑端连不进来，不要列进计划里：
+                // 高通/联发科/三星的蜂窝网卡名字分别是 rmnet*、ccmni*、pdp_ip*
+                boolean cellular = ifName.startsWith("rmnet") || ifName.startsWith("ccmni")
+                        || ifName.startsWith("pdp_ip");
+                if (!address.isLoopbackAddress() && address instanceof Inet4Address && !cellular) {
                     NetInterfaceInfo item = new NetInterfaceInfo(networkInterface.getDisplayName(), address);
                     //VPN开的虚拟网卡，默认不勾选
                     if (item.name.startsWith("tun")) {

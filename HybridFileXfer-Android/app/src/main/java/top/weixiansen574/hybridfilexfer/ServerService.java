@@ -76,6 +76,9 @@ public class ServerService extends Service implements ServiceConnection {
 
     private Config config;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private GlobalProgress globalProgress;
+    /** 应用是否在前台（在前台时用应用内浮层，不再叠全局悬浮窗） */
+    public static volatile boolean appVisible = false;
 
     private IIOService ioService;
     private Thread loopThread;
@@ -356,7 +359,7 @@ public class ServerService extends Service implements ServiceConnection {
     }
 
     /** MIUI 会吞应用日志，调试信息直接写文件（仅 debug 构建） */
-    private static void debugFile(String line) {
+    static void debugFile(String line) {
         if (!BuildConfig.DEBUG) {
             return;
         }
@@ -677,6 +680,9 @@ public class ServerService extends Service implements ServiceConnection {
         // 局域网广播：让电脑不用 adb、不用手动输 IP 也能发现手机
         discoveryBeacon = new DiscoveryBeacon(this, config.getServerPort());
         discoveryBeacon.start();
+        // 全局接收进度（悬浮窗 + 通知栏）
+        globalProgress = new GlobalProgress(this, mainHandler);
+        globalProgress.start();
     }
 
     @Override
@@ -1095,6 +1101,10 @@ public class ServerService extends Service implements ServiceConnection {
 
     @Override
     public void onDestroy() {
+        if (globalProgress != null) {
+            globalProgress.destroy();
+            globalProgress = null;
+        }
         if (discoveryBeacon != null) {
             discoveryBeacon.stop();
             discoveryBeacon = null;
@@ -1189,7 +1199,7 @@ public class ServerService extends Service implements ServiceConnection {
     }
 
     private Notification buildNotification() {
-        Intent openIntent = new Intent(this, MainActivity.class);
+        Intent openIntent = new Intent(this, top.weixiansen574.hybridfilexfer.compose.MiuixMainActivity.class);
         openIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
         PendingIntent contentIntent = PendingIntent.getActivity(this, 0, openIntent,
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
@@ -1224,7 +1234,7 @@ public class ServerService extends Service implements ServiceConnection {
             text = getString(R.string.notification_waiting_text);
         }
 
-        return new NotificationCompat.Builder(this, CHANNEL_ID)
+        NotificationCompat.Builder builder = new NotificationCompat.Builder(this, CHANNEL_ID)
                 .setSmallIcon(R.drawable.baseline_upload_24)
                 .setContentTitle(title)
                 .setContentText(text)
@@ -1233,8 +1243,37 @@ public class ServerService extends Service implements ServiceConnection {
                 .setOngoing(true)
                 .setOnlyAlertOnce(true)
                 .setPriority(NotificationCompat.PRIORITY_LOW)
-                .addAction(0, getString(R.string.notification_stop), stopPendingIntent)
-                .build();
+                .addAction(0, getString(R.string.notification_stop), stopPendingIntent);
+        // 正在接收时通知栏也显示进度（全局可见，不依赖悬浮窗权限）
+        Live transfer = currentTransfer();
+        if (transfer != null && transfer.total > 0) {
+            long done = transfer.done;
+            HFXServer server = HFXServer.getById(transfer.connectionId);
+            if (server != null) {
+                done = Math.max(done, server.blockProgress.getDoneBytes());
+            }
+            int pct = (int) Math.max(0, Math.min(100, done * 100 / transfer.total));
+            String name = transfer.name;
+            int cut = Math.max(name.lastIndexOf('/'), name.lastIndexOf('\\'));
+            if (cut >= 0) {
+                name = name.substring(cut + 1);
+            }
+            long speedSum = 0;
+            for (ChannelLive channel : transfer.channelSnapshot()) {
+                speedSum += channel.speed;
+            }
+            builder.setContentTitle(getString(R.string.notification_receiving) + " · " + pct + "%")
+                    .setContentText(name + "  ·  " + GlobalProgress.formatSpeed(speedSum)
+                            + "  ·  " + GlobalProgress.formatSize(done) + " / "
+                            + GlobalProgress.formatSize(transfer.total))
+                    .setProgress(100, pct, false);
+        }
+        return builder.build();
+    }
+
+    /** 全局进度每秒钟刷新一次通知栏 */
+    void refreshNotification() {
+        updateNotification();
     }
 
     private void updateNotification() {
