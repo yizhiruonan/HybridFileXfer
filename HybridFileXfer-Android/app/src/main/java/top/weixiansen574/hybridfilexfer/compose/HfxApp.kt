@@ -324,6 +324,8 @@ fun HfxApp(
     // 启动/停止服务期间先把按钮变灰，给用户"点击已收到"的反馈
     // 0 空闲 / 1 正在启动 / 2 正在停止（用两个方向，避免启动过程中按钮显示成"正在停止"）
     var serviceBusy by remember { mutableStateOf(0) }
+    // 用户点了进度浮层外面把它关掉（传输继续，通知栏继续显示进度/速率）
+    var xferPanelHidden by remember { mutableStateOf(false) }
     val pagerState = rememberPagerState(pageCount = { 3 })
     // 拖动滑块时临时禁用整页横滑，否则手势会被 HorizontalPager 抢走
     var sliderActive by remember { mutableStateOf(false) }
@@ -370,6 +372,23 @@ fun HfxApp(
         }
     }
 
+    // 新的一次传输开始 → 重新显示浮层
+    LaunchedEffect(state.xferActive) {
+        if (state.xferActive) {
+            xferPanelHidden = false
+        }
+    }
+    // 从通知栏点回应用（ON_RESUME）→ 浮层重新显示
+    androidx.compose.runtime.DisposableEffect(activity) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
+                xferPanelHidden = false
+            }
+        }
+        activity.lifecycle.addObserver(observer)
+        onDispose { activity.lifecycle.removeObserver(observer) }
+    }
+
     LaunchedEffect(Unit) {
         if (!hasStoragePermission(activity)) {
             try {
@@ -397,9 +416,10 @@ fun HfxApp(
                 keepPartials = cancelledPartials
             }
             val now = android.os.SystemClock.elapsedRealtime()
-            // 传输中：每 50ms 只刷进度相关的轻量状态，配合更短的补间动画，
-            // 进度条看起来是连续在走而不是一跳一跳
-            if (state.xferActive && now - lastFullRead < 1200) {
+            // 传输中只刷进度相关的轻量状态（每 50ms），完全不做全量刷新：
+            // readState 里有 root / 网卡等 shell 查询，跑一次要几百毫秒，插在中间就是每秒一次的顿挫。
+            // 传输结束后再补一次全量刷新。
+            if (state.xferActive) {
                 state = withContext(Dispatchers.IO) { readProgressState(state) }
                 delay(50)
                 continue
@@ -670,8 +690,8 @@ fun HfxApp(
                 },
             )
         }
-        if (state.xferActive) {
-            ReceiveProgressPanel(state)
+        if (state.xferActive && !xferPanelHidden) {
+            ReceiveProgressPanel(state, onDismiss = { xferPanelHidden = true })
         }
         if (keepPartials.isNotEmpty()) {
             KeepPartialDialog(
@@ -1054,6 +1074,25 @@ private fun SettingsPage(
                     onCheckedChange = onAutoConnect,
                     title = "自动连接",
                     summary = "后台一直等待电脑连接（通知栏常驻）",
+                )
+                // 全局悬浮窗：接收时在别的应用上也能看到进度（需要系统"显示在其他应用上层"权限）
+                SwitchPreference(
+                    checked = android.provider.Settings.canDrawOverlays(activity),
+                    onCheckedChange = { enabled ->
+                        if (enabled && !android.provider.Settings.canDrawOverlays(activity)) {
+                            try {
+                                activity.startActivity(
+                                    android.content.Intent(
+                                        android.provider.Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                        android.net.Uri.parse("package:" + activity.packageName),
+                                    ),
+                                )
+                            } catch (_: Exception) {
+                            }
+                        }
+                    },
+                    title = "全局悬浮窗",
+                    summary = "接收文件时在其他应用上也显示进度（需在系统里允许悬浮窗）",
                 )
                 OverlayDropdownPreference(
                     title = "连接模式",

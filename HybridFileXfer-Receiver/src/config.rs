@@ -27,6 +27,8 @@ pub struct Config {
     pub minimize_to_tray: bool,
     /// 同时连接的手机数量上限（多设备）
     pub max_devices: usize,
+    /// 是否在右键「发送到」菜单里放一个「发送到手机」快捷方式
+    pub sendto: bool,
 }
 
 impl Default for Config {
@@ -40,6 +42,7 @@ impl Default for Config {
             lang: None,
             minimize_to_tray: true,
             max_devices: 3,
+            sendto: false,
         }
     }
 }
@@ -120,6 +123,9 @@ impl Config {
                 "minimize_to_tray" | "tray" => {
                     cfg.minimize_to_tray = !(value == "0" || value.eq_ignore_ascii_case("false"));
                 }
+                "sendto" | "send_to" => {
+                    cfg.sendto = !(value == "0" || value.eq_ignore_ascii_case("false"));
+                }
                 _ => {}
             }
         }
@@ -144,7 +150,10 @@ impl Config {
              # 关闭窗口时最小化到托盘（1 开启 / 0 关闭）\n\
              minimize_to_tray = {}\n\
              # 同时连接的手机数量上限（1-8）\n\
-             max_devices = {}\n",
+             # 同时连接的手机数量上限（1-8）\n\
+             max_devices = {}\n\
+             # 右键「发送到」菜单里显示「发送到手机」（1 显示 / 0 不显示）\n\
+             sendto = {}\n",
             self.receive_dir.display(),
             self.port,
             self.adb_path
@@ -159,7 +168,8 @@ impl Config {
                 None => "",
             },
             if self.minimize_to_tray { "1" } else { "0" },
-            self.max_devices
+            self.max_devices,
+            if self.sendto { "1" } else { "0" }
         );
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);

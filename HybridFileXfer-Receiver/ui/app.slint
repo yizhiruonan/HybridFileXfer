@@ -118,6 +118,8 @@ export component AppWindow inherits Window {
     in-out property <int> mode-index: 0;
     in-out property <bool> autostart: false;
     in-out property <bool> tray: true;
+    // 右键「发送到」里显示「发送到手机」
+    in-out property <bool> sendto: false;
     in-out property <string> message: "";
 
     // ---- 传输进度 ----
@@ -153,6 +155,7 @@ export component AppWindow inherits Window {
     callback stop-clicked();
     callback autostart-toggled(bool);
     callback tray-toggled(bool);
+    callback sendto-toggled(bool);
     callback device-clicked(int);
     callback device-chosen(int);
     callback toggle-pause-send();
@@ -476,6 +479,12 @@ export component AppWindow inherits Window {
                     text: "关闭窗口后最小化到托盘（后台继续等待连接）";
                     checked <=> root.tray;
                     toggled => { root.tray-toggled(root.tray); }
+                }
+
+                CheckBox {
+                    text: "在右键「发送到」菜单里显示「发送到手机」";
+                    checked <=> root.sendto;
+                    toggled => { root.sendto-toggled(root.sendto); }
                 }
 
                 Text {

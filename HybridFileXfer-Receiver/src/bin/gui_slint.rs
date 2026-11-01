@@ -194,7 +194,16 @@ fn main() -> Result<(), slint::PlatformError> {
     ui.set_ip_text(ip_text.into());
     ui.set_autostart(autostart);
     ui.set_tray(state.lock().unwrap().config.minimize_to_tray);
+    ui.set_sendto(state.lock().unwrap().config.sendto);
     ui.set_status_kind(0);
+    // 之前勾选过就确保快捷方式还在（换电脑/程序挪位置后路径会变）
+    if state.lock().unwrap().config.sendto {
+        std::thread::spawn(|| {
+            if let Err(e) = hfx_receiver::sendto::ensure() {
+                log::warn(&format!("创建「发送到手机」快捷方式失败: {e}"));
+            }
+        });
+    }
 
     // ---------- 回调 ----------
     {
@@ -316,6 +325,28 @@ fn main() -> Result<(), slint::PlatformError> {
             let config = s.config.clone();
             if let Err(e) = config.save(&path) {
                 eprintln!("保存托盘设置失败: {e}");
+            }
+        });
+    }
+    {
+        let st = Arc::clone(&state);
+        ui.on_sendto_toggled(move |enabled| {
+            let mut s = st.lock().unwrap();
+            s.config.sendto = enabled;
+            let path = s.config_path.clone();
+            let config = s.config.clone();
+            drop(s);
+            if let Err(e) = config.save(&path) {
+                eprintln!("保存「发送到」设置失败: {e}");
+            }
+            if enabled {
+                std::thread::spawn(|| {
+                    if let Err(e) = hfx_receiver::sendto::ensure() {
+                        log::warn(&format!("创建「发送到手机」快捷方式失败: {e}"));
+                    }
+                });
+            } else {
+                hfx_receiver::sendto::remove();
             }
         });
     }

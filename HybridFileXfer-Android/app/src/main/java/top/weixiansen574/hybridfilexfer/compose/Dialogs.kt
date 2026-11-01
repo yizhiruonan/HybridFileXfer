@@ -344,7 +344,7 @@ private fun humanSize(bytes: Long): String {
 
 /** 电脑推送文件时的进度提示：分块进度条 + 每通道明细（IDM / 迅雷 那种） */
 @Composable
-internal fun ReceiveProgressPanel(state: UiState) {
+internal fun ReceiveProgressPanel(state: UiState, onDismiss: () -> Unit = {}) {
     val colorScheme = MiuixTheme.colorScheme
     val haptic = LocalHapticFeedback.current
     // 用累计字节数算速率：多台电脑同时接收时显示的是合计速率。
@@ -384,7 +384,8 @@ internal fun ReceiveProgressPanel(state: UiState) {
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(Color.Black.copy(alpha = 0.35f)),
+            .background(Color.Black.copy(alpha = 0.35f))
+            .clickable { onDismiss() },
         contentAlignment = Alignment.Center,
     ) {
         Column(
@@ -393,6 +394,7 @@ internal fun ReceiveProgressPanel(state: UiState) {
                 .heightIn(max = 560.dp)
                 .clip(RoundedCornerShape(24.dp))
                 .background(colorScheme.surfaceContainer)
+                .clickable { }
                 .verticalScroll(rememberScrollState())
                 .padding(20.dp),
             horizontalAlignment = Alignment.CenterHorizontally,

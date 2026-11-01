@@ -163,6 +163,7 @@
     <string name="notification_waiting_text">插上数据线，或在电脑上运行接收器</string>
     <string name="notification_starting_text">正在启动IO服务…</string>
     <string name="notification_connected_title">已连接电脑</string>
+    <string name="notification_receiving">正在接收文件</string>
     <string name="notification_connected_text">通道：%1$s</string>
     <string name="notification_connected_multi">%1$d 台电脑 · %2$d 条通道</string>
     <string name="notification_stop">停止</string>

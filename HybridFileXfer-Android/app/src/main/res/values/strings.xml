@@ -164,6 +164,7 @@
     <string name="notification_waiting_text">Plug in the USB cable, or run the receiver on the PC</string>
     <string name="notification_starting_text">Starting the IO service…</string>
     <string name="notification_connected_title">Connected to the computer</string>
+    <string name="notification_receiving">Receiving files</string>
     <string name="notification_connected_text">Channels: %1$s</string>
     <string name="notification_connected_multi">%1$d computer(s) · %2$d channel(s)</string>
     <string name="notification_stop">Stop</string>
