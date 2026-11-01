@@ -130,8 +130,15 @@ fn main() -> Result<(), slint::PlatformError> {
     // 这样用户自己把快捷方式拖进 SendTo 即可，程序不需要拉 PowerShell 去造 .lnk
     //（无签名程序 + 拉起脚本 + 写快捷方式，很容易被杀软判成木马）。
     let mut send_files: Vec<PathBuf> = Vec::new();
-    for arg in std::env::args().skip(1) {
+    let mut send_target: Option<String> = None;
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
         if arg == "--send" || arg == "--autostart" {
+            continue;
+        }
+        // --to <串号>：只把文件推给指定设备（多设备时用）
+        if arg == "--to" {
+            send_target = args.next();
             continue;
         }
         let path = PathBuf::from(&arg);
@@ -142,11 +149,11 @@ fn main() -> Result<(), slint::PlatformError> {
     let send_mode = !send_files.is_empty();
     if send_mode {
         #[cfg(windows)]
-        if tray_win::deliver_paths(&send_files) {
+        if tray_win::deliver_paths_with_target(&send_files, send_target.as_deref()) {
             return Ok(());
         }
         // 没有运行中的实例：这些文件先入队，本进程接着正常启动
-        hfx_receiver::pending::push(send_files.clone());
+        hfx_receiver::pending::push_with_target(send_files.clone(), send_target.clone());
     }
 
     let autostart = autostart_enabled();
