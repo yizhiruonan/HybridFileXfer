@@ -234,6 +234,23 @@ fn command_exists(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// 多设备：返回所有就绪设备（可按 serial 过滤），最多 `limit` 台
+pub fn pick_devices<'a>(
+    devices: &'a [Device],
+    wanted: Option<&str>,
+    limit: usize,
+) -> Vec<&'a Device> {
+    let mut ready: Vec<&'a Device> = devices.iter().filter(|d| d.state == "device").collect();
+    if let Some(wanted) = wanted {
+        let wanted = wanted.trim();
+        if !wanted.is_empty() {
+            ready.retain(|d| d.serial == wanted);
+        }
+    }
+    ready.truncate(limit.max(1));
+    ready
+}
+
 pub fn pick_device<'a>(devices: &'a [Device], wanted: Option<&str>) -> Result<&'a Device, String> {
     if let Some(wanted) = wanted {
         if let Some(device) = devices.iter().find(|d| d.serial == wanted) {
