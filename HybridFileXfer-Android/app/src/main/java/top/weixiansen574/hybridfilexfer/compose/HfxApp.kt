@@ -213,6 +213,9 @@ fun HfxApp(
     val scope = rememberCoroutineScope()
     val haptic = LocalHapticFeedback.current
 
+    // 手动输入保存路径：SAF 不让选的目录（存储根、Android/data 等）用这个绕过去
+    var pathDialog by remember { mutableStateOf(false) }
+
     // 选一个目录作为“电脑推送到手机”的保存位置
     val pickPushDir = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
         if (uri != null) {
@@ -440,9 +443,28 @@ fun HfxApp(
                         onOpenUrl = { url -> openUrl(activity, url) },
                         onBrowsePc = { pcBrowse = true },
                         onPickPushDir = { pickPushDir.launch(null) },
+                        onTypePushDir = { pathDialog = true },
                     )
                 }
             }
+        }
+        if (pathDialog) {
+            TextDialog(
+                spec = TextDialogSpec(
+                    title = "保存路径",
+                    subtitle = "例如 /storage/emulated/0/Download/HybridFileXfer",
+                    initial = state.pushDir,
+                ) { value ->
+                    Config.getInstance(activity).pushDir = value.trim()
+                    state = readState(activity)
+                },
+                onDismiss = { pathDialog = false },
+                onConfirm = { value ->
+                    Config.getInstance(activity).pushDir = value.trim()
+                    state = readState(activity)
+                    pathDialog = false
+                },
+            )
         }
         if (state.xferActive) {
             ReceiveProgressPanel(state)
@@ -626,6 +648,7 @@ private fun SettingsPage(
     onOpenUrl: (String) -> Unit,
     onBrowsePc: () -> Unit,
     onPickPushDir: () -> Unit,
+    onTypePushDir: () -> Unit,
 ) {
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
@@ -704,6 +727,12 @@ private fun SettingsPage(
                     summary = if (state.pushDir.isNotEmpty()) state.pushDir else "默认：Download/HybridFileXfer",
                     endActions = { ActionText("选择") },
                     onClick = onPickPushDir,
+                )
+                ArrowPreference(
+                    title = "手动指定保存路径",
+                    summary = "系统选择器不让选的目录（如存储根目录）可以用这里手输",
+                    endActions = { ActionText("输入") },
+                    onClick = onTypePushDir,
                 )
                 ArrowPreference(
                     title = "浏览电脑文件夹",
