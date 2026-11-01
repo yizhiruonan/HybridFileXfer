@@ -149,6 +149,27 @@ public class ServerService extends Service implements ServiceConnection {
         return HFXServer.getAny();
     }
 
+    /**
+     * 取消某台电脑上正在进行的传输。
+     * 传输线程是阻塞读写的，没有单独的取消协议——直接断开这条连接，
+     * 对端（电脑）会立刻收到断线、停止发送，然后按自己的重连逻辑连回来。
+     */
+    public static void cancelTransfer(int connectionId) {
+        HFXServer target = HFXServer.getById(connectionId);
+        if (target == null) {
+            return;
+        }
+        try {
+            // 标记"用户取消"：收尾时不要自动删半成品，交给界面问用户保不保留
+            liveFor(connectionId).userCancelled = true;
+            // 只关 socket，让传输线程抛异常退出；缓冲区由会话线程收尾时释放，
+            // 这里绝不能调 disconnect()（会 free 掉正在用的 native 内存）
+            target.abortTransfer();
+            HFXServer.unregister(target);
+        } catch (Throwable ignored) {
+        }
+    }
+
     /** 按连接号取指定的那台电脑；那台已经断开时退回任意一台（-1 也表示任意一台）。 */
     public static HFXServer getServer(int connectionId) {
         HFXServer server = HFXServer.getById(connectionId);
@@ -207,6 +228,8 @@ public class ServerService extends Service implements ServiceConnection {
         public volatile String name = "";
         public volatile long done = 0;
         public volatile long total = 0;
+        /** 是用户主动点的取消（要问"保不保留已接收的部分"），不是掉线 */
+        public volatile boolean userCancelled = false;
         private volatile long lastDone = 0;
         /** 每一条传输通道的累计字节 / 当前速度，进度浮层的明细表用 */
         private final java.util.Map<String, ChannelLive> channels = new java.util.LinkedHashMap<>();
@@ -217,6 +240,7 @@ public class ServerService extends Service implements ServiceConnection {
             done = 0;
             total = 0;
             lastDone = 0;
+            userCancelled = false;
             synchronized (this) {
                 channels.clear();
             }
@@ -334,24 +358,19 @@ public class ServerService extends Service implements ServiceConnection {
     private void pullPendingFiles(HFXServer server,
             java.util.List<top.weixiansen574.hybridfilexfer.core.bean.RemoteFile> files) {
         final String TAG2 = "HFXPULL";
+        final java.io.File dir = ensurePushDir();
+        final Live live = liveFor(server.getId());
         try {
             debugFile("pull start, files=" + files.size());
-            final Live live = liveFor(server.getId());
             live.reset();
             live.active = true;
             server.blockProgress.reset();
             for (top.weixiansen574.hybridfilexfer.core.bean.RemoteFile f : files) {
                 debugFile("  pending: " + f.getPath() + " (" + f.getSize() + ")");
             }
-            String configured = Config.getInstance(this).getPushDir();
-            java.io.File dir = configured != null && !configured.isEmpty()
-                    ? new java.io.File(configured)
-                    : new java.io.File(
-                            android.os.Environment.getExternalStoragePublicDirectory(
-                                    android.os.Environment.DIRECTORY_DOWNLOADS),
-                            "HybridFileXfer");
-            if (!dir.exists() && !dir.mkdirs()) {
-                Log.w(TAG, "cannot create " + dir);
+            if (dir == null) {
+                Log.w(TAG, "cannot create push dir");
+                live.active = false;
                 return;
             }
             top.weixiansen574.hybridfilexfer.core.bean.Directory local =
@@ -410,12 +429,97 @@ public class ServerService extends Service implements ServiceConnection {
                         public void onIncomplete() {
                             debugFile("incomplete");
                             live.active = false;
+                            if (live.userCancelled) {
+                                collectPartials(dir, files);
+                            } else {
+                                deletePartial(dir, files);
+                            }
                         }
                     });
             debugFile("pulled " + files.size() + " file(s) from PC");
             live.active = false;
         } catch (Throwable e) {
             debugFile("pull failed: " + e);
+            if (live.userCancelled) {
+                // 用户主动取消：先别删，等界面问"保留还是删除"
+                collectPartials(dir, files);
+            } else {
+                // 掉线/出错：预分配到完整大小的半成品没有用，删掉
+                deletePartial(dir, files);
+            }
+        }
+    }
+
+    /** 用户取消接收后留下的半成品路径（界面弹"保留/删除"用） */
+    private static final java.util.List<String> CANCELLED_PARTIALS =
+            java.util.Collections.synchronizedList(new java.util.ArrayList<>());
+
+    public static java.util.List<String> takeCancelledPartials() {
+        synchronized (CANCELLED_PARTIALS) {
+            if (CANCELLED_PARTIALS.isEmpty()) {
+                return java.util.Collections.emptyList();
+            }
+            java.util.List<String> copy = new java.util.ArrayList<>(CANCELLED_PARTIALS);
+            CANCELLED_PARTIALS.clear();
+            return copy;
+        }
+    }
+
+    private static void collectPartials(java.io.File dir,
+            java.util.List<top.weixiansen574.hybridfilexfer.core.bean.RemoteFile> files) {
+        if (dir == null || files == null) {
+            return;
+        }
+        for (top.weixiansen574.hybridfilexfer.core.bean.RemoteFile file : files) {
+            String path = file.getPath();
+            int cut = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
+            String name = cut >= 0 ? path.substring(cut + 1) : path;
+            if (name.isEmpty()) {
+                continue;
+            }
+            java.io.File target = new java.io.File(dir, name);
+            if (target.isFile()) {
+                CANCELLED_PARTIALS.add(target.getAbsolutePath());
+            }
+        }
+    }
+
+    /** 电脑推送的保存目录（不存在就建）；建不出来返回 null */
+    private java.io.File ensurePushDir() {
+        String configured = Config.getInstance(this).getPushDir();
+        java.io.File dir = configured != null && !configured.isEmpty()
+                ? new java.io.File(configured)
+                : new java.io.File(
+                        android.os.Environment.getExternalStoragePublicDirectory(
+                                android.os.Environment.DIRECTORY_DOWNLOADS),
+                        "HybridFileXfer");
+        if (!dir.exists() && !dir.mkdirs()) {
+            return null;
+        }
+        return dir;
+    }
+
+    /** 删掉这次推送里已经落了一半的文件（取消/断线时用） */
+    private static void deletePartial(java.io.File dir,
+            java.util.List<top.weixiansen574.hybridfilexfer.core.bean.RemoteFile> files) {
+        if (dir == null || files == null) {
+            return;
+        }
+        for (top.weixiansen574.hybridfilexfer.core.bean.RemoteFile file : files) {
+            String path = file.getPath();
+            int cut = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
+            String name = cut >= 0 ? path.substring(cut + 1) : path;
+            if (name.isEmpty()) {
+                continue;
+            }
+            java.io.File target = new java.io.File(dir, name);
+            if (target.isFile()) {
+                if (!target.delete()) {
+                    debugFile("cannot delete partial " + target);
+                } else {
+                    debugFile("deleted partial " + target);
+                }
+            }
         }
     }
 

@@ -152,6 +152,7 @@
     <string name="share_sending">Sending: %1$s</string>
     <string name="share_complete">Sent to the computer: %1$s</string>
     <string name="share_busy">A transfer is running, please wait…</string>
+    <string name="share_cancelled">Cancelled</string>
     <string name="auto_connect">Auto connect</string>
     <string name="auto_connect_enabled">Auto connect is on: the phone keeps waiting for the computer</string>
     <string name="auto_connect_disabled">Auto connect is off</string>

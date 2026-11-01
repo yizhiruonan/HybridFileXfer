@@ -151,6 +151,7 @@
     <string name="share_sending">正在发送：%1$s</string>
     <string name="share_complete">已发送到电脑：%1$s</string>
     <string name="share_busy">正在传输，请稍候…</string>
+    <string name="share_cancelled">已取消</string>
     <string name="auto_connect">自动连接</string>
     <string name="auto_connect_enabled">已开启自动连接，手机会一直等待电脑连接</string>
     <string name="auto_connect_disabled">已关闭自动连接</string>

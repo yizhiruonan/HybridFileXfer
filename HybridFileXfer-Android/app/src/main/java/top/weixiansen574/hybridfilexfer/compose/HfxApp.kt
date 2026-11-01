@@ -140,6 +140,7 @@ internal data class UiState(
     /** 所有连接累计接收的字节数（只增不减），用来算合计速率 */
     val xferBytes: Long = 0,
     /** 当前展示的那台电脑与它的分块进度 / 通道明细 */
+    val xferId: Int = -1,
     val xferLabel: String = "",
     val xferSegments: List<SegInfo> = emptyList(),
     val xferChannels: List<ChannelStat> = emptyList(),
@@ -271,6 +272,7 @@ internal fun readState(context: Context): UiState {
         // 已完成字节按块数算（分段/乱序到达时，最后一块的位置不等于进度）
         xferDone = currentConn?.done ?: 0,
         xferTotal = currentConn?.total ?: 0,
+        xferId = currentConn?.id ?: -1,
         xferCount = ServerService.transferringCount(),
         // 合计速率用"各连接已完成字节"求和（按块统计，分段/乱序都不会乱跳），
         // 不能用 lastBlock 位置，旧算法在多通道时就地飙升
@@ -310,6 +312,8 @@ fun HfxApp(
     var uiScale by remember { mutableStateOf(Config.getInstance(activity).uiScale) }
     var numberDialog by remember { mutableStateOf<NumberDialogSpec?>(null) }
     var pcBrowse by remember { mutableStateOf(false) }
+    // 取消接收后待决定"保留还是删除"的半成品文件
+    var keepPartials by remember { mutableStateOf<List<String>>(emptyList()) }
     val pagerState = rememberPagerState(pageCount = { 3 })
     // 拖动滑块时临时禁用整页横滑，否则手势会被 HorizontalPager 抢走
     var sliderActive by remember { mutableStateOf(false) }
@@ -377,6 +381,11 @@ fun HfxApp(
         }
         var lastFullRead = 0L
         while (true) {
+            // 用户取消接收后，服务会把半成品路径放这里，弹窗问"保留还是删除"
+            val cancelledPartials = ServerService.takeCancelledPartials()
+            if (cancelledPartials.isNotEmpty()) {
+                keepPartials = cancelledPartials
+            }
             val now = android.os.SystemClock.elapsedRealtime()
             // 传输中：每 120ms 只刷进度相关的轻量状态，进度条和速度才跟得上；
             // 其余字段（权限/端口/网卡）仍然按原来的节奏全量刷新
@@ -598,6 +607,18 @@ fun HfxApp(
         }
         if (state.xferActive) {
             ReceiveProgressPanel(state)
+        }
+        if (keepPartials.isNotEmpty()) {
+            KeepPartialDialog(
+                paths = keepPartials,
+                onKeep = { keepPartials = emptyList() },
+                onDelete = {
+                    keepPartials.forEach { path ->
+                        runCatching { java.io.File(path).delete() }
+                    }
+                    keepPartials = emptyList()
+                },
+            )
         }
         if (targetChooser) {
             PcChooserDialog(
