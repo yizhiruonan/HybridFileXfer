@@ -199,6 +199,12 @@
 
 本项目衍生自 **[weixiansen574/HybridFileXfer](https://github.com/weixiansen574/HybridFileXfer)**（原作者 **weixiansen574**），在其基础上重做了安卓端界面并新增了电脑接收器。
 
+## 赞助
+
+感谢以下朋友的支持：
+
+- 雨
+
 ## 许可证
 
 **GNU General Public License v3.0**，见 [LICENSE.txt](./LICENSE.txt)。分发时必须保留原作者署名，并以 GPL-3.0 公开完整源代码。
