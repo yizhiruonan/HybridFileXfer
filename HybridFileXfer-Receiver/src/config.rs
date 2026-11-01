@@ -23,6 +23,8 @@ pub struct Config {
     /// Component started on the phone so that it starts listening for us.
     pub service_component: String,
     pub lang: Option<Lang>,
+    /// 关闭窗口时是否最小化到系统托盘（后台继续等待连接）
+    pub minimize_to_tray: bool,
 }
 
 impl Default for Config {
@@ -34,6 +36,7 @@ impl Default for Config {
             device: None,
             service_component: DEFAULT_COMPONENT.to_string(),
             lang: None,
+            minimize_to_tray: true,
         }
     }
 }
@@ -106,6 +109,9 @@ impl Config {
                         _ => None,
                     };
                 }
+                "minimize_to_tray" | "tray" => {
+                    cfg.minimize_to_tray = !(value == "0" || value.eq_ignore_ascii_case("false"));
+                }
                 _ => {}
             }
         }
@@ -126,7 +132,9 @@ impl Config {
              # 在手机上启动的组件（接收服务）\n\
              service_component = {}\n\
              # zh / en，留空跟随系统\n\
-             lang = {}\n",
+             lang = {}\n\
+             # 关闭窗口时最小化到托盘（1 开启 / 0 关闭）\n\
+             minimize_to_tray = {}\n",
             self.receive_dir.display(),
             self.port,
             self.adb_path
@@ -139,7 +147,8 @@ impl Config {
                 Some(Lang::Zh) => "zh",
                 Some(Lang::En) => "en",
                 None => "",
-            }
+            },
+            if self.minimize_to_tray { "1" } else { "0" }
         );
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);

@@ -247,6 +247,14 @@ fun HfxApp(
                 }
                 if (changed) {
                     interfaces = fresh
+                    // 服务在跑但还没连上电脑时，用新网卡列表重启会话。
+                    // 否则会残留上一轮的网卡（比如 WiFi 重连后名字从 wlan0 变成 wlan1，旧通道还在）。
+                    if (ServerService.isRunning() && !ServerService.isConnected()) {
+                        try {
+                            ServerService.restartSession(activity)
+                        } catch (_: Exception) {
+                        }
+                    }
                 }
             }
             delay(if (next.connected) 800 else 1500)

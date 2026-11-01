@@ -192,7 +192,7 @@ public class HFXServer extends HFXService {
             }
             if (connections != null) {
                 for (TransferConnection connection : connections) {
-                    if (connection == null || connection.channel == null) {
+                    if (connection == null || connection.channel == null || !connection.channel.isOpen()) {
                         continue;
                     }
                     java.net.InetSocketAddress addr = connection.channel.getRemoteAddress();
@@ -212,7 +212,7 @@ public class HFXServer extends HFXService {
         try {
             if (connections != null) {
                 for (TransferConnection connection : connections) {
-                    if (connection == null || connection.channel == null) {
+                    if (connection == null || connection.channel == null || !connection.channel.isOpen()) {
                         continue;
                     }
                     java.net.InetSocketAddress remote = connection.channel.getRemoteAddress();
@@ -336,6 +336,10 @@ public class HFXServer extends HFXService {
     public List<String> getConnectionListINames() {
         List<String> names = new ArrayList<>(connections.size());
         for (TransferConnection connection : connections) {
+            // 已经断开的通道不计入（WiFi 断开/切网后会残留在这里）
+            if (connection.channel == null || !connection.channel.isOpen()) {
+                continue;
+            }
             names.add(connection.iName);
         }
         return names;
