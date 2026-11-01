@@ -201,10 +201,9 @@ internal fun treeUriToPath(uri: android.net.Uri): String? {
     }
 }
 
-internal fun readState(context: Context): UiState {
-    val config = Config.getInstance(context)
-    val servers = ServerService.getConnections()
-    val connections = servers.map { server ->
+/** 把已连接电脑转换成界面模型（完整刷新和快速进度刷新共用） */
+internal fun buildPcConnections(servers: List<top.weixiansen574.hybridfilexfer.droidcore.HFXServer>): List<PcConn> {
+    return servers.map { server ->
         val live = ServerService.liveFor(server.id)
         PcConn(
             id = server.id,
@@ -225,6 +224,37 @@ internal fun readState(context: Context): UiState {
             },
         )
     }
+}
+
+/**
+ * 传输中的快速刷新：只读进度相关的轻量状态（端口/权限/版本都不重读），
+ * 让进度条和速度每 100 多毫秒就能动一次，避免 800ms 一跳的顿挫感。
+ */
+internal fun readProgressState(base: UiState): UiState {
+    val connections = buildPcConnections(ServerService.getConnections())
+    val current = ServerService.currentTransfer()
+    val currentConn = connections.firstOrNull { it.id == (current?.connectionId ?: -1) }
+    return base.copy(
+        state = ServerService.getState(),
+        connected = ServerService.isConnected(),
+        connections = connections,
+        channelCount = connections.sumOf { it.channels.size },
+        xferActive = current != null,
+        xferName = current?.name ?: "",
+        xferDone = currentConn?.done ?: 0,
+        xferTotal = currentConn?.total ?: 0,
+        xferCount = ServerService.transferringCount(),
+        xferBytes = connections.filter { it.transferring }.sumOf { it.done },
+        xferLabel = currentConn?.label ?: "",
+        xferSegments = currentConn?.segments ?: emptyList(),
+        xferChannels = currentConn?.channelStats ?: emptyList(),
+    )
+}
+
+internal fun readState(context: Context): UiState {
+    val config = Config.getInstance(context)
+    val servers = ServerService.getConnections()
+    val connections = buildPcConnections(servers)
     val current = ServerService.currentTransfer()
     val currentConn = connections.firstOrNull { it.id == (current?.connectionId ?: -1) }
     return UiState(
@@ -242,7 +272,9 @@ internal fun readState(context: Context): UiState {
         xferDone = currentConn?.done ?: 0,
         xferTotal = currentConn?.total ?: 0,
         xferCount = ServerService.transferringCount(),
-        xferBytes = ServerService.receivedTotalBytes(),
+        // 合计速率用"各连接已完成字节"求和（按块统计，分段/乱序都不会乱跳），
+        // 不能用 lastBlock 位置，旧算法在多通道时就地飙升
+        xferBytes = connections.filter { it.transferring }.sumOf { it.done },
         xferLabel = currentConn?.label ?: "",
         xferSegments = currentConn?.segments ?: emptyList(),
         xferChannels = currentConn?.channelStats ?: emptyList(),
@@ -343,7 +375,17 @@ fun HfxApp(
         } catch (e: Exception) {
             emptyList()
         }
+        var lastFullRead = 0L
         while (true) {
+            val now = android.os.SystemClock.elapsedRealtime()
+            // 传输中：每 120ms 只刷进度相关的轻量状态，进度条和速度才跟得上；
+            // 其余字段（权限/端口/网卡）仍然按原来的节奏全量刷新
+            if (state.xferActive && now - lastFullRead < 1200) {
+                state = withContext(Dispatchers.IO) { readProgressState(state) }
+                delay(80)
+                continue
+            }
+            lastFullRead = now
             val next = withContext(Dispatchers.IO) { readState(activity) }
             if (next != state) {
                 state = next
