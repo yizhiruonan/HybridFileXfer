@@ -343,18 +343,37 @@ private fun humanSize(bytes: Long): String {
 @Composable
 internal fun ReceiveProgressPanel(state: UiState) {
     val colorScheme = MiuixTheme.colorScheme
-    // 用累计字节数算速率：多台电脑同时接收时显示的是合计速率
+    // 用累计字节数算速率：多台电脑同时接收时显示的是合计速率。
+    // 采样值先做一次指数平滑，再交给动画逐帧插值，数字才是"滑"的而不是一跳一跳。
     var lastBytes by remember { mutableStateOf(state.xferBytes) }
     var lastAt by remember { mutableStateOf(System.currentTimeMillis()) }
-    var speed by remember { mutableStateOf(0L) }
+    var targetSpeed by remember { mutableStateOf(0f) }
 
     LaunchedEffect(state.xferBytes) {
         val now = System.currentTimeMillis()
-        val dt = (now - lastAt).coerceAtLeast(1L)
-        speed = if (state.xferBytes >= lastBytes) (state.xferBytes - lastBytes) * 1000L / dt else 0L
+        val dt = (now - lastAt).coerceAtLeast(16L)
+        val instant = if (state.xferBytes >= lastBytes) (state.xferBytes - lastBytes) * 1000f / dt else 0f
+        targetSpeed = if (targetSpeed <= 0f) instant else targetSpeed * 0.6f + instant * 0.4f
         lastBytes = state.xferBytes
         lastAt = now
     }
+    val animatedSpeed by androidx.compose.animation.core.animateFloatAsState(
+        targetValue = targetSpeed,
+        animationSpec = androidx.compose.animation.core.tween(
+            durationMillis = 500,
+            easing = androidx.compose.animation.core.LinearEasing,
+        ),
+        label = "speed",
+    )
+    // 已接收字节也做插值，"x MB / y MB" 才会连着走而不是每块跳一下
+    val animatedDone by androidx.compose.animation.core.animateFloatAsState(
+        targetValue = state.xferDone.toFloat(),
+        animationSpec = androidx.compose.animation.core.tween(
+            durationMillis = 450,
+            easing = androidx.compose.animation.core.LinearEasing,
+        ),
+        label = "doneBytes",
+    )
 
     val name = state.xferName.substringAfterLast('/').substringAfterLast('\\')
 
@@ -394,11 +413,13 @@ internal fun ReceiveProgressPanel(state: UiState) {
                 fallback = if (state.xferTotal > 0) state.xferDone.toFloat() / state.xferTotal else 0f,
                 color = colorScheme.primary,
                 track = colorScheme.onSurface.copy(alpha = 0.16f),
+                // 分段竖线：细、显眼（参考 IDM 的分段红线）
+                divider = Color(0xFFE53935),
             )
             Spacer(Modifier.height(10.dp))
             Text(
-                humanSize(state.xferDone) + " / " + humanSize(state.xferTotal) +
-                    "   ·   " + (if (state.xferCount > 1) "合计 " else "") + formatSpeed(speed),
+                humanSize(animatedDone.toLong()) + " / " + humanSize(state.xferTotal) +
+                    "   ·   " + (if (state.xferCount > 1) "合计 " else "") + formatSpeed(animatedSpeed.toLong()),
                 fontSize = 12.sp,
                 color = colorScheme.onSurfaceVariantSummary,
             )
@@ -464,7 +485,13 @@ internal fun ReceiveProgressPanel(state: UiState) {
  * 段宽按区间块数分配，段数会随"空闲连接去切别人的段"变化。
  */
 @Composable
-private fun SegmentedProgressBar(segments: List<SegInfo>, fallback: Float, color: Color, track: Color) {
+private fun SegmentedProgressBar(
+    segments: List<SegInfo>,
+    fallback: Float,
+    color: Color,
+    track: Color,
+    divider: Color,
+) {
     val shape = RoundedCornerShape(50)
     Box(
         modifier = Modifier
@@ -473,12 +500,9 @@ private fun SegmentedProgressBar(segments: List<SegInfo>, fallback: Float, color
             .clip(shape)
             .background(track),
     ) {
-        Row(
-            modifier = Modifier.fillMaxSize(),
-            horizontalArrangement = Arrangement.spacedBy(2.dp),
-        ) {
+        Row(modifier = Modifier.fillMaxSize()) {
             if (segments.isEmpty()) {
-                ProgressCell(fallback.coerceIn(0f, 1f), Modifier.weight(1f), color, first = true, last = true)
+                ProgressCell(fallback.coerceIn(0f, 1f), Modifier.weight(1f), color, divider, first = true)
             } else {
                 segments.forEachIndexed { index, seg ->
                     val span = (seg.end - seg.start).coerceAtLeast(1)
@@ -486,8 +510,8 @@ private fun SegmentedProgressBar(segments: List<SegInfo>, fallback: Float, color
                         fraction = seg.filled.coerceIn(0f, 1f),
                         modifier = Modifier.weight(span.toFloat()),
                         color = color,
+                        divider = divider,
                         first = index == 0,
-                        last = index == segments.lastIndex,
                     )
                 }
             }
@@ -496,26 +520,36 @@ private fun SegmentedProgressBar(segments: List<SegInfo>, fallback: Float, color
 }
 
 /**
- * 一段的填充块：只有整条进度条的最左/最右是圆角，中间各块的接缝是直角，
- * 看起来才是"一条滑条被分成几段"，而不是一串圆珠子。
+ * 一段的填充：整条被外层胶囊裁掉圆角，所以最左/最右自动是圆头，中间是直角。
+ * 段与段之间不空开，而是画一条竖线隔开（IDM 那种）。
  */
 @Composable
-private fun ProgressCell(fraction: Float, modifier: Modifier, color: Color, first: Boolean, last: Boolean) {
-    val radius = 8.dp
-    val shape = RoundedCornerShape(
-        topStart = if (first) radius else 0.dp,
-        bottomStart = if (first) radius else 0.dp,
-        topEnd = if (last) radius else 0.dp,
-        bottomEnd = if (last) radius else 0.dp,
+private fun ProgressCell(fraction: Float, modifier: Modifier, color: Color, divider: Color, first: Boolean) {
+    // 每 120ms 采一次样，再补 150ms 的线性动画，看起来是连续走的
+    val animated by androidx.compose.animation.core.animateFloatAsState(
+        targetValue = fraction.coerceIn(0f, 1f),
+        animationSpec = androidx.compose.animation.core.tween(
+            durationMillis = 300,
+            easing = androidx.compose.animation.core.LinearEasing,
+        ),
+        label = "segmentFill",
     )
     Box(modifier = modifier.fillMaxHeight()) {
-        if (fraction > 0f) {
+        if (animated > 0f) {
             Box(
                 modifier = Modifier
                     .fillMaxHeight()
-                    .fillMaxWidth(fraction)
-                    .clip(shape)
+                    .fillMaxWidth(animated)
                     .background(color),
+            )
+        }
+        if (!first) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.CenterStart)
+                    .width(1.dp)
+                    .fillMaxHeight()
+                    .background(divider),
             )
         }
     }
