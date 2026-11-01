@@ -43,6 +43,7 @@ struct State {
     device_order: Vec<String>,
     expanded: std::collections::HashSet<String>,
     expanded_dirty: bool,
+    asked_target: bool,
 }
 
 impl State {
@@ -169,6 +170,7 @@ fn main() -> Result<(), slint::PlatformError> {
         device_order: Vec::new(),
         expanded: std::collections::HashSet::new(),
         expanded_dirty: false,
+        asked_target: false,
         state_rx,
         state_tx,
     }));
@@ -265,6 +267,16 @@ fn main() -> Result<(), slint::PlatformError> {
                 s.expanded.insert(serial);
             }
             s.expanded_dirty = true;
+        });
+    }
+    {
+        let st = Arc::clone(&state);
+        ui.on_device_chosen(move |index| {
+            let s = st.lock().unwrap();
+            if let Some(serial) = s.device_order.get(index as usize) {
+                hfx_receiver::pending::assign_all(serial);
+                log::info(&format!("推送目标已选定：{}", serial));
+            }
         });
     }
     {
@@ -401,6 +413,22 @@ fn main() -> Result<(), slint::PlatformError> {
                 ui.set_devices(slint::ModelRc::new(slint::VecModel::from(rows)));
             }
 
+            // 多台设备在线时暂扣待发送文件，避免某台抢先取走
+            hfx_receiver::pending::set_hold(s.devices.len() >= 2);
+            // 多台设备 + 队列里有没有指定目标的文件 → 弹出选择
+            let ask = s.devices.len() >= 2 && hfx_receiver::pending::needs_target();
+            if ask != ui.get_ask_target() {
+                ui.set_ask_target(ask);
+            }
+            if ask && !s.asked_target {
+                s.asked_target = true;
+                let _ = ui.show();
+                #[cfg(windows)]
+                tray_win::show_main_window(WINDOW_TITLE);
+            } else if !ask {
+                s.asked_target = false;
+            }
+
             // 开机自启：等窗口真正创建后隐藏到托盘（只做一次）
             #[cfg(windows)]
             if launch_at_boot && !boot_hidden && ui.get_tray() {
@@ -455,6 +483,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 0.0
             };
             let want_h = 400.0
+                + if ui.get_ask_target() { 60.0 } else { 0.0 }
                 + devices_h
                 + if xfer_now { 130.0 } else { 0.0 }
                 + if ui.get_update_state() == 2 || ui.get_update_state() == 5 {
