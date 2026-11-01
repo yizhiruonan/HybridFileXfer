@@ -95,6 +95,11 @@ internal data class UiState(
     val connected: Boolean = false,
     val interfaceNames: List<String> = emptyList(),
     val connectedNames: List<String> = emptyList(),
+    // 电脑推送文件的实时进度
+    val xferActive: Boolean = false,
+    val xferName: String = "",
+    val xferDone: Long = 0,
+    val xferTotal: Long = 0,
     val mode: Int = 0,
     val autoConnect: Boolean = true,
     val localBuffer: Int = 256,
@@ -143,6 +148,10 @@ internal fun readState(context: Context): UiState {
         connected = ServerService.isConnected(),
         interfaceNames = ServerService.getInterfaceNames(),
         connectedNames = ServerService.getConnectedInterfaceNames(),
+        xferActive = ServerService.Live.active,
+        xferName = ServerService.Live.name,
+        xferDone = ServerService.Live.done,
+        xferTotal = ServerService.Live.total,
         mode = config.mode,
         autoConnect = config.isAutoConnectEnabled,
         localBuffer = config.localBufferCount,
@@ -401,6 +410,9 @@ fun HfxApp(
                     )
                 }
             }
+        }
+        if (state.xferActive) {
+            ReceiveProgressPanel(state)
         }
         if (infoDialog) {
             ConnectionInfoPanel(state, onDismiss = { infoDialog = false })
