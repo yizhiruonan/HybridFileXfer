@@ -22,6 +22,8 @@ pub mod controller {
     /// connection is idle so that a dead link is detected. Unknown ids are
     /// ignored by every client implementation, so this is backwards compatible.
     pub const PING: i16 = 20;
+/// 手机轮询：电脑有没有要推给我的文件（本项目新增）
+pub const CHECK_PENDING: i16 = 21;
 }
 
 pub mod transfer {

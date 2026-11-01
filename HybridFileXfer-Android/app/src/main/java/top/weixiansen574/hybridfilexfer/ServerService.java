@@ -151,6 +151,81 @@ public class ServerService extends Service implements ServiceConnection {
         return server != null ? server.getChannelDetails() : java.util.Collections.emptyList();
     }
 
+    /** MIUI 会吞应用日志，调试信息直接写文件 */
+    private static void debugFile(String line) {
+        try {
+            java.io.File f = new java.io.File(
+                    android.os.Environment.getExternalStoragePublicDirectory(
+                            android.os.Environment.DIRECTORY_DOWNLOADS),
+                    "hfx_pull.log");
+            java.io.FileWriter w = new java.io.FileWriter(f, true);
+            w.write(new java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US)
+                    .format(new java.util.Date()) + "  " + line + "\n");
+            w.close();
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /**
+     * 电脑通过「发送到手机」推送过来的文件：拉到手机的 Downloads/HybridFileXfer。
+     */
+    private void pullPendingFiles(HFXServer server,
+            java.util.List<top.weixiansen574.hybridfilexfer.core.bean.RemoteFile> files) {
+        final String TAG2 = "HFXPULL";
+        try {
+            debugFile("pull start, files=" + files.size());
+            for (top.weixiansen574.hybridfilexfer.core.bean.RemoteFile f : files) {
+                debugFile("  pending: " + f.getPath() + " (" + f.getSize() + ")");
+            }
+            java.io.File dir = new java.io.File(
+                    android.os.Environment.getExternalStoragePublicDirectory(
+                            android.os.Environment.DIRECTORY_DOWNLOADS),
+                    "HybridFileXfer");
+            if (!dir.exists() && !dir.mkdirs()) {
+                Log.w(TAG, "cannot create " + dir);
+                return;
+            }
+            top.weixiansen574.hybridfilexfer.core.bean.Directory local =
+                    new top.weixiansen574.hybridfilexfer.core.bean.Directory(
+                            dir.getAbsolutePath(),
+                            top.weixiansen574.hybridfilexfer.core.bean.Directory.getCurrentFileSystem());
+            top.weixiansen574.hybridfilexfer.core.bean.Directory remote =
+                    new top.weixiansen574.hybridfilexfer.core.bean.Directory(
+                            "/",
+                            top.weixiansen574.hybridfilexfer.core.bean.Directory.getCurrentFileSystem());
+            debugFile("local=" + local.path + " remote=" + remote.path);
+            server.sendFilesToShelf(files, local, remote,
+                    new top.weixiansen574.hybridfilexfer.core.callback.TransferFileCallback() {
+                        public void onFileUploading(String iName, String path, long targetSize, long totalSize) {
+                        }
+                        public void onFileDownloading(String iName, String path, long targetSize, long totalSize) {
+                        }
+                        public void onSpeedInfo(java.util.List<top.weixiansen574.hybridfilexfer.core.bean.TrafficInfo> list) {
+                        }
+                        public void onChannelComplete(String iName, long traffic, long time) {
+                        }
+                        public void onChannelError(String iName, int errorType, String message) {
+                            debugFile("channel error " + iName + " type=" + errorType + " " + message);
+                        }
+                        public void onReadFileError(String message) {
+                            debugFile("read file error: " + message);
+                        }
+                        public void onWriteFileError(String message) {
+                            debugFile("WRITE FILE ERROR: " + message);
+                        }
+                        public void onComplete(boolean isUpload, long traffic, long time) {
+                            debugFile("complete: " + traffic + " bytes -> " + dir);
+                        }
+                        public void onIncomplete() {
+                            debugFile("incomplete");
+                        }
+                    });
+            debugFile("pulled " + files.size() + " file(s) from PC");
+        } catch (Throwable e) {
+            debugFile("pull failed: " + e);
+        }
+    }
+
     public static List<String> getConnectedInterfaceNames() {
         HFXServer server = HFXServer.instance;
         if (server == null || state != STATE_CONNECTED) {
@@ -454,6 +529,16 @@ public class ServerService extends Service implements ServiceConnection {
                     } catch (IOException e) {
                         Log.i(TAG, "heartbeat failed: " + e);
                         break;
+                    }
+                    // 问一下电脑有没有"发送到手机"推过来的文件，有就直接拉下来
+                    try {
+                        java.util.List<top.weixiansen574.hybridfilexfer.core.bean.RemoteFile> pending =
+                                server.checkPending();
+                        if (!pending.isEmpty()) {
+                            pullPendingFiles(server, pending);
+                        }
+                    } catch (Throwable e) {
+                        debugFile("checkPending failed: " + e);
                     }
                 }
             }
