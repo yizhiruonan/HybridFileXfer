@@ -109,6 +109,7 @@ pub fn human_bytes(bytes: u64) -> String {
 }
 
 /// 传输进度（全局唯一：GUI / CLI 都只有一份接收器实例）
+#[derive(Default)]
 pub struct ProgressState {
     /// 当前正在写的文件（显示用短名）
     pub file_name: RwLock<String>,
@@ -174,6 +175,20 @@ impl ProgressState {
     }
 }
 
+/// 每台设备一份进度（多设备并行互不干扰）
+static PROGRESS_MAP: LazyLock<Mutex<std::collections::HashMap<String, Arc<ProgressState>>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// 取某台设备的进度对象，没有就建一个
+pub fn progress_for(device: &str) -> Arc<ProgressState> {
+    let mut map = PROGRESS_MAP.lock().unwrap();
+    Arc::clone(
+        map.entry(device.to_string())
+            .or_insert_with(|| Arc::new(ProgressState::default())),
+    )
+}
+
+/// 第一台设备的进度（单设备场景 / CLI 沿用）
 pub static PROGRESS: LazyLock<ProgressState> = LazyLock::new(|| ProgressState {
     file_name: RwLock::new(String::new()),
     file_done: AtomicU64::new(0),
@@ -184,6 +199,8 @@ pub static PROGRESS: LazyLock<ProgressState> = LazyLock::new(|| ProgressState {
 });
 
 pub struct Receiver {
+    /// 本设备独立的进度（多设备并行）
+    pub progress: Arc<ProgressState>,
     dir: SharedDir,
     entries: Mutex<HashMap<PathBuf, Arc<FileState>>>,
     bytes: AtomicU64,
@@ -196,7 +213,13 @@ impl Receiver {
     }
 
     pub fn with_shared(dir: SharedDir) -> Receiver {
+        Receiver::with_device(dir, "default")
+    }
+
+    /// 指定设备 ID 的接收器：进度对象按设备隔离
+    pub fn with_device(dir: SharedDir, device: &str) -> Receiver {
         Receiver {
+            progress: progress_for(device),
             dir,
             entries: Mutex::new(HashMap::new()),
             bytes: AtomicU64::new(0),
@@ -266,11 +289,11 @@ impl Receiver {
         self.bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
 
         // ---- 进度上报 ----
-        PROGRESS
+        self.progress
             .file_total
             .store(total_size, Ordering::Relaxed);
         let changed = {
-            let mut guard = match PROGRESS.file_name.write() {
+            let mut guard = match self.progress.file_name.write() {
                 Ok(g) => g,
                 Err(_) => return Ok(()),
             };
@@ -282,19 +305,19 @@ impl Receiver {
             }
         };
         if changed {
-            PROGRESS.file_done.store(0, Ordering::Relaxed);
-            PROGRESS.files_started.fetch_add(1, Ordering::Relaxed);
-            if let Ok(mut blocks) = PROGRESS.blocks.lock() {
+            self.progress.file_done.store(0, Ordering::Relaxed);
+            self.progress.files_started.fetch_add(1, Ordering::Relaxed);
+            if let Ok(mut blocks) = self.progress.blocks.lock() {
                 blocks.reset();
             }
         }
-        if let Ok(mut blocks) = PROGRESS.blocks.lock() {
+        if let Ok(mut blocks) = self.progress.blocks.lock() {
             blocks.mark(index, total_size, BLOCK_SIZE);
         }
-        PROGRESS
+        self.progress
             .file_done
             .fetch_add(data.len() as u64, Ordering::Relaxed);
-        PROGRESS
+        self.progress
             .session_bytes
             .fetch_add(data.len() as u64, Ordering::Relaxed);
 
