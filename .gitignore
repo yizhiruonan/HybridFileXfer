@@ -37,3 +37,7 @@ HybridFileXfer-Receiver/config.ini
 
 # ================= 内部资料（含设备序列号 / 内网 IP，不公开） =================
 HANDOFF.md
+
+# 本地联调测试脚本/截图
+tmp-test/
+

@@ -789,6 +789,17 @@ public class ServerService extends Service implements ServiceConnection {
                     Log.i(TAG, "heartbeat failed (" + server.getDisplayName() + "): " + e);
                     break;
                 }
+                // 拔数据线/掉 WiFi 时控制通道可能还活着（走的是别的链路），
+                // 但某些传输通道已经被对端关掉了——探到就断开这条连接，让电脑重连，
+                // 否则界面上会一直挂着已经死掉的通道。
+                try {
+                    if (server.hasDeadChannel()) {
+                        Log.i(TAG, "dead transfer channel (" + server.getDisplayName() + "), reconnecting");
+                        break;
+                    }
+                } catch (Throwable e) {
+                    debugFile("channel probe failed: " + e);
+                }
                 // 问一下电脑有没有"发送到手机"推过来的文件，有就直接拉下来
                 try {
                     java.util.List<top.weixiansen574.hybridfilexfer.core.bean.RemoteFile> pending =

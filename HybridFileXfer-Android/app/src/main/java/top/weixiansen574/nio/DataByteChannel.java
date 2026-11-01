@@ -16,6 +16,14 @@ public class DataByteChannel implements ByteChannel, DataInput, DataOutput {
         this.origin = origin;
     }
 
+    /** 底下真正的 SocketChannel；不是 SocketChannel 时返回 null。 */
+    public java.nio.channels.SocketChannel getSocketChannel() {
+        if (origin instanceof java.nio.channels.SocketChannel) {
+            return (java.nio.channels.SocketChannel) origin;
+        }
+        return null;
+    }
+
     /** 对端地址；不是 SocketChannel 时返回 null。 */
     public java.net.InetSocketAddress getRemoteAddress() {
         try {
