@@ -214,11 +214,10 @@ export component AppWindow inherits Window {
 
                 for d[i] in root.devices : VerticalLayout {
                     spacing: 2px;
-                    horizontal-stretch: 1;
+                    width: parent.width - 32px;
                     HorizontalLayout {
                         height: 24px;
                         spacing: 8px;
-                        horizontal-stretch: 1;
                         ta := TouchArea {
                             clicked => { root.device-clicked(i); }
                         }
