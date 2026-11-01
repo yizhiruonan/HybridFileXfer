@@ -40,6 +40,9 @@ struct State {
     state_rx: Receiver<(String, EngineState)>,
     state_tx: Sender<(String, EngineState)>,
     devices: std::collections::HashMap<String, EngineState>,
+    device_order: Vec<String>,
+    expanded: std::collections::HashSet<String>,
+    expanded_dirty: bool,
 }
 
 impl State {
@@ -154,6 +157,9 @@ fn main() -> Result<(), slint::PlatformError> {
         engine: None,
         state: EngineState::Stopped,
         devices: std::collections::HashMap::new(),
+        device_order: Vec::new(),
+        expanded: std::collections::HashSet::new(),
+        expanded_dirty: false,
         state_rx,
         state_tx,
     }));
@@ -241,6 +247,19 @@ fn main() -> Result<(), slint::PlatformError> {
     }
     {
         let st = Arc::clone(&state);
+        ui.on_device_clicked(move |index| {
+            let mut s = st.lock().unwrap();
+            let Some(serial) = s.device_order.get(index as usize).cloned() else {
+                return;
+            };
+            if !s.expanded.remove(&serial) {
+                s.expanded.insert(serial);
+            }
+            s.expanded_dirty = true;
+        });
+    }
+    {
+        let st = Arc::clone(&state);
         ui.on_tray_toggled(move |enabled| {
             let mut s = st.lock().unwrap();
             s.config.minimize_to_tray = enabled;
@@ -286,7 +305,8 @@ fn main() -> Result<(), slint::PlatformError> {
                     s.devices.insert(device, next);
                 }
             }
-            if changed {
+            if changed || s.expanded_dirty {
+                s.expanded_dirty = false;
                 let mut connected: Vec<String> = Vec::new();
                 let mut waiting: Option<String> = None;
                 let mut retrying: Option<String> = None;
@@ -338,24 +358,35 @@ fn main() -> Result<(), slint::PlatformError> {
                 ui.set_status_sub(sub.into());
                 ui.set_running(count > 0);
 
-                // 每台设备一行：串号后 8 位 + 状态 + 已接收字节
-                let mut rows: Vec<DeviceRow> = Vec::with_capacity(count);
-                let mut serials: Vec<&String> = s.devices.keys().collect();
+                let mut serials: Vec<String> = s.devices.keys().cloned().collect();
                 serials.sort();
-                for serial in serials {
+                s.device_order = serials.clone();
+                let mut rows: Vec<DeviceRow> = Vec::with_capacity(count);
+                for serial in &s.device_order {
                     let state = &s.devices[serial];
-                    let label = match state {
-                        EngineState::Connected(_) => "已连接",
-                        EngineState::Waiting(_) => "等待连接",
-                        EngineState::Retrying(_) => "重试中",
-                        EngineState::Stopped => "已停止",
+                    let (label, detail) = match state {
+                        EngineState::Connected(names) => (
+                            "已连接",
+                            format!("通道：{}", names.join(", ")),
+                        ),
+                        EngineState::Waiting(reason) => ("等待连接", reason.clone()),
+                        EngineState::Retrying(reason) => ("重试中", reason.clone()),
+                        EngineState::Stopped => ("已停止", String::new()),
                     };
                     let progress = hfx_receiver::receiver::progress_for(serial);
-                    let (_, _, _, session_bytes, _files) = progress.snapshot();
+                    let (path, done, total, session_bytes, files) = progress.snapshot();
+                    let detail = if detail.is_empty() {
+                        format!("已接收 {} · {} 个文件", human(session_bytes), files)
+                    } else {
+                        format!("{}\n已接收 {} · {} 个文件", detail, human(session_bytes), files)
+                    };
+                    let _ = (path, done, total);
                     rows.push(DeviceRow {
                         name: serial.chars().take(8).collect::<String>().into(),
                         state: label.into(),
                         rate: human(session_bytes).into(),
+                        detail: detail.into(),
+                        expanded: s.expanded.contains(serial),
                     });
                 }
                 ui.set_devices(slint::ModelRc::new(slint::VecModel::from(rows)));
