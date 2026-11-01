@@ -40,16 +40,33 @@ public class DroidWriteFileCall extends WriteFileCall {
     @Override
     protected FileChannel createAndOpenFile(String path, long length) throws Exception {
         pfd = ioService.createAndOpenWriteableFile(path, length);
-        fileOutputStream = new FileOutputStream(pfd.getFileDescriptor());
+        if (pfd != null) {
+            fileOutputStream = new FileOutputStream(pfd.getFileDescriptor());
+        } else {
+            // 普通模式下 ioService 给不出 ParcelFileDescriptor，
+            // 直接用 Java 文件 API 写（App 已有全盘访问权限时可用）
+            java.io.File file = new java.io.File(path);
+            java.io.File parent = file.getParentFile();
+            if (parent != null && !parent.exists() && !parent.mkdirs()) {
+                throw new IOException("cannot create " + parent);
+            }
+            fileOutputStream = new FileOutputStream(file);
+        }
         channel = fileOutputStream.getChannel();
         return channel;
     }
 
     @Override
     protected void closeFile() throws Exception {
-        channel.close();
-        fileOutputStream.close();
-        pfd.close();
+        if (channel != null) {
+            channel.close();
+        }
+        if (fileOutputStream != null) {
+            fileOutputStream.close();
+        }
+        if (pfd != null) {
+            pfd.close();
+        }
     }
 
     @Override

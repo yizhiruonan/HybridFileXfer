@@ -103,6 +103,14 @@ fn main() -> Result<(), slint::PlatformError> {
 
     log::init(Some(exe_dir.join("receiver.log")), false);
     log::set_console(false);
+    log::info(&format!(
+        "GUI build={} pid={} exe={}",
+        env!("CARGO_PKG_VERSION"),
+        std::process::id(),
+        std::env::current_exe()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default()
+    ));
 
     let (state_tx, state_rx) = mpsc::channel();
 
@@ -110,6 +118,25 @@ fn main() -> Result<(), slint::PlatformError> {
     let _ = std::fs::remove_file(exe_dir.join("HybridFileXfer-Receiver.exe.old"));
 
     remove_legacy_autostart_script();
+    // Explorer「发送到 → 手机」：把选中文件投递给已运行的实例，投递成功就直接退出
+    let mut send_mode = false;
+    let mut send_files: Vec<PathBuf> = Vec::new();
+    for arg in std::env::args().skip(1) {
+        if arg == "--send" {
+            send_mode = true;
+        } else if send_mode {
+            send_files.push(PathBuf::from(arg));
+        }
+    }
+    if send_mode {
+        #[cfg(windows)]
+        if tray_win::deliver_paths(&send_files) {
+            return Ok(());
+        }
+        // 没有运行中的实例：这些文件先入队，本进程接着正常启动
+        hfx_receiver::pending::push(send_files.clone());
+    }
+
     let autostart = autostart_enabled();
     let ip_text = std::env::var("HFX_LAST_IP").unwrap_or_else(|_| "192.168.1.100".to_string());
 
@@ -344,12 +371,11 @@ fn main() -> Result<(), slint::PlatformError> {
             ui.set_update_text("正在下载更新，完成后会自动重启…".into());
             let ui_weak2 = ui_weak.clone();
             std::thread::spawn(move || {
-                match download_update() {
-                    Ok(path) => {
-                        let text = format!("已下载到下载目录，关闭本程序后替换即可：{}", path.display());
+                match open_release_page() {
+                    Ok(()) => {
                         post_ui(ui_weak2.clone(), move |ui| {
                             ui.set_update_state(5);
-                            ui.set_update_text(text.into());
+                            ui.set_update_text("已打开下载页面".into());
                         });
                     }
                     Err(e) => {
@@ -392,6 +418,9 @@ fn main() -> Result<(), slint::PlatformError> {
             },
         );
     }
+
+    #[cfg(windows)]
+    ensure_send_to_shortcut(&exe_dir);
 
     // --autostart：开机自启时直接开始接收（隐藏交给轮询定时器，等窗口真正创建好）
     if launch_at_boot {
@@ -513,49 +542,63 @@ fn start_update_check(ui_weak: slint::Weak<AppWindow>) {
     });
 }
 
-/// 只负责把新版本下载到下载目录，然后定位到该文件；
-/// 不做“替换自身 + 重新启动”，那是杀软眼里的 dropper 行为（会被误报为木马释放器）。
-fn download_update() -> Result<PathBuf, String> {
-    let url = UPDATE_EXE_URL
-        .lock()
-        .map(|g| g.clone())
-        .map_err(|_| "内部状态错误".to_string())?;
-    if url.is_empty() {
-        return Err("没有可用的下载地址".into());
+/// 不下载可执行文件（会被杀软当成 dropper），只在浏览器里打开 Release 页面
+fn open_release_page() -> Result<(), String> {
+    let url = "https://github.com/yizhiruonan/HybridFileXfer/releases/latest";
+    std::process::Command::new("cmd")
+        .args(["/C", "start", "", url])
+        .spawn()
+        .map_err(|e| format!("打开浏览器失败：{e}"))?;
+    Ok(())
+}
+
+/// 在「发送到」菜单里放一个指向本程序的快捷方式（已存在则跳过）
+#[cfg(windows)]
+fn ensure_send_to_shortcut(exe_dir: &Path) {
+    use std::os::windows::process::CommandExt;
+    let Some(appdata) = std::env::var_os("APPDATA") else {
+        return;
+    };
+    let dir = PathBuf::from(appdata)
+        .join("Microsoft")
+        .join("Windows")
+        .join("SendTo");
+    let link = dir.join("发送到手机.lnk");
+    if link.exists() {
+        return;
     }
-    let version = UPDATE_VERSION
-        .lock()
-        .map(|g| g.clone())
-        .unwrap_or_default();
-
-    let downloads = std::env::var_os("USERPROFILE")
-        .map(|p| PathBuf::from(p).join("Downloads"))
-        .filter(|p| p.is_dir())
-        .unwrap_or_else(std::env::temp_dir);
-    let target = downloads.join(format!(
-        "HybridFileXfer-Receiver{}.exe",
-        if version.is_empty() {
-            String::new()
-        } else {
-            format!("-v{version}")
-        }
-    ));
-
-    let response = ureq::get(&url)
-        .timeout(Duration::from_secs(600))
-        .call()
-        .map_err(|e| format!("下载失败：{e}"))?;
-    let mut reader = response.into_reader();
-    let mut file = std::fs::File::create(&target).map_err(|e| format!("创建文件失败：{e}"))?;
-    std::io::copy(&mut reader, &mut file).map_err(|e| format!("写入失败：{e}"))?;
-    drop(file);
-
-    // 在资源管理器里定位到刚下载的文件
-    let _ = std::process::Command::new("explorer")
-        .arg(format!("/select,{}", target.display()))
-        .spawn();
-
-    Ok(target)
+    let exe = exe_dir.join("HybridFileXfer-Receiver.exe");
+    // 用临时 .ps1（UTF-8 BOM）执行，避免命令行编码问题
+    let script_path = std::env::temp_dir().join("hfx_sendto.ps1");
+    let script = format!(
+        "$s = (New-Object -ComObject WScript.Shell).CreateShortcut('{}')\r\n\
+         $s.TargetPath = '{}'\r\n\
+         $s.Arguments = '--send'\r\n\
+         $s.IconLocation = '{}'\r\n\
+         $s.Save()\r\n",
+        link.display(),
+        exe.display(),
+        exe.display()
+    );
+    let mut bytes = vec![0xEF, 0xBB, 0xBF];
+    bytes.extend_from_slice(script.as_bytes());
+    if std::fs::write(&script_path, bytes).is_err() {
+        return;
+    }
+    let _ = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ])
+        .arg(&script_path)
+        .creation_flags(0x0800_0000)
+        .status();
+    let _ = std::fs::remove_file(&script_path);
 }
 
 // ---------------- 工具函数 ----------------

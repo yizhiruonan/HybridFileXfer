@@ -2,8 +2,9 @@
 
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -226,15 +227,23 @@ impl Session {
             let result = match id {
                 controller::SHUTDOWN => return SessionEnd::Shutdown,
                 controller::PING => Ok(()),
+                controller::CHECK_PENDING => self.handle_check_pending(),
                 controller::LIST_FILES => self.handle_list_files(),
                 controller::DELETE_FILE => self.handle_delete(),
                 controller::MKDIR => self.handle_mkdir(),
                 controller::REQUEST_RECEIVE => self.handle_receive(receiver),
-                controller::REQUEST_SEND => self.handle_send_unsupported(),
-                other => Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("unknown controller command {}", other),
-                )),
+                controller::REQUEST_SEND => self.handle_send(),
+                other => {
+                    // 不认识的控制指令就忽略（协议要求老客户端也能兼容），别断开连接，
+                    // 否则新手机端 + 旧电脑端会陷入"连上-被踢-重连"的死循环
+                    let _ = self.reader.set_read_timeout(Some(Duration::from_millis(500)));
+                    log::warn(&format!(
+                        "{} {}（已忽略）",
+                        crate::i18n::tr("收到不认识的控制指令", "unknown controller command"),
+                        other
+                    ));
+                    Ok(())
+                }
             };
             let _ = self
                 .reader
@@ -286,33 +295,116 @@ impl Session {
         proto::write_bool(&mut self.writer, ok)
     }
 
-    fn handle_send_unsupported(&mut self) -> io::Result<()> {
-        // The phone wants to download files from this PC. This receiver only
-        // forwards files from the phone, so end every transfer channel politely.
-        let count = proto::read_i32(&mut self.reader)?;
-        for _ in 0..count.max(0) {
-            proto::read_utf(&mut self.reader)?;
+    /// 手机请求从电脑取文件（REQUEST_SEND）：把选中的文件/文件夹切块，
+    /// 通过所有传输通道发过去。格式与手机端 ReceiveFileCall 对应。
+    /// 手机问"有没有要推给我的文件"：回列表（路径 + 大小）
+    fn handle_check_pending(&mut self) -> io::Result<()> {
+        let items = crate::pending::snapshot();
+        if !items.is_empty() {
+            log::info(&format!("CHECK_PENDING -> {} item(s)", items.len()));
         }
-        proto::read_utf(&mut self.reader)?; // phone side local dir
-        proto::read_i32(&mut self.reader)?; // its file system
-        proto::read_utf(&mut self.reader)?; // dir on the PC to read from
-        for (_, stream) in &self.transfers {
-            let mut tw: &TcpStream = stream;
-            let _ = proto::write_i16(&mut tw, transfer::END_OF_READ_ERROR);
+        proto::write_i32(&mut self.writer, items.len() as i32)?;
+        for (path, size) in &items {
+            proto::write_utf(&mut self.writer, &path.to_string_lossy())?;
+            proto::write_i64(&mut self.writer, *size as i64)?;
         }
-        let _ = proto::read_bool(&mut self.reader);
-        proto::write_bool(&mut self.writer, false)?;
-        proto::write_utf(
-            &mut self.writer,
-            crate::i18n::tr(
-                "电脑端接收器只支持接收文件，不支持从电脑取文件",
-                "this PC receiver only accepts files from the phone",
-            ),
-        )?;
-        log::warn(crate::i18n::tr(
-            "手机请求从电脑取文件，本接收器不支持，已拒绝",
-            "the phone asked to download files from this PC, which this receiver does not support",
+        Ok(())
+    }
+
+    fn handle_send(&mut self) -> io::Result<()> {
+        // 手机来拉了，队列清空，避免重复推送
+        let _ = crate::pending::take_all();
+        let count = proto::read_i32(&mut self.reader)?.max(0);
+        let mut sources = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            sources.push(proto::read_utf(&mut self.reader)?);
+        }
+        let phone_dir = proto::read_utf(&mut self.reader)?;
+        let _phone_fs = proto::read_i32(&mut self.reader)?;
+        let _pc_dir = proto::read_utf(&mut self.reader)?;
+
+        if self.transfers.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "no transfer channel available",
+            ));
+        }
+
+        log::info(crate::i18n::tr(
+            "手机开始从电脑取文件",
+            "the phone is downloading files from this PC",
         ));
+
+        let base = PathBuf::from(&phone_dir);
+        let mut tasks: Vec<SendTask> = Vec::new();
+        let mut next_index = 0i32;
+        for source in &sources {
+            collect_send_tasks(Path::new(source), &base, Path::new(source), &mut tasks, &mut next_index);
+        }
+        if tasks.is_empty() {
+            log::warn(crate::i18n::tr("没有可发送的文件", "nothing to send"));
+        }
+
+        let queue = Arc::new(Mutex::new(std::collections::VecDeque::from(tasks)));
+        let sent = Arc::new(AtomicU64::new(0));
+        let started = Instant::now();
+
+        let mut handles = Vec::with_capacity(self.transfers.len());
+        for (name, stream) in &self.transfers {
+            let stream = stream.try_clone()?;
+            let queue = Arc::clone(&queue);
+            let sent = Arc::clone(&sent);
+            let name = name.clone();
+            handles.push((
+                name,
+                thread::spawn(move || send_channel(stream, queue, sent)),
+            ));
+        }
+
+        let mut hard_error: Option<String> = None;
+        for (name, handle) in handles {
+            match handle.join() {
+                Ok(Ok(bytes)) => {
+                    log::info(&format!("{}: {} {}", name, crate::i18n::tr("已发送", "sent"), crate::receiver::human_bytes(bytes)));
+                }
+                Ok(Err(e)) => {
+                    log::error(&format!("{}: {}", name, e));
+                    if hard_error.is_none() {
+                        hard_error = Some(format!("{}: {}", name, e));
+                    }
+                }
+                Err(_) => {
+                    if hard_error.is_none() {
+                        hard_error = Some(format!("{}: panic", name));
+                    }
+                }
+            }
+        }
+
+        let total = sent.load(Ordering::Relaxed);
+        let seconds = started.elapsed().as_secs_f64().max(0.001);
+        log::info(&format!(
+            "{} {} · {} · {:.1}s",
+            crate::i18n::tr("发送完成，共", "sent"),
+            crate::receiver::human_bytes(total),
+            crate::i18n::tr("结束", "done"),
+            seconds
+        ));
+
+        // 与 HFXService.receiveFiles() 的收尾对齐：
+        //   手机：writeBoolean(true) → readBoolean()
+        //   电脑：先读手机的 bool，再回一个 bool（失败时再跟一段 UTF 错误信息）
+        let _ = proto::read_bool(&mut self.reader);
+        match &hard_error {
+            None => {
+                proto::write_bool(&mut self.writer, true)?;
+            }
+            Some(message) => {
+                log::warn(&format!("send finished with error: {message}"));
+                proto::write_bool(&mut self.writer, false)?;
+                proto::write_utf(&mut self.writer, message)?;
+            }
+        }
         Ok(())
     }
 
@@ -847,4 +939,167 @@ mod tests {
         assert_eq!(std::fs::read(&small_path).unwrap(), small);
         assert!(std::path::Path::new(&folder_path).is_dir());
     }
+}
+// ---------------- 发送方向（电脑 -> 手机） ----------------
+
+/// 发往手机的一条记录：文件夹，或者某个文件的第 index 块
+enum SendTask {
+    Folder {
+        file_index: i32,
+        dest: String,
+        modified_ms: i64,
+    },
+    Block {
+        file_index: i32,
+        dest: String,
+        modified_ms: i64,
+        total_size: u64,
+        index: u32,
+        length: u32,
+        host_path: PathBuf,
+    },
+}
+
+/// 把源路径展开成发送任务；目录按协议逐条发 FOLDER 记录，文件按 1MiB 切块
+fn collect_send_tasks(
+    host: &Path,
+    dest_root: &Path,
+    base: &Path,
+    tasks: &mut Vec<SendTask>,
+    next_index: &mut i32,
+) {
+    let meta = match std::fs::metadata(host) {
+        Ok(meta) => meta,
+        Err(e) => {
+            log::warn(&format!("{}: {}", host.display(), e));
+            return;
+        }
+    };
+    // 顶层文件的 strip_prefix 结果是空路径，这时要用文件名，否则目标会变成目录本身
+    let relative: PathBuf = host
+        .strip_prefix(base)
+        .ok()
+        .filter(|rest| !rest.as_os_str().is_empty())
+        .map(|rest| rest.to_path_buf())
+        .unwrap_or_else(|| host.file_name().map(PathBuf::from).unwrap_or_default());
+    // 目标路径是 Android 上的路径，统一用正斜杠
+    let dest = dest_root
+        .join(relative.to_string_lossy().replace('\\', "/"))
+        .to_string_lossy()
+        .to_string();
+
+    let file_index = *next_index;
+    *next_index += 1;
+    let modified_ms = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+
+    if meta.is_dir() {
+        tasks.push(SendTask::Folder {
+            file_index,
+            dest: dest.clone(),
+            modified_ms,
+        });
+        if let Ok(reader) = std::fs::read_dir(host) {
+            let mut children: Vec<_> = reader.flatten().map(|e| e.path()).collect();
+            children.sort();
+            for child in children {
+                collect_send_tasks(&child, dest_root, base, tasks, next_index);
+            }
+        }
+        return;
+    }
+
+    let total_size = meta.len();
+    let blocks = ((total_size + BLOCK_SIZE - 1) / BLOCK_SIZE).max(1) as u32;
+    for index in 0..blocks {
+        let offset = index as u64 * BLOCK_SIZE;
+        let length = (total_size.saturating_sub(offset)).min(BLOCK_SIZE) as u32;
+        tasks.push(SendTask::Block {
+            file_index,
+            dest: dest.clone(),
+            modified_ms,
+            total_size,
+            index,
+            length,
+            host_path: host.to_path_buf(),
+        });
+    }
+}
+
+/// 单个通道：不断从共享队列取任务发出去，发完写 EOF
+fn send_channel(
+    mut stream: std::net::TcpStream,
+    queue: Arc<Mutex<std::collections::VecDeque<SendTask>>>,
+    sent: Arc<AtomicU64>,
+) -> io::Result<u64> {
+    let mut written = 0u64;
+    loop {
+        let task = {
+            let mut guard = queue.lock().unwrap();
+            guard.pop_front()
+        };
+        let Some(task) = task else { break };
+        match task {
+            SendTask::Folder {
+                file_index,
+                dest,
+                modified_ms,
+            } => {
+                proto::write_i16(&mut stream, transfer::FOLDER)?;
+                proto::write_i32(&mut stream, file_index)?;
+                proto::write_utf(&mut stream, &dest)?;
+                proto::write_i64(&mut stream, modified_ms)?;
+            }
+            SendTask::Block {
+                file_index,
+                dest,
+                modified_ms,
+                total_size,
+                index,
+                length,
+                host_path,
+            } => {
+                let mut buffer = vec![0u8; length as usize];
+                let mut file = match std::fs::File::open(&host_path) {
+                    Ok(file) => file,
+                    Err(e) => {
+                        log::error(&format!("{}: {}", host_path.display(), e));
+                        let _ = proto::write_i16(&mut stream, transfer::END_OF_READ_ERROR);
+                        return Err(e);
+                    }
+                };
+                use std::io::{Read as _, Seek as _, SeekFrom};
+                if let Err(e) = file.seek(SeekFrom::Start(index as u64 * BLOCK_SIZE)) {
+                    let _ = proto::write_i16(&mut stream, transfer::END_OF_READ_ERROR);
+                    return Err(e);
+                }
+                if let Err(e) = file.read_exact(&mut buffer) {
+                    let _ = proto::write_i16(&mut stream, transfer::END_OF_READ_ERROR);
+                    return Err(e);
+                }
+
+                proto::write_i16(&mut stream, transfer::FILE)?;
+                proto::write_i32(&mut stream, file_index)?;
+                proto::write_utf(&mut stream, &dest)?;
+                proto::write_i64(&mut stream, modified_ms)?;
+                proto::write_i64(&mut stream, total_size as i64)?;
+                proto::write_i32(&mut stream, index as i32)?;
+                proto::write_i32(&mut stream, length as i32)?;
+                use std::io::Write as _;
+                stream.write_all(&buffer)?;
+                stream.flush()?;
+
+                written += length as u64;
+                sent.fetch_add(length as u64, Ordering::Relaxed);
+                crate::receiver::PROGRESS.set_sending(&dest, index as u64 * BLOCK_SIZE + length as u64, total_size, length as u64);
+            }
+        }
+    }
+    proto::write_i16(&mut stream, transfer::EOF)?;
+    stream.flush()?;
+    Ok(written)
 }

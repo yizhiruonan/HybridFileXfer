@@ -225,6 +225,25 @@ public class HFXServer extends HFXService {
         return details;
     }
 
+    /**
+     * 问电脑有没有待推送的文件：回 数量 + (路径, 大小)*
+     */
+    public List<RemoteFile> checkPending() throws IOException {
+        synchronized (controlLock) {
+            ctChannel.writeShort(ControllerIdentifiers.CHECK_PENDING);
+            int count = ctChannel.readInt();
+            List<RemoteFile> files = new ArrayList<>();
+            for (int i = 0; i < count; i++) {
+                String path = ctChannel.readUTF();
+                long size = ctChannel.readLong();
+                int cut = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
+                String name = cut >= 0 ? path.substring(cut + 1) : path;
+                files.add(new RemoteFile(name, path, System.currentTimeMillis(), size, false));
+            }
+            return files;
+        }
+    }
+
     public String getRemoteHomeDir() {
         return remoteHomeDir;
     }

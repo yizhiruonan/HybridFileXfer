@@ -93,6 +93,21 @@ impl BlockMap {
     }
 }
 
+/// 字节数 -> 人类可读（供其它模块复用）
+pub fn human_bytes(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    let b = bytes as f64;
+    if b >= KB * KB * KB {
+        format!("{:.2} GB", b / (KB * KB * KB))
+    } else if b >= KB * KB {
+        format!("{:.1} MB", b / (KB * KB))
+    } else if b >= KB {
+        format!("{:.0} KB", b / KB)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
 /// 传输进度（全局唯一：GUI / CLI 都只有一份接收器实例）
 pub struct ProgressState {
     /// 当前正在写的文件（显示用短名）
@@ -121,6 +136,18 @@ impl ProgressState {
         if let Ok(mut b) = self.blocks.lock() {
             b.reset();
         }
+    }
+
+    /// 发送方向（电脑 -> 手机）更新进度
+    pub fn set_sending(&self, dest: &str, done: u64, total: u64, delta: u64) {
+        if let Ok(mut name) = self.file_name.write() {
+            if name.as_str() != dest {
+                *name = dest.to_string();
+            }
+        }
+        self.file_done.store(done, Ordering::Relaxed);
+        self.file_total.store(total, Ordering::Relaxed);
+        self.session_bytes.fetch_add(delta, Ordering::Relaxed);
     }
 
     /// 当前文件的 n 段完成比例

@@ -23,6 +23,15 @@ extern "system" {
     fn RegisterClassW(lp_wnd_class: *const WNDCLASSW) -> u16;
 }
 
+const WM_COPYDATA: u32 = 0x004A;
+
+#[repr(C)]
+struct CopyDataStruct {
+    dw_data: usize,
+    cb_data: u32,
+    lp_data: *mut std::ffi::c_void,
+}
+
 const WM_TRAY: u32 = WM_APP + 1;
 const CMD_SHOW: usize = 1001;
 const CMD_QUIT: usize = 1002;
@@ -33,6 +42,41 @@ static ON_QUIT: Mutex<Option<Box<dyn Fn() + Send>>> = Mutex::new(None);
 
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// 找到运行中实例的托盘窗口（--send 靠它投递文件）
+pub fn tray_window_handle() -> Option<HWND> {
+    let class = wide("HfxTrayWindow");
+    let title = wide("HybridFileXfer Tray");
+    let hwnd = unsafe { FindWindowW(class.as_ptr(), title.as_ptr()) };
+    if hwnd.is_null() { None } else { Some(hwnd) }
+}
+
+/// 把文件列表投递给已经运行的实例，成功返回 true
+pub fn deliver_paths(paths: &[std::path::PathBuf]) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW;
+    let Some(hwnd) = tray_window_handle() else {
+        return false;
+    };
+    let text = paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join("\r\n");
+    let mut buffer: Vec<u16> = text.encode_utf16().collect();
+    let cds = CopyDataStruct {
+        dw_data: 0,
+        cb_data: (buffer.len() * 2) as u32,
+        lp_data: buffer.as_mut_ptr() as *mut std::ffi::c_void,
+    };
+    unsafe {
+        SendMessageW(
+            hwnd,
+            WM_COPYDATA,
+            0,
+            &cds as *const CopyDataStruct as isize,
+        ) != 0
+    }
 }
 
 fn window_handle(title: &str) -> HWND {
@@ -107,6 +151,29 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 }
             }
             0
+        }
+        WM_COPYDATA => {
+            let cds = &*(lparam as *const CopyDataStruct);
+            if !cds.lp_data.is_null() && cds.cb_data > 0 {
+                let len = cds.cb_data as usize / 2;
+                let slice = std::slice::from_raw_parts(cds.lp_data as *const u16, len);
+                let text = String::from_utf16_lossy(slice);
+                let paths: Vec<std::path::PathBuf> = text
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .map(std::path::PathBuf::from)
+                    .collect();
+                if !paths.is_empty() {
+                    hfx_receiver::log::info(&format!(
+                        "{}: {}",
+                        hfx_receiver::i18n::tr("收到待发送文件", "pending files"),
+                        paths.len()
+                    ));
+                    hfx_receiver::pending::push(paths);
+                }
+            }
+            1
         }
         WM_DESTROY => {
             PostQuitMessage(0);

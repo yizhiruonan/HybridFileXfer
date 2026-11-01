@@ -12,6 +12,11 @@ public class ControllerIdentifiers {
      * 客户端遇到不认识的控制指令会直接忽略，因此旧版客户端也能正常工作。
      */
     public static final short PING = 20;
+    /**
+     * 轮询：电脑有没有要推给手机的文件（本项目新增）。
+     * 旧电脑端不认识这条指令会报错，所以只在本机配套版本上使用。
+     */
+    public static final short CHECK_PENDING = 21;
 
     //就让魔法打败魔法吧！
     /**
