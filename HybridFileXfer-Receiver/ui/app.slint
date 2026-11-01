@@ -89,6 +89,12 @@ export struct DeviceRow {
     expanded: bool,
 }
 
+export struct DevicePair {
+    left: DeviceRow,
+    right: DeviceRow,
+    has-right: bool,
+}
+
 export component AppWindow inherits Window {
     title: "多轨快传";
     icon: @image-url("logo-accent.png");
@@ -123,6 +129,8 @@ export component AppWindow inherits Window {
     in-out property <[float]> blocks: [];
     // 多设备列表（点状态卡展开）
     in-out property <[DeviceRow]> devices: [];
+    // 两两配对后的行（一行两个小卡片）
+    in-out property <[DevicePair]> device-rows: [];
     in-out property <bool> devices-expanded: false;
     // 多台设备时，有文件要推送但没指定目标 → 让用户选一台
     in-out property <bool> ask-target: false;
@@ -215,43 +223,66 @@ export component AppWindow inherits Window {
                 }
             }
 
-            // 展开后的设备：小卡片（和手机端首页的卡片风格一致）
+            // 展开后的设备：一行两个小卡片（和手机端首页的卡片风格一致）
             if (root.devices-expanded) : VerticalLayout {
                 spacing: 6px;
                 padding-left: 12px;
                 padding-right: 12px;
                 padding-bottom: 10px;
-                for d[i] in root.devices : Rectangle {
-                    height: 46px;
-                    border-radius: 10px;
-                    background: #F7F7F7;
-                    HorizontalLayout {
-                        padding-left: 10px;
-                        padding-right: 10px;
-                        spacing: 8px;
-                        Text {
-                            text: d.name;
-                            font-size: 12px;
-                            font-weight: 600;
-                            color: #1A1A1A;
-                            width: 92px;
-                            vertical-alignment: center;
-                            overflow: elide;
+                for p in root.device-rows : HorizontalLayout {
+                    spacing: 6px;
+                            Rectangle {
+                                horizontal-stretch: 1;
+                                height: 46px;
+                                border-radius: 10px;
+                                background: #F7F7F7;
+                                VerticalLayout {
+                                    padding-left: 10px;
+                                    padding-right: 10px;
+                                    spacing: 2px;
+                                    Text {
+                                        text: p.left.name;
+                                        font-size: 12px;
+                                        font-weight: 600;
+                                        color: #1A1A1A;
+                                        overflow: elide;
+                                    }
+                                    Text {
+                                        text: p.left.state + "  ·  " + p.left.rate;
+                                        font-size: 10.5px;
+                                        color: #616161;
+                                        overflow: elide;
+                                    }
+                                }
+                            }
+                    if (p.has-right) : Rectangle {
+                        horizontal-stretch: 1;
+                        height: 46px;
+                        border-radius: 10px;
+                        background: #F7F7F7;
+                        VerticalLayout {
+                            padding-left: 10px;
+                            padding-right: 10px;
+                            spacing: 2px;
+                            Text {
+                                text: p.right.name;
+                                font-size: 12px;
+                                font-weight: 600;
+                                color: #1A1A1A;
+                                overflow: elide;
+                            }
+                            Text {
+                                text: p.right.state + "  ·  " + p.right.rate;
+                                font-size: 10.5px;
+                                color: #616161;
+                                overflow: elide;
+                            }
                         }
-                        Text {
-                            text: d.state;
-                            font-size: 11px;
-                            color: #616161;
-                            horizontal-stretch: 1;
-                            vertical-alignment: center;
-                            overflow: elide;
-                        }
-                        Text {
-                            text: d.rate;
-                            font-size: 11px;
-                            color: #005FB8;
-                            vertical-alignment: center;
-                        }
+                    }
+                    if (!p.has-right) : Rectangle {
+                        horizontal-stretch: 1;
+                        height: 46px;
+                        background: transparent;
                     }
                 }
             }
