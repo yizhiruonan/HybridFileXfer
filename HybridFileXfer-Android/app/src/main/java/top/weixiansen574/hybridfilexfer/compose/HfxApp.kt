@@ -20,6 +20,9 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.waitForUpOrCancellation
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.CircleShape
@@ -38,6 +41,8 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -173,6 +178,8 @@ fun HfxApp(
     var pcBrowse by remember { mutableStateOf(false) }
     var infoDialog by remember { mutableStateOf(false) }
     val pagerState = rememberPagerState(pageCount = { 3 })
+    // 拖动滑块时临时禁用整页横滑，否则手势会被 HorizontalPager 抢走
+    var sliderActive by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     val haptic = LocalHapticFeedback.current
 
@@ -211,6 +218,36 @@ fun HfxApp(
             val next = withContext(Dispatchers.IO) { readState(activity) }
             if (next != state) {
                 state = next
+            }
+            // 实时刷新网卡：插拔数据线 / 连上或断开 WiFi 后不必重启应用。
+            // 按名字合并，保留用户已做的勾选与指定 IP；新出现的网卡沿用枚举默认值。
+            val fresh = withContext(Dispatchers.IO) {
+                try {
+                    NetInterfaces.enumerate(activity)
+                } catch (e: Exception) {
+                    null
+                }
+            }
+            if (fresh != null) {
+                val previous = interfaces.associateBy { it.name }
+                fresh.forEach { item ->
+                    val old = previous[item.name]
+                    if (old != null) {
+                        item.enabled = old.enabled
+                        item.bindAddress = old.bindAddress
+                    }
+                }
+                val changed = fresh.size != interfaces.size || fresh.indices.any { index ->
+                    val a = fresh[index]
+                    val b = interfaces[index]
+                    a.name != b.name ||
+                        a.address?.hostAddress != b.address?.hostAddress ||
+                        a.enabled != b.enabled ||
+                        a.bindAddress != b.bindAddress
+                }
+                if (changed) {
+                    interfaces = fresh
+                }
             }
             delay(if (next.connected) 800 else 1500)
         }
@@ -312,10 +349,12 @@ fun HfxApp(
                 state = pagerState,
                 modifier = Modifier.fillMaxSize().padding(padding),
                 beyondViewportPageCount = 1,
+                userScrollEnabled = !sliderActive,
             ) { page ->
                 when (page) {
                     TAB_HOME -> HomePage(
                         state = state,
+                        interfaceCount = interfaces.size,
                         onStart = ::startServer,
                         onStop = {
                             ServerService.stopServer(activity)
@@ -341,6 +380,7 @@ fun HfxApp(
                         themeMode = themeMode,
                         onThemeModeChange = onThemeModeChange,
                         onScaleChange = ::applyScale,
+                        onSliderActiveChange = { sliderActive = it },
                         onAutoConnect = ::setAutoConnect,
                         onModeChange = ::setMode,
                         onOpenNumber = { spec -> numberDialog = spec },
@@ -378,6 +418,7 @@ fun HfxApp(
 @Composable
 private fun HomePage(
     state: UiState,
+    interfaceCount: Int,
     onStart: () -> Unit,
     onStop: () -> Unit,
     onTransfer: () -> Unit,
@@ -396,7 +437,7 @@ private fun HomePage(
                 SmallTile(
                     modifier = Modifier.weight(1f),
                     label = "通道",
-                    value = if (state.connected) state.connectedNames.size.toString() else state.interfaceNames.size.toString(),
+                    value = if (state.connected) state.connectedNames.size.toString() else interfaceCount.toString(),
                     onClick = onOpenChannels,
                 )
                 SmallTile(
@@ -521,6 +562,7 @@ private fun SettingsPage(
     themeMode: Int,
     onThemeModeChange: (Int) -> Unit,
     onScaleChange: (Float) -> Unit,
+    onSliderActiveChange: (Boolean) -> Unit,
     onAutoConnect: (Boolean) -> Unit,
     onModeChange: (Int) -> Unit,
     onOpenNumber: (NumberDialogSpec) -> Unit,
@@ -554,31 +596,51 @@ private fun SettingsPage(
                     selectedIndex = state.mode.coerceIn(0, 2),
                     onSelectedIndexChange = onModeChange,
                 )
-                // SukiSU 同款：Miuix 0.9 的 SliderPreference —— 标题/数值在上，滑块在下方，
-                // 刻度点用原生 showKeyPoints（steps=2 → 80/90/100/110 四个点）。
-                SliderPreference(
-                    value = uiScale,
-                    onValueChange = { raw -> onScaleChange((raw * 10f).roundToInt() / 10f) },
-                    title = "界面缩放",
-                    summary = "调整全局显示比例（80% - 110%）",
-                    valueText = (uiScale * 100).roundToInt().toString() + "%",
-                    valueRange = 0.8f..1.1f,
-                    steps = 2,
-                    showKeyPoints = true,
-                    onClick = {
-                        onOpenNumber(
-                            NumberDialogSpec(
-                                title = "界面缩放",
-                                subtitle = "80% - 110%",
-                                initial = (uiScale * 100).roundToInt(),
-                                min = 80,
-                                max = 110,
-                                suffix = "%",
-                                onConfirm = { value -> onScaleChange(value / 100f) },
-                            ),
-                        )
+                // 无级拖动 + 吸附到 80/90/100/110 四个刻度点；
+                // 拖动过程中只更新本地值，松手后才真正应用缩放（实时缩放会拖慢整页重排）。
+                // 外面套一层只观察不消费的手势，拖动期间暂停 Pager 横滑。
+                var dragScale by remember(uiScale) { mutableStateOf(uiScale) }
+                Box(
+                    modifier = Modifier.pointerInput(Unit) {
+                        awaitEachGesture {
+                            awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                            onSliderActiveChange(true)
+                            waitForUpOrCancellation(pass = PointerEventPass.Initial)
+                            onSliderActiveChange(false)
+                        }
                     },
-                )
+                ) {
+                    SliderPreference(
+                        value = dragScale,
+                        onValueChange = { raw -> dragScale = raw },
+                        onValueChangeFinished = {
+                            val snapped = (dragScale * 10f).roundToInt() / 10f
+                            dragScale = snapped
+                            onScaleChange(snapped)
+                        },
+                        title = "界面缩放",
+                        summary = "调整全局显示比例（80% - 110%）",
+                        valueText = (dragScale * 100).roundToInt().toString() + "%",
+                        valueRange = 0.8f..1.1f,
+                        steps = 0,
+                        keyPoints = listOf(0.8f, 0.9f, 1.0f, 1.1f),
+                        showKeyPoints = true,
+                        magnetThreshold = 0.03f,
+                        onClick = {
+                            onOpenNumber(
+                                NumberDialogSpec(
+                                    title = "界面缩放",
+                                    subtitle = "80% - 110%",
+                                    initial = (uiScale * 100).roundToInt(),
+                                    min = 80,
+                                    max = 110,
+                                    suffix = "%",
+                                    onConfirm = { value -> onScaleChange(value / 100f) },
+                                ),
+                            )
+                        },
+                    )
+                }
                 ArrowPreference(
                     title = "浏览电脑文件夹",
                     summary = if (state.absDir.isEmpty()) "点此在手机上浏览并选择电脑的接收目录" else state.absDir,
