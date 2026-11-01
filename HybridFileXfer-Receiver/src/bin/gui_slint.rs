@@ -441,7 +441,14 @@ fn main() -> Result<(), slint::PlatformError> {
 
             // 进度卡 / 更新提示出现时调整窗口高度（否则底部按钮会被裁掉）
             let xfer_now = ui.get_xfer_visible();
+            // 展开设备列表后内容会变高，窗口高度要跟着加，否则底部按钮被裁掉
+            let devices_h = if ui.get_devices_expanded() {
+                26.0 * s.devices.len() as f32 + 30.0
+            } else {
+                0.0
+            };
             let want_h = 400.0
+                + devices_h
                 + if xfer_now { 130.0 } else { 0.0 }
                 + if ui.get_update_state() == 2 || ui.get_update_state() == 5 {
                     34.0
