@@ -245,7 +245,7 @@ impl AdbCycle {
 }
 
 fn run_auto(options: &EngineOptions, stop: &Arc<AtomicBool>, on_state: &StateSink) {
-    let discovery = Discovery::start(DISCOVERY_PORT);
+    let discovery = Discovery::shared(DISCOVERY_PORT);
     let adb = Adb::detect(&options.adb_search_dir, options.adb_path.as_deref());
     if let Some(adb) = &adb {
         log::debug(&format!("adb: {}", adb.path.display()));
@@ -293,7 +293,7 @@ fn run_discovery(options: &EngineOptions, stop: &Arc<AtomicBool>, on_state: &Sta
         "只使用局域网发现（UDP 广播）",
         "using LAN discovery only (UDP broadcast)",
     ));
-    let discovery = Discovery::start(DISCOVERY_PORT);
+    let discovery = Discovery::shared(DISCOVERY_PORT);
     while !stop.load(Ordering::Relaxed) {
         if try_discovery(&discovery, options, stop, on_state) {
             continue;

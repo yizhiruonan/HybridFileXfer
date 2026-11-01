@@ -25,6 +25,19 @@ pub struct Discovery {
 }
 
 impl Discovery {
+    /// 全局单例：多设备会话共用同一个监听套接字，避免第二条会话绑定 5741 失败。
+    pub fn shared(port: u16) -> Discovery {
+        static SHARED: std::sync::LazyLock<Mutex<Option<Discovery>>> =
+            std::sync::LazyLock::new(|| Mutex::new(None));
+        let mut guard = SHARED.lock().unwrap();
+        if let Some(existing) = guard.as_ref() {
+            return existing.clone();
+        }
+        let created = Discovery::start(port);
+        *guard = Some(created.clone());
+        created
+    }
+
     /// 后台监听 UDP 广播；端口被占用时只打日志，不影响其它连接方式。
     pub fn start(port: u16) -> Discovery {
         let discovery = Discovery {
