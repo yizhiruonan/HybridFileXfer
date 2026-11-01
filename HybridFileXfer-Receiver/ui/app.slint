@@ -81,6 +81,12 @@ component SecondaryButton inherits Rectangle {
     ta := TouchArea { clicked => { root.clicked(); } }
 }
 
+export struct DeviceRow {
+    name: string,
+    state: string,
+    rate: string,
+}
+
 export component AppWindow inherits Window {
     title: "多轨快传";
     icon: @image-url("logo-accent.png");
@@ -113,6 +119,8 @@ export component AppWindow inherits Window {
     in-out property <string> session-text: "";
     // IDM 式分块：每个元素是该段已完成比例（0..1）
     in-out property <[float]> blocks: [];
+    // 多设备列表（单台时自动隐藏）
+    in-out property <[DeviceRow]> devices: [];
 
     // ---- 更新检查：0 检查中 / 1 已是最新 / 2 有新版 / 3 正在下载 / 4 出错 ----
     in-out property <int> update-state: 0;
@@ -187,6 +195,45 @@ export component AppWindow inherits Window {
                     font-weight: 400;
                     color: root.status-color;
                     vertical-alignment: center;
+                }
+            }
+        }
+
+        // ---------------- 多设备列表 ----------------
+        if root.devices.length > 1 : Card {
+            vertical-stretch: 0;
+            VerticalLayout {
+                padding-left: 16px;
+                padding-right: 16px;
+                padding-top: 10px;
+                padding-bottom: 10px;
+                spacing: 4px;
+
+                for d in root.devices : HorizontalLayout {
+                    height: 22px;
+                    spacing: 8px;
+                    Text {
+                        text: d.name;
+                        font-size: 12px;
+                        color: #1A1A1A;
+                        width: 96px;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                    Text {
+                        text: d.state;
+                        font-size: 11px;
+                        color: #616161;
+                        horizontal-stretch: 1;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                    Text {
+                        text: d.rate;
+                        font-size: 11px;
+                        color: #005FB8;
+                        vertical-alignment: center;
+                    }
                 }
             }
         }
