@@ -168,8 +168,11 @@ public class ServerService extends Service implements ServiceConnection {
         }
     }
 
-    /** MIUI 会吞应用日志，调试信息直接写文件 */
+    /** MIUI 会吞应用日志，调试信息直接写文件（仅 debug 构建） */
     private static void debugFile(String line) {
+        if (!BuildConfig.DEBUG) {
+            return;
+        }
         try {
             java.io.File f = new java.io.File(
                     android.os.Environment.getExternalStoragePublicDirectory(
