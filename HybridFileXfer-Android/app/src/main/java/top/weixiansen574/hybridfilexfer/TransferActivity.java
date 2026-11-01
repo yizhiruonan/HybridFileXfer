@@ -70,7 +70,7 @@ public class TransferActivity extends AppCompatActivity {
         Toolbar leftSelectToolbar = findViewById(R.id.toolbar_select_left);
         Toolbar rightSelectToolbar = findViewById(R.id.toolbar_select_right);
 
-        server = HFXServer.instance;
+        server = ServerService.getServer();
         if (server == null) {
             Toast.makeText(this, R.string.fu_wu_wei_yun_xing, Toast.LENGTH_SHORT).show();
             finish();

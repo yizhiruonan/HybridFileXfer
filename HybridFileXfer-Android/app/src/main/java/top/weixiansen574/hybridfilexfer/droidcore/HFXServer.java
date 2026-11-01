@@ -6,6 +6,7 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.channels.ServerSocketChannel;
+import java.nio.channels.SocketChannel;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -34,47 +35,171 @@ import top.weixiansen574.hybridfilexfer.core.callback.TransferFileCallback;
 import top.weixiansen574.nio.DataByteChannel;
 
 public class HFXServer extends HFXService {
-    public static HFXServer instance;
+    /** 所有会话共用的监听套接字：整个手机只绑定一次端口（B 方案：多台电脑连同一台手机）。 */
+    private static ServerSocketChannel sharedSocket;
+    /** 每个已连接的电脑一个实例，key 为自增连接号。 */
+    private static final java.util.Map<Integer, HFXServer> INSTANCES = new java.util.concurrent.ConcurrentHashMap<>();
+    private static final java.util.concurrent.atomic.AtomicInteger NEXT_ID = new java.util.concurrent.atomic.AtomicInteger(1);
+    private static final String LABELS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    /** 等一条传输通道的超时（电脑端整体握手超时是 15s） */
+    private static final int TRANSFER_WAIT_MS = 12000;
+
     protected final IIOService ioService;
     /**
      * 控制通道的写锁。心跳线程与传输线程共用它，避免心跳字节插到一次传输的
      * 指令/回复之间，破坏协议。
      */
     public final Object controlLock = new Object();
-    protected ServerSocketChannel serverSocketChannel;
     protected int remoteFileSystem;
     protected String remoteHomeDir;
+
+    private final int id = NEXT_ID.getAndIncrement();
+    private volatile String displayName = "";
 
     public HFXServer(IIOService ioService) {
         this.ioService = ioService;
     }
 
-    public void startServer(int port, List<ServerNetInterface> interfaceList, int localBufferCount, int remoteBufferCount, StartServerCallback callback) throws IOException {
-        ServerSocketChannel serverSocketChannel;
-        try {
-            serverSocketChannel = ServerSocketChannel.open().bind(new InetSocketAddress(port));
-        } catch (IOException e) {
-            callback.onBindFailed(port);
-            return;
+    public int getId() {
+        return id;
+    }
+
+    /** 界面显示用的名字："电脑 A"，按连接顺序分配字母。 */
+    public String getDisplayName() {
+        return displayName.isEmpty() ? "电脑 " + id : displayName;
+    }
+
+    /** 控制通道是否还活着（心跳线程据此判断会话是否已失效） */
+    public boolean isAlive() {
+        DataByteChannel channel = ctChannel;
+        return channel != null && channel.isOpen();
+    }
+
+    // ------------------------------------------------------------------
+    // 共享监听套接字
+    // ------------------------------------------------------------------
+
+    /** 只在服务启动时绑定一次；后面的每台电脑都从这个套接字上 accept。 */
+    public static synchronized ServerSocketChannel bindShared(int port) throws IOException {
+        if (sharedSocket != null && sharedSocket.isOpen()) {
+            return sharedSocket;
         }
-        this.serverSocketChannel = serverSocketChannel;
-        callback.onStatedServer();
-        //控制通道
-        DataByteChannel ctChannel;
-        //传输通道
-        List<TransferConnection> connections;
-        //第一此accept的为控制通道
-        conn:
-        while (true) {
-            //协议判断
-            ctChannel = new DataByteChannel(serverSocketChannel.accept());
+        ServerSocketChannel channel = ServerSocketChannel.open();
+        try {
+            channel.bind(new InetSocketAddress(port), 16);
+            // 非阻塞：accept 循环要能在没有新连接时定期检查服务是否还在运行
+            channel.configureBlocking(false);
+        } catch (IOException e) {
+            try {
+                channel.close();
+            } catch (IOException ignored) {
+            }
+            throw e;
+        }
+        sharedSocket = channel;
+        return channel;
+    }
+
+    public static synchronized void closeShared() {
+        ServerSocketChannel channel = sharedSocket;
+        sharedSocket = null;
+        if (channel != null) {
+            try {
+                channel.close();
+            } catch (IOException ignored) {
+            }
+        }
+    }
+
+    public static synchronized boolean isListening() {
+        return sharedSocket != null && sharedSocket.isOpen();
+    }
+
+    // ------------------------------------------------------------------
+    // 多实例注册表（替代原来的 static HFXServer.instance 单例）
+    // ------------------------------------------------------------------
+
+    public static synchronized void register(HFXServer server) {
+        server.displayName = nextLabel();
+        INSTANCES.put(server.id, server);
+    }
+
+    private static String nextLabel() {
+        java.util.HashSet<Character> used = new java.util.HashSet<>();
+        for (HFXServer server : INSTANCES.values()) {
+            if (server.displayName.startsWith("电脑 ") && server.displayName.length() > 3) {
+                used.add(server.displayName.charAt(3));
+            }
+        }
+        for (int i = 0; i < LABELS.length(); i++) {
+            char letter = LABELS.charAt(i);
+            if (!used.contains(letter)) {
+                return "电脑 " + letter;
+            }
+        }
+        return "电脑 " + (INSTANCES.size() + 1);
+    }
+
+    public static void unregister(HFXServer server) {
+        if (server != null) {
+            INSTANCES.remove(server.id);
+        }
+    }
+
+    /** 当前所有已握手的连接，按连接顺序排列。 */
+    public static List<HFXServer> snapshot() {
+        List<HFXServer> list = new ArrayList<>(INSTANCES.values());
+        java.util.Collections.sort(list, (a, b) -> Integer.compare(a.id, b.id));
+        return list;
+    }
+
+    /** 只关心"有没有连接"的地方用这个（单例时代的 getServer()）。 */
+    public static HFXServer getAny() {
+        List<HFXServer> list = snapshot();
+        return list.isEmpty() ? null : list.get(0);
+    }
+
+    public static HFXServer getById(int id) {
+        return INSTANCES.get(id);
+    }
+
+    public static int count() {
+        return INSTANCES.size();
+    }
+
+    public static void disconnectAll() {
+        for (HFXServer server : snapshot()) {
+            try {
+                server.disconnect();
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 一次握手
+    // ------------------------------------------------------------------
+
+    /**
+     * 在共享监听套接字上跑完一次握手：版本 → 网卡列表 → 传输通道 → 缓冲区 → 对方文件系统。
+     * 控制通道已经由 {@link ServerListener} 接受并完成协议分类（顺便读掉了 4 字节协议头）。
+     * 失败只关闭本次连接，不会动共享的监听套接字，也不影响其它电脑。
+     *
+     * @return true 表示会话已建立（本实例已注册）
+     */
+    public boolean startServer(ServerListener listener, ServerListener.PendingControl control,
+                               List<ServerNetInterface> interfaceList, int localBufferCount,
+                               int remoteBufferCount, StartServerCallback callback) throws IOException {
+        DataByteChannel ctChannel = new DataByteChannel(control.socket);
+        this.ctChannel = ctChannel;
+        List<TransferConnection> connections = null;
+        boolean success = false;
+        try {
+            //协议判断（协议头在分类阶段已经读掉）
             byte[] headerBytes = HFXServer.CLIENT_HEADER.getBytes(StandardCharsets.UTF_8);
-            byte[] header = new byte[headerBytes.length];
-            ctChannel.readFully(header);
-            if (!Arrays.equals(headerBytes, header)) {
+            if (!Arrays.equals(headerBytes, control.header)) {
                 ctChannel.writeBytes("protocol error\n");
-                ctChannel.close();
-                continue;
+                return false;
             }
             //版本判断
             int versionCode = ctChannel.readInt();
@@ -82,8 +207,7 @@ public class HFXServer extends HFXService {
                 //返回当前服务端版本信息
                 ctChannel.writeBoolean(false);//版本未正确匹配
                 ctChannel.writeInt(HFXServer.VERSION_CODE);
-                ctChannel.close();
-                continue;
+                return false;
             }
             ctChannel.writeBoolean(true);//版本正确匹配
             ctChannel.writeInt(interfaceList.size());//网卡IP数量
@@ -110,8 +234,13 @@ public class HFXServer extends HFXService {
                 //对方所连接通道的名称（由控制器通道发送名称）
                 String name = ctChannel.readUTF();
                 if (succeed) {
-                    //accept通道
-                    connections.add(new TransferConnection(name, new DataByteChannel(serverSocketChannel.accept())));
+                    //从共享套接字上取一条传输通道（别的电脑的控制通道会被暂存，不会认错）
+                    SocketChannel socket = listener.takeTransfer(TRANSFER_WAIT_MS);
+                    if (socket == null) {
+                        ctChannel.writeBoolean(false);
+                        throw new IOException("waiting for transfer channel " + name + " timed out");
+                    }
+                    connections.add(new TransferConnection(name, new DataByteChannel(socket)));
                     ctChannel.writeBoolean(true);
                     callback.onAccepted(name);
                 } else {
@@ -120,57 +249,71 @@ public class HFXServer extends HFXService {
                 }
             }
             if (connections.isEmpty()) {
-                //一条都没连上，回去等电脑重新连接
-                ctChannel.close();
-                callback.onError(new IOException("no transfer channel could be established"));
-                continue conn;
+                //一条都没连上，本次握手放弃；监听还在，电脑会重连
+                return false;
             }
-            break;
-        }
 
-        LinkedBlockingDeque<ByteBuffer> buffers = this.buffers;
-        //告知对方创建的缓冲区块数量
-        ctChannel.writeInt(remoteBufferCount);
-        if (!ctChannel.readBoolean()) {
-            callback.onPcOOM();
-            serverSocketChannel.close();
-            return;
-        }
-        //创建缓冲区块
-        for (int i = 0; i < localBufferCount; i++) {
-            ByteBuffer buffer = NativeMemory.allocateLargeBuffer(FileBlock.BLOCK_SIZE);
-            if (buffer != null) {
-                buffers.add(buffer);
-            } else {
-                //释放缓冲区块内存
-                for (ByteBuffer buff : buffers) {
-                    NativeMemory.freeBuffer(buff);
+            LinkedBlockingDeque<ByteBuffer> buffers = this.buffers;
+            //告知对方创建的缓冲区块数量
+            ctChannel.writeInt(remoteBufferCount);
+            if (!ctChannel.readBoolean()) {
+                callback.onPcOOM();
+                return false;
+            }
+            //创建缓冲区块
+            for (int i = 0; i < localBufferCount; i++) {
+                ByteBuffer buffer = NativeMemory.allocateLargeBuffer(FileBlock.BLOCK_SIZE);
+                if (buffer != null) {
+                    buffers.add(buffer);
+                } else {
+                    ctChannel.writeBoolean(false);
+                    callback.onMeOOM(i, localBufferCount);
+                    return false;
                 }
-                buffers.clear();
-                ctChannel.writeBoolean(false);
-                serverSocketChannel.close();
-                callback.onMeOOM(i, localBufferCount);
-                return;
+            }
+            ctChannel.writeBoolean(true);
+            //读取对方文件系统信息
+            this.remoteFileSystem = ctChannel.readInt();
+            //读取对方设定的主目录
+            this.remoteHomeDir = ctChannel.readUTF();
+            this.connections = connections;
+            register(this);
+            success = true;
+            callback.onConnectSuccess();
+            return true;
+        } finally {
+            if (!success) {
+                //只清理本次连接的资源，共享监听套接字继续用
+                unregister(this);
+                releaseBuffers();
+                closeConnections(connections);
+                this.connections = null;
+                try {
+                    ctChannel.close();
+                } catch (IOException ignored) {
+                }
+                this.ctChannel = null;
             }
         }
-        ctChannel.writeBoolean(true);
-        //读取对方文件系统信息
-        this.remoteFileSystem = ctChannel.readInt();
-        //读取对方设定的主目录
-        this.remoteHomeDir = ctChannel.readUTF();
-        this.ctChannel = ctChannel;
-        this.connections = connections;
-        callback.onConnectSuccess();
     }
 
-    public void closeServerSocket() {
-        if (serverSocketChannel != null) {
+    private static void closeConnections(List<TransferConnection> connections) {
+        if (connections == null) {
+            return;
+        }
+        for (TransferConnection connection : connections) {
             try {
-                serverSocketChannel.close();
-            } catch (IOException e) {
-                e.printStackTrace();
+                connection.close();
+            } catch (IOException ignored) {
             }
         }
+    }
+
+    private void releaseBuffers() {
+        for (ByteBuffer buffer : buffers) {
+            NativeMemory.freeBuffer(buffer);
+        }
+        buffers.clear();
     }
 
     public void disconnect(BackstageTask.BaseEventHandler callback) {
@@ -190,8 +333,9 @@ public class HFXServer extends HFXService {
                     return addr.getAddress().getHostAddress();
                 }
             }
-            if (connections != null) {
-                for (TransferConnection connection : connections) {
+            List<TransferConnection> snapshot = connections;
+            if (snapshot != null) {
+                for (TransferConnection connection : snapshot) {
                     if (connection == null || connection.channel == null || !connection.channel.isOpen()) {
                         continue;
                     }
@@ -209,9 +353,10 @@ public class HFXServer extends HFXService {
     /** 每个已连接通道的实时信息："名称\t对端地址" */
     public java.util.List<String> getChannelDetails() {
         java.util.ArrayList<String> details = new java.util.ArrayList<>();
+        List<TransferConnection> snapshot = connections;
         try {
-            if (connections != null) {
-                for (TransferConnection connection : connections) {
+            if (snapshot != null) {
+                for (TransferConnection connection : snapshot) {
                     if (connection == null || connection.channel == null || !connection.channel.isOpen()) {
                         continue;
                     }
@@ -353,8 +498,12 @@ public class HFXServer extends HFXService {
     }
 
     public List<String> getConnectionListINames() {
-        List<String> names = new ArrayList<>(connections.size());
-        for (TransferConnection connection : connections) {
+        List<TransferConnection> snapshot = connections;
+        if (snapshot == null) {
+            return new ArrayList<>();
+        }
+        List<String> names = new ArrayList<>(snapshot.size());
+        for (TransferConnection connection : snapshot) {
             // 已经断开的通道不计入（WiFi 断开/切网后会残留在这里）
             if (connection.channel == null || !connection.channel.isOpen()) {
                 continue;
@@ -364,56 +513,31 @@ public class HFXServer extends HFXService {
         return names;
     }
 
-    public void disconnect(){
-        //释放缓冲区块内存
-        for (ByteBuffer buffer : buffers) {
-            NativeMemory.freeBuffer(buffer);
-        }
-        buffers.clear();
-        if (ctChannel != null) {
+    /** 会话结束：通知对端、关闭本连接的所有通道并释放缓冲；共享监听套接字保持打开。 */
+    public synchronized void disconnect() {
+        unregister(this);
+        releaseBuffers();
+        DataByteChannel channel = ctChannel;
+        ctChannel = null;
+        if (channel != null) {
             try {
                 //通知断开连接
-                ctChannel.writeShort(ControllerIdentifiers.SHUTDOWN);
+                channel.writeShort(ControllerIdentifiers.SHUTDOWN);
             } catch (IOException ignored) {
             }
             //释放控制通道，避免反复重连时残留socket
             try {
-                ctChannel.close();
-            } catch (IOException ignored) {
-            }
-            ctChannel = null;
-        }
-        if (serverSocketChannel != null) {
-            try {
-                serverSocketChannel.close();
+                channel.close();
             } catch (IOException ignored) {
             }
         }
-        //关闭所有用于传输的连接
-        if (connections != null) {
-            for (TransferConnection connection : connections) {
-                try {
-                    connection.close();
-                } catch (IOException ignored) {
-                }
-            }
-        }
+        closeConnections(connections);
+        connections = null;
     }
 
-    public void close(){
-        //释放并清理缓冲区块
-        for (ByteBuffer buffer : buffers) {
-            NativeMemory.freeBuffer(buffer);
-        }
-        buffers.clear();
-        //关闭serverSocket，释放端口绑定，不用管其他accept的Socket
-        if (serverSocketChannel != null) {
-            try {
-                serverSocketChannel.close();
-            } catch (IOException e) {
-                e.printStackTrace();
-            }
-        }
+    /** 旧接口：等价于断开本连接（监听套接字由 ServerService 统一管理）。 */
+    public void close() {
+        disconnect();
     }
 
     @Override

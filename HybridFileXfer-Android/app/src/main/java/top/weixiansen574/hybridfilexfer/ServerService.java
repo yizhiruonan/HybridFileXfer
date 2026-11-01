@@ -26,15 +26,20 @@ import java.io.IOException;
 import java.net.InetAddress;
 import java.net.SocketException;
 import java.net.UnknownHostException;
+import java.nio.channels.SocketChannel;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
 import rikka.shizuku.Shizuku;
 import top.weixiansen574.hybridfilexfer.aidl.IIOService;
 import top.weixiansen574.hybridfilexfer.core.bean.ServerNetInterface;
 import top.weixiansen574.hybridfilexfer.droidcore.HFXServer;
+import top.weixiansen574.hybridfilexfer.droidcore.ServerListener;
 import top.weixiansen574.hybridfilexfer.droidcore.callback.StartServerCallback;
 
 /**
@@ -74,9 +79,9 @@ public class ServerService extends Service implements ServiceConnection {
     private IIOService ioService;
     private Thread loopThread;
     private volatile boolean active;
-    private volatile boolean freshRequested;
-    private volatile boolean sessionConnected;
     private volatile boolean bound;
+    /** 共享监听套接字的分类器；只有 accept 循环线程会用它 */
+    private volatile ServerListener listener;
     private volatile boolean shizukuBound;
     private volatile int ioMode = Config.MODE_NORMAL;
     private volatile List<ServerNetInterface> interfaces = Collections.emptyList();
@@ -135,37 +140,127 @@ public class ServerService extends Service implements ServiceConnection {
     }
 
     public static boolean isConnected() {
-        return state == STATE_CONNECTED && HFXServer.instance != null;
+        return HFXServer.count() > 0;
     }
 
+    /** 只看有没有连接的地方用（分享面板等旧界面）；多台电脑时取第一台。 */
     public static HFXServer getServer() {
-        return HFXServer.instance;
+        return HFXServer.getAny();
+    }
+
+    /** 按连接号取指定的那台电脑；那台已经断开时退回任意一台（-1 也表示任意一台）。 */
+    public static HFXServer getServer(int connectionId) {
+        HFXServer server = HFXServer.getById(connectionId);
+        return server != null ? server : HFXServer.getAny();
+    }
+
+    /** 当前已连接的所有电脑，按连接顺序排列。 */
+    public static List<HFXServer> getConnections() {
+        return HFXServer.snapshot();
+    }
+
+    public static int getConnectionCount() {
+        return HFXServer.count();
+    }
+
+    /** 所有电脑的通道总数 */
+    public static int getConnectedChannelCount() {
+        int count = 0;
+        for (HFXServer server : HFXServer.snapshot()) {
+            try {
+                count += server.getConnectionListINames().size();
+            } catch (Throwable ignored) {
+            }
+        }
+        return count;
     }
 
     public static List<String> getInterfaceNames() {
         return interfaceNames;
     }
 
+    /** 所有电脑的通道明细，按"电脑 A · 通道名\t地址"聚合（不同电脑的同名通道靠前缀区分）。 */
     public static List<String> getChannelDetails() {
-        HFXServer server = getServer();
-        return server != null ? server.getChannelDetails() : java.util.Collections.emptyList();
+        List<String> details = new ArrayList<>();
+        for (HFXServer server : HFXServer.snapshot()) {
+            try {
+                for (String detail : server.getChannelDetails()) {
+                    int tab = detail.indexOf('\t');
+                    String channel = tab >= 0 ? detail.substring(0, tab) : detail;
+                    String rest = tab >= 0 ? detail.substring(tab) : "";
+                    details.add(server.getDisplayName() + " · " + channel + rest);
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        return details;
     }
 
-    /** 电脑推送文件的实时进度（界面轮询读取） */
+    /**
+     * 每台电脑一份的推送进度（界面轮询读取）。
+     * 以前是全局唯一的一份，多台电脑会互相覆盖；现在按连接号隔离。
+     */
     public static final class Live {
-        public static volatile boolean active = false;
-        public static volatile String name = "";
-        public static volatile long done = 0;
-        public static volatile long total = 0;
-        public static volatile long session = 0;
+        public volatile boolean active = false;
+        public volatile String name = "";
+        public volatile long done = 0;
+        public volatile long total = 0;
+        private volatile long lastDone = 0;
 
-        public static void reset() {
+        void reset() {
             active = false;
             name = "";
             done = 0;
             total = 0;
-            session = 0;
+            lastDone = 0;
         }
+    }
+
+    private static final ConcurrentHashMap<Integer, Live> LIVES = new ConcurrentHashMap<>();
+    /** 所有连接累计接收的字节数（只增不减），界面据此算"合计速率" */
+    private static final AtomicLong RX_TOTAL = new AtomicLong();
+
+    public static Live liveFor(int connectionId) {
+        Live live = LIVES.get(connectionId);
+        if (live == null) {
+            Live created = new Live();
+            Live existing = LIVES.putIfAbsent(connectionId, created);
+            live = existing != null ? existing : created;
+        }
+        return live;
+    }
+
+    /** 当前正在接收的电脑数量 */
+    public static int transferringCount() {
+        int count = 0;
+        for (Live live : LIVES.values()) {
+            if (live.active) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    /** 最活跃的一台（还没传完的优先），没有则返回 null */
+    public static Live currentTransfer() {
+        Live best = null;
+        for (Live live : LIVES.values()) {
+            if (!live.active) {
+                continue;
+            }
+            boolean unfinished = live.total <= 0 || live.done < live.total;
+            boolean bestUnfinished = best != null && (best.total <= 0 || best.done < best.total);
+            if (best == null
+                    || (unfinished && !bestUnfinished)
+                    || (unfinished == bestUnfinished && live.done > best.done)) {
+                best = live;
+            }
+        }
+        return best;
+    }
+
+    public static long receivedTotalBytes() {
+        return RX_TOTAL.get();
     }
 
     /** MIUI 会吞应用日志，调试信息直接写文件（仅 debug 构建） */
@@ -194,8 +289,9 @@ public class ServerService extends Service implements ServiceConnection {
         final String TAG2 = "HFXPULL";
         try {
             debugFile("pull start, files=" + files.size());
-            Live.reset();
-            Live.active = true;
+            final Live live = liveFor(server.getId());
+            live.reset();
+            live.active = true;
             for (top.weixiansen574.hybridfilexfer.core.bean.RemoteFile f : files) {
                 debugFile("  pending: " + f.getPath() + " (" + f.getSize() + ")");
             }
@@ -224,10 +320,16 @@ public class ServerService extends Service implements ServiceConnection {
                         public void onFileUploading(String iName, String path, long targetSize, long totalSize) {
                         }
                         public void onFileDownloading(String iName, String path, long targetSize, long totalSize) {
-                            Live.name = path;
-                            Live.done = targetSize;
-                            Live.total = totalSize;
-                            Live.session += 0;
+                            if (!path.equals(live.name)) {
+                                // 换文件了：进度从这一块重新算
+                                live.name = path;
+                                live.lastDone = targetSize;
+                            } else if (targetSize > live.lastDone) {
+                                RX_TOTAL.addAndGet(targetSize - live.lastDone);
+                            }
+                            live.lastDone = Math.max(live.lastDone, targetSize);
+                            live.done = targetSize;
+                            live.total = totalSize;
                         }
                         public void onSpeedInfo(java.util.List<top.weixiansen574.hybridfilexfer.core.bean.TrafficInfo> list) {
                         }
@@ -241,35 +343,50 @@ public class ServerService extends Service implements ServiceConnection {
                         }
                         public void onWriteFileError(String message) {
                             debugFile("WRITE FILE ERROR: " + message);
-                            Live.active = false;
+                            live.active = false;
                         }
                         public void onComplete(boolean isUpload, long traffic, long time) {
                             debugFile("complete: " + traffic + " bytes -> " + dir);
-                            Live.session = traffic;
-                            Live.active = false;
+                            live.active = false;
                         }
                         public void onIncomplete() {
                             debugFile("incomplete");
-                            Live.active = false;
+                            live.active = false;
                         }
                     });
             debugFile("pulled " + files.size() + " file(s) from PC");
-            Live.active = false;
+            live.active = false;
         } catch (Throwable e) {
             debugFile("pull failed: " + e);
         }
     }
 
+    /**
+     * 所有已连接电脑的通道名（去重、保持顺序）。
+     * 旧界面（网卡列表、通知栏）只关心"哪些线路连上了"，不需要归属；
+     * 需要区分电脑时用 {@link #getChannelDetails()}。
+     */
     public static List<String> getConnectedInterfaceNames() {
-        HFXServer server = HFXServer.instance;
-        if (server == null || state != STATE_CONNECTED) {
-            return Collections.emptyList();
+        java.util.LinkedHashSet<String> names = new java.util.LinkedHashSet<>();
+        for (HFXServer server : HFXServer.snapshot()) {
+            try {
+                names.addAll(server.getConnectionListINames());
+            } catch (Throwable ignored) {
+            }
         }
-        try {
-            return server.getConnectionListINames();
-        } catch (Throwable e) {
-            return Collections.emptyList();
+        return new ArrayList<>(names);
+    }
+
+    /** 通知栏/状态卡用的一句话摘要 */
+    public static String getConnectionSummary() {
+        int computers = HFXServer.count();
+        if (computers <= 0) {
+            return "";
         }
+        if (computers == 1) {
+            return TextUtils.join(", ", getConnectedInterfaceNames());
+        }
+        return computers + " 台电脑 · " + getConnectedChannelCount() + " 条通道";
     }
 
     /**
@@ -345,10 +462,23 @@ public class ServerService extends Service implements ServiceConnection {
     }
 
     /**
-     * 电脑重新接上时调用：断开可能已经失效的旧连接，重新开始监听。
+     * 电脑重新接上时调用。
+     *
+     * <p>以前这里会断开唯一的连接、重新监听；多台电脑时那样做会把别的电脑一起踢掉。
+     * 现在只清理已经失效的会话，正常的连接交给心跳自然判断。
      */
     private void requestFresh() {
-        freshRequested = true;
+        for (HFXServer server : HFXServer.snapshot()) {
+            if (!server.isAlive()) {
+                try {
+                    server.disconnect();
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+        if (HFXServer.count() == 0 && state == STATE_CONNECTED) {
+            setState(STATE_WAITING);
+        }
     }
 
     // ------------------------------------------------------------------
@@ -418,8 +548,6 @@ public class ServerService extends Service implements ServiceConnection {
         stopLoop(true);
         generation++;
         loopThread = null;
-        // 旧循环用 freshRequested 退出，新循环一开始应该是"正常监听"状态
-        freshRequested = false;
         this.interfaces = new ArrayList<>(requested);
         this.localBufferCount = local;
         this.remoteBufferCount = remote;
@@ -493,104 +621,88 @@ public class ServerService extends Service implements ServiceConnection {
         }
     }
 
+    /**
+     * 监听循环：绑定一次端口，然后不断接连接、跑握手，给每台电脑开一条会话线程。
+     *
+     * <p>握手是串行的：所有电脑的控制通道和传输通道都连同一个端口，只有同一个线程
+     * 在 accept，才能保证不会把别台电脑的控制通道错当成当前连接的传输通道
+     * （分类和暂存由 {@link ServerListener} 负责）。
+     */
     private void serverLoop(int gen) {
+        int port = config.getServerPort();
+        ServerListener listener = null;
         while (active && gen == generation) {
-            HFXServer server = null;
-            sessionConnected = false;
             try {
-                server = new HFXServer(ioService);
-                final HFXServer thisServer = server;
-                HFXServer.instance = thisServer;
-                thisServer.startServer(config.getServerPort(), interfaces, localBufferCount, remoteBufferCount,
-                        new StartServerCallback() {
-                            @Override
-                            public void onBindFailed(int port) {
-                                notifyBindFailed(port);
-                            }
-
-                            @Override
-                            public void onStatedServer() {
-                                setState(STATE_WAITING);
-                            }
-
-                            @Override
-                            public void onAccepted(String name) {
-                                notifyAccepted(name);
-                            }
-
-                            @Override
-                            public void onAcceptFailed(String name) {
-                                notifyAcceptFailed(name);
-                            }
-
-                            @Override
-                            public void onPcOOM() {
-                                notifyRemoteOOM();
-                            }
-
-                            @Override
-                            public void onMeOOM(int created, int localBufferCount) {
-                                notifyLocalOOM(created, localBufferCount);
-                            }
-
-                            @Override
-                            public void onConnectSuccess() {
-                                sessionConnected = true;
-                                HFXServer.instance = thisServer;
-                                setState(STATE_CONNECTED);
-                            }
-
-                            @Override
-                            public void onError(Throwable th) {
-                                notifyError(String.valueOf(th));
-                            }
-                        });
-            } catch (Throwable e) {
-                Log.w(TAG, "startServer failed", e);
-                notifyError(String.valueOf(e));
+                listener = new ServerListener(HFXServer.bindShared(port));
+                break;
+            } catch (IOException e) {
+                Log.w(TAG, "bind failed on port " + port, e);
+                notifyBindFailed(port);
+                SystemClock.sleep(1000);
             }
-
-            if (server != null && sessionConnected) {
-                long lastPing = SystemClock.elapsedRealtime();
-                while (active && sessionConnected && !freshRequested && gen == generation) {
-                    SystemClock.sleep(250);
-                    if (SystemClock.elapsedRealtime() - lastPing < PING_INTERVAL_MS) {
-                        continue;
-                    }
-                    lastPing = SystemClock.elapsedRealtime();
-                    try {
-                        server.writePing();
-                    } catch (IOException e) {
-                        Log.i(TAG, "heartbeat failed: " + e);
+        }
+        if (listener == null || gen != generation) {
+            if (gen == generation) {
+                setState(STATE_STOPPED);
+            }
+            return;
+        }
+        this.listener = listener;
+        setState(STATE_WAITING);
+        try {
+            while (active && gen == generation) {
+                ServerListener.PendingControl control;
+                try {
+                    control = listener.nextControl(500);
+                } catch (IOException e) {
+                    if (!active || gen != generation) {
                         break;
                     }
-                    // 问一下电脑有没有"发送到手机"推过来的文件，有就直接拉下来
+                    Log.w(TAG, "accept failed", e);
+                    SystemClock.sleep(300);
+                    continue;
+                }
+                if (control == null) {
+                    continue;
+                }
+                int limit = maxConnections();
+                if (HFXServer.count() >= limit) {
+                    // 先清掉已经死掉但还没被心跳回收的连接（电脑重启后常见）
+                    dropDeadSessions();
+                }
+                if (HFXServer.count() >= limit) {
+                    debugFile("refuse connection: already " + HFXServer.count() + " of " + limit);
+                    closeQuietly(control.socket);
+                    continue;
+                }
+                HFXServer server = new HFXServer(ioService);
+                HandshakeGuard guard = new HandshakeGuard(server, control.socket);
+                boolean connected;
+                try {
+                    connected = server.startServer(listener, control, interfaces, localBufferCount,
+                            remoteBufferCount, newSessionCallback(server));
+                } catch (Throwable e) {
+                    Log.w(TAG, "handshake failed", e);
+                    debugFile("handshake failed: " + e);
+                    connected = false;
+                } finally {
+                    guard.cancel();
+                }
+                if (connected && gen == generation) {
+                    setState(STATE_CONNECTED);
+                    Thread session = new Thread(() -> sessionLoop(server, gen), "HFX-Session-" + server.getId());
+                    session.start();
+                } else {
                     try {
-                        java.util.List<top.weixiansen574.hybridfilexfer.core.bean.RemoteFile> pending =
-                                server.checkPending();
-                        if (!pending.isEmpty()) {
-                            pullPendingFiles(server, pending);
-                        }
-                    } catch (Throwable e) {
-                        debugFile("checkPending failed: " + e);
+                        server.disconnect();
+                    } catch (Throwable ignored) {
                     }
                 }
             }
-
-            sessionConnected = false;
-            freshRequested = false;
-            if (gen == generation) {
-                HFXServer.instance = null;
-            }
-            if (server != null) {
-                try {
-                    server.disconnect();
-                } catch (Throwable ignored) {
-                }
-            }
-            if (active && gen == generation) {
-                setState(STATE_WAITING);
-                SystemClock.sleep(600);
+        } finally {
+            listener.close();
+            if (this.listener == listener) {
+                this.listener = null;
             }
         }
         if (gen == generation) {
@@ -598,19 +710,163 @@ public class ServerService extends Service implements ServiceConnection {
         }
     }
 
+    /** 一台电脑一条会话线程：心跳 + 拉取电脑推送的文件。断开只影响这一台。 */
+    private void sessionLoop(HFXServer server, int gen) {
+        int id = server.getId();
+        try {
+            long lastPing = SystemClock.elapsedRealtime();
+            while (active && gen == generation && server.isAlive()) {
+                SystemClock.sleep(250);
+                if (!active || gen != generation || !server.isAlive()) {
+                    break;
+                }
+                long now = SystemClock.elapsedRealtime();
+                if (now - lastPing < PING_INTERVAL_MS) {
+                    continue;
+                }
+                lastPing = now;
+                try {
+                    server.writePing();
+                } catch (IOException e) {
+                    Log.i(TAG, "heartbeat failed (" + server.getDisplayName() + "): " + e);
+                    break;
+                }
+                // 问一下电脑有没有"发送到手机"推过来的文件，有就直接拉下来
+                try {
+                    java.util.List<top.weixiansen574.hybridfilexfer.core.bean.RemoteFile> pending =
+                            server.checkPending();
+                    if (!pending.isEmpty()) {
+                        pullPendingFiles(server, pending);
+                    }
+                } catch (Throwable e) {
+                    debugFile("checkPending failed (" + server.getDisplayName() + "): " + e);
+                }
+            }
+        } catch (Throwable e) {
+            debugFile("session failed (" + server.getDisplayName() + "): " + e);
+        } finally {
+            HFXServer.unregister(server);
+            LIVES.remove(id);
+            try {
+                server.disconnect();
+            } catch (Throwable ignored) {
+            }
+            if (gen == generation) {
+                setState(HFXServer.count() > 0 ? STATE_CONNECTED : STATE_WAITING);
+            }
+        }
+    }
+
+    private StartServerCallback newSessionCallback(HFXServer server) {
+        return new StartServerCallback() {
+            @Override
+            public void onBindFailed(int port) {
+            }
+
+            @Override
+            public void onStatedServer() {
+            }
+
+            @Override
+            public void onAccepted(String name) {
+                notifyAccepted(name);
+            }
+
+            @Override
+            public void onAcceptFailed(String name) {
+                notifyAcceptFailed(name);
+            }
+
+            @Override
+            public void onPcOOM() {
+                notifyRemoteOOM();
+            }
+
+            @Override
+            public void onMeOOM(int created, int localBufferCount) {
+                notifyLocalOOM(created, localBufferCount);
+            }
+
+            @Override
+            public void onConnectSuccess() {
+            }
+
+            @Override
+            public void onError(Throwable th) {
+                debugFile("session error (" + server.getDisplayName() + "): " + th);
+            }
+        };
+    }
+
+    private void dropDeadSessions() {
+        for (HFXServer server : HFXServer.snapshot()) {
+            if (!server.isAlive()) {
+                try {
+                    server.disconnect();
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+    }
+
+    private int maxConnections() {
+        try {
+            return Math.max(1, config.getMaxConnections());
+        } catch (Throwable e) {
+            return 1;
+        }
+    }
+
+    private static void closeQuietly(SocketChannel socket) {
+        if (socket == null) {
+            return;
+        }
+        try {
+            socket.close();
+        } catch (IOException ignored) {
+        }
+    }
+
+    /** 握手卡死时的兜底：超时后关掉这条控制通道，免得把 accept 循环堵住。 */
+    private final class HandshakeGuard implements Runnable {
+        private final HFXServer server;
+        private final SocketChannel control;
+        private final AtomicBoolean done = new AtomicBoolean(false);
+
+        HandshakeGuard(HFXServer server, SocketChannel control) {
+            this.server = server;
+            this.control = control;
+            mainHandler.postDelayed(this, 20000);
+        }
+
+        @Override
+        public void run() {
+            if (done.get()) {
+                return;
+            }
+            Log.w(TAG, "handshake timed out, dropping " + server.getDisplayName());
+            debugFile("handshake timed out");
+            closeQuietly(control);
+        }
+
+        void cancel() {
+            done.set(true);
+            mainHandler.removeCallbacks(this);
+        }
+    }
+
     private void stopLoop(boolean unbind) {
         generation++;
         active = false;
-        freshRequested = true;
-        sessionConnected = false;
-        HFXServer server = HFXServer.instance;
-        HFXServer.instance = null;
-        if (server != null) {
-            try {
-                server.closeServerSocket();
-            } catch (Throwable ignored) {
-            }
+        ServerListener current = listener;
+        listener = null;
+        if (current != null) {
+            current.close();
         }
+        // 关闭共享监听套接字：accept 循环会被唤醒并退出
+        HFXServer.closeShared();
+        // 停止/改配置时所有电脑的会话都结束，让电脑端重连
+        HFXServer.disconnectAll();
         Thread thread = loopThread;
         loopThread = null;
         if (thread != null) {
@@ -634,7 +890,6 @@ public class ServerService extends Service implements ServiceConnection {
         shizukuBound = false;
         bound = false;
         ioService = null;
-        HFXServer.instance = null;
     }
 
     private void stopEverything() {
@@ -759,9 +1014,14 @@ public class ServerService extends Service implements ServiceConnection {
         String title;
         String text;
         if (state == STATE_CONNECTED) {
-            List<String> names = getConnectedInterfaceNames();
             title = getString(R.string.notification_connected_title);
-            text = getString(R.string.notification_connected_text, TextUtils.join(", ", names));
+            if (HFXServer.count() > 1) {
+                text = getString(R.string.notification_connected_multi,
+                        HFXServer.count(), getConnectedChannelCount());
+            } else {
+                List<String> names = getConnectedInterfaceNames();
+                text = getString(R.string.notification_connected_text, TextUtils.join(", ", names));
+            }
         } else if (state == STATE_STARTING) {
             title = getString(R.string.notification_waiting_title);
             text = getString(R.string.notification_starting_text);

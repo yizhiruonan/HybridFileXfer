@@ -164,6 +164,7 @@
     <string name="notification_starting_text">Starting the IO service…</string>
     <string name="notification_connected_title">Connected to the computer</string>
     <string name="notification_connected_text">Channels: %1$s</string>
+    <string name="notification_connected_multi">%1$d computer(s) · %2$d channel(s)</string>
     <string name="notification_stop">Stop</string>
     <string name="storage_permission_message">The app needs "All files access" to read the files you share and to receive/send them. Please grant it in the next screen, then come back.</string>
     <string name="status_stopped">Not started</string>

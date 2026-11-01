@@ -7,12 +7,14 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -38,6 +40,7 @@ import androidx.compose.ui.unit.sp
 import top.weixiansen574.hybridfilexfer.ServerService
 import top.yukonga.miuix.kmp.basic.Icon
 import top.yukonga.miuix.kmp.basic.Text
+import top.yukonga.miuix.kmp.basic.TextButton
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 
 /** 当前应用实际拿到的最高权限：root > shizuku > normal */
@@ -104,19 +107,20 @@ internal fun SurfaceCard(
 internal fun StatusCard(state: UiState, onClick: () -> Unit) {
     val colorScheme = MiuixTheme.colorScheme
     val connected = state.connected
+    val computers = state.connections.size
     val background = if (connected) colorScheme.primary.copy(alpha = 0.12f) else colorScheme.surfaceContainer
     val iconColor = if (connected) colorScheme.primary else colorScheme.onSurfaceVariantSummary
     val title = when {
-        connected -> "已连接电脑"
+        connected -> "已连接 " + computers + " 台电脑"
         state.state == ServerService.STATE_WAITING -> "等待电脑连接"
         state.state == ServerService.STATE_STARTING -> "正在启动…"
         else -> "未开始接收"
     }
     val subtitle = when {
-        connected -> "通道：" + state.connectedNames.joinToString(", ")
+        connected -> state.channelCount.toString() + " 条通道 · 点此查看连接"
         state.state == ServerService.STATE_WAITING -> "插上数据线，或在电脑上运行接收器"
         state.state == ServerService.STATE_STARTING -> "正在启动 IO 服务"
-        else -> "点下面的按钮开始等待手机"
+        else -> "点下面的按钮开始等待电脑"
     }
     val cardInteraction = remember { MutableInteractionSource() }
     val pressed by cardInteraction.collectIsPressedAsState()
