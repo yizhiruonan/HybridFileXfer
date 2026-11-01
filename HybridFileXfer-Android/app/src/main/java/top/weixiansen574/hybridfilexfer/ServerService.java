@@ -196,10 +196,13 @@ public class ServerService extends Service implements ServiceConnection {
             for (top.weixiansen574.hybridfilexfer.core.bean.RemoteFile f : files) {
                 debugFile("  pending: " + f.getPath() + " (" + f.getSize() + ")");
             }
-            java.io.File dir = new java.io.File(
-                    android.os.Environment.getExternalStoragePublicDirectory(
-                            android.os.Environment.DIRECTORY_DOWNLOADS),
-                    "HybridFileXfer");
+            String configured = Config.getInstance(this).getPushDir();
+            java.io.File dir = configured != null && !configured.isEmpty()
+                    ? new java.io.File(configured)
+                    : new java.io.File(
+                            android.os.Environment.getExternalStoragePublicDirectory(
+                                    android.os.Environment.DIRECTORY_DOWNLOADS),
+                            "HybridFileXfer");
             if (!dir.exists() && !dir.mkdirs()) {
                 Log.w(TAG, "cannot create " + dir);
                 return;
