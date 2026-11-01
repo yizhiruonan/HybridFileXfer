@@ -57,6 +57,10 @@ public class HFXServer extends HFXService {
     /** 电脑推送文件时的分块进度（给进度浮层画分块进度条） */
     public final BlockProgress blockProgress = new BlockProgress();
 
+    /** 传输通道探测锁：探测期间不允许开始新传输，避免把数据读走 */
+    private final Object channelProbeLock = new Object();
+    private volatile boolean transferring;
+
     private final int id = NEXT_ID.getAndIncrement();
     private volatile String displayName = "";
 
@@ -399,22 +403,90 @@ public class HFXServer extends HFXService {
 
     public void sendFilesToRemote(List<RemoteFile> files, Directory localDir, Directory remoteDir, TransferFileCallback callback) throws IOException {
         synchronized (controlLock) {
-            ctChannel.writeShort(ControllerIdentifiers.REQUEST_RECEIVE);//请求对方接收
-            sendFiles(files, localDir, remoteDir, callback);
+            beginTransfer();
+            try {
+                ctChannel.writeShort(ControllerIdentifiers.REQUEST_RECEIVE);//请求对方接收
+                sendFiles(files, localDir, remoteDir, callback);
+            } finally {
+                endTransfer();
+            }
         }
     }
 
     public void sendFilesToShelf(List<RemoteFile> files, Directory localDir, Directory remoteDir, TransferFileCallback callback) throws IOException {
         synchronized (controlLock) {
-            ctChannel.writeShort(ControllerIdentifiers.REQUEST_SEND);
-            ctChannel.writeInt(files.size());
-            for (RemoteFile file : files) {
-                ctChannel.writeUTF(file.getPath());
+            beginTransfer();
+            try {
+                ctChannel.writeShort(ControllerIdentifiers.REQUEST_SEND);
+                ctChannel.writeInt(files.size());
+                for (RemoteFile file : files) {
+                    ctChannel.writeUTF(file.getPath());
+                }
+                ctChannel.writeUTF(localDir.path);
+                ctChannel.writeInt(localDir.fileSystem);
+                ctChannel.writeUTF(remoteDir.path);
+                receiveFiles(callback);
+            } finally {
+                endTransfer();
             }
-            ctChannel.writeUTF(localDir.path);
-            ctChannel.writeInt(localDir.fileSystem);
-            ctChannel.writeUTF(remoteDir.path);
-            receiveFiles(callback);
+        }
+    }
+
+    private void beginTransfer() {
+        synchronized (channelProbeLock) {
+            transferring = true;
+        }
+    }
+
+    private void endTransfer() {
+        synchronized (channelProbeLock) {
+            transferring = false;
+        }
+    }
+
+    /**
+     * 有没有已经断掉的传输通道（拔数据线 / 掉 WiFi）。
+     *
+     * <p>空闲时用非阻塞读探一下：读到 EOF 说明对端已经没了。
+     * 真正传输期间不探测（会把数据读走），由传输线程的异常去发现。
+     */
+    public boolean hasDeadChannel() {
+        synchronized (channelProbeLock) {
+            if (transferring) {
+                return false;
+            }
+            List<TransferConnection> list = connections;
+            if (list == null || list.isEmpty()) {
+                return false;
+            }
+            for (TransferConnection connection : list) {
+                if (connection == null || connection.channel == null || !connection.channel.isOpen()) {
+                    return true;
+                }
+                if (isPeerClosed(connection.channel)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+    }
+
+    private boolean isPeerClosed(DataByteChannel channel) {
+        SocketChannel socketChannel = channel.getSocketChannel();
+        if (socketChannel == null) {
+            return false;
+        }
+        try {
+            socketChannel.configureBlocking(false);
+            try {
+                int read = socketChannel.read(ByteBuffer.allocate(1));
+                return read == -1;
+            } finally {
+                socketChannel.configureBlocking(true);
+            }
+        } catch (Throwable e) {
+            // 探测本身出错，当成已经断开
+            return true;
         }
     }
 
