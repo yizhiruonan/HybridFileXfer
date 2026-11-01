@@ -113,7 +113,20 @@ public class ShareActivity extends AppCompatActivity {
                 return;
             }
             if (transferring) {
-                Toast.makeText(this, R.string.share_busy, Toast.LENGTH_SHORT).show();
+                // 传输线程是阻塞读写的，没有单独的取消指令：直接断开这条连接，
+                // 电脑端会立刻停止并自动重连；半截文件留在电脑上（电脑端自己清理）
+                cancelled = true;
+                finished = true;
+                transferring = false;
+                if (server != null) {
+                    ServerService.cancelTransfer(server.getId());
+                }
+                setIndeterminate(false);
+                progressBar.setProgress(0);
+                showStatus(getString(R.string.share_cancelled));
+                actionButton.setText(R.string.close);
+                actionButton.setOnClickListener(x -> finish());
+                handler.postDelayed(this::finish, 800);
                 return;
             }
             cancelled = true;

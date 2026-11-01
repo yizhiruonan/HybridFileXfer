@@ -43,6 +43,7 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import top.weixiansen574.hybridfilexfer.ServerService
 import top.yukonga.miuix.kmp.basic.Button
 import top.yukonga.miuix.kmp.basic.ButtonDefaults
 import top.yukonga.miuix.kmp.basic.Text
@@ -475,6 +476,15 @@ internal fun ReceiveProgressPanel(state: UiState) {
                     }
                 }
             }
+            // 电脑推过来的文件也可以中途取消：断开这条连接，电脑会自动重连
+            if (state.xferActive) {
+                Spacer(Modifier.height(10.dp))
+                TextButton(
+                    text = "取消接收",
+                    onClick = { ServerService.cancelTransfer(state.xferId) },
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
         }
     }
 }
@@ -612,6 +622,57 @@ internal fun PcChooserDialog(
                     onClick = onDismiss,
                     modifier = Modifier.fillMaxWidth().padding(top = 16.dp),
                 ) { Text("取消") }
+            }
+        }
+    }
+}
+
+/**
+ * 取消接收之后：已经收到的那部分要不要保留。
+ * 保留 = 留一个不完整的文件（预分配过，大小是整文件大小）；删除 = 直接删掉。
+ */
+@Composable
+internal fun KeepPartialDialog(paths: List<String>, onKeep: () -> Unit, onDelete: () -> Unit) {
+    val colorScheme = MiuixTheme.colorScheme
+    Dialog(
+        onDismissRequest = onKeep,
+        properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false),
+    ) {
+        Box(
+            modifier = Modifier.fillMaxSize().background(Color.Transparent).clickable { onKeep() },
+            contentAlignment = Alignment.Center,
+        ) {
+            FullScreenWindow()
+            Column(
+                modifier = Modifier.width(320.dp).clip(RoundedCornerShape(24.dp))
+                    .background(colorScheme.surfaceContainer).clickable { }.padding(20.dp),
+            ) {
+                Text("已取消接收", fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                Text(
+                    if (paths.size == 1) {
+                        "已经接收到的那部分要保留吗？保留后是一个不完整的文件。"
+                    } else {
+                        "已经接收到的那部分要保留吗？保留后是 " + paths.size + " 个不完整的文件。"
+                    },
+                    fontSize = 13.sp,
+                    color = colorScheme.onSurfaceVariantSummary,
+                    modifier = Modifier.padding(top = 8.dp),
+                )
+                Text(
+                    paths.joinToString("\n") { java.io.File(it).name },
+                    fontSize = 12.sp,
+                    color = colorScheme.onSurfaceVariantSummary,
+                    maxLines = 3,
+                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                    modifier = Modifier.padding(top = 6.dp),
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(top = 16.dp),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    TextButton(text = "删除", onClick = onDelete, modifier = Modifier.weight(1f))
+                    Button(onClick = onKeep, modifier = Modifier.weight(1f)) { Text("保留") }
+                }
             }
         }
     }

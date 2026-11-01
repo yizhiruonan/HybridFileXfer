@@ -432,6 +432,32 @@ public class HFXServer extends HFXService {
         }
     }
 
+    /**
+     * 中止正在进行的传输：只关 socket，**不动缓冲区**。
+     *
+     * <p>传输线程还在用缓冲区块，如果这里像 {@link #disconnect()} 那样释放，
+     * 会把正在读写的 native 内存 free 掉（崩溃）。关掉通道后传输线程会抛
+     * AsynchronousCloseException，等会话线程收尾时再统一释放。
+     */
+    public void abortTransfer() {
+        DataByteChannel control = ctChannel;
+        if (control != null) {
+            try {
+                control.close();
+            } catch (IOException ignored) {
+            }
+        }
+        List<TransferConnection> list = connections;
+        if (list != null) {
+            for (TransferConnection connection : list) {
+                try {
+                    connection.close();
+                } catch (IOException ignored) {
+                }
+            }
+        }
+    }
+
     private void beginTransfer() {
         synchronized (channelProbeLock) {
             transferring = true;
