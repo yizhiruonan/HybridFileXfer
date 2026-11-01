@@ -187,7 +187,9 @@ impl AdbCycle {
         let device = match adb::pick_device(&devices, options.device.as_deref()) {
             Ok(device) => device.clone(),
             Err(reason) => {
-                self.fresh_sent_for = None;
+                // 不要清空 fresh_sent_for：设备短暂不可见时若清空，
+                // 下次连上又会带 fresh=true 去重启手机端服务，
+                // 两台设备同时在线时会互相把对方的服务顶掉，形成连接抖动。
                 if self.last_notice.as_deref() != Some(reason.as_str()) {
                     let message = format!("{}（{}）", tr("等待手机连接", "waiting for a phone"), reason);
                     log::info(&message);
