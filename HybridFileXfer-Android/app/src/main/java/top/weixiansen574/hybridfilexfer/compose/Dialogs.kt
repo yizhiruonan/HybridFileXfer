@@ -326,72 +326,6 @@ private fun formatSpeed(bytesPerSecond: Long): String {
     }
 }
 
-@Composable
-internal fun ConnectionInfoPanel(state: UiState, onDismiss: () -> Unit) {
-    val colorScheme = MiuixTheme.colorScheme
-    Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(Color.Black.copy(alpha = 0.40f))
-            .clickable(interactionSource = androidx.compose.foundation.interaction.MutableInteractionSource(), indication = null) { onDismiss() },
-        contentAlignment = Alignment.Center,
-    ) {
-        Column(
-            modifier = Modifier
-                .width(330.dp)
-                .clip(RoundedCornerShape(24.dp))
-                .background(colorScheme.surfaceContainer)
-                .clickable(interactionSource = androidx.compose.foundation.interaction.MutableInteractionSource(), indication = null) { }
-                .padding(20.dp),
-        ) {
-            Text("连接详情", fontSize = 20.sp, fontWeight = FontWeight.Bold)
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .heightIn(max = 460.dp)
-                    .verticalScroll(rememberScrollState()),
-            ) {
-                InfoRow("状态", if (state.connected) "已连接电脑" else "等待电脑连接")
-                InfoRow("模式", modeLabel(state.mode))
-                InfoRow("电脑 IP", state.peerIp ?: "未知（adb 连接）")
-                if (state.channelDetails.isEmpty()) {
-                    InfoRow("已用通道", "无")
-                } else {
-                    state.channelDetails.forEach { detail ->
-                        val parts = detail.split("\t")
-                        val name = parts.getOrNull(0) ?: detail
-                        val address = parts.getOrNull(1) ?: ""
-                        val rate = when {
-                            name.startsWith("wlan") -> state.wifiRate
-                            name.startsWith("USB") -> state.usbSpeed
-                            else -> ""
-                        }
-                        val value = buildString {
-                            append(address.ifEmpty { "已连接" })
-                            if (rate.isNotEmpty()) {
-                                append("\n")
-                                append(rate)
-                            }
-                        }
-                        InfoRow(name, value)
-                    }
-                }
-                InfoRow("接收目录", state.homeDir.ifEmpty { "未连接" })
-                InfoRow("WLAN 协商速率", state.wifiRate.ifEmpty { "未连接 WLAN" })
-                InfoRow("USB 协议", state.usbSpeed.ifEmpty { "无法读取（需要 ROOT 权限）" })
-                InfoRow("ROOT 权限", state.rootState.ifEmpty { "未知" })
-                InfoRow("SHELL（Shizuku）", state.shellState.ifEmpty { "未知" })
-
-            }
-            Button(
-                onClick = onDismiss,
-                modifier = Modifier.fillMaxWidth().padding(top = 16.dp),
-                colors = ButtonDefaults.buttonColorsPrimary(),
-            ) { Text("关闭", color = Color.White) }
-        }
-    }
-}
-
 private fun humanSize(bytes: Long): String {
     if (bytes <= 0) return "0 B"
     val kb = 1024.0
@@ -408,15 +342,16 @@ private fun humanSize(bytes: Long): String {
 @Composable
 internal fun ReceiveProgressPanel(state: UiState) {
     val colorScheme = MiuixTheme.colorScheme
-    var lastDone by remember { mutableStateOf(state.xferDone) }
+    // 用累计字节数算速率：多台电脑同时接收时显示的是合计速率
+    var lastBytes by remember { mutableStateOf(state.xferBytes) }
     var lastAt by remember { mutableStateOf(System.currentTimeMillis()) }
     var speed by remember { mutableStateOf(0L) }
 
-    LaunchedEffect(state.xferDone) {
+    LaunchedEffect(state.xferBytes) {
         val now = System.currentTimeMillis()
         val dt = (now - lastAt).coerceAtLeast(1L)
-        speed = if (state.xferDone >= lastDone) (state.xferDone - lastDone) * 1000L / dt else 0L
-        lastDone = state.xferDone
+        speed = if (state.xferBytes >= lastBytes) (state.xferBytes - lastBytes) * 1000L / dt else 0L
+        lastBytes = state.xferBytes
         lastAt = now
     }
 
@@ -442,7 +377,11 @@ internal fun ReceiveProgressPanel(state: UiState) {
                 .padding(20.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            Text("正在接收文件", fontSize = 19.sp, fontWeight = FontWeight.Bold)
+            Text(
+                if (state.xferCount > 1) "正在接收 " + state.xferCount + " 台电脑的文件" else "正在接收文件",
+                fontSize = 19.sp,
+                fontWeight = FontWeight.Bold,
+            )
             Spacer(Modifier.height(12.dp))
             Text(
                 name.ifEmpty { "…" },
@@ -467,10 +406,72 @@ internal fun ReceiveProgressPanel(state: UiState) {
             Spacer(Modifier.height(10.dp))
             Text(
                 humanSize(state.xferDone) + " / " + humanSize(state.xferTotal) +
-                    "   ·   " + formatSpeed(speed),
+                    "   ·   " + (if (state.xferCount > 1) "合计 " else "") + formatSpeed(speed),
                 fontSize = 12.sp,
                 color = colorScheme.onSurfaceVariantSummary,
             )
+        }
+    }
+}
+
+/** 多台电脑时选一台作为"发送到电脑"的目标 */
+@Composable
+internal fun PcChooserDialog(
+    connections: List<PcConn>,
+    onDismiss: () -> Unit,
+    onSelected: (Int) -> Unit,
+) {
+    val colorScheme = MiuixTheme.colorScheme
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false),
+    ) {
+        Box(
+            modifier = Modifier.fillMaxSize().background(Color.Transparent).clickable { onDismiss() },
+            contentAlignment = Alignment.Center,
+        ) {
+            FullScreenWindow()
+            Column(
+                modifier = Modifier.width(320.dp).clip(RoundedCornerShape(24.dp))
+                    .background(colorScheme.surfaceContainer).clickable { }.padding(20.dp),
+            ) {
+                Text("发送到哪台电脑", fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                Text(
+                    "已连接 " + connections.size + " 台，选一台接收",
+                    fontSize = 13.sp,
+                    color = colorScheme.onSurfaceVariantSummary,
+                    modifier = Modifier.padding(top = 6.dp),
+                )
+                connections.forEach { pc ->
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(top = 12.dp)
+                            .clip(RoundedCornerShape(14.dp))
+                            .background(colorScheme.secondaryContainerVariant)
+                            .clickable { onSelected(pc.id) }
+                            .padding(horizontal = 14.dp, vertical = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text(pc.label, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                            Text(
+                                pc.ip ?: "USB / ADB",
+                                fontSize = 12.sp,
+                                color = colorScheme.onSurfaceVariantSummary,
+                                modifier = Modifier.padding(top = 2.dp),
+                            )
+                        }
+                        Text(
+                            pc.channels.size.toString() + " 通道",
+                            fontSize = 12.sp,
+                            color = colorScheme.onSurfaceVariantSummary,
+                        )
+                    }
+                }
+                Button(
+                    onClick = onDismiss,
+                    modifier = Modifier.fillMaxWidth().padding(top = 16.dp),
+                ) { Text("取消") }
+            }
         }
     }
 }

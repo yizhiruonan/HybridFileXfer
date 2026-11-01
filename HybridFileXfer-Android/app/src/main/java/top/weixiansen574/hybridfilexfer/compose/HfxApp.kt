@@ -87,20 +87,39 @@ import top.yukonga.miuix.kmp.preference.SwitchPreference
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 
 private const val TAB_HOME = 0
-private const val TAB_CHANNELS = 1
+private const val TAB_CONNECTIONS = 1
 private const val TAB_SETTINGS = 2
+
+/** 一台已连接电脑的界面模型（B 方案：手机同时接多台电脑） */
+internal data class PcConn(
+    val id: Int,
+    val label: String,
+    val ip: String?,
+    val channels: List<String>,
+    val details: List<String>,
+    val transferring: Boolean = false,
+    val fileName: String = "",
+    val done: Long = 0,
+    val total: Long = 0,
+)
 
 internal data class UiState(
     val state: Int = 0,
     val connected: Boolean = false,
     val interfaceNames: List<String> = emptyList(),
     val connectedNames: List<String> = emptyList(),
+    val connections: List<PcConn> = emptyList(),
+    val channelCount: Int = 0,
+    val maxConnections: Int = 3,
     // 电脑推送文件的实时进度
     val pushDir: String = "",
     val xferActive: Boolean = false,
     val xferName: String = "",
     val xferDone: Long = 0,
     val xferTotal: Long = 0,
+    val xferCount: Int = 0,
+    /** 所有连接累计接收的字节数（只增不减），用来算合计速率 */
+    val xferBytes: Long = 0,
     val mode: Int = 0,
     val autoConnect: Boolean = true,
     val localBuffer: Int = 256,
@@ -115,7 +134,6 @@ internal data class UiState(
     val lastPeak: Long = 0L,
     val wifiRate: String = "",
     val channelSpeeds: String = "",
-    val channelDetails: List<String> = emptyList(),
     val usbSpeed: String = "",
     val rootState: String = "",
     val shellState: String = "",
@@ -162,24 +180,44 @@ internal fun treeUriToPath(uri: android.net.Uri): String? {
 
 internal fun readState(context: Context): UiState {
     val config = Config.getInstance(context)
-    val server = ServerService.getServer()
+    val servers = ServerService.getConnections()
+    val connections = servers.map { server ->
+        val live = ServerService.liveFor(server.id)
+        PcConn(
+            id = server.id,
+            label = server.displayName,
+            ip = server.peerIp,
+            channels = server.connectionListINames,
+            details = server.channelDetails,
+            transferring = live.active,
+            fileName = live.name,
+            done = live.done,
+            total = live.total,
+        )
+    }
+    val current = ServerService.currentTransfer()
     return UiState(
         state = ServerService.getState(),
         connected = ServerService.isConnected(),
         interfaceNames = ServerService.getInterfaceNames(),
         connectedNames = ServerService.getConnectedInterfaceNames(),
-        pushDir = Config.getInstance(context).pushDir,
-        xferActive = ServerService.Live.active,
-        xferName = ServerService.Live.name,
-        xferDone = ServerService.Live.done,
-        xferTotal = ServerService.Live.total,
+        connections = connections,
+        channelCount = connections.sumOf { it.channels.size },
+        maxConnections = config.maxConnections,
+        pushDir = config.pushDir,
+        xferActive = current != null,
+        xferName = current?.name ?: "",
+        xferDone = current?.done ?: 0,
+        xferTotal = current?.total ?: 0,
+        xferCount = ServerService.transferringCount(),
+        xferBytes = ServerService.receivedTotalBytes(),
         mode = config.mode,
         autoConnect = config.isAutoConnectEnabled,
         localBuffer = config.localBufferCount,
         remoteBuffer = config.remoteBufferCount,
-        homeDir = server?.remoteHomeDir ?: "",
+        homeDir = servers.firstOrNull()?.remoteHomeDir ?: "",
         absDir = config.remoteAbsDir,
-        peerIp = server?.peerIp,
+        peerIp = servers.firstOrNull()?.peerIp,
         subDir = config.remoteSubDir,
         speedLimit = config.speedLimitMbps,
         disabledChannels = config.disabledChannels,
@@ -187,7 +225,6 @@ internal fun readState(context: Context): UiState {
         lastPeak = config.lastPeakBytesPerSecond,
         wifiRate = wifiRateText(context),
         channelSpeeds = config.channelSpeeds,
-        channelDetails = ServerService.getChannelDetails(),
         usbSpeed = UsbSpeed.query(context),
         rootState = PrivCheck.rootStatus(),
         shellState = PrivCheck.shizukuStatus(),
@@ -206,7 +243,6 @@ fun HfxApp(
     var uiScale by remember { mutableStateOf(Config.getInstance(activity).uiScale) }
     var numberDialog by remember { mutableStateOf<NumberDialogSpec?>(null) }
     var pcBrowse by remember { mutableStateOf(false) }
-    var infoDialog by remember { mutableStateOf(false) }
     val pagerState = rememberPagerState(pageCount = { 3 })
     // 拖动滑块时临时禁用整页横滑，否则手势会被 HorizontalPager 抢走
     var sliderActive by remember { mutableStateOf(false) }
@@ -227,6 +263,9 @@ fun HfxApp(
         }
     }
 
+    // 多台电脑时先把"发给谁"选清楚，再启动系统文件选择器
+    var transferTarget by remember { mutableStateOf(-1) }
+    var targetChooser by remember { mutableStateOf(false) }
     val pickFiles = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
         if (!uris.isNullOrEmpty()) {
             val intent = Intent(activity, ShareActivity::class.java).apply {
@@ -234,8 +273,19 @@ fun HfxApp(
                 putParcelableArrayListExtra(Intent.EXTRA_STREAM, ArrayList(uris))
                 type = "*/*"
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                putExtra(ShareActivity.EXTRA_CONNECTION_ID, transferTarget)
             }
             activity.startActivity(intent)
+        }
+    }
+
+    fun beginTransfer() {
+        val targets = state.connections
+        if (targets.size > 1) {
+            targetChooser = true
+        } else {
+            transferTarget = targets.firstOrNull()?.id ?: -1
+            pickFiles.launch(arrayOf("*/*"))
         }
     }
 
@@ -376,12 +426,12 @@ fun HfxApp(
     ) {
         Box(modifier = Modifier.fillMaxSize()) {
         Scaffold(
-            topBar = { TopAppBar(title = listOf("多轨快传", "通道", "设置")[pagerState.currentPage.coerceIn(0, 2)]) },
+            topBar = { TopAppBar(title = listOf("多轨快传", "连接", "设置")[pagerState.currentPage.coerceIn(0, 2)]) },
             bottomBar = {
                 NavigationBar {
                     listOf(
                         "主页" to Icons.Rounded.Home,
-                        "通道" to Icons.Rounded.PhonelinkRing,
+                        "连接" to Icons.Rounded.PhonelinkRing,
                         "设置" to Icons.Rounded.Settings,
                     ).forEachIndexed { index, (label, icon) ->
                         NavigationBarItem(
@@ -416,12 +466,11 @@ fun HfxApp(
                             ServerService.stopServer(activity)
                             state = readState(activity)
                         },
-                        onTransfer = { pickFiles.launch(arrayOf("*/*")) },
-                        onShowInfo = { infoDialog = true },
-                        onOpenChannels = { scope.launch { pagerState.animateScrollToPage(TAB_CHANNELS) } },
+                        onTransfer = ::beginTransfer,
+                        onOpenConnections = { scope.launch { pagerState.animateScrollToPage(TAB_CONNECTIONS) } },
                         onOpenSettings = { scope.launch { pagerState.animateScrollToPage(TAB_SETTINGS) } },
                     )
-                    TAB_CHANNELS -> ChannelsPage(
+                    TAB_CONNECTIONS -> ConnectionsPage(
                         state = state,
                         interfaces = interfaces,
                         onToggleInterface = ::toggleInterface,
@@ -444,6 +493,10 @@ fun HfxApp(
                         onBrowsePc = { pcBrowse = true },
                         onPickPushDir = { pickPushDir.launch(null) },
                         onTypePushDir = { pathDialog = true },
+                        onMaxConnections = { value ->
+                            Config.getInstance(activity).maxConnections = value
+                            state = readState(activity)
+                        },
                     )
                 }
             }
@@ -469,8 +522,16 @@ fun HfxApp(
         if (state.xferActive) {
             ReceiveProgressPanel(state)
         }
-        if (infoDialog) {
-            ConnectionInfoPanel(state, onDismiss = { infoDialog = false })
+        if (targetChooser) {
+            PcChooserDialog(
+                connections = state.connections,
+                onDismiss = { targetChooser = false },
+                onSelected = { id ->
+                    transferTarget = id
+                    targetChooser = false
+                    pickFiles.launch(arrayOf("*/*"))
+                },
+            )
         }
         }
     }
@@ -501,8 +562,7 @@ private fun HomePage(
     onStart: () -> Unit,
     onStop: () -> Unit,
     onTransfer: () -> Unit,
-    onShowInfo: () -> Unit,
-    onOpenChannels: () -> Unit,
+    onOpenConnections: () -> Unit,
     onOpenSettings: () -> Unit,
 ) {
     LazyColumn(
@@ -510,14 +570,16 @@ private fun HomePage(
         contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 96.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        item { StatusCard(state, onShowInfo) }
+        item {
+            StatusCard(state, onOpenConnections)
+        }
         item {
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 SmallTile(
                     modifier = Modifier.weight(1f),
                     label = "通道",
-                    value = if (state.connected) state.connectedNames.size.toString() else plannedChannels.toString(),
-                    onClick = onOpenChannels,
+                    value = if (state.connected) state.channelCount.toString() else plannedChannels.toString(),
+                    onClick = onOpenConnections,
                 )
                 SmallTile(
                     modifier = Modifier.weight(1f),
@@ -554,8 +616,12 @@ private fun HomePage(
     }
 }
 
+/**
+ * 「连接」标签页：已连接的电脑 + 通道/网卡配置 + 环境信息。
+ * （B 方案：一台手机同时接多台电脑；原来独立的「通道」页并到这里）
+ */
 @Composable
-private fun ChannelsPage(
+private fun ConnectionsPage(
     state: UiState,
     interfaces: List<NetInterfaceInfo>,
     onToggleInterface: (String, Boolean) -> Unit,
@@ -570,6 +636,9 @@ private fun ChannelsPage(
         contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 96.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
+        item {
+            ConnectedComputersCard(state)
+        }
         item {
             Card {
                 ArrowPreference(
@@ -630,6 +699,134 @@ private fun ChannelsPage(
                 }
             }
         }
+        item {
+            EnvironmentCard(state)
+        }
+    }
+}
+
+/** 「连接」页顶部：现在连着哪几台电脑、各自用了几条通道、正在接收什么 */
+@Composable
+private fun ConnectedComputersCard(state: UiState) {
+    val colorScheme = MiuixTheme.colorScheme
+    val connected = state.connected
+    Card {
+        Column(modifier = Modifier.fillMaxWidth().padding(16.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(
+                    modifier = Modifier.size(38.dp).clip(CircleShape)
+                        .background(colorScheme.primary.copy(alpha = if (connected) 0.15f else 0.08f)),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.PhonelinkRing,
+                        contentDescription = null,
+                        tint = if (connected) colorScheme.primary else colorScheme.onSurfaceVariantSummary,
+                        modifier = Modifier.size(24.dp),
+                    )
+                }
+                Spacer(Modifier.width(12.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        if (connected) "已连接 " + state.connections.size + " 台电脑" else "等待电脑连接",
+                        fontSize = 17.sp,
+                        fontWeight = FontWeight.Bold,
+                    )
+                    Text(
+                        if (connected) state.channelCount.toString() + " 条通道" else "插上数据线，或在电脑上运行接收器",
+                        fontSize = 12.sp,
+                        color = colorScheme.onSurfaceVariantSummary,
+                        modifier = Modifier.padding(top = 2.dp),
+                    )
+                }
+            }
+            // 每台电脑一张小卡：IP / 通道明细 / 当前传输
+            state.connections.forEach { pc ->
+                Column(
+                    modifier = Modifier.fillMaxWidth().padding(top = 12.dp)
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(colorScheme.surfaceVariant)
+                        .padding(12.dp),
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            pc.label,
+                            fontSize = 15.sp,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.weight(1f),
+                        )
+                        Text(
+                            pc.channels.size.toString() + " 条通道",
+                            fontSize = 12.sp,
+                            color = colorScheme.onSurfaceVariantSummary,
+                        )
+                    }
+                    Text(
+                        pc.ip ?: "USB / ADB",
+                        fontSize = 12.sp,
+                        color = colorScheme.onSurfaceVariantSummary,
+                        modifier = Modifier.padding(top = 2.dp),
+                    )
+                    pc.details.forEach { detail ->
+                        val parts = detail.split("\t")
+                        val name = parts.getOrNull(0) ?: detail
+                        val address = parts.getOrNull(1) ?: ""
+                        val rate = when {
+                            name.contains("wlan", ignoreCase = true) -> state.wifiRate
+                            name.startsWith("USB") -> state.usbSpeed
+                            else -> ""
+                        }
+                        val line = buildString {
+                            append(name)
+                            if (address.isNotEmpty()) {
+                                append(" · ")
+                                append(address)
+                            }
+                            if (rate.isNotEmpty()) {
+                                append(" · ")
+                                append(rate)
+                            }
+                        }
+                        Text(
+                            line,
+                            fontSize = 11.sp,
+                            color = colorScheme.onSurfaceVariantSummary,
+                            maxLines = 1,
+                            overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                            modifier = Modifier.padding(top = 2.dp),
+                        )
+                    }
+                    if (pc.transferring) {
+                        val file = pc.fileName.substringAfterLast('/').substringAfterLast('\\')
+                        val percent = if (pc.total > 0) (pc.done * 100 / pc.total).toInt() else 0
+                        Text(
+                            "接收中 " + percent + "% · " + file,
+                            fontSize = 11.sp,
+                            color = colorScheme.primary,
+                            maxLines = 1,
+                            overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                            modifier = Modifier.padding(top = 4.dp),
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+/** 「连接」页底部：接收目录、权限、链路速率这些"看一眼"的信息 */
+@Composable
+private fun EnvironmentCard(state: UiState) {
+    Card {
+        Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp)) {
+            Text("环境", fontSize = 17.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(bottom = 4.dp))
+            InfoRow("接收目录", state.homeDir.ifEmpty { "未连接" })
+            InfoRow("模式", modeLabel(state.mode))
+            InfoRow("WLAN 协商速率", state.wifiRate.ifEmpty { "未连接 WLAN" })
+            InfoRow("USB 协议", state.usbSpeed.ifEmpty { "无法读取（需要 ROOT 权限）" })
+            InfoRow("ROOT 权限", state.rootState.ifEmpty { "未知" })
+            InfoRow("SHELL（Shizuku）", state.shellState.ifEmpty { "未知" })
+        }
     }
 }
 
@@ -649,6 +846,7 @@ private fun SettingsPage(
     onBrowsePc: () -> Unit,
     onPickPushDir: () -> Unit,
     onTypePushDir: () -> Unit,
+    onMaxConnections: (Int) -> Unit,
 ) {
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
@@ -722,6 +920,24 @@ private fun SettingsPage(
                         },
                     )
                 }
+                ArrowPreference(
+                    title = "最多连接电脑数",
+                    summary = "每台电脑占用约 8 MiB 缓冲；同时连接多台时按这个上限",
+                    endActions = { ActionText(state.maxConnections.toString() + " 台") },
+                    onClick = {
+                        onOpenNumber(
+                            NumberDialogSpec(
+                                title = "最多连接电脑数",
+                                subtitle = "1 - 5 台",
+                                initial = state.maxConnections,
+                                min = 1,
+                                max = 5,
+                                suffix = "台",
+                                onConfirm = onMaxConnections,
+                            ),
+                        )
+                    },
+                )
                 ArrowPreference(
                     title = "电脑推送保存到",
                     summary = if (state.pushDir.isNotEmpty()) state.pushDir else "默认：Download/HybridFileXfer",

@@ -54,6 +54,8 @@ public class ShareActivity extends AppCompatActivity {
 
     private static final String TAG = "ShareActivity";
     private static final long CONNECT_TIMEOUT_MS = 30_000L;
+    /** 多台电脑时指定发给哪一台（连接号；不传或 -1 表示随便一台） */
+    public static final String EXTRA_CONNECTION_ID = "top.weixiansen574.hybridfilexfer.extra.CONNECTION_ID";
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final Queue<Group> groups = new ConcurrentLinkedQueue<>();
@@ -68,6 +70,7 @@ public class ShareActivity extends AppCompatActivity {
     private volatile boolean finished;
     private volatile boolean transferring;
     private volatile HFXServer server;
+    private int targetConnectionId = -1;
 
     private long totalBytes;
     private long completedBytes;
@@ -91,6 +94,8 @@ public class ShareActivity extends AppCompatActivity {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
             setFinishOnTouchOutside(false);
         }
+        // 界面在多台电脑里选了哪一台，就只发给那一台
+        targetConnectionId = getIntent().getIntExtra(EXTRA_CONNECTION_ID, -1);
 
         statusView = findViewById(R.id.share_status);
         hintView = findViewById(R.id.share_hint);
@@ -260,7 +265,7 @@ public class ShareActivity extends AppCompatActivity {
 
     private boolean ensureConnected() {
         if (ServerService.isConnected()) {
-            server = ServerService.getServer();
+            server = ServerService.getServer(targetConnectionId);
             return server != null;
         }
         if (!ServerService.isRunning()) {
@@ -278,7 +283,7 @@ public class ShareActivity extends AppCompatActivity {
         long deadline = System.currentTimeMillis() + CONNECT_TIMEOUT_MS;
         while (System.currentTimeMillis() < deadline && !cancelled) {
             if (ServerService.isConnected()) {
-                server = ServerService.getServer();
+                server = ServerService.getServer(targetConnectionId);
                 return server != null;
             }
             try {

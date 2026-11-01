@@ -32,6 +32,15 @@ public class Config {
         return 5740;
     }
 
+    /** 同时连接的电脑数量上限；每台电脑占用一份缓冲区块内存（默认 8 MiB） */
+    public int getMaxConnections() {
+        return Math.max(1, Math.min(5, preferences.getInt("max_connections", 3)));
+    }
+
+    public void setMaxConnections(int count) {
+        preferences.edit().putInt("max_connections", Math.max(1, Math.min(5, count))).apply();
+    }
+
     public int getLocalBufferCount() {
         return preferences.getInt("local_buffer_count",256);
     }

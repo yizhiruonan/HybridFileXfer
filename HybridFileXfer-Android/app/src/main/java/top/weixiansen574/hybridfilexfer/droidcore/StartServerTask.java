@@ -1,22 +1,11 @@
 package top.weixiansen574.hybridfilexfer.droidcore;
 
 import java.io.IOException;
-import java.net.InetSocketAddress;
-import java.nio.ByteBuffer;
-import java.nio.channels.ServerSocketChannel;
-import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
-import java.util.concurrent.LinkedBlockingDeque;
 
 import top.weixiansen574.async.BackstageTask;
-import top.weixiansen574.hybridfilexfer.NativeMemory;
-import top.weixiansen574.hybridfilexfer.core.FileBlock;
-import top.weixiansen574.hybridfilexfer.core.TransferConnection;
 import top.weixiansen574.hybridfilexfer.core.bean.ServerNetInterface;
 import top.weixiansen574.hybridfilexfer.droidcore.callback.StartServerCallback;
-import top.weixiansen574.nio.DataByteChannel;
 
 public class StartServerTask extends BackstageTask<StartServerCallback> {
     private final HFXServer server;
@@ -36,7 +25,24 @@ public class StartServerTask extends BackstageTask<StartServerCallback> {
 
     @Override
     protected void onStart(StartServerCallback callback) throws Throwable {
-        server.startServer(port,interfaceList,localBufferCount,remoteBufferCount,callback);
+        // 旧的一次性启动入口：绑定共享端口、等一台电脑接入。
+        // 后台服务（ServerService）已经接管了常驻监听，这里只保留给旧界面用。
+        ServerListener listener = new ServerListener(HFXServer.bindShared(port));
+        boolean connected = false;
+        try {
+            ServerListener.PendingControl control = listener.nextControl(60000);
+            if (control == null) {
+                throw new IOException("timed out waiting for the computer");
+            }
+            connected = server.startServer(listener, control, interfaceList,
+                    localBufferCount, remoteBufferCount, callback);
+        } finally {
+            listener.close();
+            HFXServer.closeShared();
+        }
+        if (!connected) {
+            throw new IOException("handshake failed");
+        }
     }
 
     @Override
