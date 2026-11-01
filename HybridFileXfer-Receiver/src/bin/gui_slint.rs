@@ -157,6 +157,19 @@ fn main() -> Result<(), slint::PlatformError> {
         hfx_receiver::pending::push_with_target(send_files.clone(), send_target.clone());
     }
 
+    // 单实例：已经有接收器在跑时，不再开第二个窗口（除非是"发送到手机"的投递进程）
+    #[cfg(windows)]
+    if tray_win::tray_window_handle().is_some() {
+        if send_mode {
+            // 走到这里说明投递失败（窗口还没建好），直接退出，别再开一个实例
+            log::warn("已有实例在运行，投递未完成");
+        } else {
+            // 把已运行的窗口叫到前面，然后退出
+            tray_win::show_main_window(WINDOW_TITLE);
+        }
+        return Ok(());
+    }
+
     let autostart = autostart_enabled();
     let ip_text = std::env::var("HFX_LAST_IP").unwrap_or_else(|_| "192.168.1.100".to_string());
 
