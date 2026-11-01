@@ -413,6 +413,9 @@ fn main() -> Result<(), slint::PlatformError> {
                         expanded: s.expanded.contains(serial),
                     });
                 }
+                // 平板模型给"选择接收设备"卡片用；配对模型给一行两个的设备卡片用
+                ui.set_devices(slint::ModelRc::new(slint::VecModel::from(rows.clone())));
+
                 // 两两配对，界面一行画两个
                 let mut pairs: Vec<DevicePair> = Vec::with_capacity((rows.len() + 1) / 2);
                 let mut iter = rows.into_iter();
