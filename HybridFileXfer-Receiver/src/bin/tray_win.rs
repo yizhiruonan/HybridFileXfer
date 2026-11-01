@@ -53,16 +53,25 @@ pub fn tray_window_handle() -> Option<HWND> {
 }
 
 /// 把文件列表投递给已经运行的实例，成功返回 true
+pub fn deliver_paths_with_target(paths: &[std::path::PathBuf], target: Option<&str>) -> bool {
+    deliver(paths, target)
+}
+
 pub fn deliver_paths(paths: &[std::path::PathBuf]) -> bool {
+    deliver(paths, None)
+}
+
+fn deliver(paths: &[std::path::PathBuf], target: Option<&str>) -> bool {
     use windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW;
     let Some(hwnd) = tray_window_handle() else {
         return false;
     };
-    let text = paths
-        .iter()
-        .map(|path| path.display().to_string())
-        .collect::<Vec<_>>()
-        .join("\r\n");
+    let mut lines: Vec<String> = Vec::with_capacity(paths.len() + 1);
+    if let Some(target) = target {
+        lines.push(format!("@to={target}"));
+    }
+    lines.extend(paths.iter().map(|path| path.display().to_string()));
+    let text = lines.join("\r\n");
     let mut buffer: Vec<u16> = text.encode_utf16().collect();
     let cds = CopyDataStruct {
         dw_data: 0,
@@ -158,19 +167,26 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 let len = cds.cb_data as usize / 2;
                 let slice = std::slice::from_raw_parts(cds.lp_data as *const u16, len);
                 let text = String::from_utf16_lossy(slice);
-                let paths: Vec<std::path::PathBuf> = text
-                    .lines()
-                    .map(str::trim)
-                    .filter(|line| !line.is_empty())
-                    .map(std::path::PathBuf::from)
-                    .collect();
+                let mut target: Option<String> = None;
+                let mut paths: Vec<std::path::PathBuf> = Vec::new();
+                for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                    if let Some(rest) = line.strip_prefix("@to=") {
+                        target = Some(rest.to_string());
+                    } else {
+                        paths.push(std::path::PathBuf::from(line));
+                    }
+                }
                 if !paths.is_empty() {
                     hfx_receiver::log::info(&format!(
-                        "{}: {}",
+                        "{}: {}{}",
                         hfx_receiver::i18n::tr("收到待发送文件", "pending files"),
-                        paths.len()
+                        paths.len(),
+                        target
+                            .as_ref()
+                            .map(|t| format!(" -> {}", t))
+                            .unwrap_or_default()
                     ));
-                    hfx_receiver::pending::push(paths);
+                    hfx_receiver::pending::push_with_target(paths, target);
                 }
             }
             1

@@ -248,6 +248,7 @@ impl AdbCycle {
                 0,
             ) {
             Ok(mut session) => {
+                session.device = device.serial.clone();
                 report_connected(&session, on_state);
                 run_session(&mut session, options, stop);
                 return Attempt::Ran;

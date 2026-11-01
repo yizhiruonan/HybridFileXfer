@@ -26,6 +26,8 @@ pub struct PeerInterface {
 }
 
 pub struct Session {
+    /// 本会话对应的手机串号（多设备时用于对待发送队列分流）
+    pub device: String,
     reader: TcpStream,
     writer: TcpStream,
     transfers: Vec<(String, TcpStream)>,
@@ -196,6 +198,7 @@ impl Session {
         reader.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
 
         Ok(Session {
+            device: String::new(),
             reader,
             writer,
             transfers,
@@ -317,7 +320,7 @@ impl Session {
     /// 通过所有传输通道发过去。格式与手机端 ReceiveFileCall 对应。
     /// 手机问"有没有要推给我的文件"：回列表（路径 + 大小）
     fn handle_check_pending(&mut self) -> io::Result<()> {
-        let items = crate::pending::snapshot();
+        let items = crate::pending::snapshot_for(&self.device);
         if !items.is_empty() {
             log::info(&format!("CHECK_PENDING -> {} item(s)", items.len()));
         }
@@ -331,7 +334,7 @@ impl Session {
 
     fn handle_send(&mut self) -> io::Result<()> {
         // 手机来拉了，队列清空，避免重复推送
-        let _ = crate::pending::take_all();
+        let _ = crate::pending::take_for(&self.device);
         let count = proto::read_i32(&mut self.reader)?.max(0);
         let mut sources = Vec::with_capacity(count as usize);
         for _ in 0..count {
