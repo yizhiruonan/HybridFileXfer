@@ -124,13 +124,14 @@ impl Adb {
         Ok(devices)
     }
 
-    pub fn forward(&self, serial: &str, port: u16) -> io::Result<bool> {
+    /// 本机 <local_port> → 手机 <remote_port>（多设备时每台用不同的本机端口）
+    pub fn forward(&self, serial: &str, local_port: u16, remote_port: u16) -> io::Result<bool> {
         let mut cmd = self.command();
         cmd.arg("-s")
             .arg(serial)
             .arg("forward")
-            .arg(format!("tcp:{port}"))
-            .arg(format!("tcp:{port}"));
+            .arg(format!("tcp:{local_port}"))
+            .arg(format!("tcp:{remote_port}"));
         let out = run(&mut cmd, Duration::from_secs(15))?;
         Ok(out.success)
     }

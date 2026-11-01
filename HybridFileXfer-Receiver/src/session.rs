@@ -48,8 +48,21 @@ impl Session {
         home_dir: &str,
         expected_interfaces: usize,
     ) -> io::Result<Session> {
+        Session::connect_with_local_port(address, port, port, home_dir, expected_interfaces)
+    }
+
+    /// 多设备时每台手机有独立的 adb 转发端口：
+    /// 回环地址（USB_ADB）用 local_port，其它网卡仍用手机监听的 port。
+    pub fn connect_with_local_port(
+        address: IpAddr,
+        port: u16,
+        local_port: u16,
+        home_dir: &str,
+        expected_interfaces: usize,
+    ) -> io::Result<Session> {
+        let control_port = if address.is_loopback() { local_port } else { port };
         let control = TcpStream::connect_timeout(
-            &SocketAddr::new(address, port),
+            &SocketAddr::new(address, control_port),
             CONNECT_TIMEOUT,
         )?;
         control.set_nodelay(true)?;
@@ -115,7 +128,12 @@ impl Session {
         // flags are exchanged there, not on the transfer channels.
         let mut cw = writer.try_clone()?;
         for interface in &interfaces {
-            let target = SocketAddr::new(interface.address, port);
+            let interface_port = if interface.address.is_loopback() {
+                local_port
+            } else {
+                port
+            };
+            let target = SocketAddr::new(interface.address, interface_port);
             log::debug(&format!(
                 "connecting transfer channel {} -> {} (bind: {})",
                 interface.name,

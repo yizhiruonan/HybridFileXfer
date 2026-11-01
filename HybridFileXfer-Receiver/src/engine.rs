@@ -52,6 +52,11 @@ pub struct EngineOptions {
     pub adb_path: Option<PathBuf>,
     /// 用来查找旁边目录里的 adb.exe
     pub adb_search_dir: PathBuf,
+    /// 本机 adb 转发用的端口（多设备时每台不同，避免互相覆盖）
+    pub local_port: u16,
+    /// 已绑定具体设备（多设备会话）：不要再走"谁最近就联谁"的局域网发现回退，
+    /// 否则两条会话可能抢同一台手机，互相把对方踢掉。
+    pub pinned: bool,
 }
 
 pub type StateSink = Arc<dyn Fn(EngineState) + Send + Sync>;
@@ -85,6 +90,9 @@ pub fn run_multi(
                     }
                     let mut per_device = options.clone();
                     per_device.device = Some(serial.clone());
+                    // 每台手机一个独立的本机转发端口（从 5750 起），否则互相覆盖
+                    per_device.local_port = 5750 + running.len() as u16;
+                    per_device.pinned = true;
                     let stop_for_device = Arc::clone(&stop);
                     let sink = {
                         let on_state = Arc::clone(&on_state);
@@ -191,7 +199,7 @@ impl AdbCycle {
         };
         self.last_notice = None;
 
-        if !adb.forward(&device.serial, options.port).unwrap_or(false) {
+        if !adb.forward(&device.serial, options.local_port, options.port).unwrap_or(false) {
             let message = format!(
                 "{} {}",
                 tr("adb 端口转发失败", "adb port forward failed:"),
@@ -230,7 +238,13 @@ impl AdbCycle {
             self.last_ensure = Instant::now();
         }
 
-        match Session::connect(IpAddr::from([127, 0, 0, 1]), options.port, &home_dir(options), 0) {
+        match Session::connect_with_local_port(
+                IpAddr::from([127, 0, 0, 1]),
+                options.port,
+                options.local_port,
+                &home_dir(options),
+                0,
+            ) {
             Ok(mut session) => {
                 report_connected(&session, on_state);
                 run_session(&mut session, options, stop);
@@ -279,7 +293,7 @@ fn run_auto(options: &EngineOptions, stop: &Arc<AtomicBool>, on_state: &StateSin
             }
         }
 
-        if try_discovery(&discovery, options, stop, on_state) {
+        if !options.pinned && try_discovery(&discovery, options, stop, on_state) {
             continue;
         }
         if !sleep_unless_stopped(stop, Duration::from_millis(800)) {
@@ -425,5 +439,7 @@ pub fn options_from_config(
         component: config.service_component.clone(),
         adb_path: config.adb_path.clone(),
         adb_search_dir: adb_search_dir.to_path_buf(),
+        local_port: config.port,
+        pinned: false,
     }
 }

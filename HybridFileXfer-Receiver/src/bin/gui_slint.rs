@@ -74,6 +74,8 @@ impl State {
             component: self.config.service_component.clone(),
             adb_path: self.config.adb_path.clone(),
             adb_search_dir: self.exe_dir.clone(),
+            local_port: port,
+            pinned: false,
         };
         let stop = Arc::new(AtomicBool::new(false));
         let stop_for_thread = Arc::clone(&stop);
