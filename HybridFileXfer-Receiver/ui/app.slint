@@ -149,18 +149,18 @@ export component AppWindow inherits Window {
     private property <string> status-text: root.status-kind == 2 ? "已连接" : root.status-kind == 3 ? "重试中" : root.status-kind == 1 ? "等待中" : "未启动";
 
     VerticalLayout {
-        padding: 14px;
-        spacing: 10px;
+        padding: 10px;
+        spacing: 8px;
 
         // ---------------- 状态（点击展开设备） ----------------
         Card {
             vertical-stretch: 0;
             HorizontalLayout {
-                padding-left: 16px;
-                padding-right: 16px;
-                padding-top: 14px;
-                padding-bottom: 14px;
-                spacing: 12px;
+                padding-left: 12px;
+                padding-right: 12px;
+                padding-top: 10px;
+                padding-bottom: 10px;
+                spacing: 10px;
 
                 Rectangle {
                     width: 40px;
@@ -227,11 +227,11 @@ export component AppWindow inherits Window {
             vertical-stretch: 0;
             VerticalLayout {
                 width: parent.width;
-                padding-left: 16px;
-                padding-right: 16px;
-                padding-top: 12px;
-                padding-bottom: 12px;
-                spacing: 6px;
+                padding-left: 12px;
+                padding-right: 12px;
+                padding-top: 8px;
+                padding-bottom: 8px;
+                spacing: 4px;
 
                 Text {
                     text: "有文件要推送，选择接收的设备：";
@@ -239,7 +239,7 @@ export component AppWindow inherits Window {
                     color: #1A1A1A;
                 }
                 for d[i] in root.devices : HorizontalLayout {
-                    height: 28px;
+                    height: 26px;
                     spacing: 8px;
                     Text {
                         text: d.name;
@@ -261,11 +261,11 @@ export component AppWindow inherits Window {
             vertical-stretch: 0;
             VerticalLayout {
                 width: parent.width;
-                padding-left: 16px;
-                padding-right: 16px;
-                padding-top: 10px;
-                padding-bottom: 10px;
-                spacing: 4px;
+                padding-left: 12px;
+                padding-right: 12px;
+                padding-top: 8px;
+                padding-bottom: 8px;
+                spacing: 3px;
 
                 for d[i] in root.devices : VerticalLayout {
                     spacing: 2px;
@@ -360,11 +360,11 @@ export component AppWindow inherits Window {
         Card {
             vertical-stretch: 0;
             VerticalLayout {
-                padding-left: 16px;
-                padding-right: 16px;
-                padding-top: 12px;
-                padding-bottom: 12px;
-                spacing: 5px;
+                padding-left: 12px;
+                padding-right: 12px;
+                padding-top: 8px;
+                padding-bottom: 8px;
+                spacing: 3px;
 
                 // 接收文件夹：标签在上，输入框自适应
                 Text { text: "接收文件夹"; font-size: 11px; color: #8A8A8A; }
