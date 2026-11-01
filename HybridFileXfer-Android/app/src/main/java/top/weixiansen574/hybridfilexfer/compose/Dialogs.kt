@@ -34,6 +34,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
@@ -344,6 +346,7 @@ private fun humanSize(bytes: Long): String {
 @Composable
 internal fun ReceiveProgressPanel(state: UiState) {
     val colorScheme = MiuixTheme.colorScheme
+    val haptic = LocalHapticFeedback.current
     // 用累计字节数算速率：多台电脑同时接收时显示的是合计速率。
     // 采样值先做一次指数平滑，再交给动画逐帧插值，数字才是"滑"的而不是一跳一跳。
     var lastBytes by remember { mutableStateOf(state.xferBytes) }
@@ -361,7 +364,7 @@ internal fun ReceiveProgressPanel(state: UiState) {
     val animatedSpeed by androidx.compose.animation.core.animateFloatAsState(
         targetValue = targetSpeed,
         animationSpec = androidx.compose.animation.core.tween(
-            durationMillis = 500,
+            durationMillis = 300,
             easing = androidx.compose.animation.core.LinearEasing,
         ),
         label = "speed",
@@ -370,7 +373,7 @@ internal fun ReceiveProgressPanel(state: UiState) {
     val animatedDone by androidx.compose.animation.core.animateFloatAsState(
         targetValue = state.xferDone.toFloat(),
         animationSpec = androidx.compose.animation.core.tween(
-            durationMillis = 450,
+            durationMillis = 200,
             easing = androidx.compose.animation.core.LinearEasing,
         ),
         label = "doneBytes",
@@ -489,7 +492,10 @@ internal fun ReceiveProgressPanel(state: UiState) {
                         horizontalArrangement = Arrangement.spacedBy(10.dp),
                     ) {
                         Button(
-                            onClick = { ServerService.resumeTransfer(state.xferId) },
+                            onClick = {
+                                haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                ServerService.resumeTransfer(state.xferId)
+                            },
                             modifier = Modifier.weight(1f),
                             colors = ButtonDefaults.buttonColorsPrimary(),
                         ) {
@@ -497,14 +503,20 @@ internal fun ReceiveProgressPanel(state: UiState) {
                         }
                         TextButton(
                             text = "取消接收",
-                            onClick = { ServerService.cancelTransfer(state.xferId) },
+                            onClick = {
+                                haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                ServerService.cancelTransfer(state.xferId)
+                            },
                             modifier = Modifier.weight(1f),
                         )
                     }
                 } else {
                     TextButton(
                         text = "暂停接收",
-                        onClick = { ServerService.pauseTransfer(state.xferId) },
+                        onClick = {
+                            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            ServerService.pauseTransfer(state.xferId)
+                        },
                         modifier = Modifier.fillMaxWidth(),
                     )
                 }
@@ -559,11 +571,11 @@ private fun SegmentedProgressBar(
  */
 @Composable
 private fun ProgressCell(fraction: Float, modifier: Modifier, color: Color, divider: Color, first: Boolean) {
-    // 每 120ms 采一次样，再补 150ms 的线性动画，看起来是连续走的
+    // 50ms 采一次样，补 120ms 线性动画：每次只追一小段，看起来是连续流动的
     val animated by androidx.compose.animation.core.animateFloatAsState(
         targetValue = fraction.coerceIn(0f, 1f),
         animationSpec = androidx.compose.animation.core.tween(
-            durationMillis = 300,
+            durationMillis = 120,
             easing = androidx.compose.animation.core.LinearEasing,
         ),
         label = "segmentFill",

@@ -321,6 +321,9 @@ fun HfxApp(
     var pcBrowse by remember { mutableStateOf(false) }
     // 取消接收后待决定"保留还是删除"的半成品文件
     var keepPartials by remember { mutableStateOf<List<String>>(emptyList()) }
+    // 启动/停止服务期间先把按钮变灰，给用户"点击已收到"的反馈
+    // 0 空闲 / 1 正在启动 / 2 正在停止（用两个方向，避免启动过程中按钮显示成"正在停止"）
+    var serviceBusy by remember { mutableStateOf(0) }
     val pagerState = rememberPagerState(pageCount = { 3 })
     // 拖动滑块时临时禁用整页横滑，否则手势会被 HorizontalPager 抢走
     var sliderActive by remember { mutableStateOf(false) }
@@ -394,11 +397,11 @@ fun HfxApp(
                 keepPartials = cancelledPartials
             }
             val now = android.os.SystemClock.elapsedRealtime()
-            // 传输中：每 120ms 只刷进度相关的轻量状态，进度条和速度才跟得上；
-            // 其余字段（权限/端口/网卡）仍然按原来的节奏全量刷新
+            // 传输中：每 50ms 只刷进度相关的轻量状态，配合更短的补间动画，
+            // 进度条看起来是连续在走而不是一跳一跳
             if (state.xferActive && now - lastFullRead < 1200) {
                 state = withContext(Dispatchers.IO) { readProgressState(state) }
-                delay(80)
+                delay(50)
                 continue
             }
             lastFullRead = now
@@ -478,23 +481,60 @@ fun HfxApp(
         }
     }
 
+    /** 等服务真正进入目标状态（服务状态的更新是异步的，读得太早会读到旧值） */
+    fun waitForService(expected: (Int) -> Boolean, timeoutMs: Long) {
+        val deadline = android.os.SystemClock.elapsedRealtime() + timeoutMs
+        while (android.os.SystemClock.elapsedRealtime() < deadline) {
+            if (expected(ServerService.getState())) return
+            try {
+                Thread.sleep(50)
+            } catch (_: InterruptedException) {
+                return
+            }
+        }
+    }
+
     fun startServer() {
+        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
         try {
             val config = Config.getInstance(activity)
             val selected = NetInterfaces.selected(interfaces)
             if (selected.isEmpty()) return
             NetInterfaces.save(activity, interfaces)
-            ServerService.startServer(activity, config.mode, selected, config.localBufferCount, config.remoteBufferCount)
-            state = readState(activity)
+            // 绑端口 + 重新读状态（里面有 root/网卡查询，都是阻塞的）放到 IO 线程，
+            // 否则主线程被占住，按钮点下去要等一会儿才有反应
+            serviceBusy = 1
+            scope.launch {
+                try {
+                    val began = android.os.SystemClock.elapsedRealtime()
+                    withContext(Dispatchers.IO) {
+                        ServerService.startServer(activity, config.mode, selected,
+                            config.localBufferCount, config.remoteBufferCount)
+                        // 等服务起来再刷新，避免按钮短暂回到"启动服务并等待连接"
+                        waitForService({ it != ServerService.STATE_STOPPED }, 3000)
+                    }
+                    state = withContext(Dispatchers.IO) { readState(activity) }
+                    // 操作太快时也把"正在启动…"显示够久，用户才看得见
+                    val left = 500L - (android.os.SystemClock.elapsedRealtime() - began)
+                    if (left > 0) kotlinx.coroutines.delay(left)
+                } finally {
+                    serviceBusy = 0
+                }
+            }
         } catch (_: Exception) {
+            serviceBusy = 0
         }
     }
 
     fun setAutoConnect(enabled: Boolean) {
         haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
         Config.getInstance(activity).isAutoConnectEnabled = enabled
-        if (enabled) ServerService.startAuto(activity) else ServerService.stopServer(activity)
-        state = readState(activity)
+        scope.launch {
+            withContext(Dispatchers.IO) {
+                if (enabled) ServerService.startAuto(activity) else ServerService.stopServer(activity)
+            }
+            state = withContext(Dispatchers.IO) { readState(activity) }
+        }
     }
 
     fun setMode(index: Int) {
@@ -549,6 +589,7 @@ fun HfxApp(
                 when (page) {
                     TAB_HOME -> HomePage(
                         state = state,
+                        serviceBusy = serviceBusy,
                         // 空闲时按"预计通道数"显示，和已连接时的口径保持一致：
                         // 一张 USB 网卡开 2 条通道，一张 WiFi/以太网开 4 条
                         plannedChannels = interfaces
@@ -556,8 +597,25 @@ fun HfxApp(
                             .sumOf { if (it.name.startsWith("USB_ADB")) 2 else 4 },
                         onStart = ::startServer,
                         onStop = {
-                            ServerService.stopServer(activity)
-                            state = readState(activity)
+                            if (serviceBusy == 0) {
+                                haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                serviceBusy = 2
+                                scope.launch {
+                                    try {
+                                        val began = android.os.SystemClock.elapsedRealtime()
+                                        withContext(Dispatchers.IO) {
+                                            ServerService.stopServer(activity)
+                                            // 等服务真正停掉再刷新，否则按钮会先变回"停止服务"再变"启动"
+                                            waitForService({ it == ServerService.STATE_STOPPED }, 3000)
+                                        }
+                                        state = withContext(Dispatchers.IO) { readState(activity) }
+                                        val left = 500L - (android.os.SystemClock.elapsedRealtime() - began)
+                                        if (left > 0) kotlinx.coroutines.delay(left)
+                                    } finally {
+                                        serviceBusy = 0
+                                    }
+                                }
+                            }
                         },
                         onTransfer = ::beginTransfer,
                         onOpenConnections = { scope.launch { pagerState.animateScrollToPage(TAB_CONNECTIONS) } },
@@ -663,6 +721,7 @@ fun HfxApp(
 @Composable
 private fun HomePage(
     state: UiState,
+    serviceBusy: Int,
     plannedChannels: Int,
     onStart: () -> Unit,
     onStop: () -> Unit,
@@ -695,12 +754,35 @@ private fun HomePage(
             }
         }
         item {
-            if (state.state != ServerService.STATE_STOPPED) {
-                Button(onClick = onStop, modifier = Modifier.fillMaxWidth(), colors = ButtonDefaults.buttonColorsPrimary()) {
+            when {
+                serviceBusy == 1 -> Button(
+                    onClick = {},
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = false,
+                    colors = ButtonDefaults.buttonColorsPrimary(),
+                ) {
+                    Text("正在启动…", color = Color.White)
+                }
+                serviceBusy == 2 -> Button(
+                    onClick = {},
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = false,
+                    colors = ButtonDefaults.buttonColorsPrimary(),
+                ) {
+                    Text("正在停止…", color = Color.White)
+                }
+                state.state != ServerService.STATE_STOPPED -> Button(
+                    onClick = onStop,
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.buttonColorsPrimary(),
+                ) {
                     Text("停止服务", color = Color.White)
                 }
-            } else {
-                Button(onClick = onStart, modifier = Modifier.fillMaxWidth(), colors = ButtonDefaults.buttonColorsPrimary()) {
+                else -> Button(
+                    onClick = onStart,
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.buttonColorsPrimary(),
+                ) {
                     Text("启动服务并等待连接", color = Color.White)
                 }
             }
