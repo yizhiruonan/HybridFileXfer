@@ -90,6 +90,14 @@ private const val TAB_HOME = 0
 private const val TAB_CONNECTIONS = 1
 private const val TAB_SETTINGS = 2
 
+/** 一条传输通道的进度（进度浮层表格里的一行） */
+internal data class ChannelStat(
+    val name: String,
+    val bytes: Long,
+    val speed: Long,
+    val finished: Boolean,
+)
+
 /** 一台已连接电脑的界面模型（B 方案：手机同时接多台电脑） */
 internal data class PcConn(
     val id: Int,
@@ -101,6 +109,9 @@ internal data class PcConn(
     val fileName: String = "",
     val done: Long = 0,
     val total: Long = 0,
+    /** 当前文件的分块完成度（96 段，0~1） */
+    val segments: List<Float> = emptyList(),
+    val channelStats: List<ChannelStat> = emptyList(),
 )
 
 internal data class UiState(
@@ -120,6 +131,10 @@ internal data class UiState(
     val xferCount: Int = 0,
     /** 所有连接累计接收的字节数（只增不减），用来算合计速率 */
     val xferBytes: Long = 0,
+    /** 当前展示的那台电脑与它的分块进度 / 通道明细 */
+    val xferLabel: String = "",
+    val xferSegments: List<Float> = emptyList(),
+    val xferChannels: List<ChannelStat> = emptyList(),
     val mode: Int = 0,
     val autoConnect: Boolean = true,
     val localBuffer: Int = 256,
@@ -193,9 +208,14 @@ internal fun readState(context: Context): UiState {
             fileName = live.name,
             done = live.done,
             total = live.total,
+            segments = server.blockProgress.segments(96).toList(),
+            channelStats = live.channelSnapshot().mapNotNull { stat ->
+                stat.name?.let { name -> ChannelStat(name, stat.bytes, stat.speed, stat.finished) }
+            },
         )
     }
     val current = ServerService.currentTransfer()
+    val currentConn = connections.firstOrNull { it.id == (current?.connectionId ?: -1) }
     return UiState(
         state = ServerService.getState(),
         connected = ServerService.isConnected(),
@@ -211,6 +231,9 @@ internal fun readState(context: Context): UiState {
         xferTotal = current?.total ?: 0,
         xferCount = ServerService.transferringCount(),
         xferBytes = ServerService.receivedTotalBytes(),
+        xferLabel = currentConn?.label ?: "",
+        xferSegments = currentConn?.segments ?: emptyList(),
+        xferChannels = currentConn?.channelStats ?: emptyList(),
         mode = config.mode,
         autoConnect = config.isAutoConnectEnabled,
         localBuffer = config.localBufferCount,

@@ -18,6 +18,7 @@ import java.util.concurrent.LinkedBlockingDeque;
 import top.weixiansen574.async.BackstageTask;
 import top.weixiansen574.hybridfilexfer.NativeMemory;
 import top.weixiansen574.hybridfilexfer.aidl.IIOService;
+import top.weixiansen574.hybridfilexfer.core.BlockProgress;
 import top.weixiansen574.hybridfilexfer.core.ControllerIdentifiers;
 import top.weixiansen574.hybridfilexfer.core.FileBlock;
 import top.weixiansen574.hybridfilexfer.core.HFXService;
@@ -52,6 +53,9 @@ public class HFXServer extends HFXService {
     public final Object controlLock = new Object();
     protected int remoteFileSystem;
     protected String remoteHomeDir;
+
+    /** 电脑推送文件时的分块进度（给进度浮层画分块进度条） */
+    public final BlockProgress blockProgress = new BlockProgress();
 
     private final int id = NEXT_ID.getAndIncrement();
     private volatile String displayName = "";
@@ -542,7 +546,7 @@ public class HFXServer extends HFXService {
 
     @Override
     protected WriteFileCall createWriteFileCall(LinkedBlockingDeque<ByteBuffer> buffers, int dequeCount) {
-        return new DroidWriteFileCall(buffers,dequeCount,ioService);
+        return new DroidWriteFileCall(buffers, dequeCount, ioService, blockProgress);
     }
 
     @Override

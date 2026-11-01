@@ -8,6 +8,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -338,7 +339,7 @@ private fun humanSize(bytes: Long): String {
     }
 }
 
-/** 电脑推送文件时的进度提示（和发送时同款的浮层样式） */
+/** 电脑推送文件时的进度提示：分块进度条 + 每通道明细（IDM / 迅雷 那种） */
 @Composable
 internal fun ReceiveProgressPanel(state: UiState) {
     val colorScheme = MiuixTheme.colorScheme
@@ -355,12 +356,6 @@ internal fun ReceiveProgressPanel(state: UiState) {
         lastAt = now
     }
 
-    val ratio = if (state.xferTotal > 0) {
-        (state.xferDone.toFloat() / state.xferTotal.toFloat()).coerceIn(0f, 1f)
-    } else {
-        0f
-    }
-    val segments = 48
     val name = state.xferName.substringAfterLast('/').substringAfterLast('\\')
 
     Box(
@@ -371,9 +366,11 @@ internal fun ReceiveProgressPanel(state: UiState) {
     ) {
         Column(
             modifier = Modifier
-                .width(320.dp)
+                .width(340.dp)
+                .heightIn(max = 560.dp)
                 .clip(RoundedCornerShape(24.dp))
                 .background(colorScheme.surfaceContainer)
+                .verticalScroll(rememberScrollState())
                 .padding(20.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
@@ -382,27 +379,20 @@ internal fun ReceiveProgressPanel(state: UiState) {
                 fontSize = 19.sp,
                 fontWeight = FontWeight.Bold,
             )
-            Spacer(Modifier.height(12.dp))
+            Spacer(Modifier.height(10.dp))
             Text(
-                name.ifEmpty { "…" },
+                (if (state.xferLabel.isNotEmpty()) state.xferLabel + " · " else "") + name.ifEmpty { "…" },
                 fontSize = 13.sp,
                 maxLines = 1,
                 overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
             )
-            Spacer(Modifier.height(10.dp))
-            Row(modifier = Modifier.fillMaxWidth().height(14.dp)) {
-                for (i in 0 until segments) {
-                    val filled = ratio * segments > i + 0.5f
-                    Box(
-                        modifier = Modifier
-                            .weight(1f)
-                            .height(14.dp)
-                            .padding(horizontal = 0.5.dp)
-                            .clip(RoundedCornerShape(3.dp))
-                            .background(if (filled) colorScheme.primary else colorScheme.surfaceVariant),
-                    )
-                }
-            }
+            Spacer(Modifier.height(12.dp))
+            // 整条进度条按文件块完成度切段填充
+            SegmentedProgressBar(
+                segments = state.xferSegments,
+                color = colorScheme.primary,
+                track = colorScheme.surfaceVariant,
+            )
             Spacer(Modifier.height(10.dp))
             Text(
                 humanSize(state.xferDone) + " / " + humanSize(state.xferTotal) +
@@ -410,6 +400,87 @@ internal fun ReceiveProgressPanel(state: UiState) {
                 fontSize = 12.sp,
                 color = colorScheme.onSurfaceVariantSummary,
             )
+            if (state.xferChannels.isNotEmpty()) {
+                Spacer(Modifier.height(14.dp))
+                Box(Modifier.fillMaxWidth().height(1.dp).background(colorScheme.surfaceVariant))
+                Spacer(Modifier.height(10.dp))
+                Text(
+                    "各通道进度",
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Spacer(Modifier.height(4.dp))
+                state.xferChannels.forEachIndexed { index, channel ->
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            (index + 1).toString(),
+                            fontSize = 11.sp,
+                            color = colorScheme.onSurfaceVariantSummary,
+                            modifier = Modifier.width(18.dp),
+                        )
+                        Text(
+                            channel.name,
+                            fontSize = 12.sp,
+                            maxLines = 1,
+                            overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f),
+                        )
+                        Text(
+                            humanSize(channel.bytes),
+                            fontSize = 11.sp,
+                            color = colorScheme.onSurfaceVariantSummary,
+                            maxLines = 1,
+                            textAlign = TextAlign.End,
+                            modifier = Modifier.width(74.dp),
+                        )
+                        Text(
+                            when {
+                                channel.speed > 0 -> formatSpeed(channel.speed)
+                                channel.finished -> "已完成"
+                                else -> "正在接收数据…"
+                            },
+                            fontSize = 11.sp,
+                            maxLines = 1,
+                            color = if (channel.speed > 0) colorScheme.primary else colorScheme.onSurfaceVariantSummary,
+                            textAlign = TextAlign.End,
+                            modifier = Modifier.width(82.dp),
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+/** 分块进度条：整条按文件块完成度切段填充（IDM / 迅雷 那种效果） */
+@Composable
+private fun SegmentedProgressBar(segments: List<Float>, color: Color, track: Color) {
+    Row(
+        modifier = Modifier.fillMaxWidth().height(14.dp),
+        horizontalArrangement = Arrangement.spacedBy(1.dp),
+    ) {
+        segments.forEach { ratio ->
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxHeight()
+                    .clip(RoundedCornerShape(1.dp))
+                    .background(track),
+            ) {
+                val filled = ratio.coerceIn(0f, 1f)
+                if (filled > 0f) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxHeight()
+                            .fillMaxWidth(filled)
+                            .background(color),
+                    )
+                }
+            }
         }
     }
 }
