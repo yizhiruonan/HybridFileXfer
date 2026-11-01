@@ -410,7 +410,24 @@ fn main() -> Result<(), slint::PlatformError> {
                         expanded: s.expanded.contains(serial),
                     });
                 }
-                ui.set_devices(slint::ModelRc::new(slint::VecModel::from(rows)));
+                // 两两配对，界面一行画两个
+                let mut pairs: Vec<DevicePair> = Vec::with_capacity((rows.len() + 1) / 2);
+                let mut iter = rows.into_iter();
+                while let Some(left) = iter.next() {
+                    let right = iter.next();
+                    pairs.push(DevicePair {
+                        has_right: right.is_some(),
+                        right: right.unwrap_or(DeviceRow {
+                            name: "".into(),
+                            state: "".into(),
+                            rate: "".into(),
+                            detail: "".into(),
+                            expanded: false,
+                        }),
+                        left,
+                    });
+                }
+                ui.set_device_rows(slint::ModelRc::new(slint::VecModel::from(pairs)));
             }
 
             // 多台设备在线时暂扣待发送文件，避免某台抢先取走
