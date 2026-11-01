@@ -119,15 +119,20 @@ fn main() -> Result<(), slint::PlatformError> {
 
     remove_legacy_autostart_script();
     // Explorer「发送到 → 手机」：把选中文件投递给已运行的实例，投递成功就直接退出
-    let mut send_mode = false;
+    // 只要命令行里带了已存在的文件路径，就当作「发送到手机」。
+    // 这样用户自己把快捷方式拖进 SendTo 即可，程序不需要拉 PowerShell 去造 .lnk
+    //（无签名程序 + 拉起脚本 + 写快捷方式，很容易被杀软判成木马）。
     let mut send_files: Vec<PathBuf> = Vec::new();
     for arg in std::env::args().skip(1) {
-        if arg == "--send" {
-            send_mode = true;
-        } else if send_mode {
-            send_files.push(PathBuf::from(arg));
+        if arg == "--send" || arg == "--autostart" {
+            continue;
+        }
+        let path = PathBuf::from(&arg);
+        if path.exists() {
+            send_files.push(path);
         }
     }
+    let send_mode = !send_files.is_empty();
     if send_mode {
         #[cfg(windows)]
         if tray_win::deliver_paths(&send_files) {
@@ -419,9 +424,6 @@ fn main() -> Result<(), slint::PlatformError> {
         );
     }
 
-    #[cfg(windows)]
-    ensure_send_to_shortcut(&exe_dir);
-
     // --autostart：开机自启时直接开始接收（隐藏交给轮询定时器，等窗口真正创建好）
     if launch_at_boot {
         ui.invoke_start_clicked();
@@ -550,55 +552,6 @@ fn open_release_page() -> Result<(), String> {
         .spawn()
         .map_err(|e| format!("打开浏览器失败：{e}"))?;
     Ok(())
-}
-
-/// 在「发送到」菜单里放一个指向本程序的快捷方式（已存在则跳过）
-#[cfg(windows)]
-fn ensure_send_to_shortcut(exe_dir: &Path) {
-    use std::os::windows::process::CommandExt;
-    let Some(appdata) = std::env::var_os("APPDATA") else {
-        return;
-    };
-    let dir = PathBuf::from(appdata)
-        .join("Microsoft")
-        .join("Windows")
-        .join("SendTo");
-    let link = dir.join("发送到手机.lnk");
-    if link.exists() {
-        return;
-    }
-    let exe = exe_dir.join("HybridFileXfer-Receiver.exe");
-    // 用临时 .ps1（UTF-8 BOM）执行，避免命令行编码问题
-    let script_path = std::env::temp_dir().join("hfx_sendto.ps1");
-    let script = format!(
-        "$s = (New-Object -ComObject WScript.Shell).CreateShortcut('{}')\r\n\
-         $s.TargetPath = '{}'\r\n\
-         $s.Arguments = '--send'\r\n\
-         $s.IconLocation = '{}'\r\n\
-         $s.Save()\r\n",
-        link.display(),
-        exe.display(),
-        exe.display()
-    );
-    let mut bytes = vec![0xEF, 0xBB, 0xBF];
-    bytes.extend_from_slice(script.as_bytes());
-    if std::fs::write(&script_path, bytes).is_err() {
-        return;
-    }
-    let _ = std::process::Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-WindowStyle",
-            "Hidden",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-        ])
-        .arg(&script_path)
-        .creation_flags(0x0800_0000)
-        .status();
-    let _ = std::fs::remove_file(&script_path);
 }
 
 // ---------------- 工具函数 ----------------
