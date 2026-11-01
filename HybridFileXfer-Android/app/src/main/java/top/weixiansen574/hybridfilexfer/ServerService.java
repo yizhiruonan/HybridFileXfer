@@ -151,6 +151,23 @@ public class ServerService extends Service implements ServiceConnection {
         return server != null ? server.getChannelDetails() : java.util.Collections.emptyList();
     }
 
+    /** 电脑推送文件的实时进度（界面轮询读取） */
+    public static final class Live {
+        public static volatile boolean active = false;
+        public static volatile String name = "";
+        public static volatile long done = 0;
+        public static volatile long total = 0;
+        public static volatile long session = 0;
+
+        public static void reset() {
+            active = false;
+            name = "";
+            done = 0;
+            total = 0;
+            session = 0;
+        }
+    }
+
     /** MIUI 会吞应用日志，调试信息直接写文件 */
     private static void debugFile(String line) {
         try {
@@ -174,6 +191,8 @@ public class ServerService extends Service implements ServiceConnection {
         final String TAG2 = "HFXPULL";
         try {
             debugFile("pull start, files=" + files.size());
+            Live.reset();
+            Live.active = true;
             for (top.weixiansen574.hybridfilexfer.core.bean.RemoteFile f : files) {
                 debugFile("  pending: " + f.getPath() + " (" + f.getSize() + ")");
             }
@@ -199,6 +218,10 @@ public class ServerService extends Service implements ServiceConnection {
                         public void onFileUploading(String iName, String path, long targetSize, long totalSize) {
                         }
                         public void onFileDownloading(String iName, String path, long targetSize, long totalSize) {
+                            Live.name = path;
+                            Live.done = targetSize;
+                            Live.total = totalSize;
+                            Live.session += 0;
                         }
                         public void onSpeedInfo(java.util.List<top.weixiansen574.hybridfilexfer.core.bean.TrafficInfo> list) {
                         }
@@ -212,15 +235,20 @@ public class ServerService extends Service implements ServiceConnection {
                         }
                         public void onWriteFileError(String message) {
                             debugFile("WRITE FILE ERROR: " + message);
+                            Live.active = false;
                         }
                         public void onComplete(boolean isUpload, long traffic, long time) {
                             debugFile("complete: " + traffic + " bytes -> " + dir);
+                            Live.session = traffic;
+                            Live.active = false;
                         }
                         public void onIncomplete() {
                             debugFile("incomplete");
+                            Live.active = false;
                         }
                     });
             debugFile("pulled " + files.size() + " file(s) from PC");
+            Live.active = false;
         } catch (Throwable e) {
             debugFile("pull failed: " + e);
         }

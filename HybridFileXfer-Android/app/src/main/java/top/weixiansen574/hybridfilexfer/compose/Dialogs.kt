@@ -391,3 +391,86 @@ internal fun ConnectionInfoPanel(state: UiState, onDismiss: () -> Unit) {
         }
     }
 }
+
+private fun humanSize(bytes: Long): String {
+    if (bytes <= 0) return "0 B"
+    val kb = 1024.0
+    val b = bytes.toDouble()
+    return when {
+        b >= kb * kb * kb -> String.format("%.2f GB", b / (kb * kb * kb))
+        b >= kb * kb -> String.format("%.1f MB", b / (kb * kb))
+        b >= kb -> String.format("%.0f KB", b / kb)
+        else -> "$bytes B"
+    }
+}
+
+/** 电脑推送文件时的进度提示（和发送时同款的浮层样式） */
+@Composable
+internal fun ReceiveProgressPanel(state: UiState) {
+    val colorScheme = MiuixTheme.colorScheme
+    var lastDone by remember { mutableStateOf(state.xferDone) }
+    var lastAt by remember { mutableStateOf(System.currentTimeMillis()) }
+    var speed by remember { mutableStateOf(0L) }
+
+    LaunchedEffect(state.xferDone) {
+        val now = System.currentTimeMillis()
+        val dt = (now - lastAt).coerceAtLeast(1L)
+        speed = if (state.xferDone >= lastDone) (state.xferDone - lastDone) * 1000L / dt else 0L
+        lastDone = state.xferDone
+        lastAt = now
+    }
+
+    val ratio = if (state.xferTotal > 0) {
+        (state.xferDone.toFloat() / state.xferTotal.toFloat()).coerceIn(0f, 1f)
+    } else {
+        0f
+    }
+    val segments = 48
+    val name = state.xferName.substringAfterLast('/').substringAfterLast('\\')
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black.copy(alpha = 0.35f)),
+        contentAlignment = Alignment.Center,
+    ) {
+        Column(
+            modifier = Modifier
+                .width(320.dp)
+                .clip(RoundedCornerShape(24.dp))
+                .background(colorScheme.surfaceContainer)
+                .padding(20.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Text("正在接收文件", fontSize = 19.sp, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(12.dp))
+            Text(
+                name.ifEmpty { "…" },
+                fontSize = 13.sp,
+                maxLines = 1,
+                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+            )
+            Spacer(Modifier.height(10.dp))
+            Row(modifier = Modifier.fillMaxWidth().height(14.dp)) {
+                for (i in 0 until segments) {
+                    val filled = ratio * segments > i + 0.5f
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(14.dp)
+                            .padding(horizontal = 0.5.dp)
+                            .clip(RoundedCornerShape(3.dp))
+                            .background(if (filled) colorScheme.primary else colorScheme.surfaceVariant),
+                    )
+                }
+            }
+            Spacer(Modifier.height(10.dp))
+            Text(
+                humanSize(state.xferDone) + " / " + humanSize(state.xferTotal) +
+                    "   ·   " + formatSpeed(speed),
+                fontSize = 12.sp,
+                color = colorScheme.onSurfaceVariantSummary,
+            )
+        }
+    }
+}
