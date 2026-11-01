@@ -19,9 +19,13 @@ public abstract class HFXService {
     protected final LinkedBlockingDeque<ByteBuffer> buffers = new LinkedBlockingDeque<>();
     protected DataByteChannel ctChannel;
     protected List<TransferConnection> connections;
+    /** 当前传输的暂停闸门（每次传输新建一个，暂停/继续都作用在它上面） */
+    protected volatile TransferPause pauseGate = new TransferPause();
 
     protected boolean sendFiles(List<RemoteFile> fileList,Directory localDir, Directory remoteDir, TransferFileCallback callback) throws IOException {
+        pauseGate = new TransferPause();
         ReadFileCall readFileCall = createReadFileCall(buffers, fileList, localDir, remoteDir, connections.size());
+        readFileCall.setPause(pauseGate);
         FutureTask<Void> readFileTask = new FutureTask<>(readFileCall);
         Thread readThread = new Thread(readFileTask);
         readThread.setName("FileRead");
@@ -33,7 +37,7 @@ public abstract class HFXService {
         long startTime = System.currentTimeMillis();
         List<FutureTask<Void>> transferTasks = new ArrayList<>(connections.size());
         for (TransferConnection connection : connections) {
-            FutureTask<Void> task = new FutureTask<>(new SendFileCall(readFileCall, connection, callback));
+            FutureTask<Void> task = new FutureTask<>(new SendFileCall(readFileCall, connection, callback, pauseGate));
             transferTasks.add(task);
             Thread thread = new Thread(task);
             thread.setName("UL_" + connection.iName);
@@ -90,6 +94,7 @@ public abstract class HFXService {
     }
 
     protected boolean receiveFiles(TransferFileCallback callback) throws IOException {
+        pauseGate = new TransferPause();
         WriteFileCall writeFileCall = createWriteFileCall(buffers, connections.size());
         long startTime = System.currentTimeMillis();
 
@@ -100,7 +105,7 @@ public abstract class HFXService {
         List<FutureTask<Void>> transferTasks = new ArrayList<>(connections.size());
         for (int i = 0; i < connections.size(); i++) {
             TransferConnection connection = connections.get(i);
-            FutureTask<Void> task = new FutureTask<>(new ReceiveFileCall(i, connection, writeFileCall, callback));
+            FutureTask<Void> task = new FutureTask<>(new ReceiveFileCall(i, connection, writeFileCall, callback, pauseGate));
             transferTasks.add(task);
             Thread thread = new Thread(task);
             thread.setName("DL_" + connection.iName);

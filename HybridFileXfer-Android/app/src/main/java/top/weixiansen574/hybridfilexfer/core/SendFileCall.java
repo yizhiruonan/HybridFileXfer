@@ -10,12 +10,14 @@ public class SendFileCall implements Callable<Void> {
     private final DataByteChannel channel;
     private final TransferConnection connection;
     private final TransferFileCallback callback;
+    private final TransferPause pause;
 
-    public SendFileCall(ReadFileCall readFileCall, TransferConnection connection, TransferFileCallback callback) {
+    public SendFileCall(ReadFileCall readFileCall, TransferConnection connection, TransferFileCallback callback, TransferPause pause) {
         this.readFileCall = readFileCall;
         this.connection = connection;
         this.channel = connection.channel;
         this.callback = callback;
+        this.pause = pause;
         connection.resetTotalTrafficInfo();
     }
 
@@ -25,6 +27,9 @@ public class SendFileCall implements Callable<Void> {
         try {
             long startTime = System.currentTimeMillis();
             while (true) {
+                if (pause != null) {
+                    pause.awaitResume();
+                }
                 fileBlock = readFileCall.takeBlock();
                 if (fileBlock != null && fileBlock.isFile && fileBlock.data != null) {
                     SpeedLimiter.throttle(fileBlock.data.capacity());

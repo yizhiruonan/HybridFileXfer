@@ -22,6 +22,8 @@ public abstract class ReadFileCall implements Callable<Void> {
     private final Directory remoteDir;
     private final int operateThreadCount;
     private int fileIndex = -1;
+    /** 暂停闸门：暂停时不再往队列里读块 */
+    private volatile TransferPause pause;
 
     public ReadFileCall(LinkedBlockingDeque<ByteBuffer> buffers, List<RemoteFile> files, Directory localDir, Directory remoteDir, int operateThreadCount) {
         this.buffers = buffers;
@@ -29,6 +31,14 @@ public abstract class ReadFileCall implements Callable<Void> {
         this.localDir = localDir;
         this.remoteDir = remoteDir;
         this.operateThreadCount = operateThreadCount;
+    }
+
+    public void setPause(TransferPause pause) {
+        this.pause = pause;
+    }
+
+    private TransferPause pause() {
+        return pause;
     }
 
     @Override
@@ -93,6 +103,10 @@ public abstract class ReadFileCall implements Callable<Void> {
         }
         int i = 0;
         while (remaining > 0){
+            TransferPause gate = pause();
+            if (gate != null) {
+                gate.awaitResume();
+            }
             int blkSize = (int) Math.min(remaining,FileBlock.BLOCK_SIZE);
             ByteBuffer buffer = buffers.take();
             buffer.clear();

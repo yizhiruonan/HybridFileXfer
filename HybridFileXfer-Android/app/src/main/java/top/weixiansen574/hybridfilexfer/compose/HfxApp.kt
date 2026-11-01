@@ -120,6 +120,8 @@ internal data class PcConn(
     /** 当前文件的分段进度（一段 = 一条连接负责的区间，段数随动态切分变化） */
     val segments: List<SegInfo> = emptyList(),
     val channelStats: List<ChannelStat> = emptyList(),
+    /** 当前传输是否被用户暂停 */
+    val paused: Boolean = false,
 )
 
 internal data class UiState(
@@ -141,6 +143,7 @@ internal data class UiState(
     val xferBytes: Long = 0,
     /** 当前展示的那台电脑与它的分块进度 / 通道明细 */
     val xferId: Int = -1,
+    val xferPaused: Boolean = false,
     val xferLabel: String = "",
     val xferSegments: List<SegInfo> = emptyList(),
     val xferChannels: List<ChannelStat> = emptyList(),
@@ -223,6 +226,7 @@ internal fun buildPcConnections(servers: List<top.weixiansen574.hybridfilexfer.d
             channelStats = live.channelSnapshot().mapNotNull { stat ->
                 stat.name?.let { name -> ChannelStat(name, stat.bytes, stat.speed, stat.finished) }
             },
+            paused = server.isTransferPaused,
         )
     }
 }
@@ -244,6 +248,8 @@ internal fun readProgressState(base: UiState): UiState {
         xferName = current?.name ?: "",
         xferDone = currentConn?.done ?: 0,
         xferTotal = currentConn?.total ?: 0,
+        xferId = currentConn?.id ?: -1,
+        xferPaused = currentConn?.paused ?: false,
         xferCount = ServerService.transferringCount(),
         xferBytes = connections.filter { it.transferring }.sumOf { it.done },
         xferLabel = currentConn?.label ?: "",
@@ -273,6 +279,7 @@ internal fun readState(context: Context): UiState {
         xferDone = currentConn?.done ?: 0,
         xferTotal = currentConn?.total ?: 0,
         xferId = currentConn?.id ?: -1,
+        xferPaused = currentConn?.paused ?: false,
         xferCount = ServerService.transferringCount(),
         // 合计速率用"各连接已完成字节"求和（按块统计，分段/乱序都不会乱跳），
         // 不能用 lastBlock 位置，旧算法在多通道时就地飙升

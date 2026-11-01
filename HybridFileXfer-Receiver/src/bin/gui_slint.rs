@@ -293,6 +293,21 @@ fn main() -> Result<(), slint::PlatformError> {
         });
     }
     {
+        let ui_weak = ui.as_weak();
+        ui.on_toggle_pause_send(move || {
+            let paused = !hfx_receiver::control::paused();
+            hfx_receiver::control::pause(paused);
+            if let Some(ui) = ui_weak.upgrade() {
+                ui.set_send_paused(paused);
+            }
+        });
+    }
+    {
+        ui.on_cancel_send(move || {
+            hfx_receiver::control::cancel();
+        });
+    }
+    {
         let st = Arc::clone(&state);
         ui.on_tray_toggled(move |enabled| {
             let mut s = st.lock().unwrap();
@@ -489,6 +504,9 @@ fn main() -> Result<(), slint::PlatformError> {
 
             let active = s.running() && total > 0;
             ui.set_xfer_visible(active);
+            // 手机来拉文件时显示「暂停发送 / 中断发送」
+            ui.set_send_active(hfx_receiver::control::sending());
+            ui.set_send_paused(hfx_receiver::control::paused());
             if active {
                 let short = path
                     .rsplit(['/', '\\'])
@@ -524,6 +542,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 + if ui.get_ask_target() { 60.0 } else { 0.0 }
                 + devices_h
                 + if xfer_now { 130.0 } else { 0.0 }
+                + if xfer_now && ui.get_send_active() { 44.0 } else { 0.0 }
                 + if ui.get_update_state() == 2 || ui.get_update_state() == 5 {
                     34.0
                 } else {
