@@ -337,6 +337,28 @@ fn main() -> Result<(), slint::PlatformError> {
                 ui.set_status_title(title.into());
                 ui.set_status_sub(sub.into());
                 ui.set_running(count > 0);
+
+                // 每台设备一行：串号后 8 位 + 状态 + 已接收字节
+                let mut rows: Vec<DeviceRow> = Vec::with_capacity(count);
+                let mut serials: Vec<&String> = s.devices.keys().collect();
+                serials.sort();
+                for serial in serials {
+                    let state = &s.devices[serial];
+                    let label = match state {
+                        EngineState::Connected(_) => "已连接",
+                        EngineState::Waiting(_) => "等待连接",
+                        EngineState::Retrying(_) => "重试中",
+                        EngineState::Stopped => "已停止",
+                    };
+                    let progress = hfx_receiver::receiver::progress_for(serial);
+                    let (_, _, _, session_bytes, _files) = progress.snapshot();
+                    rows.push(DeviceRow {
+                        name: serial.chars().take(8).collect::<String>().into(),
+                        state: label.into(),
+                        rate: human(session_bytes).into(),
+                    });
+                }
+                ui.set_devices(slint::ModelRc::new(slint::VecModel::from(rows)));
             }
 
             // 开机自启：等窗口真正创建后隐藏到托盘（只做一次）
