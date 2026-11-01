@@ -23,12 +23,16 @@ public final class NetInterfaces {
     }
 
     /**
-     * 枚举所有可用的IPv4网卡，第一个固定为USB_ADB（adb转发到127.0.0.1）。
+     * 枚举所有可用的IPv4网卡；插着数据线（USB 供电）时第一个是 USB_ADB（adb 转发到 127.0.0.1）。
+     *
+     * <p>没插线时不再把 USB_ADB 列进计划里——否则拔线后界面上还挂着 USB 通道。
      */
     public static ArrayList<NetInterfaceInfo> enumerate(Context context)
             throws SocketException, UnknownHostException {
         ArrayList<NetInterfaceInfo> netInterfaceList = new ArrayList<>();
-        netInterfaceList.add(new NetInterfaceInfo(NetInterfaceInfo.USB_ADB, InetAddress.getByName("127.0.0.1")));
+        if (usbCablePresent(context)) {
+            netInterfaceList.add(new NetInterfaceInfo(NetInterfaceInfo.USB_ADB, InetAddress.getByName("127.0.0.1")));
+        }
         Enumeration<NetworkInterface> networkInterfaces = NetworkInterface.getNetworkInterfaces();
         while (networkInterfaces.hasMoreElements()) {
             NetworkInterface networkInterface = networkInterfaces.nextElement();
@@ -47,6 +51,22 @@ public final class NetInterfaces {
             }
         }
         return netInterfaceList;
+    }
+
+    /** 数据线插着吗（USB 供电）；查不到时按插着处理，保持旧行为 */
+    private static boolean usbCablePresent(Context context) {
+        try {
+            android.content.Intent intent = context.registerReceiver(null,
+                    new android.content.IntentFilter(android.content.Intent.ACTION_BATTERY_CHANGED));
+            if (intent == null) {
+                return true;
+            }
+            int plugged = intent.getIntExtra(android.os.BatteryManager.EXTRA_PLUGGED, 0);
+            return plugged == android.os.BatteryManager.BATTERY_PLUGGED_USB
+                    || plugged == android.os.BatteryManager.BATTERY_PLUGGED_AC;
+        } catch (Throwable e) {
+            return true;
+        }
     }
 
     /**
