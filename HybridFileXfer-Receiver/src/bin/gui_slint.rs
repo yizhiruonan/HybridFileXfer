@@ -1,6 +1,7 @@
 //! 图形界面版接收器（Slint + fluent 样式，Windows 11 观感）。
 
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// 一律使用 Windows 子系统：GUI 版不要控制台窗口（日志写 receiver.log）
+#![windows_subsystem = "windows"]
 
 slint::include_modules!();
 
@@ -17,6 +18,13 @@ use hfx_receiver::config::{self, Config};
 use hfx_receiver::engine::{self, ConnectMode, EngineOptions, EngineState};
 use hfx_receiver::i18n::{self, Lang};
 use hfx_receiver::log;
+use slint::ComponentHandle;
+
+#[cfg(windows)]
+mod tray_win;
+
+/// 窗口标题（托盘线程靠它找到主窗口）
+const WINDOW_TITLE: &str = "多轨快传";
 
 struct EngineHandle {
     stop: Arc<AtomicBool>,
@@ -119,6 +127,7 @@ fn main() -> Result<(), slint::PlatformError> {
     ui.set_port_text(state.lock().unwrap().config.port.to_string().into());
     ui.set_ip_text(ip_text.into());
     ui.set_autostart(autostart);
+    ui.set_tray(state.lock().unwrap().config.minimize_to_tray);
     ui.set_status_kind(0);
 
     // ---------- 回调 ----------
@@ -196,11 +205,25 @@ fn main() -> Result<(), slint::PlatformError> {
     }
     {
         let st = Arc::clone(&state);
+        ui.on_tray_toggled(move |enabled| {
+            let mut s = st.lock().unwrap();
+            s.config.minimize_to_tray = enabled;
+            let path = s.config_path.clone();
+            let config = s.config.clone();
+            if let Err(e) = config.save(&path) {
+                eprintln!("保存托盘设置失败: {e}");
+            }
+        });
+    }
+    {
+        let st = Arc::clone(&state);
         ui.on_open_dir(move || {
             let s = st.lock().unwrap();
             open_in_explorer(&s.config.receive_dir.display().to_string());
         });
     }
+
+    let launch_at_boot = std::env::args().any(|a| a == "--autostart");
 
     // ---------- 定时把线程里的状态/日志刷到界面 ----------
     let timer = slint::Timer::default();
@@ -212,6 +235,7 @@ fn main() -> Result<(), slint::PlatformError> {
         let mut speed = 0f64;
         let mut last_xfer_visible = false;
         let mut last_want_h = 0f32;
+        let mut boot_hidden = false;
 
         timer.start(slint::TimerMode::Repeated, Duration::from_millis(150), move || {
             let Some(ui) = ui_weak.upgrade() else { return };
@@ -239,6 +263,13 @@ fn main() -> Result<(), slint::PlatformError> {
                 ui.set_status_title(title.into());
                 ui.set_status_sub(sub.into());
                 ui.set_running(!matches!(s.state, EngineState::Stopped));
+            }
+
+            // 开机自启：等窗口真正创建后隐藏到托盘（只做一次）
+            #[cfg(windows)]
+            if launch_at_boot && !boot_hidden && ui.get_tray() {
+                boot_hidden = true;
+                tray_win::hide_main_window(WINDOW_TITLE);
             }
 
             // ---- 传输进度 ----
@@ -330,6 +361,40 @@ fn main() -> Result<(), slint::PlatformError> {
                 }
             });
         });
+    }
+
+    // ---------- 系统托盘 / 关闭行为 ----------
+    #[cfg(windows)]
+    {
+        let ui_weak = ui.as_weak();
+        ui.window().on_close_requested(move || {
+            let tray_enabled = ui_weak.upgrade().map(|ui| ui.get_tray()).unwrap_or(false);
+            if tray_enabled {
+                tray_win::hide_main_window(WINDOW_TITLE);
+                // 不真正关窗，只把原生窗口隐藏，事件循环继续跑
+                slint::CloseRequestResponse::KeepWindowShown
+            } else {
+                slint::CloseRequestResponse::HideWindow
+            }
+        });
+
+        let ui_weak = ui.as_weak();
+        tray_win::init(
+            move || {
+                if let Some(ui) = ui_weak.upgrade() {
+                    let _ = ui.show();
+                }
+                tray_win::show_main_window(WINDOW_TITLE);
+            },
+            || {
+                let _ = slint::quit_event_loop();
+            },
+        );
+    }
+
+    // --autostart：开机自启时直接开始接收（隐藏交给轮询定时器，等窗口真正创建好）
+    if launch_at_boot {
+        ui.invoke_start_clicked();
     }
 
     ui.run()
