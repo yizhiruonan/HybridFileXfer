@@ -85,6 +85,8 @@ export struct DeviceRow {
     name: string,
     state: string,
     rate: string,
+    detail: string,
+    expanded: bool,
 }
 
 export component AppWindow inherits Window {
@@ -134,6 +136,7 @@ export component AppWindow inherits Window {
     callback stop-clicked();
     callback autostart-toggled(bool);
     callback tray-toggled(bool);
+    callback device-clicked(int);
     callback open-dir();
 
     private property <color> status-color: root.status-kind == 2 ? #0F7B0F : root.status-kind == 3 ? #9D5D00 : #8A8A8A;
@@ -209,30 +212,44 @@ export component AppWindow inherits Window {
                 padding-bottom: 10px;
                 spacing: 4px;
 
-                for d in root.devices : HorizontalLayout {
-                    height: 22px;
-                    spacing: 8px;
-                    Text {
-                        text: d.name;
-                        font-size: 12px;
-                        color: #1A1A1A;
-                        width: 96px;
-                        vertical-alignment: center;
-                        overflow: elide;
+                for d[i] in root.devices : VerticalLayout {
+                    spacing: 2px;
+                    horizontal-stretch: 1;
+                    HorizontalLayout {
+                        height: 24px;
+                        spacing: 8px;
+                        horizontal-stretch: 1;
+                        ta := TouchArea {
+                            clicked => { root.device-clicked(i); }
+                        }
+                        Text {
+                            text: d.name;
+                            font-size: 12px;
+                            color: #1A1A1A;
+                            width: 96px;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                        Text {
+                            text: d.state;
+                            font-size: 11px;
+                            color: #616161;
+                            horizontal-stretch: 1;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                        Text {
+                            text: d.rate;
+                            font-size: 11px;
+                            color: #005FB8;
+                            vertical-alignment: center;
+                        }
                     }
-                    Text {
-                        text: d.state;
+                    if d.expanded : Text {
+                        text: d.detail;
                         font-size: 11px;
                         color: #616161;
-                        horizontal-stretch: 1;
-                        vertical-alignment: center;
-                        overflow: elide;
-                    }
-                    Text {
-                        text: d.rate;
-                        font-size: 11px;
-                        color: #005FB8;
-                        vertical-alignment: center;
+                        wrap: word-wrap;
                     }
                 }
             }
