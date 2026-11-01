@@ -25,6 +25,8 @@ pub struct Config {
     pub lang: Option<Lang>,
     /// 关闭窗口时是否最小化到系统托盘（后台继续等待连接）
     pub minimize_to_tray: bool,
+    /// 同时连接的手机数量上限（多设备）
+    pub max_devices: usize,
 }
 
 impl Default for Config {
@@ -37,6 +39,7 @@ impl Default for Config {
             service_component: DEFAULT_COMPONENT.to_string(),
             lang: None,
             minimize_to_tray: true,
+            max_devices: 3,
         }
     }
 }
@@ -109,6 +112,11 @@ impl Config {
                         _ => None,
                     };
                 }
+                "max_devices" | "devices" => {
+                    if let Ok(count) = value.parse::<usize>() {
+                        cfg.max_devices = count.clamp(1, 8);
+                    }
+                }
                 "minimize_to_tray" | "tray" => {
                     cfg.minimize_to_tray = !(value == "0" || value.eq_ignore_ascii_case("false"));
                 }
@@ -134,7 +142,9 @@ impl Config {
              # zh / en，留空跟随系统\n\
              lang = {}\n\
              # 关闭窗口时最小化到托盘（1 开启 / 0 关闭）\n\
-             minimize_to_tray = {}\n",
+             minimize_to_tray = {}\n\
+             # 同时连接的手机数量上限（1-8）\n\
+             max_devices = {}\n",
             self.receive_dir.display(),
             self.port,
             self.adb_path
@@ -148,7 +158,8 @@ impl Config {
                 Some(Lang::En) => "en",
                 None => "",
             },
-            if self.minimize_to_tray { "1" } else { "0" }
+            if self.minimize_to_tray { "1" } else { "0" },
+            self.max_devices
         );
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
