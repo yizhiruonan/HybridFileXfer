@@ -387,11 +387,13 @@ internal fun ReceiveProgressPanel(state: UiState) {
                 overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
             )
             Spacer(Modifier.height(12.dp))
-            // 整条进度条按文件块完成度切段填充
+            // IDM 式动态分段：一段 = 一条连接负责的文件区间，段数随切分变化。
+            // 底色用深一点的灰，没传到的部分也能看出进度条的总长度。
             SegmentedProgressBar(
                 segments = state.xferSegments,
+                fallback = if (state.xferTotal > 0) state.xferDone.toFloat() / state.xferTotal else 0f,
                 color = colorScheme.primary,
-                track = colorScheme.surfaceVariant,
+                track = colorScheme.onSurface.copy(alpha = 0.16f),
             )
             Spacer(Modifier.height(10.dp))
             Text(
@@ -456,31 +458,65 @@ internal fun ReceiveProgressPanel(state: UiState) {
     }
 }
 
-/** 分块进度条：整条按文件块完成度切段填充（IDM / 迅雷 那种效果） */
+/**
+ * 分块进度条：一段 = 一条连接负责的文件区间（IDM / 迅雷 那种）。
+ * 外观跟设置页的滑动条一致：整条是圆角胶囊，填充块也是圆头；
+ * 段宽按区间块数分配，段数会随"空闲连接去切别人的段"变化。
+ */
 @Composable
-private fun SegmentedProgressBar(segments: List<Float>, color: Color, track: Color) {
-    Row(
-        modifier = Modifier.fillMaxWidth().height(14.dp),
-        horizontalArrangement = Arrangement.spacedBy(1.dp),
+private fun SegmentedProgressBar(segments: List<SegInfo>, fallback: Float, color: Color, track: Color) {
+    val shape = RoundedCornerShape(50)
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(16.dp)
+            .clip(shape)
+            .background(track),
     ) {
-        segments.forEach { ratio ->
-            Box(
-                modifier = Modifier
-                    .weight(1f)
-                    .fillMaxHeight()
-                    .clip(RoundedCornerShape(1.dp))
-                    .background(track),
-            ) {
-                val filled = ratio.coerceIn(0f, 1f)
-                if (filled > 0f) {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxHeight()
-                            .fillMaxWidth(filled)
-                            .background(color),
+        Row(
+            modifier = Modifier.fillMaxSize(),
+            horizontalArrangement = Arrangement.spacedBy(2.dp),
+        ) {
+            if (segments.isEmpty()) {
+                ProgressCell(fallback.coerceIn(0f, 1f), Modifier.weight(1f), color, first = true, last = true)
+            } else {
+                segments.forEachIndexed { index, seg ->
+                    val span = (seg.end - seg.start).coerceAtLeast(1)
+                    ProgressCell(
+                        fraction = seg.filled.coerceIn(0f, 1f),
+                        modifier = Modifier.weight(span.toFloat()),
+                        color = color,
+                        first = index == 0,
+                        last = index == segments.lastIndex,
                     )
                 }
             }
+        }
+    }
+}
+
+/**
+ * 一段的填充块：只有整条进度条的最左/最右是圆角，中间各块的接缝是直角，
+ * 看起来才是"一条滑条被分成几段"，而不是一串圆珠子。
+ */
+@Composable
+private fun ProgressCell(fraction: Float, modifier: Modifier, color: Color, first: Boolean, last: Boolean) {
+    val radius = 8.dp
+    val shape = RoundedCornerShape(
+        topStart = if (first) radius else 0.dp,
+        bottomStart = if (first) radius else 0.dp,
+        topEnd = if (last) radius else 0.dp,
+        bottomEnd = if (last) radius else 0.dp,
+    )
+    Box(modifier = modifier.fillMaxHeight()) {
+        if (fraction > 0f) {
+            Box(
+                modifier = Modifier
+                    .fillMaxHeight()
+                    .fillMaxWidth(fraction)
+                    .clip(shape)
+                    .background(color),
+            )
         }
     }
 }

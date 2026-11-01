@@ -1,113 +1,194 @@
 package top.weixiansen574.hybridfilexfer.core;
 
+import java.util.ArrayList;
 import java.util.BitSet;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 
 /**
- * 单个文件的"块完成度"位图，给进度浮层画分块进度条用（IDM / 迅雷 那种）。
+ * 接收进度：按"谁负责哪一段"来记，给进度浮层画 IDM 那种动态分块进度条。
  *
- * <p>写盘线程每写完一块调用 {@link #onBlockWritten(String, int, long)}，
- * 界面线程随时调用 {@link #segments(int)} 取各段的完成比例：
- * 0 = 还没到，1 = 已完成，0~1 = 这一段只传了一部分。
+ * <p>IDM 的进度条不是固定段数：文件按连接切成若干段，一条连接一段；
+ * 某条连接传完自己的段后，它会去把别人还没传完的段再切一半过来。
+ * 所以段数会随传输过程变化（一开始 = 连接数，之后可能变多）。
  *
- * <p>线程安全：写盘线程和 UI 线程会同时访问。
+ * <p>手机是接收方，块由电脑分配；这里只需要记录"哪个通道送了第几块"，
+ * 相邻块归属变化的地方就是一段的边界（{@link #segments()}）。
+ * 电脑端按连续区间调度时，这里得到的就是 IDM 的段；旧电脑端按共享队列
+ * 轮询发送时，几乎每块都会换通道，段数会爆炸——{@link #segments(int)}
+ * 会检测到并退回成整条进度。
+ *
+ * <p>线程安全：接收线程写、UI 线程读。（块到达时记录，不区分是否已写盘）
  */
 public class BlockProgress {
-    /** 位图上限，防止异常文件大小把内存吃光（1M 块 = 1TB） */
     public static final int MAX_BLOCKS = 1 << 20;
+    private static final int MAX_SEGMENTS = 24;
+
+    /** 进度条上的一段：一个连接负责的文件区间 */
+    public static final class Segment {
+        /** 负责这条连接的名字（旧电脑端退回整条时为空串） */
+        public final String owner;
+        public final int start;
+        public final int end;
+        /** 这一段已完成比例 0~1 */
+        public final float filled;
+
+        Segment(String owner, int start, int end, float filled) {
+            this.owner = owner;
+            this.start = start;
+            this.end = end;
+            this.filled = filled;
+        }
+    }
 
     private final Object lock = new Object();
     private String path = "";
-    private long totalSize;
     private int totalBlocks;
+    private long totalSize;
+    private int[] owners = new int[0];
     private final BitSet done = new BitSet();
-    private int doneCount;
+    private final List<String> names = new ArrayList<>();
+    private final Map<String, Integer> nameIds = new HashMap<>();
 
-    /** 换一次传输（或断开）时清空 */
     public void reset() {
         synchronized (lock) {
             path = "";
-            totalSize = 0;
             totalBlocks = 0;
+            totalSize = 0;
+            owners = new int[0];
             done.clear();
-            doneCount = 0;
         }
     }
 
     /**
-     * 读到文件头时先告诉它文件多大，这样进度条一开始就是完整的一条，
-     * 而不是"先有一条缝、传完才变长"。
+     * 收到某一块的文件头（还没收完数据也算，进度条会稍微提前一点点）。
+     *
+     * @param owner  哪个传输通道送来的
+     * @param file   文件路径（换文件时自动重来）
+     * @param index  第几块
+     * @param size   文件总大小
      */
-    public void beginFile(String filePath, long size) {
-        if (filePath == null) {
+    public void onBlock(String owner, String file, int index, long size) {
+        if (file == null || index < 0 || index >= MAX_BLOCKS) {
             return;
         }
         synchronized (lock) {
-            if (!filePath.equals(path)) {
-                path = filePath;
+            if (!file.equals(path)) {
+                path = file;
                 done.clear();
-                doneCount = 0;
-                totalSize = 0;
-                totalBlocks = 0;
-            }
-            if (size > 0) {
-                totalSize = size;
-                totalBlocks = blocksOf(size);
-            }
-        }
-    }
-
-    /** 写盘线程每写完一块调用一次 */
-    public void onBlockWritten(String filePath, int index, long size) {
-        synchronized (lock) {
-            if (filePath != null && !filePath.equals(path)) {
-                path = filePath;
-                done.clear();
-                doneCount = 0;
-                totalSize = 0;
+                names.clear();
+                nameIds.clear();
+                owners = new int[0];
                 totalBlocks = 0;
             }
             if (size > 0) {
                 totalSize = size;
                 int blocks = blocksOf(size);
-                if (blocks > totalBlocks) {
-                    totalBlocks = blocks;
+                if (blocks > totalBlocks || owners.length < blocks) {
+                    int[] next = new int[Math.max(blocks, index + 1)];
+                    java.util.Arrays.fill(next, -1);
+                    System.arraycopy(owners, 0, next, 0, Math.min(owners.length, next.length));
+                    owners = next;
+                    totalBlocks = Math.max(totalBlocks, blocks);
                 }
             }
-            if (index >= 0 && index < MAX_BLOCKS && !done.get(index)) {
-                done.set(index);
-                doneCount++;
+            if (index >= owners.length) {
+                int[] next = new int[index + 1];
+                java.util.Arrays.fill(next, -1);
+                System.arraycopy(owners, 0, next, 0, owners.length);
+                owners = next;
+            }
+            owners[index] = ownerId(owner);
+            done.set(index);
+            if (index + 1 > totalBlocks) {
+                totalBlocks = index + 1;
             }
         }
     }
 
-    /** 各段完成比例（0~1），段数为界面要画的格子数 */
-    public float[] segments(int count) {
-        int segmentCount = Math.max(1, count);
-        float[] out = new float[segmentCount];
+    private int ownerId(String owner) {
+        if (owner == null) {
+            owner = "";
+        }
+        Integer id = nameIds.get(owner);
+        if (id == null) {
+            id = names.size();
+            names.add(owner);
+            nameIds.put(owner, id);
+        }
+        return id;
+    }
+
+    /**
+     * 当前的分段：相邻块归属一变就是一段。
+     * 段数超过上限（旧电脑端的轮询调度会让它爆炸）时退化成一条整进度。
+     */
+    public List<Segment> segments() {
         synchronized (lock) {
-            int blocks = totalBlocks > 0 ? totalBlocks : Math.max(doneCount, 1);
-            for (int i = 0; i < segmentCount; i++) {
-                int from = (int) ((long) i * blocks / segmentCount);
-                int to = (int) ((long) (i + 1) * blocks / segmentCount);
-                if (to <= from) {
-                    to = from + 1;
-                }
-                int filled = 0;
-                for (int b = from; b < to && b < blocks; b++) {
-                    if (done.get(b)) {
-                        filled++;
-                    }
-                }
-                out[i] = Math.min(1f, (float) filled / (to - from));
+            int total = Math.max(totalBlocks, done.length());
+            if (total <= 0) {
+                return new ArrayList<>();
             }
+            // 按索引扫描已完成块，记录归属发生变化的位置
+            List<int[]> bounds = new ArrayList<>(); // [startBlock, ownerId]
+            int previous = -2;
+            int segmentStart = 0;
+            for (int i = done.nextSetBit(0); i >= 0 && i < total; i = done.nextSetBit(i + 1)) {
+                int owner = i < owners.length ? owners[i] : -1;
+                if (owner < 0) {
+                    continue;
+                }
+                if (previous == -2) {
+                    previous = owner;
+                    segmentStart = 0;
+                } else if (owner != previous) {
+                    bounds.add(new int[]{segmentStart, previous});
+                    segmentStart = i;
+                    previous = owner;
+                }
+            }
+            if (previous == -2) {
+                return new ArrayList<>();
+            }
+            bounds.add(new int[]{segmentStart, previous});
+            if (bounds.size() > MAX_SEGMENTS) {
+                // 旧电脑端的轮询调度：每块都换通道，画出来全是碎条，退回整条
+                List<Segment> single = new ArrayList<>(1);
+                single.add(new Segment("", 0, total, (float) done.cardinality() / total));
+                return single;
+            }
+            List<Segment> out = new ArrayList<>(bounds.size());
+            for (int b = 0; b < bounds.size(); b++) {
+                int start = bounds.get(b)[0];
+                int end = b + 1 < bounds.size() ? bounds.get(b + 1)[0] : total;
+                if (end <= start) {
+                    end = Math.min(total, start + 1);
+                }
+                int span = Math.max(1, end - start);
+                int filled = 0;
+                for (int i = done.nextSetBit(start); i >= 0 && i < end; i = done.nextSetBit(i + 1)) {
+                    filled++;
+                }
+                String ownerName = names.get(bounds.get(b)[1]);
+                out.add(new Segment(ownerName, start, end, Math.min(1f, (float) filled / span)));
+            }
+            return out;
         }
-        return out;
     }
 
-    /** 已经完成的块数（调试/备用） */
+    /** 已完成字节数（按块估，末块可能略多一点点） */
+    public long getDoneBytes() {
+        synchronized (lock) {
+            long bytes = (long) done.cardinality() * FileBlock.BLOCK_SIZE;
+            return totalSize > 0 ? Math.min(bytes, totalSize) : bytes;
+        }
+    }
+
+    /** 已完成块数（调试用） */
     public int getDoneBlocks() {
         synchronized (lock) {
-            return doneCount;
+            return done.cardinality();
         }
     }
 
