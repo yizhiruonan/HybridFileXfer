@@ -9,16 +9,32 @@ import java.nio.channels.FileChannel;
 import java.util.concurrent.LinkedBlockingDeque;
 
 import top.weixiansen574.hybridfilexfer.aidl.IIOService;
+import top.weixiansen574.hybridfilexfer.core.BlockProgress;
+import top.weixiansen574.hybridfilexfer.core.FileBlock;
 import top.weixiansen574.hybridfilexfer.core.WriteFileCall;
 
 public class DroidWriteFileCall extends WriteFileCall {
     private final IIOService ioService;
+    private final BlockProgress blockProgress;
     private ParcelFileDescriptor pfd;
     private FileOutputStream fileOutputStream;
     private FileChannel channel;
     public DroidWriteFileCall(LinkedBlockingDeque<ByteBuffer> buffers, int dequeCount, IIOService ioService) {
+        this(buffers, dequeCount, ioService, null);
+    }
+
+    public DroidWriteFileCall(LinkedBlockingDeque<ByteBuffer> buffers, int dequeCount, IIOService ioService,
+                              BlockProgress blockProgress) {
         super(buffers, dequeCount);
         this.ioService = ioService;
+        this.blockProgress = blockProgress;
+    }
+
+    @Override
+    protected void onBlockWritten(FileBlock block) {
+        if (blockProgress != null) {
+            blockProgress.onBlockWritten(block.path, block.index, block.totalSize);
+        }
     }
 
     @Override

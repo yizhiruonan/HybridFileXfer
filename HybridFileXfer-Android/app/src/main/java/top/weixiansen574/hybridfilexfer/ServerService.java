@@ -38,6 +38,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import rikka.shizuku.Shizuku;
 import top.weixiansen574.hybridfilexfer.aidl.IIOService;
 import top.weixiansen574.hybridfilexfer.core.bean.ServerNetInterface;
+import top.weixiansen574.hybridfilexfer.core.bean.TrafficInfo;
 import top.weixiansen574.hybridfilexfer.droidcore.HFXServer;
 import top.weixiansen574.hybridfilexfer.droidcore.ServerListener;
 import top.weixiansen574.hybridfilexfer.droidcore.callback.StartServerCallback;
@@ -201,11 +202,14 @@ public class ServerService extends Service implements ServiceConnection {
      * 以前是全局唯一的一份，多台电脑会互相覆盖；现在按连接号隔离。
      */
     public static final class Live {
+        public volatile int connectionId;
         public volatile boolean active = false;
         public volatile String name = "";
         public volatile long done = 0;
         public volatile long total = 0;
         private volatile long lastDone = 0;
+        /** 每一条传输通道的累计字节 / 当前速度，进度浮层的明细表用 */
+        private final java.util.Map<String, ChannelLive> channels = new java.util.LinkedHashMap<>();
 
         void reset() {
             active = false;
@@ -213,6 +217,48 @@ public class ServerService extends Service implements ServiceConnection {
             done = 0;
             total = 0;
             lastDone = 0;
+            synchronized (this) {
+                channels.clear();
+            }
+        }
+
+        synchronized void updateSpeed(java.util.List<TrafficInfo> list) {
+            for (TrafficInfo info : list) {
+                if (info == null || info.iName == null) {
+                    continue;
+                }
+                ChannelLive channel = channels.get(info.iName);
+                if (channel == null) {
+                    channel = new ChannelLive(info.iName);
+                    channels.put(info.iName, channel);
+                }
+                channel.speed = info.downloadTraffic;
+                channel.bytes += info.downloadTraffic;
+            }
+        }
+
+        synchronized void finishChannel(String name) {
+            ChannelLive channel = channels.get(name);
+            if (channel != null) {
+                channel.speed = 0;
+                channel.finished = true;
+            }
+        }
+
+        public synchronized java.util.List<ChannelLive> channelSnapshot() {
+            return new ArrayList<>(channels.values());
+        }
+    }
+
+    /** 一条传输通道的进度（浮层表格的一行） */
+    public static final class ChannelLive {
+        public final String name;
+        public volatile long bytes;
+        public volatile long speed;
+        public volatile boolean finished;
+
+        ChannelLive(String name) {
+            this.name = name;
         }
     }
 
@@ -224,6 +270,7 @@ public class ServerService extends Service implements ServiceConnection {
         Live live = LIVES.get(connectionId);
         if (live == null) {
             Live created = new Live();
+            created.connectionId = connectionId;
             Live existing = LIVES.putIfAbsent(connectionId, created);
             live = existing != null ? existing : created;
         }
@@ -292,6 +339,7 @@ public class ServerService extends Service implements ServiceConnection {
             final Live live = liveFor(server.getId());
             live.reset();
             live.active = true;
+            server.blockProgress.reset();
             for (top.weixiansen574.hybridfilexfer.core.bean.RemoteFile f : files) {
                 debugFile("  pending: " + f.getPath() + " (" + f.getSize() + ")");
             }
@@ -320,6 +368,8 @@ public class ServerService extends Service implements ServiceConnection {
                         public void onFileUploading(String iName, String path, long targetSize, long totalSize) {
                         }
                         public void onFileDownloading(String iName, String path, long targetSize, long totalSize) {
+                            // 先知道文件多大，分块进度条一开始就是完整的一条
+                            server.blockProgress.beginFile(path, totalSize);
                             if (!path.equals(live.name)) {
                                 // 换文件了：进度从这一块重新算
                                 live.name = path;
@@ -332,10 +382,13 @@ public class ServerService extends Service implements ServiceConnection {
                             live.total = totalSize;
                         }
                         public void onSpeedInfo(java.util.List<top.weixiansen574.hybridfilexfer.core.bean.TrafficInfo> list) {
+                            live.updateSpeed(list);
                         }
                         public void onChannelComplete(String iName, long traffic, long time) {
+                            live.finishChannel(iName);
                         }
                         public void onChannelError(String iName, int errorType, String message) {
+                            live.finishChannel(iName);
                             debugFile("channel error " + iName + " type=" + errorType + " " + message);
                         }
                         public void onReadFileError(String message) {

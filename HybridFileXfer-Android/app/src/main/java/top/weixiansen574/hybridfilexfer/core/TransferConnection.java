@@ -30,6 +30,8 @@ public class TransferConnection {
 
     public synchronized TrafficInfo resetCurrentTrafficInfo() {
         TrafficInfo info = currentTraffic;
+        // 第一秒的 currentTraffic 是 new TrafficInfo()，没有名字；补上，调用方按名字分组
+        info.iName = iName;
         currentTraffic = new TrafficInfo(iName);
         return info;
     }
