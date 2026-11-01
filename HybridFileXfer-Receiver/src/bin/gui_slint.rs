@@ -109,7 +109,8 @@ fn main() -> Result<(), slint::PlatformError> {
     // 清理上一次自我更新留下的旧文件
     let _ = std::fs::remove_file(exe_dir.join("HybridFileXfer-Receiver.exe.old"));
 
-    let autostart = autostart_path().map(|p| p.exists()).unwrap_or(false);
+    remove_legacy_autostart_script();
+    let autostart = autostart_enabled();
     let ip_text = std::env::var("HFX_LAST_IP").unwrap_or_else(|_| "192.168.1.100".to_string());
 
     let state = Arc::new(Mutex::new(State {
@@ -610,41 +611,105 @@ fn open_in_explorer(path: &str) {
     let _ = std::process::Command::new("explorer").arg(path).spawn();
 }
 
-fn autostart_path() -> Option<PathBuf> {
-    let appdata = std::env::var_os("APPDATA")?;
-    Some(
-        PathBuf::from(appdata)
+/// 开机自启用注册表 Run 项（HKCU），不要写启动目录的 .vbs 脚本——
+/// 那种"释放脚本到启动目录"的行为会被杀软判为 dropper。
+fn autostart_value_name() -> Vec<u16> {
+    "HybridFileXfer-Receiver\0".encode_utf16().collect()
+}
+
+fn run_key_path() -> Vec<u16> {
+    "Software\\Microsoft\\Windows\\CurrentVersion\\Run\0"
+        .encode_utf16()
+        .collect()
+}
+
+#[cfg(windows)]
+fn autostart_enabled() -> bool {
+    use windows_sys::Win32::System::Registry::{
+        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ,
+    };
+    let mut key: HKEY = std::ptr::null_mut();
+    let sub = run_key_path();
+    let status = unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, sub.as_ptr(), 0, KEY_READ, &mut key) };
+    if status != 0 {
+        return false;
+    }
+    let name = autostart_value_name();
+    let mut size: u32 = 0;
+    let query = unsafe {
+        RegQueryValueExW(
+            key,
+            name.as_ptr(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut size,
+        )
+    };
+    unsafe { RegCloseKey(key) };
+    query == 0 && size > 0
+}
+
+#[cfg(not(windows))]
+fn autostart_enabled() -> bool {
+    false
+}
+
+#[cfg(windows)]
+fn set_autostart(enabled: bool, exe_dir: &Path) -> io::Result<()> {
+    use windows_sys::Win32::System::Registry::{
+        RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
+        KEY_SET_VALUE, REG_SZ,
+    };
+    let mut key: HKEY = std::ptr::null_mut();
+    let sub = run_key_path();
+    let status =
+        unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, sub.as_ptr(), 0, KEY_SET_VALUE, &mut key) };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    let name = autostart_value_name();
+    let result = if enabled {
+        let exe = exe_dir.join("HybridFileXfer-Receiver.exe");
+        let value = format!("\"{}\" --autostart", exe.display());
+        let data: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
+        unsafe {
+            RegSetValueExW(
+                key,
+                name.as_ptr(),
+                0,
+                REG_SZ,
+                data.as_ptr() as *const u8,
+                (data.len() * 2) as u32,
+            )
+        }
+    } else {
+        unsafe { RegDeleteValueW(key, name.as_ptr()) }
+    };
+    unsafe { RegCloseKey(key) };
+    if result != 0 && !(result == 2 && !enabled) {
+        return Err(io::Error::from_raw_os_error(result as i32));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn set_autostart(_enabled: bool, _exe_dir: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+/// 旧版本用启动目录 .vbs 实现自启，启动时顺手清掉
+fn remove_legacy_autostart_script() {
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        let legacy = PathBuf::from(appdata)
             .join("Microsoft")
             .join("Windows")
             .join("Start Menu")
             .join("Programs")
             .join("Startup")
-            .join("HybridFileXfer-Receiver.vbs"),
-    )
-}
-
-fn set_autostart(enabled: bool, exe_dir: &Path) -> io::Result<()> {
-    let path = autostart_path().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "APPDATA environment variable is missing",
-        )
-    })?;
-    if enabled {
-        let exe = exe_dir.join("HybridFileXfer-Receiver.exe");
-        let content = format!(
-            "' HybridFileXfer 接收器开机自启\r\nCreateObject(\"WScript.Shell\").Run \"\"\"\" & \"{}\" & \"\"\" --autostart\", 7, False\r\n",
-            exe.display()
-        );
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(path, content)
-    } else {
-        match std::fs::remove_file(path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e),
+            .join("HybridFileXfer-Receiver.vbs");
+        if legacy.exists() {
+            let _ = std::fs::remove_file(legacy);
         }
     }
 }

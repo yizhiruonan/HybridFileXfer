@@ -362,7 +362,11 @@ fun HfxApp(
                 when (page) {
                     TAB_HOME -> HomePage(
                         state = state,
-                        interfaceCount = interfaces.size,
+                        // 空闲时按"预计通道数"显示，和已连接时的口径保持一致：
+                        // 一张 USB 网卡开 2 条通道，一张 WiFi/以太网开 4 条
+                        plannedChannels = interfaces
+                            .filter { it.enabled }
+                            .sumOf { if (it.name.startsWith("USB_ADB")) 2 else 4 },
                         onStart = ::startServer,
                         onStop = {
                             ServerService.stopServer(activity)
@@ -426,7 +430,7 @@ fun HfxApp(
 @Composable
 private fun HomePage(
     state: UiState,
-    interfaceCount: Int,
+    plannedChannels: Int,
     onStart: () -> Unit,
     onStop: () -> Unit,
     onTransfer: () -> Unit,
@@ -445,7 +449,7 @@ private fun HomePage(
                 SmallTile(
                     modifier = Modifier.weight(1f),
                     label = "通道",
-                    value = if (state.connected) state.connectedNames.size.toString() else interfaceCount.toString(),
+                    value = if (state.connected) state.connectedNames.size.toString() else plannedChannels.toString(),
                     onClick = onOpenChannels,
                 )
                 SmallTile(
