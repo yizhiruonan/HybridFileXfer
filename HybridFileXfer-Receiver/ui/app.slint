@@ -121,8 +121,11 @@ export component AppWindow inherits Window {
     in-out property <string> session-text: "";
     // IDM 式分块：每个元素是该段已完成比例（0..1）
     in-out property <[float]> blocks: [];
-    // 多设备列表（单台时自动隐藏）
+    // 多设备列表（点状态卡展开）
     in-out property <[DeviceRow]> devices: [];
+    in-out property <bool> devices-expanded: false;
+    // 有设备可展开时才让状态卡可点
+    private property <bool> has-devices: root.devices.length > 0;
 
     // ---- 更新检查：0 检查中 / 1 已是最新 / 2 有新版 / 3 正在下载 / 4 出错 ----
     in-out property <int> update-state: 0;
@@ -146,7 +149,7 @@ export component AppWindow inherits Window {
         padding: 14px;
         spacing: 10px;
 
-        // ---------------- 状态 ----------------
+        // ---------------- 状态（点击展开设备） ----------------
         Card {
             vertical-stretch: 0;
             HorizontalLayout {
@@ -199,13 +202,28 @@ export component AppWindow inherits Window {
                     color: root.status-color;
                     vertical-alignment: center;
                 }
+
+                if root.has-devices : Text {
+                    text: root.devices-expanded ? "收起" : "展开";
+                    font-size: 11px;
+                    color: #8A8A8A;
+                    vertical-alignment: center;
+                }
+            }
+            TouchArea {
+                clicked => {
+                    if (root.has-devices) {
+                        root.devices-expanded = !root.devices-expanded;
+                    }
+                }
             }
         }
 
         // ---------------- 多设备列表 ----------------
-        if root.devices.length > 1 : Card {
+        if (root.devices-expanded) : Card {
             vertical-stretch: 0;
             VerticalLayout {
+                width: parent.width;
                 padding-left: 16px;
                 padding-right: 16px;
                 padding-top: 10px;
@@ -214,10 +232,10 @@ export component AppWindow inherits Window {
 
                 for d[i] in root.devices : VerticalLayout {
                     spacing: 2px;
-                    width: parent.width - 32px;
                     HorizontalLayout {
                         height: 24px;
                         spacing: 8px;
+                        width: parent.width;
                         ta := TouchArea {
                             clicked => { root.device-clicked(i); }
                         }
