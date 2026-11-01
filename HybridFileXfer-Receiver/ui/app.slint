@@ -108,6 +108,7 @@ export component AppWindow inherits Window {
 
     in-out property <string> status-title: "未开始接收";
     in-out property <string> status-sub: "点「开始接收」等待手机连接";
+    in-out property <string> status-sub-full: "";
     in-out property <int> status-kind: 0;
     in-out property <bool> running: false;
 
@@ -202,7 +203,12 @@ export component AppWindow inherits Window {
                     alignment: center;
                     spacing: 2px;
                     Text { text: root.status-title; font-size: 17px; font-weight: 600; color: #1A1A1A; }
-                    Text { text: root.status-sub; font-size: 11px; color: #616161; overflow: elide; }
+                    Text {
+                        text: root.devices-expanded ? root.status-sub-full : root.status-sub;
+                        font-size: 11px;
+                        color: #616161;
+                        overflow: elide;
+                    }
                 }
 
                 Rectangle { horizontal-stretch: 1; }

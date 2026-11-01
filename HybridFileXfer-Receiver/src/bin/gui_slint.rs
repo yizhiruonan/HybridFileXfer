@@ -356,7 +356,8 @@ fn main() -> Result<(), slint::PlatformError> {
                         } else {
                             "已连接电脑".to_string()
                         },
-                        format!("通道：{}", connected.join(", ")),
+                        // 收起时只给概况，完整通道列表在展开后显示
+                        format!("{count} 台设备 · {} 条通道", connected.len()),
                     )
                 } else if let Some(reason) = retrying {
                     (3, "连接有问题，正在重试".to_string(), reason)
@@ -369,6 +370,7 @@ fn main() -> Result<(), slint::PlatformError> {
                         "点「开始接收」等待手机连接".to_string(),
                     )
                 };
+                let full_channels = format!("通道：{}", connected.join(", "));
                 s.state = if count > 0 {
                     EngineState::Connected(connected)
                 } else {
@@ -377,6 +379,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 ui.set_status_kind(kind);
                 ui.set_status_title(title.into());
                 ui.set_status_sub(sub.into());
+                ui.set_status_sub_full(full_channels.clone().into());
                 ui.set_running(count > 0);
 
                 let mut serials: Vec<String> = s.devices.keys().cloned().collect();
