@@ -6,6 +6,7 @@ import android.os.StatFs
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -21,7 +22,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.runtime.Composable
@@ -37,6 +38,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -94,6 +96,9 @@ internal fun TransferScreen(
     var message by remember { mutableStateOf("") }
     var refreshTick by remember { mutableIntStateOf(0) }
     var focusRight by remember { mutableStateOf(false) }
+    // 滑动选择：第一次滑动记下锚点，再滑到另一项就选中两项之间的全部
+    var localAnchor by remember { mutableIntStateOf(-1) }
+    var remoteAnchor by remember { mutableIntStateOf(-1) }
     var mkdirDialog by remember { mutableStateOf(false) }
     var newName by remember { mutableStateOf("") }
 
@@ -106,6 +111,7 @@ internal fun TransferScreen(
         val result = withContext(Dispatchers.IO) { runCatching { server.listLocalFiles(path) ?: emptyList() } }
         loadingLocal = false
         localSel.clear()
+        localAnchor = -1
         localFiles.clear()
         result.onSuccess { list ->
             localPath = path
@@ -118,6 +124,7 @@ internal fun TransferScreen(
         val result = withContext(Dispatchers.IO) { runCatching { server.listClientFiles(path) ?: emptyList() } }
         loadingRemote = false
         remoteSel.clear()
+        remoteAnchor = -1
         remoteFiles.clear()
         result.onSuccess { list ->
             remotePath = path
@@ -161,12 +168,8 @@ internal fun TransferScreen(
         }
 
         override fun onComplete(isUpload: Boolean, traffic: Long, time: Long) {
-            main.post {
-                busy = false
-                statusText = ""
-                message = if (isUpload) "发送完成" else "接收完成"
-                refreshTick++
-            }
+            // 真正的收尾（移动的删除、刷新）由调用处的协程统一做
+            main.post { statusText = "" }
         }
 
         override fun onIncomplete() {
@@ -178,50 +181,66 @@ internal fun TransferScreen(
         }
     }
 
-    fun sendToPc() {
-        if (localSel.isEmpty() || busy) return
-        val files = localFiles.filter { it.path in localSel }
+    /** 复制/移动：把焦点窗口里选中的项目送到另一个窗口的当前目录 */
+    fun startTransfer(move: Boolean, fromLeft: Boolean) {
+        val files = if (fromLeft) localFiles.filter { it.path in localSel }
+        else remoteFiles.filter { it.path in remoteSel }
+        if (files.isEmpty() || busy) return
         busy = true
-        statusText = "正在发送…"
+        statusText = if (move) "正在移动…" else "正在复制…"
         scope.launch(Dispatchers.IO) {
             try {
-                server.sendFilesToRemote(
-                    files,
-                    Directory(localPath, Directory.getCurrentFileSystem()),
-                    Directory(remotePath, server.remoteFileSystem),
-                    callback(true),
-                )
+                val localDir = Directory(localPath, Directory.getCurrentFileSystem())
+                val remoteDir = Directory(remotePath, server.remoteFileSystem)
+                if (fromLeft) {
+                    server.sendFilesToRemote(files, localDir, remoteDir, callback(true))
+                } else {
+                    server.sendFilesToShelf(files, localDir, remoteDir, callback(false))
+                }
+                if (move) {
+                    files.forEach { file ->
+                        if (fromLeft) server.deleteLocalFile(file.path) else server.deleteRemoteFile(file.path)
+                    }
+                }
+                main.post {
+                    busy = false
+                    statusText = ""
+                    message = if (move) "移动完成" else "复制完成"
+                    refreshTick++
+                }
             } catch (e: Throwable) {
                 main.post {
                     busy = false
                     statusText = ""
-                    toast("发送失败：" + e.message)
+                    toast((if (move) "移动失败：" else "复制失败：") + e.message)
                 }
             }
         }
     }
 
-    fun receiveToPhone() {
-        if (remoteSel.isEmpty() || busy) return
-        val files = remoteFiles.filter { it.path in remoteSel }
-        busy = true
-        statusText = "正在接收…"
-        scope.launch(Dispatchers.IO) {
-            try {
-                server.sendFilesToShelf(
-                    files,
-                    Directory(localPath, Directory.getCurrentFileSystem()),
-                    Directory(remotePath, server.remoteFileSystem),
-                    callback(false),
-                )
-            } catch (e: Throwable) {
-                main.post {
-                    busy = false
-                    statusText = ""
-                    toast("接收失败：" + e.message)
-                }
+    /** 滑动选中：第一次记锚点；再滑到另一项就把两项之间全部选中（同一窗口内） */
+    fun swipeSelect(fromLeft: Boolean, index: Int) {
+        val files = if (fromLeft) localFiles else remoteFiles
+        val selected = if (fromLeft) localSel else remoteSel
+        val anchor = if (fromLeft) localAnchor else remoteAnchor
+        if (index !in files.indices) return
+        if (anchor == index) {
+            selected.clear()
+            if (fromLeft) localAnchor = -1 else remoteAnchor = -1
+            return
+        }
+        if (anchor < 0) {
+            selected.clear()
+            selected.add(files[index].path)
+        } else {
+            val from = minOf(anchor, index)
+            val to = maxOf(anchor, index)
+            selected.clear()
+            for (i in from..to) {
+                selected.add(files[i].path)
             }
         }
+        if (fromLeft) localAnchor = index else remoteAnchor = index
     }
 
     fun createEntry(isDir: Boolean) {
@@ -299,6 +318,7 @@ internal fun TransferScreen(
                 onFocus = { focusRight = false },
                 onOpen = { p -> scope.launch { loadLocal(p) } },
                 onToggle = { file -> toggle(localSel, file.path) },
+                onSwipe = { index -> swipeSelect(true, index) },
             )
             Box(Modifier.width(6.dp).fillMaxHeight().background(colorScheme.surface)) 
             FilePane(
@@ -312,6 +332,7 @@ internal fun TransferScreen(
                 onFocus = { focusRight = true },
                 onOpen = { p -> scope.launch { loadRemote(p) } },
                 onToggle = { file -> toggle(remoteSel, file.path) },
+                onSwipe = { index -> swipeSelect(false, index) },
             )
         }
         // 底部工具条
@@ -339,26 +360,27 @@ internal fun TransferScreen(
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 2.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
+                val focusCount = if (focusRight) remoteSel.size else localSel.size
                 Button(
-                    onClick = { sendToPc() },
-                    enabled = !busy && localSel.isNotEmpty(),
+                    onClick = { startTransfer(false, !focusRight) },
+                    enabled = !busy && focusCount > 0,
                     colors = ButtonDefaults.buttonColorsPrimary(),
                     modifier = Modifier.weight(1f),
                 ) {
                     Text(
-                        if (localSel.isEmpty()) "发送 →" else "发送 " + localSel.size + " 项 →",
+                        if (focusCount == 0) "复制 →" else "复制 " + focusCount + " 项 →",
                         color = Color.White,
                         fontSize = 13.sp,
                     )
                 }
                 Button(
-                    onClick = { receiveToPhone() },
-                    enabled = !busy && remoteSel.isNotEmpty(),
+                    onClick = { startTransfer(true, !focusRight) },
+                    enabled = !busy && focusCount > 0,
                     colors = ButtonDefaults.buttonColorsPrimary(),
                     modifier = Modifier.weight(1f),
                 ) {
                     Text(
-                        if (remoteSel.isEmpty()) "← 接收" else "← 接收 " + remoteSel.size + " 项",
+                        if (focusCount == 0) "移动 →" else "移动 " + focusCount + " 项 →",
                         color = Color.White,
                         fontSize = 13.sp,
                     )
@@ -445,6 +467,7 @@ private fun FilePane(
     onFocus: () -> Unit,
     onOpen: (String) -> Unit,
     onToggle: (RemoteFile) -> Unit,
+    onSwipe: (Int) -> Unit,
 ) {
     val colorScheme = MiuixTheme.colorScheme
     val folders = files.count { it.isDirectory }
@@ -476,16 +499,34 @@ private fun FilePane(
         if (loading) {
             Text("读取中…", fontSize = 11.sp, modifier = Modifier.padding(8.dp))
         }
+        val density = androidx.compose.ui.platform.LocalDensity.current
         LazyColumn(Modifier.weight(1f).fillMaxWidth()) {
-            items(files, key = { it.path }) { file ->
+            itemsIndexed(files, key = { _, f -> f.path }) { index, file ->
                 val checked = file.path in selected
                 Row(
                     modifier = Modifier.fillMaxWidth()
                         .background(if (checked) colorScheme.primary.copy(alpha = 0.14f) else Color.Transparent)
+                        .pointerInput(files, file.path) {
+                            var total = 0f
+                            detectHorizontalDragGestures(
+                                onHorizontalDrag = { _, dragAmount -> total += dragAmount },
+                                onDragEnd = {
+                                    val threshold = with(density) { 30.dp.toPx() }
+                                    if (kotlin.math.abs(total) > threshold) onSwipe(index)
+                                },
+                            )
+                        }
                         .combinedClickable(
                             onClick = {
                                 onFocus()
-                                if (file.isDirectory) onOpen(file.path) else onToggle(file)
+                                // 多选状态（已有选中项）：点谁都是勾选/取消；空闲时点文件夹进入、点文件开始多选
+                                if (selected.isNotEmpty()) {
+                                    onToggle(file)
+                                } else if (file.isDirectory) {
+                                    onOpen(file.path)
+                                } else {
+                                    onToggle(file)
+                                }
                             },
                             onLongClick = {
                                 onFocus()
