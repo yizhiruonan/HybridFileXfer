@@ -59,7 +59,7 @@ pub fn ensure() -> Result<(), String> {
 }
 
 /// PowerShell 的 -EncodedCommand 参数：UTF-16LE + Base64
-fn encode_utf16le_base64(text: &str) -> String {
+pub fn encode_utf16le_base64(text: &str) -> String {
     const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let bytes: Vec<u8> = text.encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
     let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);

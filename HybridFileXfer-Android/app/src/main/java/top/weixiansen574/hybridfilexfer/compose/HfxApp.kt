@@ -346,9 +346,10 @@ fun HfxApp(
         }
     }
 
-    // 多台电脑时先把"发给谁"选清楚，再启动系统文件选择器
+    // 多台电脑时先把"发给谁"选清楚，再打开左右双窗口的传输页
     var transferTarget by remember { mutableStateOf(-1) }
     var targetChooser by remember { mutableStateOf(false) }
+    var showTransfer by remember { mutableStateOf(false) }
     val pickFiles = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
         if (!uris.isNullOrEmpty()) {
             val intent = Intent(activity, ShareActivity::class.java).apply {
@@ -364,11 +365,12 @@ fun HfxApp(
 
     fun beginTransfer() {
         val targets = state.connections
+        if (targets.isEmpty()) return
         if (targets.size > 1) {
             targetChooser = true
         } else {
-            transferTarget = targets.firstOrNull()?.id ?: -1
-            pickFiles.launch(arrayOf("*/*"))
+            transferTarget = targets.first().id
+            showTransfer = true
         }
     }
 
@@ -690,6 +692,16 @@ fun HfxApp(
                 },
             )
         }
+        if (showTransfer) {
+            val transferServer = ServerService.getServer(transferTarget)
+            if (transferServer != null) {
+                TransferScreen(
+                    server = transferServer,
+                    startLocal = "/storage/emulated/0",
+                    onClose = { showTransfer = false },
+                )
+            }
+        }
         if (state.xferActive && !xferPanelHidden) {
             ReceiveProgressPanel(state, onDismiss = { xferPanelHidden = true })
         }
@@ -712,7 +724,7 @@ fun HfxApp(
                 onSelected = { id ->
                     transferTarget = id
                     targetChooser = false
-                    pickFiles.launch(arrayOf("*/*"))
+                    showTransfer = true
                 },
             )
         }

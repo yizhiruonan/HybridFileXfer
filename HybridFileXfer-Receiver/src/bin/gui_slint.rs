@@ -846,8 +846,52 @@ fn run_key_path() -> Vec<u16> {
         .collect()
 }
 
+const AUTOSTART_TASK: &str = "HybridFileXfer-Receiver";
+
+fn hidden_command(program: &str) -> std::process::Command {
+    let mut command = std::process::Command::new(program);
+    command
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    command
+}
+
 #[cfg(windows)]
-fn autostart_enabled() -> bool {
+fn logon_task_exists() -> bool {
+    hidden_command("schtasks")
+        .args(["/Query", "/TN", AUTOSTART_TASK])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn create_logon_task(exe: &Path) -> bool {
+    let tr = format!("\"{}\" --autostart", exe.display());
+    hidden_command("schtasks")
+        .args([
+            "/Create", "/TN", AUTOSTART_TASK, "/TR", &tr, "/SC", "ONLOGON", "/RL", "LIMITED", "/F",
+        ])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn delete_logon_task() {
+    let _ = hidden_command("schtasks")
+        .args(["/Delete", "/TN", AUTOSTART_TASK, "/F"])
+        .status();
+}
+
+/// 注册表 Run 项里有没有我们的条目
+#[cfg(windows)]
+fn run_value_present() -> bool {
     use windows_sys::Win32::System::Registry::{
         RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ,
     };
@@ -873,16 +917,77 @@ fn autostart_enabled() -> bool {
     query == 0 && size > 0
 }
 
+fn startup_shortcut_path() -> Option<PathBuf> {
+    let appdata = std::env::var_os("APPDATA")?;
+    Some(
+        PathBuf::from(appdata)
+            .join("Microsoft")
+            .join("Windows")
+            .join("Start Menu")
+            .join("Programs")
+            .join("Startup")
+            .join("HybridFileXfer-Receiver.lnk"),
+    )
+}
+
+fn startup_shortcut_present() -> bool {
+    startup_shortcut_path().map(|p| p.exists()).unwrap_or(false)
+}
+
+fn write_startup_shortcut(exe: &Path) -> bool {
+    let Some(lnk) = startup_shortcut_path() else {
+        return false;
+    };
+    let Some(dir) = exe.parent() else {
+        return false;
+    };
+    if let Some(parent) = lnk.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let ps = format!(
+        "$s=(New-Object -ComObject WScript.Shell).CreateShortcut('{}'); $s.TargetPath='{}'; $s.Arguments='--autostart'; $s.WorkingDirectory='{}'; $s.IconLocation='{},0'; $s.Save()",
+        lnk.display(),
+        exe.display(),
+        dir.display(),
+        exe.display()
+    );
+    let encoded = hfx_receiver::sendto::encode_utf16le_base64(&ps);
+    let ok = hidden_command("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
+            "-EncodedCommand",
+            &encoded,
+        ])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    ok && lnk.exists()
+}
+
+fn remove_startup_shortcut() {
+    if let Some(lnk) = startup_shortcut_path() {
+        let _ = std::fs::remove_file(lnk);
+    }
+}
+
+#[cfg(windows)]
+fn autostart_enabled() -> bool {
+    // 计划任务 / 启动目录快捷方式 / 注册表 Run 任一存在都算勾选
+    logon_task_exists() || startup_shortcut_present() || run_value_present()
+}
+
 #[cfg(not(windows))]
 fn autostart_enabled() -> bool {
     false
 }
 
 #[cfg(windows)]
-fn set_autostart(enabled: bool, exe_dir: &Path) -> io::Result<()> {
+fn write_run_value(exe: &Path) -> io::Result<()> {
     use windows_sys::Win32::System::Registry::{
-        RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
-        KEY_SET_VALUE, REG_SZ,
+        RegCloseKey, RegOpenKeyExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_SZ,
     };
     let mut key: HKEY = std::ptr::null_mut();
     let sub = run_key_path();
@@ -892,28 +997,68 @@ fn set_autostart(enabled: bool, exe_dir: &Path) -> io::Result<()> {
         return Err(io::Error::from_raw_os_error(status as i32));
     }
     let name = autostart_value_name();
-    let result = if enabled {
-        let exe = exe_dir.join("HybridFileXfer-Receiver.exe");
-        let value = format!("\"{}\" --autostart", exe.display());
-        let data: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
-        unsafe {
-            RegSetValueExW(
-                key,
-                name.as_ptr(),
-                0,
-                REG_SZ,
-                data.as_ptr() as *const u8,
-                (data.len() * 2) as u32,
-            )
-        }
-    } else {
-        unsafe { RegDeleteValueW(key, name.as_ptr()) }
+    let value = format!("\"{}\" --autostart", exe.display());
+    let data: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
+    let result = unsafe {
+        RegSetValueExW(
+            key,
+            name.as_ptr(),
+            0,
+            REG_SZ,
+            data.as_ptr() as *const u8,
+            (data.len() * 2) as u32,
+        )
     };
     unsafe { RegCloseKey(key) };
-    if result != 0 && !(result == 2 && !enabled) {
+    if result != 0 {
         return Err(io::Error::from_raw_os_error(result as i32));
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn delete_run_value() -> io::Result<()> {
+    use windows_sys::Win32::System::Registry::{
+        RegCloseKey, RegDeleteValueW, RegOpenKeyExW, HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE,
+    };
+    let mut key: HKEY = std::ptr::null_mut();
+    let sub = run_key_path();
+    let status =
+        unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, sub.as_ptr(), 0, KEY_SET_VALUE, &mut key) };
+    if status != 0 {
+        return Ok(());
+    }
+    let name = autostart_value_name();
+    unsafe { RegDeleteValueW(key, name.as_ptr()) };
+    unsafe { RegCloseKey(key) };
+    Ok(())
+}
+
+/// 优先用「登录时触发的计划任务」：Windows 11 的「启动应用」列表不会拦计划任务，
+/// 比 HKCU\Run 可靠；建任务失败再退回注册表。
+#[cfg(windows)]
+fn set_autostart(enabled: bool, exe_dir: &Path) -> io::Result<()> {
+    let exe = exe_dir.join("HybridFileXfer-Receiver.exe");
+    if enabled {
+        // 计划任务最稳，但非管理员建不了；退而求其次用启动目录快捷方式；
+        // 都不行再退回注册表 Run。每次只保留一种，避免登录时起两次。
+        if create_logon_task(&exe) {
+            let _ = delete_run_value();
+            remove_startup_shortcut();
+            Ok(())
+        } else if write_startup_shortcut(&exe) {
+            let _ = delete_run_value();
+            delete_logon_task();
+            Ok(())
+        } else {
+            write_run_value(&exe)
+        }
+    } else {
+        delete_logon_task();
+        remove_startup_shortcut();
+        let _ = delete_run_value();
+        Ok(())
+    }
 }
 
 #[cfg(not(windows))]
