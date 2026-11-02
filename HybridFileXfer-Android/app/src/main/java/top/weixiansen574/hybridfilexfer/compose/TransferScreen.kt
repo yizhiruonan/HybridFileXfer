@@ -113,6 +113,9 @@ internal fun TransferScreen(
     var renameFile by remember { mutableStateOf<RemoteFile?>(null) }
     var renameName by remember { mutableStateOf("") }
     var propsFile by remember { mutableStateOf<RemoteFile?>(null) }
+    // 滑动选块的起点：第一下滑动只选一项并记下起点，第二下滑动把起点到这一项整段选中，然后清空起点
+    var localBlockStart by remember { mutableIntStateOf(-1) }
+    var remoteBlockStart by remember { mutableIntStateOf(-1) }
 
     // 返回键：先关弹窗/菜单 → 取消焦点窗口的多选 → 最后才退出传输页
     androidx.activity.compose.BackHandler(enabled = true) {
@@ -122,8 +125,14 @@ internal fun TransferScreen(
             propsFile != null -> propsFile = null
             mkdirDialog -> mkdirDialog = false
             message.isNotEmpty() -> message = ""
-            focusRight && remoteSel.isNotEmpty() -> remoteSel.clear()
-            !focusRight && localSel.isNotEmpty() -> localSel.clear()
+            focusRight && remoteSel.isNotEmpty() -> {
+                remoteSel.clear()
+                remoteBlockStart = -1
+            }
+            !focusRight && localSel.isNotEmpty() -> {
+                localSel.clear()
+                localBlockStart = -1
+            }
             else -> onClose()
         }
     }
@@ -242,18 +251,29 @@ internal fun TransferScreen(
         }
     }
 
-    /** 滑动选择：一次滑动 = 一块（起始行到手指滑过的行），多次滑动是不同的块，互不影响 */
-    fun swipeSelect(fromLeft: Boolean, index: Int, toIndex: Int) {
+    /**
+     * 滑动选择（按块）：
+     * 第一下滑动只选中这一项并记下起点；第二下滑动选中「起点..这一项」整段，然后清空起点。
+     * 下一轮滑动又是新的一块，多块并存（1→3 选 1..3，5→10 选 5..10，1..3 保留）。
+     */
+    fun swipeSelect(fromLeft: Boolean, index: Int) {
         val files = if (fromLeft) localFiles else remoteFiles
         val selected = if (fromLeft) localSel else remoteSel
-        if (files.isEmpty()) return
-        val from = minOf(index, toIndex).coerceIn(0, files.size - 1)
-        val to = maxOf(index, toIndex).coerceIn(0, files.size - 1)
+        if (files.isEmpty() || index !in files.indices) return
+        val start = if (fromLeft) localBlockStart else remoteBlockStart
+        if (start < 0 || start !in files.indices) {
+            selected.add(files[index].path)
+            if (fromLeft) localBlockStart = index else remoteBlockStart = index
+            return
+        }
+        val from = minOf(start, index)
+        val to = maxOf(start, index)
         for (i in from..to) {
             if (files[i].path !in selected) {
                 selected.add(files[i].path)
             }
         }
+        if (fromLeft) localBlockStart = -1 else remoteBlockStart = -1
     }
 
     fun createEntry(isDir: Boolean) {
@@ -320,20 +340,22 @@ internal fun TransferScreen(
     }
 
     Column(Modifier.fillMaxSize().background(colorScheme.surface).statusBarsPadding()) {
-        // 顶栏（和应用的 TopAppBar 同一套观感）
-        Row(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            TextButton(text = "关闭", onClick = onClose)
+        // 顶栏：标题绝对居中，关闭按钮在左、电脑名在右
+        Box(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp)) {
+            TextButton(text = "关闭", onClick = onClose, modifier = Modifier.align(Alignment.CenterStart))
             Text(
                 "传输文件",
                 fontSize = 17.sp,
                 fontWeight = FontWeight.Bold,
                 textAlign = TextAlign.Center,
-                modifier = Modifier.weight(1f),
+                modifier = Modifier.align(Alignment.Center),
             )
-            Text(server.displayName, fontSize = 11.sp, color = colorScheme.onSurfaceVariantSummary)
+            Text(
+                server.displayName,
+                fontSize = 11.sp,
+                color = colorScheme.onSurfaceVariantSummary,
+                modifier = Modifier.align(Alignment.CenterEnd),
+            )
         }
         if (statusText.isNotEmpty()) {
             Text(
@@ -356,7 +378,7 @@ internal fun TransferScreen(
                 onFocus = { focusRight = false },
                 onOpen = { p -> scope.launch { loadLocal(p) } },
                 onToggle = { file -> toggle(localSel, file.path) },
-                onSwipe = { from, to -> swipeSelect(true, from, to) },
+                onSwipe = { index -> swipeSelect(true, index) },
                 onUp = {
                     parentOf(localPath)?.let { up -> scope.launch { loadLocal(up) } }
                 },
@@ -382,7 +404,7 @@ internal fun TransferScreen(
                 onFocus = { focusRight = true },
                 onOpen = { p -> scope.launch { loadRemote(p) } },
                 onToggle = { file -> toggle(remoteSel, file.path) },
-                onSwipe = { from, to -> swipeSelect(false, from, to) },
+                onSwipe = { index -> swipeSelect(false, index) },
                 onUp = {
                     parentOf(remotePath)?.let { up -> scope.launch { loadRemote(up) } }
                 },
@@ -416,36 +438,6 @@ internal fun TransferScreen(
                 }
                 BottomAction("删除", enabled = !busy && (if (focusRight) remoteSel.isNotEmpty() else localSel.isNotEmpty())) {
                     deleteSelected()
-                }
-            }
-            Row(
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 2.dp),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                val focusCount = if (focusRight) remoteSel.size else localSel.size
-                Button(
-                    onClick = { startTransfer(false, !focusRight) },
-                    enabled = !busy && focusCount > 0,
-                    colors = ButtonDefaults.buttonColorsPrimary(),
-                    modifier = Modifier.weight(1f),
-                ) {
-                    Text(
-                        if (focusCount == 0) "复制 →" else "复制 " + focusCount + " 项 →",
-                        color = Color.White,
-                        fontSize = 13.sp,
-                    )
-                }
-                Button(
-                    onClick = { startTransfer(true, !focusRight) },
-                    enabled = !busy && focusCount > 0,
-                    colors = ButtonDefaults.buttonColorsPrimary(),
-                    modifier = Modifier.weight(1f),
-                ) {
-                    Text(
-                        if (focusCount == 0) "移动 →" else "移动 " + focusCount + " 项 →",
-                        color = Color.White,
-                        fontSize = 13.sp,
-                    )
                 }
             }
         }
@@ -662,7 +654,7 @@ private fun FilePane(
     onFocus: () -> Unit,
     onOpen: (String) -> Unit,
     onToggle: (RemoteFile) -> Unit,
-    onSwipe: (Int, Int) -> Unit,
+    onSwipe: (Int) -> Unit,
     onUp: () -> Unit,
     onMenu: (RemoteFile, Int) -> Unit,
 ) {
@@ -755,15 +747,8 @@ private fun FilePane(
                                 onDragEnd = {
                                     val threshold = with(density) { 30.dp.toPx() }
                                     if (kotlin.math.abs(total) > threshold) {
-                                        // 手指竖向滑过几行，这一块就选几行；每次滑动独立成块
-                                        val rowsMoved = if (rowHeight > 1f) {
-                                            ((lastY - startY) / rowHeight).roundToInt()
-                                        } else {
-                                            0
-                                        }
-                                        val end = (index + rowsMoved).coerceIn(0, files.size - 1)
                                         haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                        onSwipe(index, end)
+                                        onSwipe(index)
                                     }
                                     dragOffset = 0f
                                 },
