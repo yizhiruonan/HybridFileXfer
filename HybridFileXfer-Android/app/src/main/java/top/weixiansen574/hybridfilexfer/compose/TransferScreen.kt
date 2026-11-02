@@ -44,6 +44,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
@@ -103,9 +104,7 @@ internal fun TransferScreen(
     var message by remember { mutableStateOf("") }
     var refreshTick by remember { mutableIntStateOf(0) }
     var focusRight by remember { mutableStateOf(false) }
-    // 滑动选择：第一次滑动记下锚点，再滑到另一项就选中两项之间的全部
-    var localAnchor by remember { mutableIntStateOf(-1) }
-    var remoteAnchor by remember { mutableIntStateOf(-1) }
+
     var mkdirDialog by remember { mutableStateOf(false) }
     var newName by remember { mutableStateOf("") }
     // 长按项目弹出的操作菜单（复制/移动/删除/重命名/属性）
@@ -114,6 +113,20 @@ internal fun TransferScreen(
     var renameFile by remember { mutableStateOf<RemoteFile?>(null) }
     var renameName by remember { mutableStateOf("") }
     var propsFile by remember { mutableStateOf<RemoteFile?>(null) }
+
+    // 返回键：先关弹窗/菜单 → 取消焦点窗口的多选 → 最后才退出传输页
+    androidx.activity.compose.BackHandler(enabled = true) {
+        when {
+            menuFile != null -> menuFile = null
+            renameFile != null -> renameFile = null
+            propsFile != null -> propsFile = null
+            mkdirDialog -> mkdirDialog = false
+            message.isNotEmpty() -> message = ""
+            focusRight && remoteSel.isNotEmpty() -> remoteSel.clear()
+            !focusRight && localSel.isNotEmpty() -> localSel.clear()
+            else -> onClose()
+        }
+    }
 
     fun toast(text: String) {
         main.post { message = text }
@@ -124,7 +137,6 @@ internal fun TransferScreen(
         val result = withContext(Dispatchers.IO) { runCatching { server.listLocalFiles(path) ?: emptyList() } }
         loadingLocal = false
         localSel.clear()
-        localAnchor = -1
         localFiles.clear()
         result.onSuccess { list ->
             localPath = path
@@ -137,7 +149,6 @@ internal fun TransferScreen(
         val result = withContext(Dispatchers.IO) { runCatching { server.listClientFiles(path) ?: emptyList() } }
         loadingRemote = false
         remoteSel.clear()
-        remoteAnchor = -1
         remoteFiles.clear()
         result.onSuccess { list ->
             remotePath = path
@@ -231,31 +242,18 @@ internal fun TransferScreen(
         }
     }
 
-    /** 滑动选中：第一次记锚点；再滑到另一项就把两项之间全部选中（同一窗口内） */
-    fun swipeSelect(fromLeft: Boolean, index: Int) {
+    /** 滑动选择：一次滑动 = 一块（起始行到手指滑过的行），多次滑动是不同的块，互不影响 */
+    fun swipeSelect(fromLeft: Boolean, index: Int, toIndex: Int) {
         val files = if (fromLeft) localFiles else remoteFiles
         val selected = if (fromLeft) localSel else remoteSel
-        val anchor = if (fromLeft) localAnchor else remoteAnchor
-        if (index !in files.indices) return
-        if (anchor == index) {
-            // 同一项再滑一次：把它取消掉
-            selected.remove(files[index].path)
-            if (fromLeft) localAnchor = -1 else remoteAnchor = -1
-            return
-        }
-        if (anchor < 0) {
-            // 多选状态下继续加选，不清掉之前已选的
-            selected.add(files[index].path)
-        } else {
-            val from = minOf(anchor, index)
-            val to = maxOf(anchor, index)
-            for (i in from..to) {
-                if (files[i].path !in selected) {
-                    selected.add(files[i].path)
-                }
+        if (files.isEmpty()) return
+        val from = minOf(index, toIndex).coerceIn(0, files.size - 1)
+        val to = maxOf(index, toIndex).coerceIn(0, files.size - 1)
+        for (i in from..to) {
+            if (files[i].path !in selected) {
+                selected.add(files[i].path)
             }
         }
-        if (fromLeft) localAnchor = index else remoteAnchor = index
     }
 
     fun createEntry(isDir: Boolean) {
@@ -357,12 +355,8 @@ internal fun TransferScreen(
                 modifier = Modifier.weight(1f),
                 onFocus = { focusRight = false },
                 onOpen = { p -> scope.launch { loadLocal(p) } },
-                onToggle = { file ->
-                    toggle(localSel, file.path)
-                    // 取消勾选到空 = 退出多选，滑动锚点也要一起清掉，否则下次滑动会接着上次的锚点选一整段
-                    if (localSel.isEmpty()) localAnchor = -1
-                },
-                onSwipe = { index -> swipeSelect(true, index) },
+                onToggle = { file -> toggle(localSel, file.path) },
+                onSwipe = { from, to -> swipeSelect(true, from, to) },
                 onUp = {
                     parentOf(localPath)?.let { up -> scope.launch { loadLocal(up) } }
                 },
@@ -371,7 +365,6 @@ internal fun TransferScreen(
                     if (file.path !in localSel) {
                         localSel.clear()
                         localSel.add(file.path)
-                        localAnchor = index
                     }
                     menuLeft = true
                     menuFile = file
@@ -388,11 +381,8 @@ internal fun TransferScreen(
                 modifier = Modifier.weight(1f),
                 onFocus = { focusRight = true },
                 onOpen = { p -> scope.launch { loadRemote(p) } },
-                onToggle = { file ->
-                    toggle(remoteSel, file.path)
-                    if (remoteSel.isEmpty()) remoteAnchor = -1
-                },
-                onSwipe = { index -> swipeSelect(false, index) },
+                onToggle = { file -> toggle(remoteSel, file.path) },
+                onSwipe = { from, to -> swipeSelect(false, from, to) },
                 onUp = {
                     parentOf(remotePath)?.let { up -> scope.launch { loadRemote(up) } }
                 },
@@ -401,7 +391,6 @@ internal fun TransferScreen(
                     if (file.path !in remoteSel) {
                         remoteSel.clear()
                         remoteSel.add(file.path)
-                        remoteAnchor = index
                     }
                     menuLeft = false
                     menuFile = file
@@ -673,7 +662,7 @@ private fun FilePane(
     onFocus: () -> Unit,
     onOpen: (String) -> Unit,
     onToggle: (RemoteFile) -> Unit,
-    onSwipe: (Int) -> Unit,
+    onSwipe: (Int, Int) -> Unit,
     onUp: () -> Unit,
     onMenu: (RemoteFile, Int) -> Unit,
 ) {
@@ -708,6 +697,8 @@ private fun FilePane(
             Text("读取中…", fontSize = 11.sp, modifier = Modifier.padding(8.dp))
         }
         val density = androidx.compose.ui.platform.LocalDensity.current
+        // 行高：一次滑动跨过几行，用来算这一块选到哪
+        var rowHeight by remember { mutableStateOf(0f) }
         LazyColumn(Modifier.weight(1f).fillMaxWidth()) {
             // 顶部「..」：返回上一级（和 MT 一样）
             if (parentOf(path) != null) {
@@ -745,19 +736,34 @@ private fun FilePane(
                 Row(
                     modifier = Modifier.fillMaxWidth()
                         .offset { IntOffset(animatedOffset.roundToInt(), 0) }
+                        .onSizeChanged { if (rowHeight <= 0f) rowHeight = it.height.toFloat() }
                         .background(if (checked) colorScheme.primary.copy(alpha = 0.14f) else Color.Transparent)
                         .pointerInput(files, file.path) {
                             var total = 0f
+                            var startY = 0f
+                            var lastY = 0f
                             detectHorizontalDragGestures(
-                                onHorizontalDrag = { _, dragAmount ->
+                                onDragStart = { offset ->
+                                    startY = offset.y
+                                    lastY = offset.y
+                                },
+                                onHorizontalDrag = { change, dragAmount ->
                                     total += dragAmount
+                                    lastY = change.position.y
                                     dragOffset = total.coerceIn(-maxOffset, maxOffset)
                                 },
                                 onDragEnd = {
                                     val threshold = with(density) { 30.dp.toPx() }
                                     if (kotlin.math.abs(total) > threshold) {
+                                        // 手指竖向滑过几行，这一块就选几行；每次滑动独立成块
+                                        val rowsMoved = if (rowHeight > 1f) {
+                                            ((lastY - startY) / rowHeight).roundToInt()
+                                        } else {
+                                            0
+                                        }
+                                        val end = (index + rowsMoved).coerceIn(0, files.size - 1)
                                         haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                        onSwipe(index)
+                                        onSwipe(index, end)
                                     }
                                     dragOffset = 0f
                                 },
