@@ -3,6 +3,8 @@ package top.weixiansen574.hybridfilexfer.compose
 import android.os.Handler
 import android.os.Looper
 import android.os.StatFs
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.spring
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
@@ -16,6 +18,7 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.size
@@ -38,7 +41,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -50,6 +56,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import kotlin.math.roundToInt
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -231,19 +238,21 @@ internal fun TransferScreen(
         val anchor = if (fromLeft) localAnchor else remoteAnchor
         if (index !in files.indices) return
         if (anchor == index) {
-            selected.clear()
+            // 同一项再滑一次：把它取消掉
+            selected.remove(files[index].path)
             if (fromLeft) localAnchor = -1 else remoteAnchor = -1
             return
         }
         if (anchor < 0) {
-            selected.clear()
+            // 多选状态下继续加选，不清掉之前已选的
             selected.add(files[index].path)
         } else {
             val from = minOf(anchor, index)
             val to = maxOf(anchor, index)
-            selected.clear()
             for (i in from..to) {
-                selected.add(files[i].path)
+                if (files[i].path !in selected) {
+                    selected.add(files[i].path)
+                }
             }
         }
         if (fromLeft) localAnchor = index else remoteAnchor = index
@@ -725,17 +734,34 @@ private fun FilePane(
             }
             itemsIndexed(files, key = { _, f -> f.path }) { index, file ->
                 val checked = file.path in selected
+                var dragOffset by remember(file.path) { mutableStateOf(0f) }
+                val animatedOffset by animateFloatAsState(
+                    targetValue = dragOffset,
+                    animationSpec = spring(stiffness = 700f),
+                    label = "rowSwipe",
+                )
+                val maxOffset = with(density) { 42.dp.toPx() }
+                val haptic = LocalHapticFeedback.current
                 Row(
                     modifier = Modifier.fillMaxWidth()
+                        .offset { IntOffset(animatedOffset.roundToInt(), 0) }
                         .background(if (checked) colorScheme.primary.copy(alpha = 0.14f) else Color.Transparent)
                         .pointerInput(files, file.path) {
                             var total = 0f
                             detectHorizontalDragGestures(
-                                onHorizontalDrag = { _, dragAmount -> total += dragAmount },
+                                onHorizontalDrag = { _, dragAmount ->
+                                    total += dragAmount
+                                    dragOffset = total.coerceIn(-maxOffset, maxOffset)
+                                },
                                 onDragEnd = {
                                     val threshold = with(density) { 30.dp.toPx() }
-                                    if (kotlin.math.abs(total) > threshold) onSwipe(index)
+                                    if (kotlin.math.abs(total) > threshold) {
+                                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                        onSwipe(index)
+                                    }
+                                    dragOffset = 0f
                                 },
+                                onDragCancel = { dragOffset = 0f },
                             )
                         }
                         .combinedClickable(
