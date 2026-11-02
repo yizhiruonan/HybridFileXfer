@@ -101,6 +101,12 @@ internal fun TransferScreen(
     var remoteAnchor by remember { mutableIntStateOf(-1) }
     var mkdirDialog by remember { mutableStateOf(false) }
     var newName by remember { mutableStateOf("") }
+    // 长按项目弹出的操作菜单（复制/移动/删除/重命名/属性）
+    var menuFile by remember { mutableStateOf<RemoteFile?>(null) }
+    var menuLeft by remember { mutableStateOf(false) }
+    var renameFile by remember { mutableStateOf<RemoteFile?>(null) }
+    var renameName by remember { mutableStateOf("") }
+    var propsFile by remember { mutableStateOf<RemoteFile?>(null) }
 
     fun toast(text: String) {
         main.post { message = text }
@@ -267,6 +273,31 @@ internal fun TransferScreen(
         }
     }
 
+    fun renameEntry(file: RemoteFile, newNameValue: String, left: Boolean) {
+        val name = newNameValue.trim()
+        if (name.isEmpty() || name == file.name) return
+        if (!left) {
+            toast("电脑端暂不支持重命名")
+            return
+        }
+        scope.launch(Dispatchers.IO) {
+            val ok = try {
+                val target = java.io.File(parentOf(file.path) ?: "/", name)
+                java.io.File(file.path).renameTo(target)
+            } catch (e: Throwable) {
+                false
+            }
+            main.post {
+                if (ok) {
+                    renameFile = null
+                    refreshTick++
+                } else {
+                    toast("重命名失败")
+                }
+            }
+        }
+    }
+
     fun deleteSelected() {
         val paths = (if (focusRight) remoteSel else localSel).toList()
         if (paths.isEmpty()) return
@@ -323,6 +354,19 @@ internal fun TransferScreen(
                     if (localSel.isEmpty()) localAnchor = -1
                 },
                 onSwipe = { index -> swipeSelect(true, index) },
+                onUp = {
+                    parentOf(localPath)?.let { up -> scope.launch { loadLocal(up) } }
+                },
+                onMenu = { file, index ->
+                    focusRight = false
+                    if (file.path !in localSel) {
+                        localSel.clear()
+                        localSel.add(file.path)
+                        localAnchor = index
+                    }
+                    menuLeft = true
+                    menuFile = file
+                },
             )
             Box(Modifier.width(6.dp).fillMaxHeight().background(colorScheme.surface)) 
             FilePane(
@@ -340,6 +384,19 @@ internal fun TransferScreen(
                     if (remoteSel.isEmpty()) remoteAnchor = -1
                 },
                 onSwipe = { index -> swipeSelect(false, index) },
+                onUp = {
+                    parentOf(remotePath)?.let { up -> scope.launch { loadRemote(up) } }
+                },
+                onMenu = { file, index ->
+                    focusRight = true
+                    if (file.path !in remoteSel) {
+                        remoteSel.clear()
+                        remoteSel.add(file.path)
+                        remoteAnchor = index
+                    }
+                    menuLeft = false
+                    menuFile = file
+                },
             )
         }
         // 底部工具条
@@ -433,6 +490,134 @@ internal fun TransferScreen(
         }
     }
 
+    if (menuFile != null) {
+        val file = menuFile!!
+        val left = menuLeft
+        val count = if (left) localSel.size else remoteSel.size
+        Dialog(
+            onDismissRequest = { menuFile = null },
+            properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false),
+        ) {
+            Box(
+                Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.35f)).clickable { menuFile = null },
+                contentAlignment = Alignment.Center,
+            ) {
+                Column(
+                    Modifier.width(300.dp).clip(RoundedCornerShape(20.dp))
+                        .background(colorScheme.surfaceContainer).clickable { }.padding(14.dp),
+                ) {
+                    Text("已选 " + count + " 项", fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                    Spacer(Modifier.height(6.dp))
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        MenuButton("复制 →", Modifier.weight(1f)) {
+                            menuFile = null
+                            startTransfer(false, left)
+                        }
+                        MenuButton("移动 →", Modifier.weight(1f)) {
+                            menuFile = null
+                            startTransfer(true, left)
+                        }
+                    }
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        MenuButton("删除", Modifier.weight(1f)) {
+                            menuFile = null
+                            deleteSelected()
+                        }
+                        MenuButton("重命名", Modifier.weight(1f)) {
+                            renameFile = file
+                            renameName = file.name
+                            menuFile = null
+                        }
+                    }
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        MenuButton("属性", Modifier.weight(1f)) {
+                            propsFile = file
+                            menuFile = null
+                        }
+                        Spacer(Modifier.weight(1f))
+                    }
+                    Spacer(Modifier.height(4.dp))
+                    TextButton(text = "取消", onClick = { menuFile = null }, modifier = Modifier.fillMaxWidth())
+                }
+            }
+        }
+    }
+
+    if (renameFile != null) {
+        Dialog(
+            onDismissRequest = { renameFile = null },
+            properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false),
+        ) {
+            Box(
+                Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.35f)).clickable { renameFile = null },
+                contentAlignment = Alignment.Center,
+            ) {
+                Column(
+                    Modifier.width(300.dp).clip(RoundedCornerShape(20.dp))
+                        .background(colorScheme.surfaceContainer).clickable { }.padding(18.dp),
+                ) {
+                    Text("重命名", fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                    Spacer(Modifier.height(10.dp))
+                    BasicTextField(
+                        value = renameName,
+                        onValueChange = { renameName = it },
+                        singleLine = true,
+                        textStyle = TextStyle(fontSize = 14.sp, color = colorScheme.onSurface),
+                        modifier = Modifier.fillMaxWidth()
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(colorScheme.surface)
+                            .padding(horizontal = 10.dp, vertical = 8.dp),
+                    )
+                    Spacer(Modifier.height(14.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        TextButton(text = "取消", onClick = { renameFile = null }, modifier = Modifier.weight(1f))
+                        Button(
+                            onClick = {
+                                val file = renameFile
+                                if (file != null) {
+                                    renameEntry(file, renameName, menuLeft)
+                                }
+                            },
+                            modifier = Modifier.weight(1f),
+                            colors = ButtonDefaults.buttonColorsPrimary(),
+                        ) { Text("确定", color = Color.White) }
+                    }
+                }
+            }
+        }
+    }
+
+    if (propsFile != null) {
+        val file = propsFile!!
+        Dialog(
+            onDismissRequest = { propsFile = null },
+            properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false),
+        ) {
+            Box(
+                Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.35f)).clickable { propsFile = null },
+                contentAlignment = Alignment.Center,
+            ) {
+                Column(
+                    Modifier.width(320.dp).clip(RoundedCornerShape(20.dp))
+                        .background(colorScheme.surfaceContainer).clickable { }.padding(18.dp),
+                ) {
+                    Text("属性", fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                    Spacer(Modifier.height(8.dp))
+                    Text("名称：" + file.name, fontSize = 12.sp)
+                    Text("路径：" + file.path, fontSize = 12.sp)
+                    Text("大小：" + if (file.isDirectory) "文件夹" else formatSizeText(file.size), fontSize = 12.sp)
+                    Text("修改时间：" + timeText(file.lastModified()), fontSize = 12.sp)
+                    Spacer(Modifier.height(14.dp))
+                    Button(
+                        onClick = { propsFile = null },
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = ButtonDefaults.buttonColorsPrimary(),
+                    ) { Text("知道了", color = Color.White) }
+                }
+            }
+        }
+    }
+
     if (message.isNotEmpty()) {
         Box(
             Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.35f)).clickable { message = "" },
@@ -457,6 +642,11 @@ internal fun TransferScreen(
 }
 
 @Composable
+private fun MenuButton(label: String, modifier: Modifier = Modifier, onClick: () -> Unit) {
+    TextButton(text = label, onClick = onClick, modifier = modifier)
+}
+
+@Composable
 private fun BottomAction(label: String, enabled: Boolean, onClick: () -> Unit) {
     TextButton(text = label, onClick = onClick, enabled = enabled)
 }
@@ -475,6 +665,8 @@ private fun FilePane(
     onOpen: (String) -> Unit,
     onToggle: (RemoteFile) -> Unit,
     onSwipe: (Int) -> Unit,
+    onUp: () -> Unit,
+    onMenu: (RemoteFile, Int) -> Unit,
 ) {
     val colorScheme = MiuixTheme.colorScheme
     val folders = files.count { it.isDirectory }
@@ -508,6 +700,29 @@ private fun FilePane(
         }
         val density = androidx.compose.ui.platform.LocalDensity.current
         LazyColumn(Modifier.weight(1f).fillMaxWidth()) {
+            // 顶部「..」：返回上一级（和 MT 一样）
+            if (parentOf(path) != null) {
+                item(key = "..parent") {
+                    Row(
+                        modifier = Modifier.fillMaxWidth()
+                            .clickable {
+                                onFocus()
+                                onUp()
+                            }
+                            .padding(horizontal = 6.dp, vertical = 5.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.Folder,
+                            contentDescription = null,
+                            tint = colorScheme.primary,
+                            modifier = Modifier.size(16.dp),
+                        )
+                        Spacer(Modifier.width(5.dp))
+                        Text("..", fontSize = 11.5.sp, fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
             itemsIndexed(files, key = { _, f -> f.path }) { index, file ->
                 val checked = file.path in selected
                 Row(
@@ -537,7 +752,7 @@ private fun FilePane(
                             },
                             onLongClick = {
                                 onFocus()
-                                onToggle(file)
+                                onMenu(file, index)
                             },
                         )
                         .padding(horizontal = 6.dp, vertical = 5.dp),
