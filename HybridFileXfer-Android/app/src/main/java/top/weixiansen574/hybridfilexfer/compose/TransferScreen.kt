@@ -493,40 +493,48 @@ internal fun TransferScreen(
                 contentAlignment = Alignment.Center,
             ) {
                 Column(
-                    Modifier.width(300.dp).clip(RoundedCornerShape(20.dp))
-                        .background(colorScheme.surfaceContainer).clickable { }.padding(14.dp),
+                    Modifier.width(322.dp).clip(RoundedCornerShape(22.dp))
+                        .background(colorScheme.surfaceContainer).clickable { }.padding(16.dp),
                 ) {
-                    Text("已选 " + count + " 项", fontSize = 13.sp, fontWeight = FontWeight.Bold)
-                    Spacer(Modifier.height(6.dp))
-                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        MenuButton("复制 →", Modifier.weight(1f)) {
+                    Text("已选 " + count + " 项", fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                    Spacer(Modifier.height(2.dp))
+                    Text(
+                        if (left) "手机窗口" else "电脑窗口",
+                        fontSize = 11.sp,
+                        color = colorScheme.onSurfaceVariantSummary,
+                    )
+                    Spacer(Modifier.height(12.dp))
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        MenuTile("复制 →", Modifier.weight(1f)) {
                             menuFile = null
                             startTransfer(false, left)
                         }
-                        MenuButton("移动 →", Modifier.weight(1f)) {
+                        MenuTile("移动 →", Modifier.weight(1f)) {
                             menuFile = null
                             startTransfer(true, left)
                         }
                     }
-                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        MenuButton("删除", Modifier.weight(1f)) {
+                    Spacer(Modifier.height(10.dp))
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        MenuTile("删除", Modifier.weight(1f)) {
                             menuFile = null
                             deleteSelected()
                         }
-                        MenuButton("重命名", Modifier.weight(1f)) {
+                        MenuTile("重命名", Modifier.weight(1f)) {
                             renameFile = file
                             renameName = file.name
                             menuFile = null
                         }
                     }
-                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        MenuButton("属性", Modifier.weight(1f)) {
+                    Spacer(Modifier.height(10.dp))
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        MenuTile("属性", Modifier.weight(1f)) {
                             propsFile = file
                             menuFile = null
                         }
                         Spacer(Modifier.weight(1f))
                     }
-                    Spacer(Modifier.height(4.dp))
+                    Spacer(Modifier.height(14.dp))
                     TextButton(text = "取消", onClick = { menuFile = null }, modifier = Modifier.fillMaxWidth())
                 }
             }
@@ -632,8 +640,18 @@ internal fun TransferScreen(
 }
 
 @Composable
-private fun MenuButton(label: String, modifier: Modifier = Modifier, onClick: () -> Unit) {
-    TextButton(text = label, onClick = onClick, modifier = modifier)
+private fun MenuTile(label: String, modifier: Modifier = Modifier, onClick: () -> Unit) {
+    val colorScheme = MiuixTheme.colorScheme
+    Box(
+        modifier = modifier
+            .height(46.dp)
+            .clip(RoundedCornerShape(12.dp))
+            .background(colorScheme.surface)
+            .clickable { onClick() },
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(label, fontSize = 14.sp, color = colorScheme.onSurface)
+    }
 }
 
 @Composable
