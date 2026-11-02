@@ -317,7 +317,11 @@ internal fun TransferScreen(
                 modifier = Modifier.weight(1f),
                 onFocus = { focusRight = false },
                 onOpen = { p -> scope.launch { loadLocal(p) } },
-                onToggle = { file -> toggle(localSel, file.path) },
+                onToggle = { file ->
+                    toggle(localSel, file.path)
+                    // 取消勾选到空 = 退出多选，滑动锚点也要一起清掉，否则下次滑动会接着上次的锚点选一整段
+                    if (localSel.isEmpty()) localAnchor = -1
+                },
                 onSwipe = { index -> swipeSelect(true, index) },
             )
             Box(Modifier.width(6.dp).fillMaxHeight().background(colorScheme.surface)) 
@@ -331,7 +335,10 @@ internal fun TransferScreen(
                 modifier = Modifier.weight(1f),
                 onFocus = { focusRight = true },
                 onOpen = { p -> scope.launch { loadRemote(p) } },
-                onToggle = { file -> toggle(remoteSel, file.path) },
+                onToggle = { file ->
+                    toggle(remoteSel, file.path)
+                    if (remoteSel.isEmpty()) remoteAnchor = -1
+                },
                 onSwipe = { index -> swipeSelect(false, index) },
             )
         }
