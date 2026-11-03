@@ -1277,8 +1277,9 @@ public class ServerService extends Service implements ServiceConnection {
             for (ChannelLive channel : transfer.channelSnapshot()) {
                 speedSum += channel.speed;
             }
+            // 通知栏内容以「接收速率」为主
             builder.setContentTitle(getString(R.string.notification_receiving) + " · " + pct + "%")
-                    .setContentText(name + "  ·  " + GlobalProgress.formatSpeed(speedSum)
+                    .setContentText("接收速率 " + GlobalProgress.formatSpeed(speedSum)
                             + "  ·  " + GlobalProgress.formatSize(done) + " / "
                             + GlobalProgress.formatSize(transfer.total))
                     .setProgress(100, pct, false);
