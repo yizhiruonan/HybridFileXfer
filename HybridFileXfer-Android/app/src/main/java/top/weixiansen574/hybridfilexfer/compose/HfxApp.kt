@@ -412,6 +412,10 @@ fun HfxApp(
         }
         var lastFullRead = 0L
         while (true) {
+            // 用户点了常驻通知回到应用 → 重新弹出接收进度窗口
+            if (ServerService.consumeShowTransfer()) {
+                xferPanelHidden = false
+            }
             // 用户取消接收后，服务会把半成品路径放这里，弹窗问"保留还是删除"
             val cancelledPartials = ServerService.takeCancelledPartials()
             if (cancelledPartials.isNotEmpty()) {
@@ -1086,25 +1090,6 @@ private fun SettingsPage(
                     onCheckedChange = onAutoConnect,
                     title = "自动连接",
                     summary = "后台一直等待电脑连接（通知栏常驻）",
-                )
-                // 全局悬浮窗：接收时在别的应用上也能看到进度（需要系统"显示在其他应用上层"权限）
-                SwitchPreference(
-                    checked = android.provider.Settings.canDrawOverlays(activity),
-                    onCheckedChange = { enabled ->
-                        if (enabled && !android.provider.Settings.canDrawOverlays(activity)) {
-                            try {
-                                activity.startActivity(
-                                    android.content.Intent(
-                                        android.provider.Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                                        android.net.Uri.parse("package:" + activity.packageName),
-                                    ),
-                                )
-                            } catch (_: Exception) {
-                            }
-                        }
-                    },
-                    title = "全局悬浮窗",
-                    summary = "接收文件时在其他应用上也显示进度（需在系统里允许悬浮窗）",
                 )
                 OverlayDropdownPreference(
                     title = "连接模式",

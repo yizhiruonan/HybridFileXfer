@@ -357,15 +357,6 @@ internal fun TransferScreen(
                 modifier = Modifier.align(Alignment.CenterEnd),
             )
         }
-        if (statusText.isNotEmpty()) {
-            Text(
-                statusText,
-                fontSize = 11.sp,
-                color = colorScheme.primary,
-                textAlign = TextAlign.Center,
-                modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
-            )
-        }
         Row(Modifier.weight(1f).fillMaxWidth()) {
             FilePane(
                 title = "手机",
@@ -450,7 +441,7 @@ internal fun TransferScreen(
         ) {
             Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.35f)).clickable { mkdirDialog = false }, contentAlignment = Alignment.Center) {
                 Column(
-                    Modifier.width(300.dp).clip(RoundedCornerShape(20.dp))
+                    Modifier.width(340.dp).clip(RoundedCornerShape(20.dp))
                         .background(colorScheme.surfaceContainer).clickable { }.padding(18.dp),
                 ) {
                     Text("新建", fontSize = 18.sp, fontWeight = FontWeight.Bold)
@@ -473,7 +464,9 @@ internal fun TransferScreen(
                             onClick = { createEntry(true) },
                             modifier = Modifier.weight(1f),
                             colors = ButtonDefaults.buttonColorsPrimary(),
-                        ) { Text("文件夹", color = Color.White) }
+                        ) {
+                            Text("文件夹", color = Color.White, fontSize = 13.sp, maxLines = 1, softWrap = false)
+                        }
                     }
                 }
             }
