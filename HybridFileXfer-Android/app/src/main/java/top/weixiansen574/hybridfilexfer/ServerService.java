@@ -76,7 +76,18 @@ public class ServerService extends Service implements ServiceConnection {
 
     private Config config;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
-    private GlobalProgress globalProgress;
+    /** 通知栏点回来时要求重新弹出接收进度窗口（Activity 在 onNewIntent/onCreate 里置位） */
+    private static volatile boolean pendingShowTransfer;
+
+    public static void requestShowTransfer() {
+        pendingShowTransfer = true;
+    }
+
+    public static boolean consumeShowTransfer() {
+        boolean value = pendingShowTransfer;
+        pendingShowTransfer = false;
+        return value;
+    }
     /** 应用是否在前台（在前台时用应用内浮层，不再叠全局悬浮窗） */
     public static volatile boolean appVisible = false;
 
@@ -681,8 +692,6 @@ public class ServerService extends Service implements ServiceConnection {
         discoveryBeacon = new DiscoveryBeacon(this, config.getServerPort());
         discoveryBeacon.start();
         // 全局接收进度（悬浮窗 + 通知栏）
-        globalProgress = new GlobalProgress(this, mainHandler);
-        globalProgress.start();
     }
 
     @Override
@@ -1101,10 +1110,6 @@ public class ServerService extends Service implements ServiceConnection {
 
     @Override
     public void onDestroy() {
-        if (globalProgress != null) {
-            globalProgress.destroy();
-            globalProgress = null;
-        }
         if (discoveryBeacon != null) {
             discoveryBeacon.stop();
             discoveryBeacon = null;
@@ -1201,6 +1206,8 @@ public class ServerService extends Service implements ServiceConnection {
     private Notification buildNotification() {
         Intent openIntent = new Intent(this, top.weixiansen574.hybridfilexfer.compose.MiuixMainActivity.class);
         openIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+        // 点通知 → 回到应用并重新弹出接收进度窗口
+        openIntent.putExtra("hfx_show_transfer", true);
         PendingIntent contentIntent = PendingIntent.getActivity(this, 0, openIntent,
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
 

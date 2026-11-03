@@ -45,6 +45,15 @@ class MiuixMainActivity : ComponentActivity() {
         top.weixiansen574.hybridfilexfer.ServerService.appVisible = false
     }
 
+    // 点通知栏常驻通知回来：让界面把接收进度窗口重新弹出来
+    override fun onNewIntent(intent: android.content.Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        if (intent.getBooleanExtra("hfx_show_transfer", false)) {
+            top.weixiansen574.hybridfilexfer.ServerService.requestShowTransfer()
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
