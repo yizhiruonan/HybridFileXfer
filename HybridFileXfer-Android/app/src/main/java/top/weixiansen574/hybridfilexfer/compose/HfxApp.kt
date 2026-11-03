@@ -1091,6 +1091,25 @@ private fun SettingsPage(
                     title = "自动连接",
                     summary = "后台一直等待电脑连接（通知栏常驻）",
                 )
+                // 全局悬浮窗：接收时在别的应用上也能看到进度（需要系统"显示在其他应用上层"权限）
+                SwitchPreference(
+                    checked = android.provider.Settings.canDrawOverlays(activity),
+                    onCheckedChange = { enabled ->
+                        if (enabled && !android.provider.Settings.canDrawOverlays(activity)) {
+                            try {
+                                activity.startActivity(
+                                    android.content.Intent(
+                                        android.provider.Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                        android.net.Uri.parse("package:" + activity.packageName),
+                                    ),
+                                )
+                            } catch (_: Exception) {
+                            }
+                        }
+                    },
+                    title = "全局悬浮窗",
+                    summary = "接收文件时在其他应用上也显示进度（需在系统里允许悬浮窗）",
+                )
                 OverlayDropdownPreference(
                     title = "连接模式",
                     summary = "IO 服务的启动方式",

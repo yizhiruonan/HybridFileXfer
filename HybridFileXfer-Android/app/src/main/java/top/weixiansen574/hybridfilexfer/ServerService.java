@@ -76,6 +76,8 @@ public class ServerService extends Service implements ServiceConnection {
 
     private Config config;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private GlobalProgress globalProgress;
+
     /** 通知栏点回来时要求重新弹出接收进度窗口（Activity 在 onNewIntent/onCreate 里置位） */
     private static volatile boolean pendingShowTransfer;
 
@@ -815,7 +817,9 @@ public class ServerService extends Service implements ServiceConnection {
         bound = false;
         ioService = null;
         if (active) {
-            mainHandler.postDelayed(() -> bindIoService(ioMode), 1000);
+            globalProgress = new GlobalProgress(this, mainHandler);
+        globalProgress.start();
+        mainHandler.postDelayed(() -> bindIoService(ioMode), 1000);
         }
     }
 
@@ -1110,6 +1114,10 @@ public class ServerService extends Service implements ServiceConnection {
 
     @Override
     public void onDestroy() {
+        if (globalProgress != null) {
+            globalProgress.destroy();
+            globalProgress = null;
+        }
         if (discoveryBeacon != null) {
             discoveryBeacon.stop();
             discoveryBeacon = null;
