@@ -572,8 +572,8 @@ fn main() -> Result<(), slint::PlatformError> {
             let want_h = 400.0
                 + if ui.get_ask_target() { 60.0 } else { 0.0 }
                 + devices_h
-                + if xfer_now { 130.0 } else { 0.0 }
-                + if xfer_now && ui.get_send_active() { 44.0 } else { 0.0 }
+                + if xfer_now { 190.0 } else { 0.0 }
+                + if xfer_now && ui.get_send_active() { 50.0 } else { 0.0 }
                 + if ui.get_update_state() == 2 || ui.get_update_state() == 5 {
                     34.0
                 } else {

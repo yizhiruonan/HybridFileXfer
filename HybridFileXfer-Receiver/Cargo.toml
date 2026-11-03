@@ -2,7 +2,7 @@
 # src/bin 下的 tray_win.rs 是模块而不是独立程序
 autobins = false
 name = "hybridfilexfer-receiver"
-version = "1.4.1"
+version = "1.4.2"
 edition = "2021"
 description = "Receiver for HybridFileXfer / 多轨快传, with a GUI"
 

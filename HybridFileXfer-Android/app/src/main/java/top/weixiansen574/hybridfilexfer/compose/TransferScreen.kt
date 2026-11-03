@@ -32,6 +32,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -116,6 +117,11 @@ internal fun TransferScreen(
     // 滑动选块的起点：第一下滑动只选一项并记下起点，第二下滑动把起点到这一项整段选中，然后清空起点
     var localBlockStart by remember { mutableIntStateOf(-1) }
     var remoteBlockStart by remember { mutableIntStateOf(-1) }
+    // 双窗口里发送/接收时的进度弹窗（和经典界面的「发送到电脑」一致）
+    var xferPopup by remember { mutableStateOf(false) }
+    var xferPopupTitle by remember { mutableStateOf("") }
+    var xferPopupFile by remember { mutableStateOf("") }
+    var xferPopupSpeed by remember { mutableLongStateOf(0L) }
 
     // 返回键：先关弹窗/菜单 → 取消焦点窗口的多选 → 最后才退出传输页
     androidx.activity.compose.BackHandler(enabled = true) {
@@ -172,17 +178,17 @@ internal fun TransferScreen(
 
     fun callback(isUpload: Boolean): TransferFileCallback = object : TransferFileCallback {
         override fun onFileUploading(iName: String?, path: String?, targetSize: Long, totalSize: Long) {
-            main.post { statusText = "正在发送：" + shortName(path) }
+            main.post { xferPopupFile = shortName(path) }
         }
 
         override fun onFileDownloading(iName: String?, path: String?, targetSize: Long, totalSize: Long) {
-            main.post { statusText = "正在接收：" + shortName(path) }
+            main.post { xferPopupFile = shortName(path) }
         }
 
         override fun onSpeedInfo(trafficInfoList: List<TrafficInfo>?) {
             val speed = trafficInfoList?.sumOf { it.uploadTraffic + it.downloadTraffic } ?: 0
             if (speed > 0) {
-                main.post { statusText = (if (isUpload) "正在发送  " else "正在接收  ") + formatSpeedText(speed) }
+                main.post { xferPopupSpeed = speed }
             }
         }
 
@@ -202,13 +208,17 @@ internal fun TransferScreen(
 
         override fun onComplete(isUpload: Boolean, traffic: Long, time: Long) {
             // 真正的收尾（移动的删除、刷新）由调用处的协程统一做
-            main.post { statusText = "" }
+            main.post {
+                statusText = ""
+                xferPopup = false
+            }
         }
 
         override fun onIncomplete() {
             main.post {
                 busy = false
                 statusText = ""
+                xferPopup = false
                 message = "传输中断"
             }
         }
@@ -221,6 +231,10 @@ internal fun TransferScreen(
         if (files.isEmpty() || busy) return
         busy = true
         statusText = if (move) "正在移动…" else "正在复制…"
+        xferPopupTitle = if (fromLeft) "发送到电脑" else "接收到手机"
+        xferPopupFile = ""
+        xferPopupSpeed = 0
+        xferPopup = true
         scope.launch(Dispatchers.IO) {
             try {
                 val localDir = Directory(localPath, Directory.getCurrentFileSystem())
@@ -238,6 +252,7 @@ internal fun TransferScreen(
                 main.post {
                     busy = false
                     statusText = ""
+                    xferPopup = false
                     message = if (move) "移动完成" else "复制完成"
                     refreshTick++
                 }
@@ -245,6 +260,7 @@ internal fun TransferScreen(
                 main.post {
                     busy = false
                     statusText = ""
+                    xferPopup = false
                     toast((if (move) "移动失败：" else "复制失败：") + e.message)
                 }
             }
@@ -473,6 +489,41 @@ internal fun TransferScreen(
         }
     }
 
+    if (xferPopup) {
+        Dialog(
+            onDismissRequest = { xferPopup = false },
+            properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false),
+        ) {
+            Box(
+                Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.35f)).clickable { xferPopup = false },
+                contentAlignment = Alignment.Center,
+            ) {
+                Column(
+                    Modifier.width(340.dp).clip(RoundedCornerShape(22.dp))
+                        .background(colorScheme.surfaceContainer).clickable { }.padding(20.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                ) {
+                    Text(xferPopupTitle, fontSize = 19.sp, fontWeight = FontWeight.Bold)
+                    Spacer(Modifier.height(10.dp))
+                    Text(
+                        xferPopupFile.ifEmpty { "准备中…" },
+                        fontSize = 13.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        if (xferPopupSpeed > 0) formatSpeedText(xferPopupSpeed) else "正在传输…",
+                        fontSize = 12.sp,
+                        color = colorScheme.primary,
+                    )
+                    Spacer(Modifier.height(18.dp))
+                    TextButton(text = "关闭", onClick = { xferPopup = false }, modifier = Modifier.fillMaxWidth())
+                }
+            }
+        }
+    }
+
     if (menuFile != null) {
         val file = menuFile!!
         val left = menuLeft
@@ -498,11 +549,11 @@ internal fun TransferScreen(
                     )
                     Spacer(Modifier.height(12.dp))
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                        MenuTile("复制 →", Modifier.weight(1f)) {
+                        MenuTile(if (left) "复制 →" else "← 复制", Modifier.weight(1f)) {
                             menuFile = null
                             startTransfer(false, left)
                         }
-                        MenuTile("移动 →", Modifier.weight(1f)) {
+                        MenuTile(if (left) "移动 →" else "← 移动", Modifier.weight(1f)) {
                             menuFile = null
                             startTransfer(true, left)
                         }
