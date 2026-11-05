@@ -548,7 +548,12 @@ fn main() -> Result<(), slint::PlatformError> {
                 last_tick = now;
             }
 
-            let active = s.running() && total > 0;
+            // 没有设备真正连着时（比如手机端服务被强停）不再显示残留的传输卡片
+            let any_connected = s
+                .devices
+                .values()
+                .any(|st| matches!(st, EngineState::Connected(_)));
+            let active = s.running() && total > 0 && any_connected;
             ui.set_xfer_visible(active);
             // 手机来拉文件时显示「暂停发送 / 中断发送」
             ui.set_send_active(hfx_receiver::control::sending());

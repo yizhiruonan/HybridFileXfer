@@ -124,6 +124,7 @@ internal fun TransferScreen(
     var xferPopupDone by remember { mutableLongStateOf(0L) }
     var xferPopupTotal by remember { mutableLongStateOf(0L) }
     var xferPopupChannels by remember { mutableStateOf<List<ChannelStat>>(emptyList()) }
+    var xferPopupPaused by remember { mutableStateOf(false) }
 
     // 返回键：先关弹窗/菜单 → 取消焦点窗口的多选 → 最后才退出传输页
     androidx.activity.compose.BackHandler(enabled = true) {
@@ -256,6 +257,7 @@ internal fun TransferScreen(
         xferPopupDone = 0
         xferPopupTotal = files.sumOf { if (it.size > 0) it.size else 0L }
         xferPopupChannels = emptyList()
+        xferPopupPaused = false
         xferPopup = true
         scope.launch(Dispatchers.IO) {
             try {
@@ -522,13 +524,27 @@ internal fun TransferScreen(
                 xferTotal = xferPopupTotal,
                 xferBytes = xferPopupDone,
                 xferChannels = xferPopupChannels,
-                xferPaused = false,
+                xferPaused = xferPopupPaused,
                 xferCount = 1,
                 xferLabel = server.displayName,
                 xferId = -1,
             ),
             onDismiss = { xferPopup = false },
             sending = xferPopupSending,
+            onPause = {
+                xferPopupPaused = true
+                server.pauseTransfer()
+            },
+            onResume = {
+                xferPopupPaused = false
+                server.resumeTransfer()
+            },
+            onCancel = {
+                xferPopupPaused = false
+                xferPopup = false
+                runCatching { server.abortTransfer() }
+                message = "已取消传输"
+            },
         )
     }
 
