@@ -13,7 +13,7 @@ use crate::proto::{self, controller, current_file_system, transfer, BLOCK_SIZE};
 use crate::receiver::Receiver;
 use crate::util;
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(60);
@@ -123,6 +123,16 @@ impl Session {
             ));
         }
 
+        // 已经连通的网段：不同网段的网卡（比如手机的 wlan1 走了另一个网段）直接跳过，
+        // 不用每条都等 CONNECT_TIMEOUT —— 否则 4 条连不上的通道会让"已连接"提示晚十几秒
+        let mut reachable_subnet: Option<[u8; 3]> = match address {
+            IpAddr::V4(v4) if !address.is_loopback() => {
+                let o = v4.octets();
+                Some([o[0], o[1], o[2]])
+            }
+            _ => None,
+        };
+
         // One transfer channel per network interface, connected in the order the
         // phone advertised them (the phone accepts them one by one).
         let mut transfers: Vec<(String, TcpStream)> = Vec::with_capacity(interfaces.len());
@@ -136,6 +146,21 @@ impl Session {
                 port
             };
             let target = SocketAddr::new(interface.address, interface_port);
+            if !interface.address.is_loopback() {
+                if let (IpAddr::V4(v4), Some(subnet)) = (interface.address, reachable_subnet) {
+                    let o = v4.octets();
+                    if [o[0], o[1], o[2]] != subnet {
+                        let _ = proto::write_bool(&mut cw, false);
+                        let _ = proto::write_utf(&mut cw, &interface.name);
+                        let _ = proto::read_bool(&mut reader);
+                        log::debug(&format!(
+                            "skip transfer channel {} ({}) : not in the reachable subnet",
+                            interface.name, interface.address
+                        ));
+                        continue;
+                    }
+                }
+            }
             log::debug(&format!(
                 "connecting transfer channel {} -> {} (bind: {})",
                 interface.name,
@@ -150,6 +175,12 @@ impl Session {
                     stream.set_nodelay(true)?;
                     stream.set_read_timeout(Some(TRANSFER_TIMEOUT))?;
                     stream.set_write_timeout(Some(TRANSFER_TIMEOUT))?;
+                    if !interface.address.is_loopback() {
+                        if let IpAddr::V4(v4) = interface.address {
+                            let o = v4.octets();
+                            reachable_subnet = Some([o[0], o[1], o[2]]);
+                        }
+                    }
                     proto::write_bool(&mut cw, true)?;
                     proto::write_utf(&mut cw, &interface.name)?;
                     let accepted = proto::read_bool(&mut reader)?;

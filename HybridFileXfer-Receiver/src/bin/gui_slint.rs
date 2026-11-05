@@ -407,16 +407,31 @@ fn main() -> Result<(), slint::PlatformError> {
                     }
                 }
                 let count = s.devices.len();
+                // 只有真正连上的才算「已连接」：之前把「等待/重试」的设备也算进去，
+                // 会出现电脑端显示「已连接 2 台」而手机上还在等连接的情况
+                let connected_devices = s
+                    .devices
+                    .values()
+                    .filter(|st| matches!(st, EngineState::Connected(_)))
+                    .count();
+                let waiting_devices = count.saturating_sub(connected_devices);
                 let (kind, title, sub) = if !connected.is_empty() {
                     (
                         2,
-                        if count > 1 {
-                            format!("已连接 {count} 台设备")
+                        if connected_devices > 1 {
+                            format!("已连接 {connected_devices} 台设备")
                         } else {
                             "已连接电脑".to_string()
                         },
                         // 收起时只给概况，完整通道列表在展开后显示
-                        format!("{count} 台设备 · {} 条通道", connected.len()),
+                        if waiting_devices > 0 {
+                            format!(
+                                "{connected_devices} 台已连接 · {waiting_devices} 台等待 · {} 条通道",
+                                connected.len()
+                            )
+                        } else {
+                            format!("{connected_devices} 台设备 · {} 条通道", connected.len())
+                        },
                     )
                 } else if let Some(reason) = retrying {
                     (3, "连接有问题，正在重试".to_string(), reason)

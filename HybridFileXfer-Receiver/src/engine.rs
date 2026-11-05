@@ -163,6 +163,8 @@ struct AdbCycle {
     last_notice: Option<String>,
     /// 这台设备之前成功出现过；之后再从 adb 列表里消失就结束会话
     seen: bool,
+    /// 上一次启动手机端服务是否成功：失败了就 2 秒重试一次，别等 10 秒
+    last_start_ok: bool,
 }
 
 impl AdbCycle {
@@ -172,6 +174,7 @@ impl AdbCycle {
             last_ensure: Instant::now(),
             last_notice: None,
             seen: false,
+            last_start_ok: true,
         }
     }
 
@@ -235,24 +238,42 @@ impl AdbCycle {
                 tr("检测到手机", "detected phone"),
                 device.serial
             )));
-            match adb.start_service(&device.serial, &options.component, true) {
-                Ok((true, _)) => {}
-                Ok((false, text)) => log::warn(&format!(
-                    "{} {} {}",
-                    tr("无法启动手机端接收服务：", "cannot start the phone service:"),
-                    options.component,
-                    text.lines().next().unwrap_or("")
-                )),
-                Err(e) => log::warn(&format!("am start-foreground-service: {}", e)),
-            }
+            let started = match adb.start_service(&device.serial, &options.component, true) {
+                Ok((true, _)) => true,
+                Ok((false, text)) => {
+                    log::warn(&format!(
+                        "{} {} {}",
+                        tr("无法启动手机端接收服务：", "cannot start the phone service:"),
+                        options.component,
+                        text.lines().next().unwrap_or("")
+                    ));
+                    false
+                }
+                Err(e) => {
+                    log::warn(&format!("am start-foreground-service: {}", e));
+                    false
+                }
+            };
+            self.last_start_ok = started;
             self.fresh_sent_for = Some(device.serial.clone());
             self.last_ensure = Instant::now();
             if !sleep_unless_stopped(stop, Duration::from_millis(500)) {
                 return Attempt::Retry;
             }
-        } else if self.last_ensure.elapsed() >= Duration::from_secs(10) {
-            let _ = adb.start_service(&device.serial, &options.component, false);
-            self.last_ensure = Instant::now();
+        } else {
+            // 启动服务失败过就 2 秒重试一次（之前固定 10 秒，手机上要等很久才连上）
+            let interval = if self.last_start_ok {
+                Duration::from_secs(10)
+            } else {
+                Duration::from_secs(2)
+            };
+            if self.last_ensure.elapsed() >= interval {
+                self.last_start_ok = adb
+                    .start_service(&device.serial, &options.component, false)
+                    .map(|(ok, _)| ok)
+                    .unwrap_or(false);
+                self.last_ensure = Instant::now();
+            }
         }
 
         match Session::connect_with_local_port(
