@@ -125,6 +125,9 @@ internal fun TransferScreen(
     var xferPopupTotal by remember { mutableLongStateOf(0L) }
     var xferPopupChannels by remember { mutableStateOf<List<ChannelStat>>(emptyList()) }
     var xferPopupPaused by remember { mutableStateOf(false) }
+    var xferPopupSpeed by remember { mutableLongStateOf(0L) }
+    var xferPopupLastTraffic by remember { mutableLongStateOf(0L) }
+    var xferPopupLastAt by remember { mutableLongStateOf(0L) }
 
     // 返回键：先关弹窗/菜单 → 取消焦点窗口的多选 → 最后才退出传输页
     androidx.activity.compose.BackHandler(enabled = true) {
@@ -192,8 +195,15 @@ internal fun TransferScreen(
             val list = trafficInfoList ?: return
             val done = list.sumOf { it.uploadTraffic + it.downloadTraffic }
             val channels = list.map { ChannelStat(it.iName ?: "", it.uploadTraffic + it.downloadTraffic, 0, false) }
+            val now = android.os.SystemClock.elapsedRealtime()
             main.post {
-                xferPopupDone = done
+                if (xferPopupLastAt > 0 && now > xferPopupLastAt && done >= xferPopupLastTraffic) {
+                    xferPopupSpeed = (done - xferPopupLastTraffic) * 1000L / (now - xferPopupLastAt)
+                }
+                xferPopupLastTraffic = done
+                xferPopupLastAt = now
+                // 插值只往前推，回调给的数比插值小的时候不要倒退
+                xferPopupDone = maxOf(xferPopupDone, done)
                 xferPopupChannels = channels
                 GlobalTransferOverlay.reportSend(
                     UiState(
@@ -229,8 +239,13 @@ internal fun TransferScreen(
             // 真正的收尾（移动的删除、刷新）由调用处的协程统一做
             main.post {
                 statusText = ""
-                xferPopup = false
+                // 先把进度条补满再关，避免"进度条没走完就显示复制完成"
+                if (xferPopupTotal > 0) xferPopupDone = xferPopupTotal
                 GlobalTransferOverlay.reportSend(null)
+                scope.launch {
+                    kotlinx.coroutines.delay(450)
+                    xferPopup = false
+                }
             }
         }
 
@@ -515,7 +530,38 @@ internal fun TransferScreen(
         }
     }
 
+    // 弹窗显示期间把已传字节按最近速率平滑推进：回调是每秒级的，直接设值会一顿一顿
+    LaunchedEffect(xferPopup) {
+        var last = android.os.SystemClock.elapsedRealtime()
+        while (xferPopup) {
+            kotlinx.coroutines.delay(100)
+            val now = android.os.SystemClock.elapsedRealtime()
+            val dt = (now - last).coerceAtLeast(1)
+            last = now
+            if (!xferPopupPaused && xferPopupSpeed > 0 && xferPopupTotal > 0 && xferPopupDone < xferPopupTotal) {
+                val step = xferPopupSpeed * dt / 1000
+                if (step > 0) xferPopupDone = minOf(xferPopupTotal, xferPopupDone + step)
+            }
+        }
+    }
+
     if (xferPopup) {
+        // 双窗口没有 BlockProgress 的区间信息，按通道数切出等分段落，填充跟随总进度：
+        // 视觉上和主页接收弹窗的分块进度条一致
+        val popupSegments = if (xferPopupChannels.isNotEmpty() && xferPopupTotal > 0) {
+            val count = xferPopupChannels.size
+            val fraction = (xferPopupDone.toFloat() / xferPopupTotal).coerceIn(0f, 1f)
+            List(count) { index ->
+                SegInfo(
+                    owner = "seg" + index,
+                    start = index * 100 / count,
+                    end = (index + 1) * 100 / count,
+                    filled = fraction,
+                )
+            }
+        } else {
+            emptyList()
+        }
         ReceiveProgressPanel(
             state = UiState(
                 xferActive = true,
@@ -523,6 +569,7 @@ internal fun TransferScreen(
                 xferDone = xferPopupDone,
                 xferTotal = xferPopupTotal,
                 xferBytes = xferPopupDone,
+                xferSegments = popupSegments,
                 xferChannels = xferPopupChannels,
                 xferPaused = xferPopupPaused,
                 xferCount = 1,
