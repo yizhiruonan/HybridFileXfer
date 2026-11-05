@@ -113,7 +113,8 @@ pub fn run_multi(
             }
         }
 
-        if !sleep_unless_stopped(&stop, Duration::from_secs(2)) {
+        // 800ms 扫一次 adb：拔插后能更快发现设备（原来 2 秒，插上要等一下才连）
+        if !sleep_unless_stopped(&stop, Duration::from_millis(800)) {
             break;
         }
     }

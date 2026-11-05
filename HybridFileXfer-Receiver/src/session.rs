@@ -1,10 +1,11 @@
 //! One connection to the phone: handshake, control channel and file receiving.
 
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -17,6 +18,13 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(60);
+/// 连不上的通道地址缓存两分钟：重连/拔插时直接跳过，不用每条再等 2 秒超时
+const UNREACHABLE_TTL: Duration = Duration::from_secs(120);
+
+fn unreachable_channels() -> &'static Mutex<HashMap<IpAddr, Instant>> {
+    static CACHE: OnceLock<Mutex<HashMap<IpAddr, Instant>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 #[derive(Clone, Debug)]
 pub struct PeerInterface {
@@ -160,6 +168,23 @@ impl Session {
                         continue;
                     }
                 }
+                // 两分钟内超时过的地址直接跳过：拔插/重连时不再逐条等 2 秒
+                let recently_failed = unreachable_channels()
+                    .lock()
+                    .ok()
+                    .and_then(|cache| cache.get(&interface.address).copied())
+                    .map(|at| at.elapsed() < UNREACHABLE_TTL)
+                    .unwrap_or(false);
+                if recently_failed {
+                    let _ = proto::write_bool(&mut cw, false);
+                    let _ = proto::write_utf(&mut cw, &interface.name);
+                    let _ = proto::read_bool(&mut reader);
+                    log::debug(&format!(
+                        "skip transfer channel {} ({}) : recently unreachable",
+                        interface.name, interface.address
+                    ));
+                    continue;
+                }
             }
             log::debug(&format!(
                 "connecting transfer channel {} -> {} (bind: {})",
@@ -194,6 +219,11 @@ impl Session {
                     }
                 }
                 Err(e) => {
+                    if !interface.address.is_loopback() {
+                        if let Ok(mut cache) = unreachable_channels().lock() {
+                            cache.insert(interface.address, Instant::now());
+                        }
+                    }
                     // 这张网卡连不上（比如电脑和手机的WIFI不在同一网段），
                     // 告诉手机跳过它，其它通道继续用 —— 自适应多通道。
                     let _ = proto::write_bool(&mut cw, false);
