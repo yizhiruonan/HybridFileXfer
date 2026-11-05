@@ -104,7 +104,7 @@ internal fun SurfaceCard(
 }
 
 @Composable
-internal fun StatusCard(state: UiState, onClick: () -> Unit) {
+internal fun StatusCard(state: UiState, plannedChannels: Int, onClick: () -> Unit) {
     val colorScheme = MiuixTheme.colorScheme
     val connected = state.connected
     val computers = state.connections.size
@@ -117,6 +117,9 @@ internal fun StatusCard(state: UiState, onClick: () -> Unit) {
         else -> "未开始接收"
     }
     val subtitle = when {
+        // 握手过程中通道是一条条接入的，主页也实时显示进度
+        connected && plannedChannels > 0 && state.channelCount < plannedChannels ->
+            "正在接入通道 " + state.channelCount + "/" + plannedChannels + " · 点此查看连接"
         connected -> state.channelCount.toString() + " 条通道 · 点此查看连接"
         state.state == ServerService.STATE_WAITING -> "插上数据线，或在电脑上运行接收器"
         state.state == ServerService.STATE_STARTING -> "正在启动 IO 服务"

@@ -241,7 +241,8 @@ internal fun readProgressState(base: UiState): UiState {
     val currentConn = connections.firstOrNull { it.id == (current?.connectionId ?: -1) }
     return base.copy(
         state = ServerService.getState(),
-        connected = ServerService.isConnected(),
+        // 会话一建立就算已连接：握手过程中通道一条条接入，主页实时显示数量
+        connected = connections.isNotEmpty() || ServerService.isConnected(),
         connections = connections,
         channelCount = connections.sumOf { it.channels.size },
         xferActive = current != null,
@@ -266,7 +267,8 @@ internal fun readState(context: Context): UiState {
     val currentConn = connections.firstOrNull { it.id == (current?.connectionId ?: -1) }
     return UiState(
         state = ServerService.getState(),
-        connected = ServerService.isConnected(),
+        // 会话一建立就算已连接：握手过程中通道一条条接入，主页实时显示数量
+        connected = connections.isNotEmpty() || ServerService.isConnected(),
         interfaceNames = ServerService.getInterfaceNames(),
         connectedNames = ServerService.getConnectedInterfaceNames(),
         connections = connections,
@@ -771,7 +773,7 @@ private fun HomePage(
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         item {
-            StatusCard(state, onOpenConnections)
+            StatusCard(state, plannedChannels, onOpenConnections)
         }
         item {
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
