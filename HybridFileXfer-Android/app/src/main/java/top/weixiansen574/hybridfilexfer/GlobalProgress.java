@@ -71,14 +71,9 @@ final class GlobalProgress {
     private void tick() {
         ServerService.Live live = ServerService.currentTransfer();
         boolean show = live != null && live.total > 0 && !ServerService.appVisible;
-        if (lastShow == null || lastShow != show) {
-            lastShow = show;
-            ServerService.debugFile("global show=" + show + " live=" + (live != null)
-                    + " visible=" + ServerService.appVisible
-                    + " canOverlay=" + Settings.canDrawOverlays(service));
-        }
+        // 应用外：用 ComposeView 渲染和应用内完全一样的接收/发送弹窗
+        top.weixiansen574.hybridfilexfer.compose.GlobalTransferOverlay.INSTANCE.refresh(service);
         if (!show) {
-            hide();
             long now = SystemClock.elapsedRealtime();
             if (live != null && live.total > 0) {
                 // 浮层收起来了（或在应用内），通知栏继续每秒更新速率
@@ -94,42 +89,7 @@ final class GlobalProgress {
             return;
         }
         hadTransfer = true;
-        if (!ensureView()) {
-            return;
-        }
-        connectionId = live.connectionId;
-        long done = live.done;
-        HFXServer server = HFXServer.getById(live.connectionId);
-        if (server != null) {
-            done = Math.max(done, server.blockProgress.getDoneBytes());
-        }
-        long total = Math.max(1, live.total);
-        int pct = (int) Math.max(0, Math.min(100, done * 100 / total));
         long now = SystemClock.elapsedRealtime();
-        if (lastAt > 0) {
-            long dt = now - lastAt;
-            if (dt >= 100) {
-                double instant = (done - lastDone) * 1000.0 / dt;
-                if (instant >= 0) {
-                    speedValue = speedValue <= 0 ? instant : speedValue * 0.5 + instant * 0.5;
-                }
-                lastDone = done;
-                lastAt = now;
-            }
-        } else {
-            lastDone = done;
-            lastAt = now;
-        }
-        String name = live.name;
-        int cut = Math.max(name.lastIndexOf('/'), name.lastIndexOf('\\'));
-        if (cut >= 0) {
-            name = name.substring(cut + 1);
-        }
-        titleView.setText("正在接收文件 · " + pct + "%");
-        fileView.setText(name);
-        speedView.setText(formatSpeed(speedValue) + "  ·  " + formatSize(done) + " / " + formatSize(live.total));
-        bar.setProgress(pct);
-        pauseButton.setText(ServerService.isTransferPaused(connectionId) ? "继续" : "暂停");
         if (now - lastNotify >= 1000) {
             lastNotify = now;
             service.refreshNotification();

@@ -119,9 +119,11 @@ internal fun TransferScreen(
     var remoteBlockStart by remember { mutableIntStateOf(-1) }
     // 双窗口里发送/接收时的进度弹窗（和经典界面的「发送到电脑」一致）
     var xferPopup by remember { mutableStateOf(false) }
-    var xferPopupTitle by remember { mutableStateOf("") }
-    var xferPopupFile by remember { mutableStateOf("") }
-    var xferPopupSpeed by remember { mutableLongStateOf(0L) }
+    var xferPopupSending by remember { mutableStateOf(true) }
+    var xferPopupName by remember { mutableStateOf("") }
+    var xferPopupDone by remember { mutableLongStateOf(0L) }
+    var xferPopupTotal by remember { mutableLongStateOf(0L) }
+    var xferPopupChannels by remember { mutableStateOf<List<ChannelStat>>(emptyList()) }
 
     // 返回键：先关弹窗/菜单 → 取消焦点窗口的多选 → 最后才退出传输页
     androidx.activity.compose.BackHandler(enabled = true) {
@@ -178,17 +180,33 @@ internal fun TransferScreen(
 
     fun callback(isUpload: Boolean): TransferFileCallback = object : TransferFileCallback {
         override fun onFileUploading(iName: String?, path: String?, targetSize: Long, totalSize: Long) {
-            main.post { xferPopupFile = shortName(path) }
+            main.post { xferPopupName = path ?: "" }
         }
 
         override fun onFileDownloading(iName: String?, path: String?, targetSize: Long, totalSize: Long) {
-            main.post { xferPopupFile = shortName(path) }
+            main.post { xferPopupName = path ?: "" }
         }
 
         override fun onSpeedInfo(trafficInfoList: List<TrafficInfo>?) {
-            val speed = trafficInfoList?.sumOf { it.uploadTraffic + it.downloadTraffic } ?: 0
-            if (speed > 0) {
-                main.post { xferPopupSpeed = speed }
+            val list = trafficInfoList ?: return
+            val done = list.sumOf { it.uploadTraffic + it.downloadTraffic }
+            val channels = list.map { ChannelStat(it.iName ?: "", it.uploadTraffic + it.downloadTraffic, 0, false) }
+            main.post {
+                xferPopupDone = done
+                xferPopupChannels = channels
+                GlobalTransferOverlay.reportSend(
+                    UiState(
+                        xferActive = true,
+                        xferName = xferPopupName,
+                        xferDone = done,
+                        xferTotal = xferPopupTotal,
+                        xferBytes = done,
+                        xferChannels = channels,
+                        xferCount = 1,
+                        xferLabel = server.displayName,
+                        xferId = -1,
+                    ),
+                )
             }
         }
 
@@ -211,6 +229,7 @@ internal fun TransferScreen(
             main.post {
                 statusText = ""
                 xferPopup = false
+                GlobalTransferOverlay.reportSend(null)
             }
         }
 
@@ -219,6 +238,7 @@ internal fun TransferScreen(
                 busy = false
                 statusText = ""
                 xferPopup = false
+                GlobalTransferOverlay.reportSend(null)
                 message = "传输中断"
             }
         }
@@ -231,9 +251,11 @@ internal fun TransferScreen(
         if (files.isEmpty() || busy) return
         busy = true
         statusText = if (move) "正在移动…" else "正在复制…"
-        xferPopupTitle = if (fromLeft) "发送到电脑" else "接收到手机"
-        xferPopupFile = ""
-        xferPopupSpeed = 0
+        xferPopupSending = fromLeft
+        xferPopupName = ""
+        xferPopupDone = 0
+        xferPopupTotal = files.sumOf { if (it.size > 0) it.size else 0L }
+        xferPopupChannels = emptyList()
         xferPopup = true
         scope.launch(Dispatchers.IO) {
             try {
@@ -253,6 +275,7 @@ internal fun TransferScreen(
                     busy = false
                     statusText = ""
                     xferPopup = false
+                    GlobalTransferOverlay.reportSend(null)
                     message = if (move) "移动完成" else "复制完成"
                     refreshTick++
                 }
@@ -261,6 +284,7 @@ internal fun TransferScreen(
                     busy = false
                     statusText = ""
                     xferPopup = false
+                    GlobalTransferOverlay.reportSend(null)
                     toast((if (move) "移动失败：" else "复制失败：") + e.message)
                 }
             }
@@ -490,38 +514,22 @@ internal fun TransferScreen(
     }
 
     if (xferPopup) {
-        Dialog(
-            onDismissRequest = { xferPopup = false },
-            properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false),
-        ) {
-            Box(
-                Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.35f)).clickable { xferPopup = false },
-                contentAlignment = Alignment.Center,
-            ) {
-                Column(
-                    Modifier.width(340.dp).clip(RoundedCornerShape(22.dp))
-                        .background(colorScheme.surfaceContainer).clickable { }.padding(20.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                ) {
-                    Text(xferPopupTitle, fontSize = 19.sp, fontWeight = FontWeight.Bold)
-                    Spacer(Modifier.height(10.dp))
-                    Text(
-                        xferPopupFile.ifEmpty { "准备中…" },
-                        fontSize = 13.sp,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                    Spacer(Modifier.height(6.dp))
-                    Text(
-                        if (xferPopupSpeed > 0) formatSpeedText(xferPopupSpeed) else "正在传输…",
-                        fontSize = 12.sp,
-                        color = colorScheme.primary,
-                    )
-                    Spacer(Modifier.height(18.dp))
-                    TextButton(text = "关闭", onClick = { xferPopup = false }, modifier = Modifier.fillMaxWidth())
-                }
-            }
-        }
+        ReceiveProgressPanel(
+            state = UiState(
+                xferActive = true,
+                xferName = xferPopupName,
+                xferDone = xferPopupDone,
+                xferTotal = xferPopupTotal,
+                xferBytes = xferPopupDone,
+                xferChannels = xferPopupChannels,
+                xferPaused = false,
+                xferCount = 1,
+                xferLabel = server.displayName,
+                xferId = -1,
+            ),
+            onDismiss = { xferPopup = false },
+            sending = xferPopupSending,
+        )
     }
 
     if (menuFile != null) {

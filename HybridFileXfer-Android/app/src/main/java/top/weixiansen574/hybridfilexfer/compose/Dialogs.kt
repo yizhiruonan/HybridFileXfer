@@ -344,7 +344,13 @@ private fun humanSize(bytes: Long): String {
 
 /** 电脑推送文件时的进度提示：分块进度条 + 每通道明细（IDM / 迅雷 那种） */
 @Composable
-internal fun ReceiveProgressPanel(state: UiState, onDismiss: () -> Unit = {}) {
+internal fun ReceiveProgressPanel(
+    state: UiState,
+    onDismiss: () -> Unit = {},
+    sending: Boolean = false,
+    /** 全局悬浮窗用：不铺黑色遮罩，只画卡片本身，窗口是 WRAP_CONTENT */
+    bare: Boolean = false,
+) {
     val colorScheme = MiuixTheme.colorScheme
     val haptic = LocalHapticFeedback.current
     // 用累计字节数算速率：多台电脑同时接收时显示的是合计速率。
@@ -381,13 +387,7 @@ internal fun ReceiveProgressPanel(state: UiState, onDismiss: () -> Unit = {}) {
 
     val name = state.xferName.substringAfterLast('/').substringAfterLast('\\')
 
-    Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(Color.Black.copy(alpha = 0.35f))
-            .clickable { onDismiss() },
-        contentAlignment = Alignment.Center,
-    ) {
+    val card: @Composable () -> Unit = {
         Column(
             modifier = Modifier
                 .width(340.dp)
@@ -400,7 +400,11 @@ internal fun ReceiveProgressPanel(state: UiState, onDismiss: () -> Unit = {}) {
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
             Text(
-                if (state.xferCount > 1) "正在接收 " + state.xferCount + " 台电脑的文件" else "正在接收文件",
+                when {
+                    sending -> "正在发送文件"
+                    state.xferCount > 1 -> "正在接收 " + state.xferCount + " 台电脑的文件"
+                    else -> "正在接收文件"
+                },
                 fontSize = 19.sp,
                 fontWeight = FontWeight.Bold,
             )
@@ -474,6 +478,7 @@ internal fun ReceiveProgressPanel(state: UiState, onDismiss: () -> Unit = {}) {
                             when {
                                 channel.speed > 0 -> formatSpeed(channel.speed)
                                 channel.finished -> "已完成"
+                                sending -> "正在发送数据…"
                                 else -> "正在接收数据…"
                             },
                             fontSize = 11.sp,
@@ -485,8 +490,17 @@ internal fun ReceiveProgressPanel(state: UiState, onDismiss: () -> Unit = {}) {
                     }
                 }
             }
-            // 接收中只给「暂停接收」；暂停之后才给「继续 / 取消接收」
-            if (state.xferActive) {
+            // 发送时只给「关闭」；接收中只给「暂停接收」，暂停之后才给「继续 / 取消接收」
+            if (sending) {
+                if (!bare) {
+                    Spacer(Modifier.height(10.dp))
+                    TextButton(
+                        text = "关闭",
+                        onClick = { haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove); onDismiss() },
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
+            } else if (state.xferActive && state.xferId >= 0) {
                 Spacer(Modifier.height(10.dp))
                 if (state.xferPaused) {
                     Row(
@@ -524,6 +538,14 @@ internal fun ReceiveProgressPanel(state: UiState, onDismiss: () -> Unit = {}) {
                 }
             }
         }
+    }
+    if (bare) {
+        Box(Modifier.fillMaxWidth().padding(12.dp), contentAlignment = Alignment.Center) { card() }
+    } else {
+        Box(
+            Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.35f)).clickable { onDismiss() },
+            contentAlignment = Alignment.Center,
+        ) { card() }
     }
 }
 

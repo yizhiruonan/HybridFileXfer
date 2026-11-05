@@ -153,12 +153,16 @@ enum Attempt {
     Ran,
     /// 尝试失败，稍后重试
     Retry,
+    /// 绑定过的设备已经从 adb 列表里消失（拔线/换机）→ 结束这台设备的会话
+    Gone,
 }
 
 struct AdbCycle {
     fresh_sent_for: Option<String>,
     last_ensure: Instant,
     last_notice: Option<String>,
+    /// 这台设备之前成功出现过；之后再从 adb 列表里消失就结束会话
+    seen: bool,
 }
 
 impl AdbCycle {
@@ -167,6 +171,7 @@ impl AdbCycle {
             fresh_sent_for: None,
             last_ensure: Instant::now(),
             last_notice: None,
+            seen: false,
         }
     }
 
@@ -196,10 +201,20 @@ impl AdbCycle {
                     on_state(EngineState::Waiting(message));
                     self.last_notice = Some(reason);
                 }
+                // 绑定过的设备彻底从 adb 消失（拔线/换机）：结束这台设备的线程，
+                // 让电脑端把它从设备列表里移除，而不是一直挂着等它回来
+                if options.pinned && self.seen {
+                    log::info(tr(
+                        "设备已断开，移除这台设备的会话",
+                        "device disappeared, removing its session",
+                    ));
+                    return Attempt::Gone;
+                }
                 return Attempt::NoDevice;
             }
         };
         self.last_notice = None;
+        self.seen = true;
 
         if !adb.forward(&device.serial, options.local_port, options.port).unwrap_or(false) {
             let message = format!(
@@ -293,6 +308,10 @@ fn run_auto(options: &EngineOptions, stop: &Arc<AtomicBool>, on_state: &StateSin
                     // adb 不通时也给局域网发现一次机会
                 }
                 Attempt::NoDevice => {}
+                Attempt::Gone => {
+                    on_state(EngineState::Stopped);
+                    break;
+                }
             }
         }
 
