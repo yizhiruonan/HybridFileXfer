@@ -552,13 +552,14 @@ internal fun TransferScreen(
         // 视觉上和主页接收弹窗的分块进度条一致
         val popupSegments = if (xferPopupChannels.isNotEmpty() && xferPopupTotal > 0) {
             val count = xferPopupChannels.size
-            val fraction = (xferPopupDone.toFloat() / xferPopupTotal).coerceIn(0f, 1f)
+            // 按总进度从左往右依次填满每一块：前面整块是满的、当前块部分填充、后面的空着
+            val filledBlocks = (xferPopupDone.toFloat() / xferPopupTotal).coerceIn(0f, 1f) * count
             List(count) { index ->
                 SegInfo(
                     owner = "seg" + index,
                     start = index * 100 / count,
                     end = (index + 1) * 100 / count,
-                    filled = fraction,
+                    filled = (filledBlocks - index).coerceIn(0f, 1f),
                 )
             }
         } else {
