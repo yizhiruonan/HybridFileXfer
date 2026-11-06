@@ -551,15 +551,22 @@ internal fun TransferScreen(
         // 双窗口没有 BlockProgress 的区间信息，按通道数切出等分段落，填充跟随总进度：
         // 视觉上和主页接收弹窗的分块进度条一致
         val popupSegments = if (xferPopupChannels.isNotEmpty() && xferPopupTotal > 0) {
+            // 和主页一样：每一块（这里按通道分）同时增长。
+            // 每块负责总量/通道数，填充 = 该通道已收 / 它那一份
             val count = xferPopupChannels.size
-            // 按总进度从左往右依次填满每一块：前面整块是满的、当前块部分填充、后面的空着
-            val filledBlocks = (xferPopupDone.toFloat() / xferPopupTotal).coerceIn(0f, 1f) * count
+            val share = xferPopupTotal.toFloat() / count
+            val complete = xferPopupDone >= xferPopupTotal
             List(count) { index ->
+                val bytes = xferPopupChannels[index].bytes
                 SegInfo(
                     owner = "seg" + index,
                     start = index * 100 / count,
                     end = (index + 1) * 100 / count,
-                    filled = (filledBlocks - index).coerceIn(0f, 1f),
+                    filled = when {
+                        complete -> 1f
+                        share > 0f -> (bytes / share).coerceIn(0f, 1f)
+                        else -> 0f
+                    },
                 )
             }
         } else {
