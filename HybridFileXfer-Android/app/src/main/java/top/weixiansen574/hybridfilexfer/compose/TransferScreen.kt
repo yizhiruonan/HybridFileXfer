@@ -198,7 +198,9 @@ internal fun TransferScreen(
             val now = android.os.SystemClock.elapsedRealtime()
             main.post {
                 if (xferPopupLastAt > 0 && now > xferPopupLastAt && done >= xferPopupLastTraffic) {
-                    xferPopupSpeed = (done - xferPopupLastTraffic) * 1000L / (now - xferPopupLastAt)
+                    val instant = (done - xferPopupLastTraffic) * 1000L / (now - xferPopupLastAt)
+                    // 指数平滑：瞬时速率会在 4～80MB/s 之间乱跳，直接显示就是"一顿一顿"的来源
+                    xferPopupSpeed = if (xferPopupSpeed <= 0) instant else (xferPopupSpeed * 3 + instant * 2) / 5
                 }
                 xferPopupLastTraffic = done
                 xferPopupLastAt = now
