@@ -383,6 +383,8 @@ impl Session {
         ));
         // 这次发送期间允许界面暂停 / 中断；离开作用域自动清标志
         let _sending = crate::control::SendingGuard::begin();
+        // 每次"手机来取文件"都重置会话计数，避免"已接收 10.41 GB"把上几次的也算进来
+        crate::receiver::PROGRESS.reset();
 
         let base = PathBuf::from(&phone_dir);
         let mut tasks: Vec<SendTask> = Vec::new();
@@ -1167,7 +1169,7 @@ fn send_task(stream: &mut std::net::TcpStream, task: &SendTask, sent: &AtomicU64
             stream.flush()?;
 
             sent.fetch_add(*length as u64, Ordering::Relaxed);
-            crate::receiver::PROGRESS.set_sending(dest, *index as u64 * BLOCK_SIZE + *length as u64, *total_size, *length as u64);
+            crate::receiver::PROGRESS.mark_sent(dest, *index, *total_size, *length as u64);
             Ok(*length as u64)
         }
     }

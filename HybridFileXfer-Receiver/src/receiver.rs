@@ -68,6 +68,11 @@ impl BlockMap {
         }
     }
 
+    /// 已置位的块数
+    pub fn count(&self) -> usize {
+        self.bits.iter().map(|w| w.count_ones() as usize).sum()
+    }
+
     /// 把块聚合成 n 段，每段返回完成比例 0..1
     pub fn segments(&self, n: usize) -> Vec<f32> {
         if self.total_blocks == 0 || n == 0 {
@@ -139,16 +144,28 @@ impl ProgressState {
         }
     }
 
-    /// 发送方向（电脑 -> 手机）更新进度
-    pub fn set_sending(&self, dest: &str, done: u64, total: u64, delta: u64) {
+    /// 发送方向（电脑 -> 手机）：标记一块已发出。
+    /// 用块位图统计已发字节和分段进度，避免用"最后一块的结束位置"当进度（乱序会乱跳）。
+    pub fn mark_sent(&self, dest: &str, index: u32, total: u64, block_len: u64) {
+        let mut new_file = false;
         if let Ok(mut name) = self.file_name.write() {
             if name.as_str() != dest {
                 *name = dest.to_string();
+                new_file = true;
             }
         }
-        self.file_done.store(done, Ordering::Relaxed);
+        if new_file {
+            self.files_started.fetch_add(1, Ordering::Relaxed);
+        }
         self.file_total.store(total, Ordering::Relaxed);
-        self.session_bytes.fetch_add(delta, Ordering::Relaxed);
+        let done = if let Ok(mut blocks) = self.blocks.lock() {
+            blocks.mark(index, total, BLOCK_SIZE);
+            (blocks.count() as u64).saturating_mul(BLOCK_SIZE)
+        } else {
+            0
+        };
+        self.file_done.store(done.min(total), Ordering::Relaxed);
+        self.session_bytes.fetch_add(block_len, Ordering::Relaxed);
     }
 
     /// 当前文件的 n 段完成比例
