@@ -18,6 +18,10 @@ use crate::util;
 struct FileState {
     file: File,
     modified_ms: std::sync::atomic::AtomicI64,
+    /// 文件总字节（0 = 未知）
+    total: u64,
+    /// 已写入字节（判断收没收完）
+    done: AtomicU64,
 }
 
 /// 接收目录，运行时可改（手机端浏览电脑文件夹后可以切换）。
@@ -73,28 +77,116 @@ impl BlockMap {
         self.bits.iter().map(|w| w.count_ones() as usize).sum()
     }
 
-    /// 把块聚合成 n 段，每段返回完成比例 0..1
-    pub fn segments(&self, n: usize) -> Vec<f32> {
-        if self.total_blocks == 0 || n == 0 {
+    /// 这块是否已完成
+    fn is_done(&self, index: usize) -> bool {
+        index < self.total_blocks && (self.bits[index / 64] & (1u64 << (index % 64))) != 0
+    }
+
+    /// 位图覆盖的块数（不是已完成块数）
+    fn blocks(&self) -> usize {
+        self.total_blocks
+    }
+}
+
+/// 进度条上的一段（一段 = 一条通道负责的连续块区间，IDM / 迅雷 那种）
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
+pub struct XferSeg {
+    /// 这一段占整条的比例（按块数算宽度）
+    pub span: f32,
+    /// 这一段已完成比例 0..1
+    pub filled: f32,
+}
+
+/// 一个文件（一次发送 / 接收）的进度：块位图 + 每块是哪条通道做的。
+///
+/// 多文件并发时每个文件一份，互不干扰；段数由"相邻块的通道归属"还原。
+#[derive(Default)]
+pub struct FileProgress {
+    total: u64,
+    blocks: BlockMap,
+    /// 每个块由哪条通道负责（u8::MAX = 未知）
+    owners: Vec<u8>,
+}
+
+impl FileProgress {
+    fn mark(&mut self, channel: u8, index: u32, total: u64) {
+        self.total = total;
+        self.blocks.mark(index, total, BLOCK_SIZE);
+        let i = index as usize;
+        if i >= self.owners.len() {
+            self.owners.resize(i + 1, u8::MAX);
+        }
+        self.owners[i] = channel;
+    }
+
+    fn done_bytes(&self) -> u64 {
+        (self.blocks.count() as u64)
+            .saturating_mul(BLOCK_SIZE)
+            .min(self.total)
+    }
+
+    /// IDM 式分段：相邻块的通道归属一变就是一段。
+    /// 段数超过上限（旧的轮询式调度会让它爆炸）时退化成一条整进度。
+    fn segments(&self, max_segments: usize) -> Vec<XferSeg> {
+        let total = self.blocks.blocks();
+        if total == 0 {
             return Vec::new();
         }
-        let mut out = Vec::with_capacity(n);
-        for s in 0..n {
-            let start = s * self.total_blocks / n;
-            let end = ((s + 1) * self.total_blocks / n).max(start);
-            if end <= start {
-                out.push(0.0);
+        let mut bounds: Vec<(usize, u8)> = Vec::new();
+        let mut previous: Option<u8> = None;
+        let mut segment_start = 0usize;
+        for i in 0..total {
+            if !self.blocks.is_done(i) {
                 continue;
             }
-            let mut got = 0usize;
-            for b in start..end {
-                if self.bits[b / 64] & (1u64 << (b % 64)) != 0 {
-                    got += 1;
+            let owner = self.owners.get(i).copied().unwrap_or(u8::MAX);
+            match previous {
+                None => {
+                    previous = Some(owner);
+                    segment_start = 0;
                 }
+                Some(prev) if prev != owner => {
+                    bounds.push((segment_start, prev));
+                    segment_start = i;
+                    previous = Some(owner);
+                }
+                _ => {}
             }
-            out.push(got as f32 / (end - start) as f32);
         }
-        out
+        let Some(last) = previous else {
+            return Vec::new();
+        };
+        bounds.push((segment_start, last));
+        if bounds.len() > max_segments.max(1) {
+            // 每块都换通道：画出来全是碎条，退回整条
+            let done = self.blocks.count() as f32;
+            return vec![XferSeg {
+                span: total as f32,
+                filled: (done / total as f32).clamp(0.0, 1.0),
+            }];
+        }
+        bounds
+            .iter()
+            .enumerate()
+            .map(|(i, &(start, _owner))| {
+                let end = bounds
+                    .get(i + 1)
+                    .map(|b| b.0)
+                    .unwrap_or(total)
+                    .clamp(start + 1, total);
+                let span = end - start;
+                let mut filled = 0usize;
+                for b in start..end {
+                    if self.blocks.is_done(b) {
+                        filled += 1;
+                    }
+                }
+                XferSeg {
+                    span: span as f32,
+                    filled: (filled as f32 / span as f32).clamp(0.0, 1.0),
+                }
+            })
+            .collect()
     }
 }
 
@@ -114,74 +206,97 @@ pub fn human_bytes(bytes: u64) -> String {
 }
 
 /// 传输进度（全局唯一：GUI / CLI 都只有一份接收器实例）
+///
+/// 每个文件一份 {@link FileProgress}：多文件并发时各算各的，文件数 = 表里的条目数，
+/// 进度条按"哪个通道做了第几块"还原 IDM 式的分段。旧实现只有一个共享位图，
+/// 并发发多个文件时会被反复重置（进度停在半路、文件数按切换次数虚高）。
 #[derive(Default)]
 pub struct ProgressState {
-    /// 当前正在写的文件（显示用短名）
-    pub file_name: RwLock<String>,
+    /// 当前正在写的文件（显示用）
+    current: RwLock<String>,
     /// 当前文件已写字节
-    pub file_done: AtomicU64,
+    file_done: AtomicU64,
     /// 当前文件总字节
-    pub file_total: AtomicU64,
+    file_total: AtomicU64,
     /// 本次会话累计字节
-    pub session_bytes: AtomicU64,
-    /// 本次会话已开始的文件数
-    pub files_started: AtomicU64,
-    /// 当前文件的块位图
-    pub blocks: Mutex<BlockMap>,
+    session_bytes: AtomicU64,
+    /// 本次会话已开始的文件数（= 表里条目数，不是切换次数）
+    files_started: AtomicU64,
+    /// 每个文件一份进度，按目标路径分开
+    files: Mutex<HashMap<String, FileProgress>>,
 }
+
+/// 进度条上最多画几段；超过就退回成一条整进度
+const MAX_SEGMENTS: usize = 24;
 
 impl ProgressState {
     pub fn reset(&self) {
-        if let Ok(mut guard) = self.file_name.write() {
+        if let Ok(mut guard) = self.current.write() {
             guard.clear();
         }
         self.file_done.store(0, Ordering::Relaxed);
         self.file_total.store(0, Ordering::Relaxed);
         self.session_bytes.store(0, Ordering::Relaxed);
         self.files_started.store(0, Ordering::Relaxed);
-        if let Ok(mut b) = self.blocks.lock() {
-            b.reset();
+        if let Ok(mut files) = self.files.lock() {
+            files.clear();
         }
     }
 
-    /// 发送方向（电脑 -> 手机）：标记一块已发出。
-    /// 用块位图统计已发字节和分段进度，避免用"最后一块的结束位置"当进度（乱序会乱跳）。
-    pub fn mark_sent(&self, dest: &str, index: u32, total: u64, block_len: u64) {
-        let mut new_file = false;
-        if let Ok(mut name) = self.file_name.write() {
-            if name.as_str() != dest {
-                *name = dest.to_string();
-                new_file = true;
+    /// 发送方向（电脑 -> 手机）：标记一块已由某条通道发出
+    pub fn mark_sent(&self, channel: u8, dest: &str, index: u32, total: u64, block_len: u64) {
+        self.mark_block(channel, dest, index, total, block_len);
+    }
+
+    /// 接收方向（手机 -> 电脑）：一块已写盘
+    pub fn mark_received(&self, channel: u8, dest: &str, index: u32, total: u64, written: u64) {
+        self.mark_block(channel, dest, index, total, written);
+    }
+
+    fn mark_block(&self, channel: u8, path: &str, index: u32, total: u64, bytes: u64) {
+        let (is_new, done, total_now) = match self.files.lock() {
+            Ok(mut files) => {
+                let is_new = !files.contains_key(path);
+                let entry = files.entry(path.to_string()).or_default();
+                entry.mark(channel, index, total);
+                let done = entry.done_bytes();
+                (is_new, done, entry.total.max(total))
             }
-        }
-        if new_file {
+            Err(_) => return,
+        };
+        if is_new {
             self.files_started.fetch_add(1, Ordering::Relaxed);
         }
-        self.file_total.store(total, Ordering::Relaxed);
-        let done = if let Ok(mut blocks) = self.blocks.lock() {
-            blocks.mark(index, total, BLOCK_SIZE);
-            (blocks.count() as u64).saturating_mul(BLOCK_SIZE)
-        } else {
-            0
-        };
-        self.file_done.store(done.min(total), Ordering::Relaxed);
-        self.session_bytes.fetch_add(block_len, Ordering::Relaxed);
+        self.file_total.store(total_now, Ordering::Relaxed);
+        self.file_done.store(done.min(total_now), Ordering::Relaxed);
+        if let Ok(mut name) = self.current.write() {
+            if name.as_str() != path {
+                *name = path.to_string();
+            }
+        }
+        self.session_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    /// 当前文件的 n 段完成比例
-    pub fn segments(&self, n: usize) -> Vec<f32> {
-        self.blocks
-            .lock()
-            .map(|b| b.segments(n))
-            .unwrap_or_default()
+    /// 当前文件的 IDM 式分段（一段 = 一条通道负责的连续块区间）
+    pub fn segments(&self) -> Vec<XferSeg> {
+        let name = match self.current.read() {
+            Ok(g) => g.clone(),
+            Err(_) => return Vec::new(),
+        };
+        if name.is_empty() {
+            return Vec::new();
+        }
+        match self.files.lock() {
+            Ok(files) => files
+                .get(&name)
+                .map(|f| f.segments(MAX_SEGMENTS))
+                .unwrap_or_default(),
+            Err(_) => Vec::new(),
+        }
     }
 
     pub fn snapshot(&self) -> (String, u64, u64, u64, u64) {
-        let name = self
-            .file_name
-            .read()
-            .map(|g| g.clone())
-            .unwrap_or_default();
+        let name = self.current.read().map(|g| g.clone()).unwrap_or_default();
         (
             name,
             self.file_done.load(Ordering::Relaxed),
@@ -206,14 +321,7 @@ pub fn progress_for(device: &str) -> Arc<ProgressState> {
 }
 
 /// 第一台设备的进度（单设备场景 / CLI 沿用）
-pub static PROGRESS: LazyLock<ProgressState> = LazyLock::new(|| ProgressState {
-    file_name: RwLock::new(String::new()),
-    file_done: AtomicU64::new(0),
-    file_total: AtomicU64::new(0),
-    session_bytes: AtomicU64::new(0),
-    files_started: AtomicU64::new(0),
-    blocks: Mutex::new(BlockMap::default()),
-});
+pub static PROGRESS: LazyLock<ProgressState> = LazyLock::new(ProgressState::default);
 
 pub struct Receiver {
     /// 本设备独立的进度（多设备并行）
@@ -257,6 +365,15 @@ impl Receiver {
         self.files.load(Ordering::Relaxed)
     }
 
+    /// 303：本次会话落盘的文件列表（收尾算整文件校验和用）。
+    /// 必须在 finish_with() 之前调用 —— 它会把这些条目清空。
+    pub fn received_files(&self) -> Vec<PathBuf> {
+        match self.entries.lock() {
+            Ok(entries) => entries.keys().cloned().collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
     /// Map a path sent by the phone into the receive directory. Paths outside of
     /// it (should never happen) are flattened into the directory.
     pub fn resolve(&self, raw: &str) -> PathBuf {
@@ -279,6 +396,7 @@ impl Receiver {
 
     pub fn write_block(
         &self,
+        channel: u8,
         raw_path: &str,
         total_size: u64,
         index: u32,
@@ -304,39 +422,13 @@ impl Receiver {
             written += n;
         }
         self.bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
+        state.done.fetch_add(data.len() as u64, Ordering::Relaxed);
 
         // ---- 进度上报 ----
+        // 本设备的进度（设备小卡片） + 全局进度（GUI 大卡片读这一份）
         self.progress
-            .file_total
-            .store(total_size, Ordering::Relaxed);
-        let changed = {
-            let mut guard = match self.progress.file_name.write() {
-                Ok(g) => g,
-                Err(_) => return Ok(()),
-            };
-            if *guard != raw_path {
-                *guard = raw_path.to_string();
-                true
-            } else {
-                false
-            }
-        };
-        if changed {
-            self.progress.file_done.store(0, Ordering::Relaxed);
-            self.progress.files_started.fetch_add(1, Ordering::Relaxed);
-            if let Ok(mut blocks) = self.progress.blocks.lock() {
-                blocks.reset();
-            }
-        }
-        if let Ok(mut blocks) = self.progress.blocks.lock() {
-            blocks.mark(index, total_size, BLOCK_SIZE);
-        }
-        self.progress
-            .file_done
-            .fetch_add(data.len() as u64, Ordering::Relaxed);
-        self.progress
-            .session_bytes
-            .fetch_add(data.len() as u64, Ordering::Relaxed);
+            .mark_received(channel, raw_path, index, total_size, data.len() as u64);
+        PROGRESS.mark_received(channel, raw_path, index, total_size, data.len() as u64);
 
         Ok(())
     }
@@ -369,6 +461,8 @@ impl Receiver {
         let state = Arc::new(FileState {
             file,
             modified_ms: std::sync::atomic::AtomicI64::new(0),
+            total: total_size,
+            done: AtomicU64::new(0),
         });
         let mut entries = self
             .entries
@@ -386,16 +480,51 @@ impl Receiver {
     /// Restore modification times and close every file handle, so that the
     /// received files are not locked on Windows.
     pub fn finish(&self) -> io::Result<()> {
-        let mut entries = self
-            .entries
-            .lock()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "poisoned entry lock"))?;
-        for (_path, state) in entries.drain() {
-            if let Err(e) = apply_modified(&state.file, state.modified_ms.load(Ordering::Relaxed)) {
-                crate::log::debug(&format!("cannot set modification time: {}", e));
+        self.finish_with(true).map(|_| ())
+    }
+
+    /// 收尾：恢复修改时间、放掉所有文件句柄。
+    /// `keep_incomplete == false`（传输中断/出错）时，把这次没接收完的半截文件删掉，
+    /// 免得电脑上留一堆"传了一半"的文件。返回（删掉的文件数, 丢掉的字节）。
+    pub fn finish_with(&self, keep_incomplete: bool) -> io::Result<(usize, u64)> {
+        let mut remove: Vec<(PathBuf, u64)> = Vec::new();
+        {
+            let mut entries = self
+                .entries
+                .lock()
+                .map_err(|_| io::Error::new(io::ErrorKind::Other, "poisoned entry lock"))?;
+            for (path, state) in entries.iter() {
+                if let Err(e) =
+                    apply_modified(&state.file, state.modified_ms.load(Ordering::Relaxed))
+                {
+                    crate::log::debug(&format!("cannot set modification time: {}", e));
+                }
+                let total = state.total;
+                let got = state.done.load(Ordering::Relaxed);
+                if !keep_incomplete && total > 0 && got < total {
+                    remove.push((path.clone(), got));
+                }
+            }
+            // 句柄必须全部放掉：Windows 上还开着的文件删不掉
+            let _handles: Vec<_> = entries.drain().collect();
+        }
+        let mut files = 0usize;
+        let mut bytes = 0u64;
+        for (path, got) in remove {
+            match fs::remove_file(&path) {
+                Ok(_) => {
+                    files += 1;
+                    bytes += got;
+                    crate::log::warn(&format!(
+                        "{} {}",
+                        crate::i18n::tr("删除未接收完的文件", "removed incomplete file"),
+                        path.display()
+                    ));
+                }
+                Err(e) => crate::log::warn(&format!("{}: {}", path.display(), e)),
             }
         }
-        Ok(())
+        Ok((files, bytes))
     }
 }
 
@@ -446,10 +575,10 @@ mod tests {
         let base = dir.join("sample.bin");
         let base_str = base.to_string_lossy().to_string();
         receiver
-            .write_block(&base_str, 2_097_152, 1, 1_700_000_000_000, &[7u8; 1024])
+            .write_block(0, &base_str, 2_097_152, 1, 1_700_000_000_000, &[7u8; 1024])
             .unwrap();
         receiver
-            .write_block(&base_str, 2_097_152, 0, 1_700_000_000_000, &[3u8; 16])
+            .write_block(0, &base_str, 2_097_152, 0, 1_700_000_000_000, &[3u8; 16])
             .unwrap();
         receiver.finish().unwrap();
         let data = fs::read(&base).unwrap();
@@ -458,6 +587,44 @@ mod tests {
         assert_eq!(&data[1024 * 1024..1024 * 1024 + 1024], &[7u8; 1024]);
         assert_eq!(receiver.bytes(), 1040);
         assert_eq!(receiver.file_count(), 1);
+    }
+
+    #[test]
+    fn incomplete_files_are_removed() {
+        let dir = temp_dir("incomplete");
+        let receiver = Receiver::new(util::normalize_dir(&dir));
+        let partial = dir.join("partial.bin");
+        let partial_str = partial.to_string_lossy().to_string();
+        // 2 块的文件只写第一块：没接收完，收尾时应该被删掉
+        receiver
+            .write_block(0, &partial_str, 2_097_152, 0, 1_700_000_000_000, &[1u8; 1024])
+            .unwrap();
+        assert!(partial.exists());
+        let (files, lost) = receiver.finish_with(false).unwrap();
+        assert_eq!(files, 1);
+        assert_eq!(lost, 1024);
+        assert!(!partial.exists(), "半截文件应该被删掉");
+    }
+
+    #[test]
+    fn complete_files_are_kept() {
+        let dir = temp_dir("complete");
+        let receiver = Receiver::new(util::normalize_dir(&dir));
+        let target = dir.join("done.bin");
+        let target_str = target.to_string_lossy().to_string();
+        receiver
+            .write_block(
+                0,
+                &target_str,
+                1_048_576,
+                0,
+                1_700_000_000_000,
+                &[1u8; 1_048_576],
+            )
+            .unwrap();
+        let (files, _) = receiver.finish_with(true).unwrap();
+        assert_eq!(files, 0);
+        assert_eq!(fs::read(&target).unwrap().len(), 1_048_576);
     }
 
     #[test]

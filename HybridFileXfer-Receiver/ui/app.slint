@@ -81,6 +81,15 @@ component SecondaryButton inherits Rectangle {
     ta := TouchArea { clicked => { root.clicked(); } }
 }
 
+export struct XferSeg {
+    // 这一段在整条里的起始位置（0..1）
+    start: float,
+    // 这一段占整条的比例（0..1）
+    span: float,
+    // 这一段已完成比例（0..1）
+    filled: float,
+}
+
 export struct DeviceRow {
     name: string,
     state: string,
@@ -126,13 +135,15 @@ export component AppWindow inherits Window {
     in-out property <bool> xfer-visible: false;
     // 手机正在从电脑取文件（显示暂停/中断按钮）
     in-out property <bool> send-active: false;
+    // 正在接收手机推过来的文件（显示暂停按钮）
+    in-out property <bool> recv-active: false;
     in-out property <bool> send-paused: false;
     in-out property <string> file-name: "";
     in-out property <float> file-progress: 0.0;
     in-out property <string> file-text: "";
     in-out property <string> session-text: "";
-    // IDM 式分块：每个元素是该段已完成比例（0..1）
-    in-out property <[float]> blocks: [];
+    // IDM 式分块：一段 = 一条通道负责的连续块区间
+    in-out property <[XferSeg]> xfer-segments: [];
     // 多设备列表（点状态卡展开）
     in-out property <[DeviceRow]> devices: [];
     // 两两配对后的行（一行两个小卡片）
@@ -373,18 +384,28 @@ export component AppWindow inherits Window {
                     overflow: elide;
                 }
 
-                // 分段进度条：每格代表一段文件范围，收到即填满（类似 IDM 的分块图）
-                HorizontalLayout {
-                    height: 14px;
-                    spacing: 1px;
-                    for seg in root.blocks : Rectangle {
-                        horizontal-stretch: 1;
-                        background: #EAEAEA;
-                        Rectangle {
-                            width: parent.width * seg;
-                            height: parent.height;
-                            background: #005FB8;
-                        }
+                // 分块进度条：一整条方角，按通道切段，每段都从段首往右填，
+                // 段与段之间画一条红色竖线 —— 和手机端「正在接收文件」弹窗一致。
+                // 全部用绝对定位（bar.width * 比例），不依赖布局，避免填充块被排到中间
+                bar := Rectangle {
+                    height: 12px;
+                    background: #E4E4E4;
+                    clip: true;
+
+                    for seg in root.xfer-segments : Rectangle {
+                        x: bar.width * seg.start;
+                        y: 0px;
+                        width: bar.width * seg.span * seg.filled;
+                        height: bar.height;
+                        background: #005FB8;
+                    }
+                    for seg[i] in root.xfer-segments : Rectangle {
+                        visible: i > 0;
+                        x: bar.width * seg.start;
+                        y: 0px;
+                        width: 1px;
+                        height: bar.height;
+                        background: #E53935;
                     }
                 }
 
@@ -394,15 +415,15 @@ export component AppWindow inherits Window {
                     color: #616161;
                 }
 
-                if root.send-active : HorizontalLayout {
+                if root.send-active || root.recv-active : HorizontalLayout {
                     height: 30px;
                     spacing: 8px;
                     Rectangle { horizontal-stretch: 1; }
                     SecondaryButton {
-                        label: root.send-paused ? "继续发送" : "暂停发送";
+                        label: root.send-paused ? "继续" : "暂停";
                         clicked => { root.toggle-pause-send(); }
                     }
-                    SecondaryButton {
+                    if root.send-active : SecondaryButton {
                         label: "中断发送";
                         clicked => { root.cancel-send(); }
                     }

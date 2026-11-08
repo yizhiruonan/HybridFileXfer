@@ -44,6 +44,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.unit.IntOffset
@@ -89,6 +90,8 @@ internal fun TransferScreen(
     onClose: () -> Unit,
 ) {
     val colorScheme = MiuixTheme.colorScheme
+    /** 取消提示用系统 Toast：传输页会随连接断开一起卸载，页内弹窗显示不出来 */
+    val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
     val main = remember { Handler(Looper.getMainLooper()) }
 
@@ -128,6 +131,9 @@ internal fun TransferScreen(
     var xferPopupSpeed by remember { mutableLongStateOf(0L) }
     var xferPopupLastTraffic by remember { mutableLongStateOf(0L) }
     var xferPopupLastAt by remember { mutableLongStateOf(0L) }
+    // 每条通道的累计已传字节。注意 onSpeedInfo 给的是"这一秒的流量"（resetCurrentTrafficInfo 会清零），
+    // 不能直接当成已传总量 —— 否则进度条每秒钟都被重置回零点几百分比，看着就是不涨。
+    val xferPopupCumulative = remember { HashMap<String, Long>() }
 
     // 返回键：先关弹窗/菜单 → 取消焦点窗口的多选 → 最后才退出传输页
     androidx.activity.compose.BackHandler(enabled = true) {
@@ -193,19 +199,28 @@ internal fun TransferScreen(
 
         override fun onSpeedInfo(trafficInfoList: List<TrafficInfo>?) {
             val list = trafficInfoList ?: return
-            val done = list.sumOf { it.uploadTraffic + it.downloadTraffic }
-            val channels = list.map { ChannelStat(it.iName ?: "", it.uploadTraffic + it.downloadTraffic, 0, false) }
+            // onSpeedInfo 每秒回调一次，每条通道给的是"这一秒的流量"（TransferConnection.resetCurrentTrafficInfo 已经清零），
+            // 所以这里自己累加出"已传总量"；之前直接把一秒的流量当已传量用，进度条每秒归零重来，看着永远不涨。
+            val delta = list.sumOf { it.uploadTraffic + it.downloadTraffic }
             val now = android.os.SystemClock.elapsedRealtime()
             main.post {
-                if (xferPopupLastAt > 0 && now > xferPopupLastAt && done >= xferPopupLastTraffic) {
-                    val instant = (done - xferPopupLastTraffic) * 1000L / (now - xferPopupLastAt)
+                var done = 0L
+                val channels = list.map { info ->
+                    val key = info.iName ?: ""
+                    val cum = (xferPopupCumulative[key] ?: 0L) + info.uploadTraffic + info.downloadTraffic
+                    xferPopupCumulative[key] = cum
+                    done += cum
+                    ChannelStat(key, cum, 0, false)
+                }
+                if (xferPopupLastAt > 0 && now > xferPopupLastAt) {
+                    val instant = delta * 1000L / (now - xferPopupLastAt)
                     // 指数平滑：瞬时速率会在 4～80MB/s 之间乱跳，直接显示就是"一顿一顿"的来源
                     xferPopupSpeed = if (xferPopupSpeed <= 0) instant else (xferPopupSpeed * 3 + instant * 2) / 5
                 }
                 xferPopupLastTraffic = done
                 xferPopupLastAt = now
-                // 插值只往前推，回调给的数比插值小的时候不要倒退
-                xferPopupDone = maxOf(xferPopupDone, done)
+                // 累计值以回调为准（真值），两次回调之间的推进交给下面的 100ms 插值
+                xferPopupDone = done
                 xferPopupChannels = channels
                 GlobalTransferOverlay.reportSend(
                     UiState(
@@ -226,6 +241,9 @@ internal fun TransferScreen(
         override fun onChannelComplete(iName: String?, traffic: Long, time: Long) {}
 
         override fun onChannelError(iName: String?, errorType: Int, message: String?) {
+            // 用户主动取消时通道是我们自己关掉的，收尾异常不该报成"通道错误"；
+            // 一条通道被别的通道拖停（INTERRUPT）也只是结果，不是错误。
+            if (server.isTransferCancelled() || errorType == TransferFileCallback.ERROR_TYPE_INTERRUPT) return
             toast("通道错误：" + (message ?: ""))
         }
 
@@ -257,7 +275,8 @@ internal fun TransferScreen(
                 statusText = ""
                 xferPopup = false
                 GlobalTransferOverlay.reportSend(null)
-                message = "传输中断"
+                // 取消和真中断要分开显示：取消是用户自己点的，别写成"传输中断"
+                message = if (server.isTransferCancelled()) "已取消传输" else "传输中断"
             }
         }
     }
@@ -275,6 +294,12 @@ internal fun TransferScreen(
         xferPopupTotal = files.sumOf { if (it.size > 0) it.size else 0L }
         xferPopupChannels = emptyList()
         xferPopupPaused = false
+        // 速率/累计/采样时间都必须清掉：上一次传输的速率留着的话，
+        // 弹窗一开就按旧速率往前插值，数字会一路虚高（进度条却还是空的）。
+        xferPopupSpeed = 0
+        xferPopupLastTraffic = 0
+        xferPopupLastAt = 0
+        xferPopupCumulative.clear()
         xferPopup = true
         scope.launch(Dispatchers.IO) {
             try {
@@ -290,9 +315,16 @@ internal fun TransferScreen(
                         if (fromLeft) server.deleteLocalFile(file.path) else server.deleteRemoteFile(file.path)
                     }
                 }
+                // 先把弹窗里的进度条补满、停 600ms 再关：
+                // SpeedMonitor 是每秒采样一次，最后一秒的字节往往还没回调上来，
+                // 直接关掉就会出现"文件传完了，可每块进度条都没满"的样子。
                 main.post {
                     busy = false
                     statusText = ""
+                    if (xferPopupTotal > 0) xferPopupDone = xferPopupTotal
+                }
+                kotlinx.coroutines.delay(600)
+                main.post {
                     xferPopup = false
                     GlobalTransferOverlay.reportSend(null)
                     message = if (move) "移动完成" else "复制完成"
@@ -537,6 +569,8 @@ internal fun TransferScreen(
         var last = android.os.SystemClock.elapsedRealtime()
         while (xferPopup) {
             kotlinx.coroutines.delay(100)
+            // 电脑端点暂停/继续时，这里的暂停闸门会被会话线程改掉，弹窗跟着显示"已暂停"
+            xferPopupPaused = server.isTransferPaused
             val now = android.os.SystemClock.elapsedRealtime()
             val dt = (now - last).coerceAtLeast(1)
             last = now
@@ -554,6 +588,8 @@ internal fun TransferScreen(
             // 和主页一样：每一块（这里按通道分）同时增长。
             // 每块负责总量/通道数，填充 = 该通道已收 / 它那一份
             val count = xferPopupChannels.size
+            // 每段宽度是全长的 1/count，所以"段内填充 = 本通道已传 / 每段应传份额"，
+            // 整条填充面积才等于 done/total（直接拿 cum/total 会把整条压小 count 倍，看着又像不涨）。
             val share = xferPopupTotal.toFloat() / count
             val complete = xferPopupDone >= xferPopupTotal
             List(count) { index ->
@@ -600,7 +636,13 @@ internal fun TransferScreen(
                 xferPopupPaused = false
                 xferPopup = false
                 runCatching { server.abortTransfer() }
-                message = "已取消传输"
+                // 取消会让这条连接整体断开、传输页随即卸载，页内弹窗根本来不及显示；
+                // 用系统 Toast 才能在页面切走之后还看得到。
+                android.widget.Toast.makeText(
+                    ctx,
+                    "已取消传输",
+                    android.widget.Toast.LENGTH_SHORT,
+                ).show()
             },
         )
     }

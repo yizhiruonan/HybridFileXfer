@@ -698,6 +698,11 @@ public class ServerService extends Service implements ServiceConnection {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        // 系统要求 startForegroundService() 之后 5 秒内必须 startForeground()；
+        // onCreate 只在第一次调用，服务已经在跑时再被 start（电脑每次连都会用 adb 拉起）
+        // 就必须再喊一次，否则进程会被系统以 "did not then call startForeground" 杀掉，
+        // 正在传的连接也会跟着断（表现就是"会话不稳定、老是断开重连"）
+        goForeground();
         if (intent == null) {
             // 被系统重启，按保存的配置恢复
             startAuto(this);
@@ -759,7 +764,24 @@ public class ServerService extends Service implements ServiceConnection {
         interfaceNames = names;
         active = true;
         setState(STATE_STARTING);
+        // 全局悬浮窗 / 通知栏进度的 tick 从这里起（之前只写在 onBindingDied 里，
+        // 正常启动时根本不会跑，所以应用外的进度弹窗一直不出现）
+        ensureGlobalProgress();
         bindIoService(mode);
+    }
+
+    /** 服务开始工作就起全局进度 tick（已存在就不重建） */
+    private void ensureGlobalProgress() {
+        if (globalProgress != null) {
+            return;
+        }
+        try {
+            globalProgress = new GlobalProgress(this, mainHandler);
+            globalProgress.start();
+        } catch (Throwable e) {
+            Log.w(TAG, "global progress start failed", e);
+            globalProgress = null;
+        }
     }
 
     private void bindIoService(int mode) {
@@ -817,9 +839,7 @@ public class ServerService extends Service implements ServiceConnection {
         bound = false;
         ioService = null;
         if (active) {
-            globalProgress = new GlobalProgress(this, mainHandler);
-        globalProgress.start();
-        mainHandler.postDelayed(() -> bindIoService(ioMode), 1000);
+            mainHandler.postDelayed(() -> bindIoService(ioMode), 1000);
         }
     }
 
@@ -922,6 +942,25 @@ public class ServerService extends Service implements ServiceConnection {
                 if (!active || gen != generation || !server.isAlive()) {
                     break;
                 }
+                // 暂停状态同步：每轮（约 250ms）都做一次，传输中也要同步 ——
+                // 电脑端点暂停，这边 250ms 内就跟着变；这边点暂停，电脑也会立刻收到。
+                // 电脑端在传输过程中也会继续读控制通道（receiver 的 poll），不会等传完。
+                //
+                // 302：手机正在发送文件时，控制通道的读取权归发送线程（它要读收尾的 RESULT 帧），
+                // 会话线程只能写 —— 否则两个读者会互相吃掉对方的帧，两边一起卡死。
+                try {
+                    // 传输期间控制通道的读权在传输线程手里，会话线程只写；
+                    // 否则两个读者会把帧流读串（表现为电脑端读到 opcode 0、传输莫名中断）。
+                    if (server.isSendingFiles()) {
+                        server.writePauseStateOnly(server.isTransferPaused());
+                    } else {
+                        server.exchangePause(server.isTransferPaused());
+                    }
+                } catch (IOException e) {
+                    Log.i(TAG, "pause sync failed (" + server.getDisplayName() + "): " + e);
+                    top.weixiansen574.hybridfilexfer.core.HFXLog.d("sessionLoop: pause sync FAILED", e);
+                    break;
+                }
                 long now = SystemClock.elapsedRealtime();
                 if (now - lastPing < PING_INTERVAL_MS) {
                     continue;
@@ -944,11 +983,15 @@ public class ServerService extends Service implements ServiceConnection {
                 } catch (Throwable e) {
                     debugFile("channel probe failed: " + e);
                 }
+                // 传输期间不要再拉"电脑推送的文件"（会和正在进行的传输打架）
+                if (server.isTransferring()) {
+                    continue;
+                }
                 // 问一下电脑有没有"发送到手机"推过来的文件，有就直接拉下来
                 try {
                     java.util.List<top.weixiansen574.hybridfilexfer.core.bean.RemoteFile> pending =
                             server.checkPending();
-                    if (!pending.isEmpty()) {
+                    if (!pending.isEmpty() && !server.isTransferring()) {
                         pullPendingFiles(server, pending);
                     }
                 } catch (Throwable e) {

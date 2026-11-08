@@ -31,8 +31,10 @@ public final class SpeedLimiter {
         synchronized (SpeedLimiter.class) {
             sentBytes += bytes;
             long elapsed = System.nanoTime() - startNanos;
-            long expected = sentBytes * 1000L / Math.max(1, limitBytesPerSecond / 1000L);
-            sleepMillis = (expected - elapsed) / 1000000L;
+            // expected 也是纳秒：按 limit 匀速发完 sentBytes 该花的时间。
+            // 旧写法算出来是微秒、拿去和纳秒比，差 1000 倍 —— 永远不用睡，限速形同虚设。
+            long expected = sentBytes * 1_000_000_000L / Math.max(1, limitBytesPerSecond);
+            sleepMillis = (expected - elapsed) / 1_000_000L;
         }
         if (sleepMillis > 0) {
             try {

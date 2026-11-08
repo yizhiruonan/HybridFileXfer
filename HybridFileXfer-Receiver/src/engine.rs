@@ -447,7 +447,21 @@ fn report_connected(session: &Session, on_state: &StateSink) {
 
 fn run_session(session: &mut Session, options: &EngineOptions, stop: &Arc<AtomicBool>) -> SessionEnd {
     let receiver = Arc::new(Receiver::with_shared(crate::webserve::current_dir()));
-    match session.run(&receiver, stop) {
+    let end = session.run(&receiver, stop);
+    // 会话结束（断开/被停止/出错）：把没收完的半截文件清掉，界面进度也复位，
+    // 否则卡片上会一直挂着一个停住不动的假进度
+    if let Ok((removed, _lost)) = receiver.finish_with(false) {
+        if removed > 0 {
+            log::warn(&format!(
+                "{} {}",
+                tr("清理了未接收完成的文件：", "removed incomplete files:"),
+                removed
+            ));
+        }
+    }
+    crate::receiver::PROGRESS.reset();
+    crate::session::reset_send_segments();
+    match end {
         SessionEnd::Shutdown => {
             log::info(tr(
                 "手机端已停止服务，等待重新连接…",

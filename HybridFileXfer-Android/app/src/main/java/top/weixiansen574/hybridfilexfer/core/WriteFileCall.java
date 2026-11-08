@@ -13,6 +13,8 @@ public abstract class WriteFileCall implements Callable<Void> {
     private final LinkedBlockingDeque<ByteBuffer> buffers;
     private final boolean[] channelFinished;
     private final ArrayList<LinkedList<FileBlock>> dequeArray;
+    /** 303：本次落盘的文件（手机本地绝对路径） */
+    private final java.util.LinkedHashSet<String> writtenPaths = new java.util.LinkedHashSet<>();
     private boolean canceled = false;
 
     public WriteFileCall(LinkedBlockingDeque<ByteBuffer> buffers, int dequeCount) {
@@ -57,6 +59,8 @@ public abstract class WriteFileCall implements Callable<Void> {
                     raf.setLength(block.totalSize);
                     channel = raf.getChannel();*/
                     channel = createAndOpenFile(block.path, block.totalSize);
+                    // 303：记下落盘的文件（收尾复算 SHA-256 用）
+                    writtenPaths.add(block.path);
                     cursor = 0;
                 } else {
                     //raf = lastRaf;
@@ -74,8 +78,12 @@ public abstract class WriteFileCall implements Callable<Void> {
 
                 ByteBuffer data = block.data;
                 data.flip();
-                channel.write(data);
-                cursor += data.position();
+                // 一整个块要写满：SocketChannel 的风格是"能写多少写多少"，
+                // 单次 write 少写了就等于文件里少了这一段（校验和会报错，但何必让它错）
+                while (data.hasRemaining()) {
+                    channel.write(data);
+                }
+                cursor += block.getLength();
                 //回收缓冲区块
                 buffers.add(block.data);
                 lastBlock = block;
@@ -191,6 +199,11 @@ public abstract class WriteFileCall implements Callable<Void> {
         if (!setFileLastModified(file,time)) {
             System.out.println("Warning! file cannot set last modified:" + file);
         }
+    }
+
+    /** 303：本次落盘的文件（手机本地绝对路径） */
+    public List<String> writtenPaths() {
+        return new ArrayList<>(writtenPaths);
     }
 
     protected abstract void createParentDirIfNotExists(String path) throws Exception;

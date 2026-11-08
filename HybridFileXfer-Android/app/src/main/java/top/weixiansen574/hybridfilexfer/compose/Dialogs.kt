@@ -367,7 +367,11 @@ internal fun ReceiveProgressPanel(
         val now = System.currentTimeMillis()
         val dt = (now - lastAt).coerceAtLeast(16L)
         val instant = if (state.xferBytes >= lastBytes) (state.xferBytes - lastBytes) * 1000f / dt else 0f
-        targetSpeed = if (targetSpeed <= 0f) instant else targetSpeed * 0.6f + instant * 0.4f
+        // 悬浮窗刚弹出来 / 采样间隔太短时会算出十几 GB/s 的离谱值，直接丢掉这次采样
+        val plausible = dt >= 100L && instant <= 2000f * 1024f * 1024f
+        if (plausible) {
+            targetSpeed = if (targetSpeed <= 0f) instant else targetSpeed * 0.6f + instant * 0.4f
+        }
         lastBytes = state.xferBytes
         lastAt = now
     }

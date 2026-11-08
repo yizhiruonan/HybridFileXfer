@@ -254,6 +254,7 @@ fn main() -> Result<(), slint::PlatformError> {
             }
             ui.set_message("".into());
             hfx_receiver::receiver::PROGRESS.reset();
+            hfx_receiver::session::reset_send_segments();
             s.start_engine(port, mode, dir);
             ui.set_running(true);
         });
@@ -555,8 +556,9 @@ fn main() -> Result<(), slint::PlatformError> {
                 .any(|st| matches!(st, EngineState::Connected(_)));
             let active = s.running() && total > 0 && any_connected;
             ui.set_xfer_visible(active);
-            // 手机来拉文件时显示「暂停发送 / 中断发送」
+            // 发送中 / 接收中都显示「暂停 / 继续」，发送时额外给「中断发送」
             ui.set_send_active(hfx_receiver::control::sending());
+            ui.set_recv_active(hfx_receiver::control::receiving());
             ui.set_send_paused(hfx_receiver::control::paused());
             if active {
                 let short = path
@@ -567,16 +569,42 @@ fn main() -> Result<(), slint::PlatformError> {
                 ui.set_file_name(short.into());
                 ui.set_file_progress(if total > 0 { done as f32 / total as f32 } else { 0.0 });
                 ui.set_file_text(format!("{} / {}", human(done), human(total)).into());
+                // 手机来取文件时是"已发送"，手机推过来时才是"已接收"
+                let verb = if ui.get_send_active() { "已发送" } else { "已接收" };
+                // 暂停时速率位置显示「已暂停」（和手机端弹窗一致）
+                let speed_text = if ui.get_send_paused() {
+                    "已暂停".to_string()
+                } else {
+                    human_speed(speed)
+                };
                 ui.set_session_text(format!(
-                    "已接收 {} · {} · {} 个文件",
+                    "{} {} · {} · {} 个文件",
+                    verb,
                     human(session_bytes),
-                    human_speed(speed),
+                    speed_text,
                     files
                 ).into());
 
-                // IDM 式分块：切 96 段，每段填多少由已收到的块决定
-                let segs = hfx_receiver::receiver::PROGRESS.segments(96);
-                ui.set_blocks(slint::ModelRc::new(slint::VecModel::from(segs)));
+                // IDM 式分块：和手机端一样按"哪条通道负责哪一段"画。
+                // 两个方向都统一用块位图（mark_sent / mark_received 都按块记下真实通道号），
+                // 段边界 = 相邻块通道归属的变化处：一个块传完就重算一次分段，
+                // 通道抢走别人的段后，旧的边界会一直留在位图里（切分痕迹）。
+                // 之前发送方向用 SendPlan 的任务区间：边界只在"领任务"那一刻重算，
+                // 和实际发完的块对不上，看起来就是整段一起跳、没有切分痕迹。
+                let raw: Vec<hfx_receiver::receiver::XferSeg> = hfx_receiver::receiver::PROGRESS.segments();
+                let total: f32 = raw.iter().map(|s| s.span).sum::<f32>().max(1.0);
+                let mut start = 0.0f32;
+                let mut segs: Vec<XferSeg> = Vec::with_capacity(raw.len());
+                for s in &raw {
+                    let span = s.span / total;
+                    segs.push(XferSeg {
+                        start: start.clamp(0.0, 1.0),
+                        span: span.clamp(0.0, 1.0),
+                        filled: s.filled.clamp(0.0, 1.0),
+                    });
+                    start += span;
+                }
+                ui.set_xfer_segments(slint::ModelRc::new(slint::VecModel::from(segs)));
             }
 
             // 进度卡 / 更新提示出现时调整窗口高度（否则底部按钮会被裁掉）

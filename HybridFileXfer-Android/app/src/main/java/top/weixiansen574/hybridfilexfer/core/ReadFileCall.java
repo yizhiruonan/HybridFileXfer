@@ -22,6 +22,8 @@ public abstract class ReadFileCall implements Callable<Void> {
     private final Directory remoteDir;
     private final int operateThreadCount;
     private int fileIndex = -1;
+    /** 303：本次发出去的文件（手机本地绝对路径），收尾复算 SHA-256 用 */
+    private final List<String> sourcePaths = new java.util.ArrayList<>();
     /** 暂停闸门：暂停时不再往队列里读块 */
     private volatile TransferPause pause;
 
@@ -87,6 +89,8 @@ public abstract class ReadFileCall implements Callable<Void> {
             return;
         }
         //RandomAccessFile randomAccessFile = new RandomAccessFile(file, "r");
+        // 303：记下这次真正发出去的文件（收尾复算 SHA-256 用）
+        sourcePaths.add(file.getPath());
         FileChannel channel = openFile(file.getPath());
         long length = channel.size();
         long lastModified = file.lastModified();
@@ -121,6 +125,11 @@ public abstract class ReadFileCall implements Callable<Void> {
             i++;
         }
         closeFile();
+    }
+
+    /** 303：本次发送涉及的文件（手机本地绝对路径） */
+    public List<String> sourcePaths() {
+        return sourcePaths;
     }
 
     public void recycleBuffer(ByteBuffer buffer) {

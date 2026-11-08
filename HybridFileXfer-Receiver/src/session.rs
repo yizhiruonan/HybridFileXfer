@@ -39,6 +39,9 @@ pub struct Session {
     reader: TcpStream,
     writer: TcpStream,
     transfers: Vec<(String, TcpStream)>,
+    /// 传输期间"偷看"控制通道时读到的、暂不处理的指令：
+    /// 传输结束后由主循环按原顺序继续处理
+    pending_opcode: Option<i16>,
     pub interfaces: Vec<PeerInterface>,
 }
 
@@ -228,6 +231,7 @@ impl Session {
             reader,
             writer,
             transfers,
+            pending_opcode: None,
             interfaces,
         })
     }
@@ -252,20 +256,27 @@ impl Session {
             if stop.load(Ordering::Relaxed) {
                 return SessionEnd::Stopped;
             }
-            let id = match proto::read_i16(&mut self.reader) {
-                Ok(id) => {
+            // 传输期间偷看控制通道时会先把指令头取走，这里优先处理暂存的那条
+            let id = match self.pending_opcode.take() {
+                Some(id) => {
                     last_activity = Instant::now();
                     id
                 }
-                Err(e) if is_timeout(&e) => {
-                    if last_activity.elapsed() > IDLE_TIMEOUT * 5 {
+                None => match proto::read_i16(&mut self.reader) {
+                    Ok(id) => {
+                        last_activity = Instant::now();
+                        id
+                    }
+                    Err(e) if is_timeout(&e) => {
+                        if last_activity.elapsed() > IDLE_TIMEOUT * 5 {
+                            return SessionEnd::Disconnected(describe_read_error(&e));
+                        }
+                        continue;
+                    }
+                    Err(e) => {
                         return SessionEnd::Disconnected(describe_read_error(&e));
                     }
-                    continue;
-                }
-                Err(e) => {
-                    return SessionEnd::Disconnected(describe_read_error(&e));
-                }
+                },
             };
             // 处理指令期间用长一点的超时（手机端处理大文件需要时间）
             let _ = self
@@ -275,11 +286,14 @@ impl Session {
                 controller::SHUTDOWN => return SessionEnd::Shutdown,
                 controller::PING => Ok(()),
                 controller::CHECK_PENDING => self.handle_check_pending(),
+                controller::PAUSE_STATE => self.handle_pause_state(),
                 controller::LIST_FILES => self.handle_list_files(),
                 controller::DELETE_FILE => self.handle_delete(),
                 controller::MKDIR => self.handle_mkdir(),
                 controller::REQUEST_RECEIVE => self.handle_receive(receiver),
                 controller::REQUEST_SEND => self.handle_send(),
+                // 302：结论帧正常只在传输收尾读，漏到这里说明时序错位，读干净别留半帧
+                controller::RESULT => self.discard_result(),
                 other => {
                     // 不认识的控制指令就忽略（协议要求老客户端也能兼容），别断开连接，
                     // 否则新手机端 + 旧电脑端会陷入"连上-被踢-重连"的死循环
@@ -342,6 +356,245 @@ impl Session {
         proto::write_bool(&mut self.writer, ok)
     }
 
+    /// 暂停状态同步：手机发它当前是否暂停，电脑回自己是否暂停。
+    /// 只有手机这一侧状态**变了**才应用到本地，避免电脑自己点的暂停被手机上报的旧状态冲掉。
+    fn handle_pause_state(&mut self) -> io::Result<()> {
+        let phone = proto::read_bool(&mut self.reader)?;
+        self.apply_pause_state(phone)
+    }
+
+    /// 应用手机端的暂停状态并回报电脑自己的状态
+    fn apply_pause_state(&mut self, phone: bool) -> io::Result<()> {
+        if phone != crate::control::phone_paused() {
+            crate::control::set_phone_paused(phone);
+            crate::control::pause(phone);
+            log::info(crate::i18n::tr(
+                if phone { "手机端暂停了传输" } else { "手机端继续传输" },
+                if phone { "the phone paused the transfer" } else { "the phone resumed the transfer" },
+            ));
+        }
+        // 302：回报带 opcode。手机端传输期间只有一个读循环（发送线程），
+        // 裸 bool 会被它当成别的帧读串。
+        proto::write_i16(&mut self.writer, controller::PAUSE_REPLY)?;
+        proto::write_bool(&mut self.writer, crate::control::paused())
+    }
+
+    /// 303：写一帧结论 `[i16 RESULT][bool ok][i32 n][(i64 size, 32B sha256)*n][utf 错误信息?]`.
+    /// 两个方向共用：接收数据的一方报"落盘结论 + 本端落盘文件的指纹"，
+    /// 发送数据的一方报"读文件结论"（指纹表为空）。
+    fn write_result(
+        &mut self,
+        ok: bool,
+        error: Option<&str>,
+        digests: &[FileDigest],
+    ) -> io::Result<()> {
+        proto::write_i16(&mut self.writer, controller::RESULT)?;
+        proto::write_bool(&mut self.writer, ok)?;
+        proto::write_i32(&mut self.writer, digests.len() as i32)?;
+        for digest in digests {
+            proto::write_i64(&mut self.writer, digest.size as i64)?;
+            self.writer.write_all(&digest.sha256)?;
+        }
+        self.writer.flush()?;
+        if let Some(message) = error {
+            proto::write_utf(&mut self.writer, message)?;
+            self.writer.flush()?;
+        }
+        Ok(())
+    }
+
+    /// 303：读一帧结论（含对端产出的文件指纹）。期间遇到手机发来的 PAUSE_STATE /
+    /// PING 就地处理 —— 收尾时手机端的暂停同步还在飞，不处理就会把结论读串。
+    fn read_result(&mut self) -> io::Result<PeerResult> {
+        loop {
+            let id = match self.pending_opcode.take() {
+                Some(id) => id,
+                None => proto::read_i16(&mut self.reader)?,
+            };
+            match id {
+                controller::RESULT => {
+                    let ok = proto::read_bool(&mut self.reader)?;
+                    let count = proto::read_i32(&mut self.reader)?.max(0) as usize;
+                    let mut digests = Vec::with_capacity(count.min(4096));
+                    for _ in 0..count {
+                        let size = proto::read_i64(&mut self.reader)?;
+                        let mut sha256 = [0u8; 32];
+                        self.reader.read_exact(&mut sha256)?;
+                        digests.push(FileDigest {
+                            size: size.max(0) as u64,
+                            sha256,
+                        });
+                    }
+                    let message = if ok {
+                        None
+                    } else {
+                        Some(proto::read_utf(&mut self.reader).unwrap_or_default())
+                    };
+                    return Ok(PeerResult {
+                        ok,
+                        message,
+                        digests,
+                    });
+                }
+                controller::PAUSE_STATE => {
+                    let phone = proto::read_bool(&mut self.reader)?;
+                    self.apply_pause_state(phone)?;
+                }
+                controller::PING => {}
+                other => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("unexpected control frame {} while waiting for RESULT", other),
+                    ));
+                }
+            }
+        }
+    }
+
+    /// 传输进行中也要服务控制通道。
+    ///
+    /// 手机端每 250ms 会发一条 PAUSE_STATE（带着它自己的暂停状态、并读回电脑的状态）。
+    /// 如果电脑在 handle_send / handle_receive 里一直等到传输结束才读控制通道，
+    /// 暂停状态就要等整个传输传完才能同步 —— 表现就是"点了暂停另一边没反应"。
+    ///
+    /// 这里用 peek 偷看：只有拿到完整的 2 字节指令头才去读，避免把半个指令头吃掉。
+    /// PING / PAUSE_STATE / CHECK_PENDING 直接处理，其它指令暂存给主循环，
+    /// 传输结束后按原顺序继续。
+    /// 控制通道已经没了（手机被杀 / 拔线 / 服务被停止）：把传输 socket 也一起 shutdown。
+    ///
+    /// 不这么做，卡在 read/write 里的传输线程会一直等到 socket 的 120 秒超时才醒，
+    /// 期间界面和日志整段冻住 —— 实测 am force-stop 之后 PC 静默 120 秒才去删半截文件。
+    /// shutdown 之后阻塞中的读写立刻返回，收尾（删半截文件、写结论帧）马上做。
+    fn shutdown_transfers(&self) {
+        for (_, stream) in self.transfers.iter() {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+    }
+
+    fn poll_control_during_transfer(&mut self) -> io::Result<()> {
+        if self.pending_opcode.is_some() {
+            return Ok(());
+        }
+        let _ = self
+            .reader
+            .set_read_timeout(Some(Duration::from_millis(2)));
+        // 先 peek 出足够判断"整帧到齐没有"的字节再动手。
+        // 只在 peek 到 2 字节就去读 opcode 是有坑的：PAUSE_STATE 是 opcode + 1 字节参数，
+        // 参数可能还在下一个 TCP 片段里 —— 那时读出 opcode、等 300ms 超时、把 opcode
+        // 记成 pending，控制通道上就留下了一个孤零零的 bool（0x00）。之后下一次读
+        // 正好是"残留的 00 + 下一帧的高位 00"，于是读出 opcode 0（SHUTDOWN），
+        // 整条控制通道彻底错位。所以这里按帧长判断：不够 3 字节就一个字节都不读。
+        let mut window = [0u8; 3];
+        // None = 这一轮没数据（超时）；0 = 对端已关闭（EOF）。两者必须分开：
+        // 把 EOF 也当成"没数据"，等待循环就永远转下去 —— 手机取消/断线后
+        // handle_receive 收不了尾，界面和日志一起定格在「已暂停」。
+        let available = match self.reader.peek(&mut window) {
+            Ok(n) => Some(n),
+            Err(ref e) if is_timeout(e) => None,
+            Err(e) => return Err(e),
+        };
+        let Some(available) = available else {
+            let _ = self
+                .reader
+                .set_read_timeout(Some(Duration::from_secs(120)));
+            return Ok(());
+        };
+        if available == 0 {
+            // 对端把控制通道关了：叫醒还在暂停里等的传输线程，再报给上层
+            crate::control::cancel();
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "control channel closed by peer",
+            ));
+        }
+        if available < 2 {
+            // 没数据或半个指令头，下一轮再看
+            let _ = self
+                .reader
+                .set_read_timeout(Some(Duration::from_secs(120)));
+            return Ok(());
+        }
+        let id = i16::from_be_bytes([window[0], window[1]]);
+        let payload_len = match id {
+            controller::PAUSE_STATE => 1,
+            _ => 0,
+        };
+        if available < 2 + payload_len {
+            // 帧还没到齐，等它齐了再读，绝不把半个帧吃掉
+            let _ = self
+                .reader
+                .set_read_timeout(Some(Duration::from_secs(120)));
+            return Ok(());
+        }
+        let id = proto::read_i16(&mut self.reader)?;
+        match id {
+            controller::PING => {}
+            controller::CHECK_PENDING => self.handle_check_pending()?,
+            controller::PAUSE_STATE => {
+                let phone = proto::read_bool(&mut self.reader)?;
+                log::debug(&format!("control: PAUSE_STATE {} during transfer", phone));
+                self.apply_pause_state(phone)?;
+            }
+            // 303：手机端点了「取消」。以前取消只有硬断 socket，电脑端在线程里
+            // 既等不到数据也等不到错误（暂停时连读都不读），整条会话就卡死在这里。
+            // 现在就地置取消标志：所有传输线程下一轮检查时干净退出。
+            controller::CANCEL => {
+                log::warn(crate::i18n::tr(
+                    "手机端取消了传输",
+                    "the phone cancelled the transfer",
+                ));
+                crate::control::cancel();
+            }
+            controller::RESULT => {
+                // 手机端的落盘结论可能在本机发送线程收尾那一瞬间到：先记下指令头，
+                // 载荷由收尾时的 read_result() 接着读，不能当成不相干的指令丢掉
+                self.pending_opcode = Some(controller::RESULT);
+            }
+            // 手机界面在传输期间也会翻目录/改文件，这些同步命令必须当场应答：
+            // 推迟到传输结束的话，手机端那个调用会一直阻塞在 controlLock 上
+            // （实测会卡住 100 秒，并连带把暂停同步和写侧全堵死）。
+            controller::LIST_FILES => self.handle_list_files()?,
+            controller::DELETE_FILE => self.handle_delete()?,
+            controller::MKDIR => self.handle_mkdir()?,
+            other => {
+                // 传输期间正常不会出现别的指令；先记下来，传输结束后处理
+                log::warn(&format!(
+                    "{} {}（传输结束后处理）",
+                    crate::i18n::tr("传输中收到控制指令", "control command during transfer"),
+                    other
+                ));
+                self.pending_opcode = Some(other);
+            }
+        }
+        let _ = self
+            .reader
+            .set_read_timeout(Some(Duration::from_secs(120)));
+        Ok(())
+    }
+
+    /// 读掉一帧 RESULT 并记一笔（时序错位时的兜底，避免把载荷留成半个帧）
+    fn discard_result(&mut self) -> io::Result<()> {
+        let ok = proto::read_bool(&mut self.reader)?;
+        let count = proto::read_i32(&mut self.reader)?.max(0);
+        for _ in 0..count {
+            let _size = proto::read_i64(&mut self.reader)?;
+            let mut sha256 = [0u8; 32];
+            self.reader.read_exact(&mut sha256)?;
+        }
+        let message = if ok {
+            String::new()
+        } else {
+            proto::read_utf(&mut self.reader).unwrap_or_default()
+        };
+        log::warn(&format!(
+            "{} ok={} {}",
+            crate::i18n::tr("空闲时收到传输结论帧（已丢弃）", "unexpected RESULT frame while idle, dropped"),
+            ok,
+            message
+        ));
+        Ok(())
+    }
+
     /// 手机请求从电脑取文件（REQUEST_SEND）：把选中的文件/文件夹切块，
     /// 通过所有传输通道发过去。格式与手机端 ReceiveFileCall 对应。
     /// 手机问"有没有要推给我的文件"：回列表（路径 + 大小）
@@ -401,6 +654,11 @@ impl Session {
         // 按"哪个通道送了第几块"还原这些段，段数会随传输过程变化。
         let tasks = Arc::new(tasks);
         let plan = Arc::new(Mutex::new(SendPlan::new(tasks.len(), self.transfers.len())));
+        // 一开始就是"通道数"段，之后谁抢了别人的段，新的边界会一直留着
+        reset_send_segments();
+        if let Ok(guard) = plan.lock() {
+            publish_segments(&guard);
+        }
         let sent = Arc::new(AtomicU64::new(0));
         let started = Instant::now();
 
@@ -418,15 +676,50 @@ impl Session {
         }
 
         let mut hard_error: Option<String> = None;
+        // 等各通道结束的同时继续服务控制通道：暂停同步不能等整个传输结束
+        let mut finished = vec![false; handles.len()];
+        let mut remaining = handles.len();
+        while remaining > 0 {
+            if let Err(e) = self.poll_control_during_transfer() {
+                log::warn(&format!(
+                    "{}: {}",
+                    crate::i18n::tr("控制通道断开", "control channel closed"),
+                    e
+                ));
+                // 手机被杀 / 拔线：别让发送线程干等 120s 超时
+                self.shutdown_transfers();
+                break;
+            }
+            for (i, (_, handle)) in handles.iter().enumerate() {
+                if !finished[i] && handle.is_finished() {
+                    finished[i] = true;
+                    remaining -= 1;
+                }
+            }
+            if remaining > 0 {
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+        let _ = self
+            .reader
+            .set_read_timeout(Some(Duration::from_secs(120)));
         for (name, handle) in handles {
             match handle.join() {
                 Ok(Ok(bytes)) => {
                     log::info(&format!("{}: {} {}", name, crate::i18n::tr("已发送", "sent"), crate::receiver::human_bytes(bytes)));
                 }
                 Ok(Err(e)) => {
-                    log::error(&format!("{}: {}", name, e));
-                    if hard_error.is_none() {
-                        hard_error = Some(format!("{}: {}", name, e));
+                    // 手机端点取消时本端线程以 Interrupted 退出，这不是发送失败
+                    if crate::control::cancelled()
+                        || e.kind() == io::ErrorKind::Interrupted
+                        || is_disconnect(&e)
+                    {
+                        log::debug(&format!("{}: cancelled ({})", name, e));
+                    } else {
+                        log::error(&format!("{}: {}", name, e));
+                        if hard_error.is_none() {
+                            hard_error = Some(format!("{}: {}", name, e));
+                        }
                     }
                 }
                 Err(_) => {
@@ -447,18 +740,78 @@ impl Session {
             seconds
         ));
 
-        // 与 HFXService.receiveFiles() 的收尾对齐：
-        //   手机：writeBoolean(true) → readBoolean()
-        //   电脑：先读手机的 bool，再回一个 bool（失败时再跟一段 UTF 错误信息）
-        let _ = proto::read_bool(&mut self.reader);
-        match &hard_error {
-            None => {
-                proto::write_bool(&mut self.writer, true)?;
+        // 302 收尾（与手机端 HFXService.receiveFiles() 对齐）：
+        //   手机：RESULT{落盘结论} → 读电脑的 RESULT{读文件结论}
+        //   电脑：先读手机的 RESULT，再回自己的 RESULT
+        // 发一半断了：把界面上的进度清掉，别留个停住不动的进度条
+        if hard_error.is_some() {
+            crate::receiver::PROGRESS.reset();
+            reset_send_segments();
+        }
+
+        if crate::control::cancelled() {
+            // 取消后控制通道通常也断了：别再去读结论帧，直接当成一次干净的中止
+            log::warn(crate::i18n::tr("发送已取消", "the transfer was cancelled"));
+            crate::receiver::PROGRESS.reset();
+            reset_send_segments();
+            return Ok(());
+        }
+
+        // 303：本端是发送方，先把自己发出去的文件算一遍指纹（和手机端算它落盘
+        // 文件的指纹同时进行），再读手机的结论帧比对。
+        let mine = if hard_error.is_none() {
+            digest_files(&source_files_of(tasks.as_slice()))
+        } else {
+            Vec::new()
+        };
+        let mut verify_error: Option<String> = None;
+        match self.read_result() {
+            Ok(peer) => {
+                if let Some(message) = peer.message.clone().filter(|_| !peer.ok) {
+                    log::error(&format!(
+                        "{}: {}",
+                        crate::i18n::tr("手机写入文件时出错", "the phone failed to write a file"),
+                        message
+                    ));
+                }
+                if hard_error.is_none() && !peer.digests.is_empty() {
+                    match compare_digests(&mine, &peer.digests) {
+                        None => log::info(&format!(
+                            "{} {} {}",
+                            crate::i18n::tr("校验通过：", "verified:"),
+                            mine.len(),
+                            crate::i18n::tr(
+                                "个文件 SHA-256 与手机端一致",
+                                "file(s) match the phone byte for byte"
+                            )
+                        )),
+                        Some(reason) => {
+                            log::error(&format!(
+                                "{} {}",
+                                crate::i18n::tr("文件校验失败：", "file verification failed:"),
+                                reason
+                            ));
+                            verify_error = Some(format!(
+                                "{} {}",
+                                crate::i18n::tr("文件校验失败：", "file verification failed:"),
+                                reason
+                            ));
+                        }
+                    }
+                }
             }
+            // 对端已经没了：下面写结论会再报一次错，这里不额外放大
+            Err(e) => log::warn(&format!(
+                "{}: {}",
+                crate::i18n::tr("读取手机端的结论失败", "reading the phone's verdict failed"),
+                e
+            )),
+        }
+        match hard_error.clone().or(verify_error) {
+            None => self.write_result(true, None, &[])?,
             Some(message) => {
                 log::warn(&format!("send finished with error: {message}"));
-                proto::write_bool(&mut self.writer, false)?;
-                proto::write_utf(&mut self.writer, message)?;
+                self.write_result(false, Some(&message), &[])?;
             }
         }
         Ok(())
@@ -472,15 +825,23 @@ impl Session {
             ));
         }
         log::info(crate::i18n::tr("手机开始发送文件", "the phone is sending files"));
+        // 接收方向没有发送计划：清掉上一次的发送分段，界面改按"谁写了第几块"还原
+        reset_send_segments();
+        // 每次接收都要重置进度：不清的话上一条会话里传过的文件还留在 files 表里，
+        // 界面会显示「已接收 9.75 GB · 3 个文件」（其实是同一个文件传了三次）。
+        crate::receiver::PROGRESS.reset();
+        // 接收期间界面显示「暂停 / 已暂停」，暂停时通知手机端停发
+        let _receiving = crate::control::ReceivingGuard::begin();
         let started = Instant::now();
         let mut handles = Vec::with_capacity(self.transfers.len());
-        for (name, stream) in &self.transfers {
+        for (channel, (name, stream)) in self.transfers.iter().enumerate() {
             let stream = stream.try_clone()?;
             let receiver = Arc::clone(receiver);
             let name = name.clone();
+            let channel = channel as u8;
             handles.push((
                 name,
-                thread::spawn(move || read_transfer_channel(stream, receiver)),
+                thread::spawn(move || read_transfer_channel(stream, receiver, channel)),
             ));
         }
         let monitor_stop = Arc::new(AtomicBool::new(false));
@@ -492,6 +853,33 @@ impl Session {
 
         let mut hard_error: Option<String> = None;
         let mut aborts: Vec<String> = Vec::new();
+        // 等各通道结束的同时继续服务控制通道：手机端的暂停同步不能等整个传输结束
+        let mut finished = vec![false; handles.len()];
+        let mut remaining = handles.len();
+        while remaining > 0 {
+            if let Err(e) = self.poll_control_during_transfer() {
+                log::warn(&format!(
+                    "{}: {}",
+                    crate::i18n::tr("控制通道断开", "control channel closed"),
+                    e
+                ));
+                // 对端没打招呼就走了：别让传输线程干等 120s 超时
+                self.shutdown_transfers();
+                break;
+            }
+            for (i, (_, handle)) in handles.iter().enumerate() {
+                if !finished[i] && handle.is_finished() {
+                    finished[i] = true;
+                    remaining -= 1;
+                }
+            }
+            if remaining > 0 {
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+        let _ = self
+            .reader
+            .set_read_timeout(Some(Duration::from_secs(120)));
         for (name, handle) in handles {
             match handle.join() {
                 Ok(Ok(ChannelEnd::Eof)) => {}
@@ -500,9 +888,23 @@ impl Session {
                     aborts.push(format!("{}: {}", name, reason));
                 }
                 Ok(Err(e)) => {
-                    log::error(&format!("{}: {}", name, e));
-                    if hard_error.is_none() {
-                        hard_error = Some(format!("{}: {}", name, e));
+                    // 用户取消时线程是以 Interrupted/连接被 reset 退出的，
+                    // 那不是"接收失败"，别当成错误弹窗，也别写进错误结论帧。
+                    if crate::control::cancelled()
+                        || e.kind() == io::ErrorKind::Interrupted
+                        || is_disconnect(&e)
+                    {
+                        log::debug(&format!("{}: cancelled ({})", name, e));
+                        aborts.push(format!(
+                            "{}: {}",
+                            name,
+                            crate::i18n::tr("已取消", "cancelled")
+                        ));
+                    } else {
+                        log::error(&format!("{}: {}", name, e));
+                        if hard_error.is_none() {
+                            hard_error = Some(format!("{}: {}", name, e));
+                        }
                     }
                 }
                 Err(_) => {
@@ -519,8 +921,37 @@ impl Session {
         let bytes = receiver.bytes();
         let files = receiver.file_count();
         let elapsed = started.elapsed().as_secs_f64().max(0.001);
-        if let Err(e) = receiver.finish() {
-            log::warn(&format!("finish(): {}", e));
+        // 中断/出错时把没收完的半截文件删掉，别留在电脑上
+        let complete = hard_error.is_none() && aborts.is_empty();
+        // 303：先把落盘文件列表记下来，finish_with() 会把条目清空
+        let received = receiver.received_files();
+        match receiver.finish_with(complete) {
+            Ok((removed, lost)) if removed > 0 => log::warn(&format!(
+                "{} {} · {}",
+                crate::i18n::tr("删除未接收完的文件", "removed incomplete files"),
+                removed,
+                crate::receiver::human_bytes(lost)
+            )),
+            Ok(_) => {}
+            Err(e) => log::warn(&format!("finish(): {}", e)),
+        }
+
+        // 303：整文件 SHA-256 复算（本端是接收方，算自己落盘的文件）。
+        // 和手机端算它发出去的文件同时进行，收尾只多这一遍读盘。
+        let digests = if complete {
+            digest_files(&received)
+        } else {
+            Vec::new()
+        };
+
+        if hard_error.is_none() && !aborts.is_empty() && crate::control::cancelled() {
+            // 手机端点了取消：没有错，只是这次传输作废（半截文件上一步已经删掉）。
+            // 控制通道多半也跟着关了，别再往里写结论帧。
+            log::warn(crate::i18n::tr(
+                "接收已取消",
+                "the transfer was cancelled",
+            ));
+            return Ok(());
         }
 
         if let Some(error) = hard_error {
@@ -529,43 +960,152 @@ impl Session {
                 crate::i18n::tr("接收失败", "receiving failed"),
                 error
             ));
-            proto::write_bool(&mut self.writer, false)?;
-            proto::write_utf(&mut self.writer, &error)?;
+            // 结论帧带 opcode，手机端 sendFiles 正循环读帧等它
+            let _ = self.write_result(false, Some(&error), &[]);
             return Ok(());
         }
 
-        // Mirror the reference client: report "written" and read the phone's
-        // verdict (it fails when reading a file on its own side).
-        proto::write_bool(&mut self.writer, true)?;
-        if !proto::read_bool(&mut self.reader)? {
-            let message = proto::read_utf(&mut self.reader).unwrap_or_default();
+        // 与手机端 sendFiles 对齐：电脑先报"落盘结论 + 文件指纹"，再读手机"读文件结论"。
+        // 传输期间手机端的 PAUSE_STATE 还在飞，read_result 会就地处理掉。
+        self.write_result(true, None, &digests)?;
+        let peer = self.read_result()?;
+        if let Some(message) = peer.message.clone().filter(|_| !peer.ok) {
             log::error(&format!(
                 "{}: {}",
-                crate::i18n::tr("手机读取文件时出错", "the phone failed to read a file"),
+                crate::i18n::tr("手机端校验/读文件出错", "the phone reported a problem"),
                 message
             ));
-        } else if aborts.is_empty() {
-            log::info(&format!(
-                "{} {} {} {} {}",
-                crate::i18n::tr("接收完成：", "received"),
-                files,
-                crate::i18n::tr("个文件", "file(s),"),
-                util::format_bytes(bytes),
-                format!(
-                    "{} {:.1}s ({})",
-                    crate::i18n::tr("用时", "in"),
-                    elapsed,
-                    util::format_speed(bytes as f64 / elapsed)
-                )
-            ));
-        } else {
-            log::warn(crate::i18n::tr(
-                "接收已中断",
-                "the transfer was interrupted",
-            ));
+        }
+        match peer.ok {
+            true => {
+                if aborts.is_empty() {
+                    log::info(&format!(
+                        "{} {} {} {} {}",
+                        crate::i18n::tr("接收完成：", "received"),
+                        files,
+                        crate::i18n::tr("个文件", "file(s),"),
+                        util::format_bytes(bytes),
+                        format!(
+                            "{} {:.1}s ({})",
+                            crate::i18n::tr("用时", "in"),
+                            elapsed,
+                            util::format_speed(bytes as f64 / elapsed)
+                        )
+                    ));
+                    // 303：接收方向的 SHA-256 由手机端比对（它复算自己发出去的文件，
+                    // 和本端回给它的落盘指纹逐字节比），这里只转述结论，
+                    // 让两个方向都打同样一句确认，用户不用猜这次到底校验了没有。
+                    if !digests.is_empty() {
+                        log::info(&format!(
+                            "{} {} {}",
+                            crate::i18n::tr("校验通过：", "verified:"),
+                            digests.len(),
+                            crate::i18n::tr(
+                                "个文件 SHA-256 与手机端一致",
+                                "file(s) match the phone byte for byte"
+                            )
+                        ));
+                    }
+                } else {
+                    log::warn(crate::i18n::tr(
+                        "接收已中断",
+                        "the transfer was interrupted",
+                    ));
+                }
+            }
+            false => log::warn(crate::i18n::tr(
+                "手机端报告传输/校验失败",
+                "the phone reported a failed transfer or check",
+            )),
         }
         Ok(())
     }
+}
+
+/// 一个文件的指纹：字节数 + SHA-256。两端各自算一遍再比对，
+/// 不带路径（两端的绝对路径本来就不一样），所以按"集合"比。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FileDigest {
+    pub size: u64,
+    pub sha256: [u8; 32],
+}
+
+/// 对端（手机）的结论帧
+pub struct PeerResult {
+    /// 对端这一步是否成功（落盘成功 / 读文件成功）
+    pub ok: bool,
+    /// 失败原因（只有 ok == false 时有）
+    pub message: Option<String>,
+    /// 对端产出的文件指纹；本端是发送方时对端为空表
+    pub digests: Vec<FileDigest>,
+}
+
+/// 算一个文件的 SHA-256 和大小（流式读，1MiB 一块，边读边算）
+fn sha256_file(path: &Path) -> io::Result<FileDigest> {
+    use ring::digest;
+    let mut file = std::fs::File::open(path)?;
+    let size = file.metadata()?.len();
+    let mut context = digest::Context::new(&digest::SHA256);
+    let mut buffer = vec![0u8; BLOCK_SIZE as usize];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        context.update(&buffer[..read]);
+    }
+    let finished = context.finish();
+    let mut sha256 = [0u8; 32];
+    sha256.copy_from_slice(finished.as_ref());
+    Ok(FileDigest { size, sha256 })
+}
+
+/// 把一组本地文件算成指纹表（排序后便于两端直接比对）
+fn digest_files(paths: &[PathBuf]) -> Vec<FileDigest> {
+    let mut digests = Vec::with_capacity(paths.len());
+    for path in paths {
+        match sha256_file(path) {
+            Ok(digest) => digests.push(digest),
+            Err(e) => log::warn(&format!("{}: {}", path.display(), e)),
+        }
+    }
+    digests.sort();
+    digests
+}
+
+/// 比对两端指纹表；一致返回 None，不一致返回一句给人看的原因
+fn compare_digests(mine: &[FileDigest], theirs: &[FileDigest]) -> Option<String> {
+    if mine.len() != theirs.len() {
+        return Some(format!(
+            "{} {} / {} {}",
+            crate::i18n::tr("文件数量不一致：本端", "file count differs: local"),
+            mine.len(),
+            crate::i18n::tr("对端", "remote"),
+            theirs.len()
+        ));
+    }
+    for (index, (a, b)) in mine.iter().zip(theirs.iter()).enumerate() {
+        if a != b {
+            return Some(format!(
+                "{} {}（{} {} {} -> {}）",
+                crate::i18n::tr("第", "file"),
+                index + 1,
+                crate::i18n::tr("SHA-256 不一致", "SHA-256 mismatch"),
+                util::format_bytes(a.size),
+                crate::i18n::tr("对端", "remote"),
+                hex32(&b.sha256)
+            ) + &format!(" {}/{}", hex32(&a.sha256), hex32(&b.sha256)));
+        }
+    }
+    None
+}
+
+fn hex32(bytes: &[u8; 32]) -> String {
+    let mut out = String::with_capacity(64);
+    for byte in bytes {
+        out.push_str(&format!("{:02x}", byte));
+    }
+    out
 }
 
 enum ChannelEnd {
@@ -576,10 +1116,52 @@ enum ChannelEnd {
 fn read_transfer_channel(
     mut stream: TcpStream,
     receiver: Arc<Receiver>,
+    channel: u8,
 ) -> io::Result<ChannelEnd> {
     let mut buffer = vec![0u8; BLOCK_SIZE as usize];
     loop {
-        let header = proto::read_i16(&mut stream)?;
+        // 暂停：接收方向也不再读（TCP 缓冲自然挡住手机端的发送）；中断：退出。
+        //
+        // 但暂停期间必须还能发现"对端已经走了"：手机点取消/拔线时 socket 被关掉，
+        // 如果这里只会 sleep，线程就永远等下去 —— handle_receive 的等待循环
+        // 不会结束，界面和日志都定格在「已暂停」（实测就是这么卡死的）。
+        // peek 不消费数据，暂停期间对端也不发数据，所以用它探活是安全的。
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
+        let mut probe = [0u8; 1];
+        while crate::control::paused() && !crate::control::cancelled() {
+            match stream.peek(&mut probe) {
+                Ok(0) => {
+                    return Ok(ChannelEnd::RemoteAbort(
+                        crate::i18n::tr("手机端取消了传输", "the phone cancelled the transfer")
+                            .to_string(),
+                    ))
+                }
+                Ok(_) => {}
+                Err(ref e) if is_timeout(e) => {}
+                Err(e) if is_disconnect(&e) => {
+                    return Ok(ChannelEnd::RemoteAbort(
+                        crate::i18n::tr(
+                            "手机端断开了连接",
+                            "the phone closed the connection",
+                        )
+                        .to_string(),
+                    ))
+                }
+                Err(e) => return Err(e),
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(120)));
+        if crate::control::cancelled() {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled by user"));
+        }
+        let header = match proto::read_i16(&mut stream) {
+            Ok(h) => h,
+            Err(e) => {
+                log::debug(&format!("ch{}: read header failed: {}", channel, e));
+                return Err(e);
+            }
+        };
         match header {
             transfer::FILE => {
                 let _file_index = proto::read_i32(&mut stream)?;
@@ -588,6 +1170,12 @@ fn read_transfer_channel(
                 let total_size = proto::read_i64(&mut stream)?;
                 let index = proto::read_i32(&mut stream)?;
                 let length = proto::read_i32(&mut stream)?;
+                // 303：这一块的 CRC32，写盘前必须一致
+                let expected_crc = proto::read_i32(&mut stream)? as u32;
+                log::debug(&format!(
+                    "ch{}: FILE idx={} len={} path={}",
+                    channel, index, length, path
+                ));
                 if index < 0 || length < 0 || length as usize > buffer.len() {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -604,7 +1192,23 @@ fn read_transfer_channel(
                 if length > 0 {
                     stream.read_exact(&mut buffer[..length])?;
                 }
+                let actual_crc = crc32fast::hash(&buffer[..length]);
+                if actual_crc != expected_crc {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        crate::i18n::tr(
+                            "数据校验失败：块内容与发送端不一致",
+                            "data check failed: block differs from what the phone sent",
+                        )
+                        .to_string()
+                            + &format!(
+                                " (ch{} {}#{}: crc {:08x} != {:08x})",
+                                channel, path, index, actual_crc, expected_crc
+                            ),
+                    ));
+                }
                 receiver.write_block(
+                    channel,
                     &path,
                     total_size as u64,
                     index as u32,
@@ -641,6 +1245,13 @@ fn read_transfer_channel(
                 .to_string()))
             }
             other => {
+                // 顺手把后续字节抓出来：能看出对端到底发了什么（错误帧？控制帧？半截块？）
+                let mut tail = [0u8; 32];
+                let n = stream.peek(&mut tail).unwrap_or(0);
+                log::error(&format!(
+                    "ch{}: unexpected transfer frame {} tail={:02x?}",
+                    channel, other, &tail[..n]
+                ));
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("unexpected transfer frame {}", other),
@@ -696,6 +1307,18 @@ fn is_timeout(error: &io::Error) -> bool {
     matches!(
         error.kind(),
         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    )
+}
+
+/// 对端消失类的错误（被 reset / 关闭 / 管道断）：和"真的出错"要分开处理
+fn is_disconnect(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::NotConnected
     )
 }
 
@@ -926,11 +1549,24 @@ mod tests {
                 }
                 proto::write_i16(&mut w, transfer::EOF).unwrap();
             });
+            // 302：传输期间的暂停同步 —— 手机发 PAUSE_STATE，电脑回 PAUSE_REPLY 帧。
+            // 以前电脑回的是裸 bool，手机端发送线程的读循环会把它当结论读串。
+            proto::write_i16(&mut cw, controller::PAUSE_STATE).unwrap();
+            proto::write_bool(&mut cw, false).unwrap();
+            assert_eq!(
+                proto::read_i16(&mut cr).unwrap(),
+                controller::PAUSE_REPLY,
+                "电脑应该用 PAUSE_REPLY 帧回报暂停状态"
+            );
+            assert!(!proto::read_bool(&mut cr).unwrap());
+
             writer_a.join().unwrap();
             writer_b.join().unwrap();
 
-            // The client confirms the write, the phone confirms its own read.
+            // 302 收尾：电脑先给落盘结论（RESULT），手机再回读文件结论（RESULT）
+            assert_eq!(proto::read_i16(&mut cr).unwrap(), controller::RESULT);
             assert!(proto::read_bool(&mut cr).unwrap());
+            proto::write_i16(&mut cw, controller::RESULT).unwrap();
             proto::write_bool(&mut cw, true).unwrap();
             proto::write_i16(&mut cw, controller::SHUTDOWN).unwrap();
         })
@@ -1014,6 +1650,25 @@ enum SendTask {
         length: u32,
         host_path: PathBuf,
     },
+}
+
+/// 303：发送任务里出现过的文件（按 file_index 去重），收尾算 SHA-256 用
+fn source_files_of(tasks: &[SendTask]) -> Vec<PathBuf> {
+    let mut seen = std::collections::HashSet::new();
+    let mut files = Vec::new();
+    for task in tasks {
+        if let SendTask::Block {
+            file_index,
+            host_path,
+            ..
+        } = task
+        {
+            if seen.insert(*file_index) {
+                files.push(host_path.clone());
+            }
+        }
+    }
+    files
 }
 
 /// 把源路径展开成发送任务；目录按协议逐条发 FOLDER 记录，文件按 1MiB 切块
@@ -1105,10 +1760,13 @@ fn send_channel(
         }
         let next = {
             let mut guard = plan.lock().unwrap();
-            guard.take(me)
+            let taken = guard.take(me);
+            // 领完任务就把"谁负责哪一段"发给界面：被切走的段会留下自己的边界
+            publish_segments(&guard);
+            taken
         };
         let Some(index) = next else { break };
-        written += send_task(&mut stream, &tasks[index], &sent)?;
+        written += send_task(&mut stream, &tasks[index], &sent, me as u8)?;
     }
     use std::io::Write as _;
     proto::write_i16(&mut stream, transfer::EOF)?;
@@ -1117,7 +1775,12 @@ fn send_channel(
 }
 
 /// 发一条任务（文件夹 / 一个文件块），返回这一块写了多少字节
-fn send_task(stream: &mut std::net::TcpStream, task: &SendTask, sent: &AtomicU64) -> io::Result<u64> {
+fn send_task(
+    stream: &mut std::net::TcpStream,
+    task: &SendTask,
+    sent: &AtomicU64,
+    channel: u8,
+) -> io::Result<u64> {
     match task {
         SendTask::Folder {
             file_index,
@@ -1165,13 +1828,95 @@ fn send_task(stream: &mut std::net::TcpStream, task: &SendTask, sent: &AtomicU64
             proto::write_i64(stream, *total_size as i64)?;
             proto::write_i32(stream, *index as i32)?;
             proto::write_i32(stream, *length as i32)?;
+            // 303：块校验和（CRC32），手机端写盘前校验这一块的数据
+            proto::write_i32(stream, crc32fast::hash(&buffer) as i32)?;
             stream.write_all(&buffer)?;
             stream.flush()?;
 
             sent.fetch_add(*length as u64, Ordering::Relaxed);
-            crate::receiver::PROGRESS.mark_sent(dest, *index, *total_size, *length as u64);
+            crate::receiver::PROGRESS.mark_sent(
+                channel,
+                dest,
+                *index,
+                *total_size,
+                *length as u64,
+            );
             Ok(*length as u64)
         }
+    }
+}
+
+/// 进度条上的一段（GUI 用）：一段 = 计划里一条通道负责的连续任务区间
+#[derive(Clone, Copy, Default, Debug)]
+pub struct SendSegView {
+    /// 这一段的任务数（决定宽度）
+    pub span: u32,
+    /// 这一段已完成比例 0..1
+    pub filled: f32,
+}
+
+static SEND_SEGS: OnceLock<Mutex<Vec<SendSegView>>> = OnceLock::new();
+
+fn send_seg_cache() -> &'static Mutex<Vec<SendSegView>> {
+    SEND_SEGS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// 当前这次发送的分段结构（一次「手机来取文件」开始时重置）。
+/// 和手机端一样按"哪条通道负责哪一段"画：被切走的段会作为新的段留下，
+/// 不会因为数据传完就重新合并回通道数。
+pub fn send_segments() -> Vec<SendSegView> {
+    send_seg_cache()
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_default()
+}
+
+pub fn reset_send_segments() {
+    if let Ok(mut g) = send_seg_cache().lock() {
+        g.clear();
+    }
+}
+
+/// 把计划里的分段发布给界面；段数过多时退化成一条整进度
+fn publish_segments(plan: &SendPlan) {
+    let mut view = match send_seg_cache().lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    view.clear();
+    let mut segs: Vec<(usize, usize, usize)> = plan
+        .segments
+        .iter()
+        .map(|s| (s.start, s.end, s.cursor))
+        .collect();
+    if segs.is_empty() {
+        return;
+    }
+    segs.sort_by_key(|s| s.0);
+    const MAX_SEGMENTS: usize = 32;
+    if segs.len() > MAX_SEGMENTS {
+        let total: usize = segs
+            .iter()
+            .map(|(s, e, _)| e.saturating_sub(*s))
+            .sum();
+        let done: usize = segs
+            .iter()
+            .map(|(s, e, c)| c.saturating_sub(*s).min(e.saturating_sub(*s)))
+            .sum();
+        let total = total.max(1);
+        view.push(SendSegView {
+            span: total as u32,
+            filled: (done as f32 / total as f32).clamp(0.0, 1.0),
+        });
+        return;
+    }
+    for (start, end, cursor) in segs {
+        let span = end.saturating_sub(start).max(1);
+        let done = cursor.saturating_sub(start).min(span);
+        view.push(SendSegView {
+            span: span as u32,
+            filled: (done as f32 / span as f32).clamp(0.0, 1.0),
+        });
     }
 }
 

@@ -10,6 +10,11 @@ pub static PAUSE_SEND: AtomicBool = AtomicBool::new(false);
 pub static CANCEL_SEND: AtomicBool = AtomicBool::new(false);
 /// 当前是否有一条「手机来拉文件」的发送在进行（界面据此显示按钮）
 pub static SENDING: AtomicBool = AtomicBool::new(false);
+/// 当前是否正在接收手机推过来的文件（界面据此显示暂停按钮）
+pub static RECEIVING: AtomicBool = AtomicBool::new(false);
+/// 手机端最近一次上报的暂停状态：只有它变了才说明是手机点的暂停，
+/// 这时才把电脑本地的暂停开关同步过去（否则电脑自己点的暂停会被手机的状态覆盖）
+pub static PHONE_PAUSED: AtomicBool = AtomicBool::new(false);
 
 pub fn pause(on: bool) {
     PAUSE_SEND.store(on, Ordering::Relaxed);
@@ -31,10 +36,41 @@ pub fn cancelled() -> bool {
 pub fn reset() {
     PAUSE_SEND.store(false, Ordering::Relaxed);
     CANCEL_SEND.store(false, Ordering::Relaxed);
+    PHONE_PAUSED.store(false, Ordering::Relaxed);
 }
 
 pub fn sending() -> bool {
     SENDING.load(Ordering::Relaxed)
+}
+
+pub fn receiving() -> bool {
+    RECEIVING.load(Ordering::Relaxed)
+}
+
+pub fn phone_paused() -> bool {
+    PHONE_PAUSED.load(Ordering::Relaxed)
+}
+
+pub fn set_phone_paused(on: bool) {
+    PHONE_PAUSED.store(on, Ordering::Relaxed);
+}
+
+/// 接收开始时重置开关并置位；离开作用域时清掉 RECEIVING
+pub struct ReceivingGuard;
+
+impl ReceivingGuard {
+    pub fn begin() -> Self {
+        reset();
+        RECEIVING.store(true, Ordering::Relaxed);
+        ReceivingGuard
+    }
+}
+
+impl Drop for ReceivingGuard {
+    fn drop(&mut self) {
+        RECEIVING.store(false, Ordering::Relaxed);
+        reset();
+    }
 }
 
 /// 发送开始时重置开关并置位；离开作用域时清掉 SENDING

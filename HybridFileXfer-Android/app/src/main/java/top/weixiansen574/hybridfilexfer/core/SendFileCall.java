@@ -68,18 +68,26 @@ public class SendFileCall implements Callable<Void> {
                         fileBlock.totalSize);
 
                 fileBlock.data.flip();
-                channel.write(fileBlock.data);
+                // 303：块校验和（CRC32），电脑端写盘前校验这一块
+                channel.writeInt(HFXService.crc32(fileBlock.data));
+                // 一整个块要写满（write 只保证写一部分）
+                channel.writeFully(fileBlock.data);
                 readFileCall.recycleBuffer(fileBlock.data);
                 connection.addUploadedBytes(fileBlock.getLength());
             }
         } catch (Exception e) {
             //若发生异常，通知其他传输通道，停止传输
+            top.weixiansen574.hybridfilexfer.core.HFXLog.d("SendFileCall[" + connection.iName + "] FAILED, wroteLast=" + fileBlock, e);
             if (fileBlock != null){
                 //回收文件分块的ByteBuffer，否则导致这个Buffer免费了
                 readFileCall.recycleBuffer(fileBlock.data);
             }
             readFileCall.shutdownByConnectionBreak();
-            callback.onChannelError(connection.iName,TransferFileCallback.ERROR_TYPE_EXCEPTION, e.toString());
+            // 用户点「取消」时通道是被我们自己关掉的，ClosedChannelException /
+            // AsynchronousCloseException 都是预期内的收尾，不该再弹"通道错误"。
+            if (!connection.isCancelled()) {
+                callback.onChannelError(connection.iName,TransferFileCallback.ERROR_TYPE_EXCEPTION, e.toString());
+            }
             throw e;
         }
         return null;

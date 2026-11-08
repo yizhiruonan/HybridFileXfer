@@ -26,6 +26,15 @@ public interface TransferFileCallback {
 
     void onComplete(boolean isUpload,long traffic, long time);
 
+    /**
+     * 303：收尾整文件校验的结果（默认空实现，界面想显示"校验通过"再覆写）。
+     *
+     * @param ok        true = 两端文件 SHA-256 全部一致
+     * @param fileCount 参与校验的文件数
+     */
+    default void onVerifyChecked(boolean ok, int fileCount) {
+    }
+
     //传输通道有其中一个断开时
     void onIncomplete();
 

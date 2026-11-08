@@ -53,6 +53,8 @@ public class ReceiveFileCall implements Callable<Void> {
                         long totalSize = channel.readLong();
                         int index = channel.readInt();
                         int length = channel.readInt();
+                        // 303：这一块的 CRC32，写盘前必须一致
+                        int expectedCrc = channel.readInt();
                         callback.onFileDownloading(iName, path,
                                 index * (long) FileBlock.BLOCK_SIZE + length,
                                 totalSize);
@@ -68,6 +70,14 @@ public class ReceiveFileCall implements Callable<Void> {
                             connection.addDownloadedBytes(read);
                         }
                         channel.readFully(buffer);
+                        // 303：块内容与发送端不一致就别写盘了，直接报错
+                        ByteBuffer peek = buffer.duplicate();
+                        peek.position(0);
+                        int actualCrc = HFXService.crc32(peek);
+                        if (actualCrc != expectedCrc) {
+                            throw new IOException("数据校验失败：块 " + index + " 的 CRC32 不符（"
+                                    + Integer.toHexString(actualCrc) + " != " + Integer.toHexString(expectedCrc) + "）");
+                        }
                         writeFileCall.putBlock(new FileBlock(true, fileIndex, path, lastModified, totalSize, index, buffer), tIndex);
                         break;
                     }
@@ -100,8 +110,11 @@ public class ReceiveFileCall implements Callable<Void> {
             }
         } catch (IOException e){
             writeFileCall.finishChannel(tIndex);
-            callback.onChannelError(iName,
-                    TransferFileCallback.ERROR_TYPE_EXCEPTION,e.toString());
+            // 用户点「取消」时通道是我们自己关的，异常属于预期收尾
+            if (!connection.isCancelled()) {
+                callback.onChannelError(iName,
+                        TransferFileCallback.ERROR_TYPE_EXCEPTION,e.toString());
+            }
             throw e;
         }
     }

@@ -46,11 +46,6 @@ public class HFXServer extends HFXService {
     private static final int TRANSFER_WAIT_MS = 12000;
 
     protected final IIOService ioService;
-    /**
-     * 控制通道的写锁。心跳线程与传输线程共用它，避免心跳字节插到一次传输的
-     * 指令/回复之间，破坏协议。
-     */
-    public final Object controlLock = new Object();
     protected int remoteFileSystem;
     protected String remoteHomeDir;
 
@@ -402,21 +397,23 @@ public class HFXServer extends HFXService {
     }
 
     public void sendFilesToRemote(List<RemoteFile> files, Directory localDir, Directory remoteDir, TransferFileCallback callback) throws IOException {
-        synchronized (controlLock) {
-            beginTransfer();
-            try {
+        beginTransfer();
+        try {
+            // 只在发请求时拿控制锁；整个传输期间不占着，会话线程才能跑暂停状态同步
+            synchronized (controlLock) {
                 ctChannel.writeShort(ControllerIdentifiers.REQUEST_RECEIVE);//请求对方接收
-                sendFiles(files, localDir, remoteDir, callback);
-            } finally {
-                endTransfer();
             }
+            sendFiles(files, localDir, remoteDir, callback);
+        } finally {
+            endTransfer();
         }
     }
 
     public void sendFilesToShelf(List<RemoteFile> files, Directory localDir, Directory remoteDir, TransferFileCallback callback) throws IOException {
-        synchronized (controlLock) {
-            beginTransfer();
-            try {
+        beginTransfer();
+        try {
+            // 只在发请求时拿控制锁；整个传输期间不占着，会话线程才能跑暂停状态同步
+            synchronized (controlLock) {
                 ctChannel.writeShort(ControllerIdentifiers.REQUEST_SEND);
                 ctChannel.writeInt(files.size());
                 for (RemoteFile file : files) {
@@ -425,12 +422,18 @@ public class HFXServer extends HFXService {
                 ctChannel.writeUTF(localDir.path);
                 ctChannel.writeInt(localDir.fileSystem);
                 ctChannel.writeUTF(remoteDir.path);
-                receiveFiles(callback);
-            } finally {
-                endTransfer();
             }
+            receiveFiles(callback);
+        } finally {
+            endTransfer();
         }
     }
+
+    /** 当前这条连接是不是正在传输（会话线程据此决定要不要做会阻塞的控制指令） */
+    public boolean isTransferring() {
+        return transferring;
+    }
+
 
     /**
      * 中止正在进行的传输：只关 socket，**不动缓冲区**。
@@ -454,6 +457,21 @@ public class HFXServer extends HFXService {
     }
 
     public void abortTransfer() {
+        top.weixiansen574.hybridfilexfer.core.HFXLog.d("abortTransfer: CLOSING all channels",
+                new Exception("abortTransfer caller"));
+        transferCancelled = true;
+        // 303：先尽量发一帧「取消」，让电脑端干净退出（置取消标志、不报错）。
+        // 电脑可能已经不在了，发失败无所谓，后面照样关 socket。
+        DataByteChannel notify = ctChannel;
+        if (notify != null && notify.isOpen()) {
+            try {
+                synchronized (controlLock) {
+                    // DataByteChannel 直接写 socket，没有缓冲，不需要 flush
+                    notify.writeShort(top.weixiansen574.hybridfilexfer.core.ControllerIdentifiers.CANCEL);
+                }
+            } catch (Throwable ignored) {
+            }
+        }
         DataByteChannel control = ctChannel;
         if (control != null) {
             try {
@@ -465,6 +483,9 @@ public class HFXServer extends HFXService {
         if (list != null) {
             for (TransferConnection connection : list) {
                 try {
+                    // 先打标再关：SendFileCall / ReceiveFileCall 的 catch 据此
+                    // 把这次的异常当"取消"而不是"通道错误"
+                    connection.markCancelled();
                     connection.close();
                 } catch (IOException ignored) {
                 }
@@ -474,13 +495,27 @@ public class HFXServer extends HFXService {
 
     private void beginTransfer() {
         synchronized (channelProbeLock) {
-            transferring = true;
+            // 关键：先把可能正在飞的 exchangePause 收干净。exchangePause 全程持有 controlLock，
+            // 拿到它就说明控制通道此刻没有别的读者；否则会话线程会卡在 readShort 里，
+            // 和传输线程抢控制帧——两边各吃半帧，帧流整体错位
+            // （表现就是电脑端读到 opcode 0、传输通道莫名 EOF）。
+            synchronized (controlLock) {
+                transferring = true;
+                // 传输线程马上要读控制通道（RESULT / PAUSE_REPLY），会话线程从现在起只能写。
+                sendingFiles = true;
+                // 上一次的"已取消"不能留到这一次，否则真出错时会被当成取消吞掉
+                transferCancelled = false;
+            }
         }
+        top.weixiansen574.hybridfilexfer.core.HFXLog.d("beginTransfer: transferring=true, sendingFiles=" + sendingFiles);
     }
 
     private void endTransfer() {
         synchronized (channelProbeLock) {
-            transferring = false;
+            synchronized (controlLock) {
+                transferring = false;
+                sendingFiles = false;
+            }
         }
     }
 
@@ -517,6 +552,11 @@ public class HFXServer extends HFXService {
             return false;
         }
         try {
+            // 有数据在排队说明通道活着，而且这时候去 read 会把数据吃掉（块头被偷 1 字节，
+            // 传输直接错位）。所以先看 available()，只有确实没数据时才用非阻塞读探 EOF。
+            if (socketChannel.socket().getInputStream().available() > 0) {
+                return false;
+            }
             socketChannel.configureBlocking(false);
             try {
                 int read = socketChannel.read(ByteBuffer.allocate(1));
@@ -540,6 +580,65 @@ public class HFXServer extends HFXService {
             }
             ctChannel.writeShort(ControllerIdentifiers.PING);
         }
+    }
+
+    /**
+     * 暂停状态同步（空闲时用）：把手机端当前的暂停状态告诉电脑，并读回电脑端的暂停状态。
+     * 电脑端点了暂停/继续，这里就跟着改本地闸门，弹窗也就显示"已暂停"。
+     *
+     * <p>只在**手机不发送文件**时调用：发送期间控制通道的读取权归发送线程
+     * （{@link #writePauseStateOnly} 只写不读，由发送线程读回 PAUSE_REPLY）。
+     *
+     * @return 电脑端是否暂停
+     */
+    public boolean exchangePause(boolean phonePaused) throws IOException {
+        synchronized (controlLock) {
+            if (ctChannel == null) {
+                throw new IOException("control channel is not connected");
+            }
+            if (sendingFiles) {
+                // 传输线程已经接管控制通道的读权（beginTransfer 在 controlLock 里置位）。
+                // 这里必须重新确认：只看调用方的判断会有窗口——它判完"没传输"的下一纳秒
+                // 传输线程就把读权拿走了，两个读者各吃半帧，帧流整体错位。
+                writePauseStateLocked(phonePaused);
+                return lastPcPaused;
+            }
+            ctChannel.writeShort(ControllerIdentifiers.PAUSE_STATE);
+            ctChannel.writeBoolean(phonePaused);
+            // 302：回报带 opcode（以前是裸 bool，传输期间会被结论帧读串）
+            short opcode = ctChannel.readShort();
+            if (opcode != ControllerIdentifiers.PAUSE_REPLY) {
+                top.weixiansen574.hybridfilexfer.core.HFXLog.d("exchangePause: BAD opcode=" + opcode + " sendingFiles=" + sendingFiles);
+                throw new IOException("unexpected pause reply opcode " + opcode);
+            }
+            boolean pcPaused = ctChannel.readBoolean();
+            applyPcPause(pcPaused);
+            return pcPaused;
+        }
+    }
+
+    /**
+     * 302：发送期间只把暂停状态**写**出去（不读回报）。
+     *
+     * <p>手机发送文件时，{@code HFXService.sendFiles} 的那个线程是控制通道唯一的读者，
+     * 会话线程再去读就会把对方的 RESULT 吃掉。这里只写，电脑的回报由发送线程的读循环应用。
+     */
+    public void writePauseStateOnly(boolean phonePaused) throws IOException {
+        synchronized (controlLock) {
+            if (ctChannel == null) {
+                throw new IOException("control channel is not connected");
+            }
+            writePauseStateLocked(phonePaused);
+        }
+    }
+
+    /** 只写一帧 PAUSE_STATE（调用方必须已持有 controlLock） */
+    private void writePauseStateLocked(boolean phonePaused) throws IOException {
+        byte[] frame = new byte[3];
+        frame[0] = (byte) (ControllerIdentifiers.PAUSE_STATE >> 8);
+        frame[1] = (byte) ControllerIdentifiers.PAUSE_STATE;
+        frame[2] = (byte) (phonePaused ? 1 : 0);
+        ctChannel.writeFully(frame);
     }
 
     public List<RemoteFile> listLocalFiles(String path) throws RemoteException {
@@ -631,6 +730,8 @@ public class HFXServer extends HFXService {
 
     /** 会话结束：通知对端、关闭本连接的所有通道并释放缓冲；共享监听套接字保持打开。 */
     public synchronized void disconnect() {
+        top.weixiansen574.hybridfilexfer.core.HFXLog.d("disconnect: called",
+                new Exception("disconnect caller"));
         // 可能还有线程停在暂停闸门里，先叫醒再关
         pauseGate.resume();
         unregister(this);

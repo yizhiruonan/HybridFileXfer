@@ -46,6 +46,17 @@ public class TransferConnection {
         return totalTraffic;
     }
 
+    /** 用户点了「取消」：这条通道是被我们自己关掉的，异常算正常收尾，不算错误 */
+    private volatile boolean cancelled;
+
+    public void markCancelled() {
+        cancelled = true;
+    }
+
+    public boolean isCancelled() {
+        return cancelled;
+    }
+
     public void close() throws IOException {
         channel.close();
     }

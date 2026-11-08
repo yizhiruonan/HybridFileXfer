@@ -17,6 +17,28 @@ public class ControllerIdentifiers {
      * 旧电脑端不认识这条指令会报错，所以只在本机配套版本上使用。
      */
     public static final short CHECK_PENDING = 21;
+    /**
+     * 暂停状态同步（本项目新增）：手机发 [bool 自己是否暂停]，电脑回 [bool 电脑是否暂停]。
+     * 任何一端暂停/继续，另一端下一次同步（约 250ms）就跟上，两边的界面一起显示"已暂停"。
+     */
+    public static final short PAUSE_STATE = 22;
+    /**
+     * 302：一次传输的结论帧 {@code [bool ok][UTF 错误信息?]}（成功时不带错误信息）。
+     * 两个方向共用：接收方写"落盘结论"，发送方写"读文件结论"。
+     * 以前这里是裸 bool 加裸 UTF，收尾期间谁都不能碰控制通道，暂停同步和心跳全被憋住。
+     */
+    public static final short RESULT = 23;
+    /** 302：PAUSE_STATE 的回报帧 {@code [bool 电脑是否暂停]}（以前是裸 bool）。 */
+    public static final short PAUSE_REPLY = 24;
+    /**
+     * 303：手机端主动取消本次传输（用户点了「取消」），无载荷。
+     *
+     * 以前取消就是直接断 socket，电脑端把 ConnectionReset 当成传输失败报错；
+     * 暂停状态下更糟——电脑的传输线程停在暂停等待里不读 socket，根本发现不了
+     * 对端已经走了，整条会话卡死在「已暂停」。现在先发这一帧再关，电脑端
+     * 就地置取消标志，各通道干净退出、界面上也不报错。
+     */
+    public static final short CANCEL = 25;
 
     //就让魔法打败魔法吧！
     /**
