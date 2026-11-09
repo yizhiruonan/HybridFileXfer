@@ -75,6 +75,8 @@ public abstract class HFXService {
     }
 
     protected boolean sendFiles(List<RemoteFile> fileList,Directory localDir, Directory remoteDir, TransferFileCallback callback) throws IOException {
+        // 限速计时窗随传输重新开始，避免上次 setLimit 之后的空闲时间变成免费流量额度
+        SpeedLimiter.resetWindow();
         pauseGate = new TransferPause();
         lastPcPaused = false;
         ReadFileCall readFileCall = createReadFileCall(buffers, fileList, localDir, remoteDir, connections.size());
@@ -176,6 +178,8 @@ public abstract class HFXService {
     }
 
     protected boolean receiveFiles(TransferFileCallback callback) throws IOException {
+        // 对称：接收方向的限速计时窗也随传输重置（PC 端若实现限速时同样受益）
+        SpeedLimiter.resetWindow();
         pauseGate = new TransferPause();
         lastPcPaused = false;
         WriteFileCall writeFileCall = createWriteFileCall(buffers, connections.size());

@@ -60,6 +60,7 @@ public class ServerService extends Service implements ServiceConnection {
     public static final String EXTRA_FRESH = "fresh";
     public static final String EXTRA_LOCAL_BUFFER = "local_buffer_count";
     public static final String EXTRA_REMOTE_BUFFER = "remote_buffer_count";
+    /** 限速 MB/s，随启动 intent 传给 :IOService 进程（静态字段跨进程不共享） */ public static final String EXTRA_SPEED_LIMIT = "speed_limit_mbps";
 
     public static final int STATE_STOPPED = 0;
     public static final int STATE_STARTING = 1;
@@ -615,6 +616,7 @@ public class ServerService extends Service implements ServiceConnection {
                 Config.getInstance(context).getSpeedLimitMbps() * 1024L * 1024L);
         intent.putExtra(EXTRA_LOCAL_BUFFER, localBuffer);
         intent.putExtra(EXTRA_REMOTE_BUFFER, remoteBuffer);
+        intent.putExtra(EXTRA_SPEED_LIMIT, Config.getInstance(context).getSpeedLimitMbps());
         ContextCompat.startForegroundService(context, intent);
     }
 
@@ -688,6 +690,11 @@ public class ServerService extends Service implements ServiceConnection {
     public void onCreate() {
         super.onCreate();
         config = Config.getInstance(this);
+        // 限速是 SpeedLimiter 的静态字段，按进程隔离：本服务跑在独立进程 `:IOService`，
+        // 界面进程里的 applySpeedLimit()/静态 startServer() 设的值传不过来。
+        // 所以必须在这里（服务自己的进程）按保存的配置再设一次，否则限速永远是 0。
+        top.weixiansen574.hybridfilexfer.core.SpeedLimiter.setLimitBytesPerSecond(
+                config.getSpeedLimitMbps() * 1024L * 1024L);
         createNotificationChannel();
         goForeground();
         // 局域网广播：让电脑不用 adb、不用手动输 IP 也能发现手机
@@ -723,6 +730,10 @@ public class ServerService extends Service implements ServiceConnection {
             int mode = intent.getIntExtra(EXTRA_MODE, config.getMode());
             int local = intent.getIntExtra(EXTRA_LOCAL_BUFFER, config.getLocalBufferCount());
             int remote = intent.getIntExtra(EXTRA_REMOTE_BUFFER, config.getRemoteBufferCount());
+            // 限速值随 intent 进服务进程（静态字段跨进程不共享）；没带就用存好的配置
+            int speedLimitMbps = intent.getIntExtra(EXTRA_SPEED_LIMIT, -1);
+            top.weixiansen574.hybridfilexfer.core.SpeedLimiter.setLimitBytesPerSecond(
+                    (speedLimitMbps >= 0 ? speedLimitMbps : config.getSpeedLimitMbps()) * 1024L * 1024L);
             if (requested.isEmpty()) {
                 // 只带了"重新开始监听"的请求：保持当前网卡配置，若服务未运行则按配置启动
                 if (!active) {
