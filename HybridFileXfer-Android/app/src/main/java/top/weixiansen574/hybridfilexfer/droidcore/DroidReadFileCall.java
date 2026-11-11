@@ -33,6 +33,15 @@ public class DroidReadFileCall extends ReadFileCall {
         this.ioService = ioService;
     }
 
+    /** 305：带续传位图（已经收到的块不再读、不再发） */
+    public DroidReadFileCall(IIOService ioService, LinkedBlockingDeque<ByteBuffer> buffers,
+                             List<RemoteFile> files, Directory localDir, Directory remoteDir,
+                             int operateThreadCount, String[] channelNames,
+                             java.util.Map<String, java.util.BitSet> resumeBits) {
+        super(buffers, files, localDir, remoteDir, operateThreadCount, channelNames, resumeBits);
+        this.ioService = ioService;
+    }
+
     @Override
     protected boolean fileExists(String path) throws Exception {
         return ioService.fileExists(path);

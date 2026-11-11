@@ -44,8 +44,16 @@ public abstract class HFXService {
      *   <li>新增 REBUILD_REQ / REBUILD_ACK 两个 opcode，电脑收尾完把传输通道重新连一批回来，
      *       整条会话不断，取消后立刻能再传。</li>
      * </ul>
+     * <p>
+     * 305：断点续传。
+     * <ul>
+     *   <li>接收方给每个文件留一份 {@code <文件名>.hfxpart}（已完成块的位图）；</li>
+     *   <li>发送方开传前先发 RESUME_QUERY（文件清单），接收方回 RESUME_REPLY（位图），
+     *       发送方跳过已经收到的块，只补缺的；</li>
+     *   <li>取消/中断时半截文件不再删除，留着下次续传。</li>
+     * </ul>
      */
-    public static final int VERSION_CODE = 304;
+    public static final int VERSION_CODE = 305;
     protected final LinkedBlockingDeque<ByteBuffer> buffers = new LinkedBlockingDeque<>();
     protected DataByteChannel ctChannel;
     /**
@@ -127,7 +135,18 @@ public abstract class HFXService {
         return pendingRebuildNames.poll();
     }
 
-    protected boolean sendFiles(List<RemoteFile> fileList,Directory localDir, Directory remoteDir, TransferFileCallback callback) throws IOException {
+    protected boolean sendFiles(List<RemoteFile> fileList, Directory localDir, Directory remoteDir, TransferFileCallback callback) throws IOException {
+        return sendFiles(fileList, localDir, remoteDir, callback, null);
+    }
+
+    /**
+     * 305：带续传位图的发送。
+     *
+     * @param resumeBits 目标路径 → "已经收到的块"位图（null/空 = 全新传输）
+     */
+    protected boolean sendFiles(List<RemoteFile> fileList, Directory localDir, Directory remoteDir,
+                                TransferFileCallback callback,
+                                java.util.Map<String, java.util.BitSet> resumeBits) throws IOException {
         // 限速计时窗随传输重新开始，避免上次 setLimit 之后的空闲时间变成免费流量额度
         SpeedLimiter.resetWindow();
         pauseGate = new TransferPause();
@@ -137,7 +156,13 @@ public abstract class HFXService {
         for (int i = 0; i < connections.size(); i++) {
             channelNames[i] = connections.get(i).iName;
         }
-        ReadFileCall readFileCall = createReadFileCall(buffers, fileList, localDir, remoteDir, connections.size(), channelNames);
+        // 305：告诉界面"已经有这么多字节在电脑上了"，进度条才不会从 0 开始涨
+        long skippedTotal = resumeSkippedBytes(fileList, localDir, remoteDir, resumeBits);
+        if (skippedTotal > 0) {
+            top.weixiansen574.hybridfilexfer.core.HFXLog.d("sendFiles: resume, already on PC = " + skippedTotal + " bytes");
+            callback.onResumeSkipped(skippedTotal);
+        }
+        ReadFileCall readFileCall = createReadFileCall(buffers, fileList, localDir, remoteDir, connections.size(), channelNames, resumeBits);
         // 界面画"动态分段进度条"要读它：当前文件被切成了哪几段、每段归哪条通道
         this.currentReadFileCall = readFileCall;
         readFileCall.setPause(pauseGate);
@@ -817,6 +842,33 @@ public abstract class HFXService {
         top.weixiansen574.hybridfilexfer.core.HFXLog.d("discarded stale RESULT frame");
     }
 
+    /** 305：按续传位图算出"接收端已经有的字节数"（进度基线） */
+    private long resumeSkippedBytes(List<RemoteFile> fileList, Directory localDir, Directory remoteDir,
+                                    java.util.Map<String, java.util.BitSet> resumeBits) {
+        if (resumeBits == null || resumeBits.isEmpty()) {
+            return 0;
+        }
+        long skipped = 0;
+        for (RemoteFile file : fileList) {
+            if (file.isDirectory()) {
+                continue;
+            }
+            java.util.BitSet set = resumeBits.get(localDir.generateTransferPath(file.getPath(), remoteDir));
+            if (set == null) {
+                continue;
+            }
+            long size = file.getSize();
+            for (int block = set.nextSetBit(0); block >= 0; block = set.nextSetBit(block + 1)) {
+                long start = (long) block * FileBlock.BLOCK_SIZE;
+                if (start >= size) {
+                    break;
+                }
+                skipped += Math.min(FileBlock.BLOCK_SIZE, size - start);
+            }
+        }
+        return skipped;
+    }
+
     /**
      * 304：等这次传输的线程真正退出（有界等待）。
      *
@@ -987,6 +1039,6 @@ public abstract class HFXService {
 
     protected abstract WriteFileCall createWriteFileCall(LinkedBlockingDeque<ByteBuffer> buffers, int dequeCount);
 
-    protected abstract ReadFileCall createReadFileCall(LinkedBlockingDeque<ByteBuffer> buffers, List<RemoteFile> files, Directory localDir, Directory remoteDir, int operateThreadCount, String[] channelNames);
+    protected abstract ReadFileCall createReadFileCall(LinkedBlockingDeque<ByteBuffer> buffers, List<RemoteFile> files, Directory localDir, Directory remoteDir, int operateThreadCount, String[] channelNames, java.util.Map<String, java.util.BitSet> resumeBits);
 
 }

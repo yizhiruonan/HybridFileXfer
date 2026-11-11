@@ -1115,11 +1115,13 @@ impl Session {
             ));
         }
         log::info(crate::i18n::tr("手机开始发送文件", "the phone is sending files"));
+        // 本次接收从头计数：上一次传过的字节/文件不能算进来（否则收尾日志会写「4 个文件 5.48 GB」）。
+        // 必须排在续传查询之前 —— 查询会把"已经全在"的文件登记进本次会话（收尾要复算它的 SHA-256），
+        // 排在后面就会把这些登记一起清掉，日志里出现「0 个文件」。
+        receiver.reset_session_counters();
         // 305：手机发完 REQUEST_RECEIVE 会立刻来一帧 RESUME_QUERY（这次要传的文件清单），
         // 这里读它、回每个文件"已经收到哪些块"的位图，发送端据此跳过已收到的块。
         self.handle_resume_query(receiver)?;
-        // 本次接收从头计数：上一次传过的字节/文件不能算进来（否则收尾日志会写「4 个文件 5.48 GB」）
-        receiver.reset_session_counters();
         // 接收方向没有发送计划：清掉上一次的发送分段，界面改按"谁写了第几块"还原
         reset_send_segments();
         // 每次接收都要重置进度：不清的话上一条会话里传过的文件还留在 files 表里，

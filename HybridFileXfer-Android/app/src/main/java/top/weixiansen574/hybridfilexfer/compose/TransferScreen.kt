@@ -139,6 +139,8 @@ internal fun TransferScreen(
     var xferPopupWaiting by remember { mutableStateOf(false) }
     /** 这次只传一个文件：进度条可以按 SendRanges 的真实分段画（多文件时退回等分近似） */
     var xferPopupSingleFile by remember { mutableStateOf(false) }
+    /** 305：断点续传时接收端已经有的字节数（进度基线，不然进度条从 0 开始涨） */
+    var xferPopupResumeBase by remember { mutableLongStateOf(0L) }
     /** 已经发完的通道名（onChannelComplete 回调），用来判断"数据阶段结束" */
     val xferPopupDoneNames = remember { HashSet<String>() }
 
@@ -211,7 +213,7 @@ internal fun TransferScreen(
             val delta = list.sumOf { it.uploadTraffic + it.downloadTraffic }
             val now = android.os.SystemClock.elapsedRealtime()
             main.post {
-                var done = 0L
+                var done = xferPopupResumeBase
                 val channels = list.map { info ->
                     val key = info.iName ?: ""
                     val cum = (xferPopupCumulative[key] ?: 0L) + info.uploadTraffic + info.downloadTraffic
@@ -246,6 +248,13 @@ internal fun TransferScreen(
                         xferId = -1,
                     ),
                 )
+            }
+        }
+
+        override fun onResumeSkipped(bytes: Long) {
+            main.post {
+                xferPopupResumeBase = bytes
+                xferPopupDone = bytes
             }
         }
 
@@ -330,6 +339,7 @@ internal fun TransferScreen(
         xferPopupWaiting = false
         xferPopupDoneNames.clear()
         xferPopupSingleFile = files.size == 1 && !files[0].isDirectory
+        xferPopupResumeBase = 0
         xferPopup = true
         scope.launch(Dispatchers.IO) {
             try {
@@ -625,7 +635,9 @@ internal fun TransferScreen(
         // 发送方向：读文件任务按 SendRanges 把文件切成"一条通道一段"的连续区间，
         // 某条通道先干完还会把别人还没产出的那段尾巴切一半过来 —— 段数会随传输变多，
         // 进度条上就出现新的切割线（IDM 那种效果）。这里直接画真实分段。
-        val planSegments = if (xferPopupSending && xferPopupSingleFile) server.currentSendSegments() else emptyList()
+        // 续传时分段计划只覆盖"缺的那些块"，和整条进度条的百分比对不上，直接画整条连续进度
+        val planSegments = if (xferPopupSending && xferPopupSingleFile && xferPopupResumeBase <= 0)
+            server.currentSendSegments() else emptyList()
         val popupSegments = if (planSegments.isNotEmpty() && xferPopupTotal > 0) {
             val complete = xferPopupDone >= xferPopupTotal
             planSegments.map { seg ->

@@ -571,6 +571,9 @@ impl Receiver {
         if journal.blocks_done() == 0 {
             return None;
         }
+        // 把这个文件登记进本次会话：即使一块都不用收（已经全在），收尾也要复算它的
+        // SHA-256 参与两端比对，否则"文件数不一致"会被判成校验失败。
+        let _ = self.state_for(&target, total_size, modified_ms);
         Some(journal.bits.clone())
     }
 }

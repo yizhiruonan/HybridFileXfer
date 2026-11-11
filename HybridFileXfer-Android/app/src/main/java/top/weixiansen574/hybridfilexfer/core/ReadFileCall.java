@@ -42,6 +42,8 @@ public abstract class ReadFileCall implements Callable<Void> {
     /** 当前文件的分段计划（界面画进度条读它） */
     private volatile SendRanges ranges;
     private final String[] channelNames;
+    /** 305：目标路径 → 接收端已经有的块（断点续传时要跳过的块） */
+    private final java.util.Map<String, java.util.BitSet> resumeBits;
 
     /** 这次传输已经被取消 / 通道出错：读文件的线程必须自己停下来 */
     private volatile boolean shutdown;
@@ -58,12 +60,21 @@ public abstract class ReadFileCall implements Callable<Void> {
     public ReadFileCall(LinkedBlockingDeque<ByteBuffer> buffers, List<RemoteFile> files,
                         Directory localDir, Directory remoteDir, int operateThreadCount,
                         String[] channelNames) {
+        this(buffers, files, localDir, remoteDir, operateThreadCount, channelNames, null);
+    }
+
+    /** 305：带续传位图（目标路径 → 已经收到的块），跳过的块不再读、不再发 */
+    @SuppressWarnings("unchecked")
+    public ReadFileCall(LinkedBlockingDeque<ByteBuffer> buffers, List<RemoteFile> files,
+                        Directory localDir, Directory remoteDir, int operateThreadCount,
+                        String[] channelNames, java.util.Map<String, java.util.BitSet> resumeBits) {
         this.buffers = buffers;
         this.files = files;
         this.localDir = localDir;
         this.remoteDir = remoteDir;
         this.operateThreadCount = Math.max(1, operateThreadCount);
         this.channelNames = channelNames;
+        this.resumeBits = resumeBits;
         this.queues = new LinkedBlockingDeque[this.operateThreadCount];
         for (int i = 0; i < this.operateThreadCount; i++) {
             this.queues[i] = new LinkedBlockingDeque<>();
@@ -152,11 +163,30 @@ public abstract class ReadFileCall implements Callable<Void> {
             closeFile();
             return;
         }
-        long blocks = (length + FileBlock.BLOCK_SIZE - 1) / FileBlock.BLOCK_SIZE;
-        SendRanges plan = new SendRanges(operateThreadCount, blocks, channelNames);
+        java.util.BitSet have = resumeBits == null ? null : resumeBits.get(transferPath);
+        int blockCount = (int) ((length + FileBlock.BLOCK_SIZE - 1) / FileBlock.BLOCK_SIZE);
+        // 305：把"要跳过的块"摘掉，剩下的块才参与分段计划
+        int missing = 0;
+        if (have == null || have.isEmpty()) {
+            missing = blockCount;
+        } else {
+            for (int b = 0; b < blockCount; b++) {
+                if (!have.get(b)) {
+                    missing++;
+                }
+            }
+        }
+        if (missing <= 0) {
+            // 接收端一块都不缺：这个文件不用再发（它已经在电脑上了）。
+            // sourcePaths 上面已经记过了，收尾照样复算 SHA-256 参与两端比对。
+            closeFile();
+            return;
+        }
+        SendRanges plan = new SendRanges(operateThreadCount, missing, channelNames);
         ranges = plan;
         long remaining = length;
         int i = 0;
+        int ordinal = 0;
         while (remaining > 0) {
             if (shutdown) {
                 closeFile();
@@ -167,6 +197,13 @@ public abstract class ReadFileCall implements Callable<Void> {
                 gate.awaitResume();
             }
             int blkSize = (int) Math.min(remaining, FileBlock.BLOCK_SIZE);
+            if (have != null && have.get(i)) {
+                // 这块接收端已经有了：跳过读取和发送，但文件读位置要往后挪
+                channel.position(channel.position() + blkSize);
+                remaining -= blkSize;
+                i++;
+                continue;
+            }
             ByteBuffer buffer = buffers.take();
             if (shutdown) {
                 // 等到缓冲区的这一瞬间整个传输已经取消了：立刻还回去，别再往里读
@@ -181,11 +218,12 @@ public abstract class ReadFileCall implements Callable<Void> {
             }
             FileBlock block = new FileBlock(true, fileIndex, transferPath,
                     lastModified, length, i, buffer);
-            int owner = plan.ownerOf(i);
-            plan.markProduced(i);
+            int owner = plan.ownerOf(ordinal);
+            plan.markProduced(ordinal);
             queues[owner].add(block);
             remaining -= blkSize;
             i++;
+            ordinal++;
         }
         plan.finish();
         closeFile();

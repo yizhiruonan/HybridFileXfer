@@ -35,6 +35,13 @@ public interface TransferFileCallback {
     default void onVerifyChecked(boolean ok, int fileCount) {
     }
 
+    /**
+     * 305：这次传输是从断点续传接上的，已经有 {@code bytes} 字节在接收端了。
+     * 界面拿它当进度基线，不然进度条会从 0 开始涨（其实前面早就传完了）。
+     */
+    default void onResumeSkipped(long bytes) {
+    }
+
     //传输通道有其中一个断开时
     void onIncomplete();
 

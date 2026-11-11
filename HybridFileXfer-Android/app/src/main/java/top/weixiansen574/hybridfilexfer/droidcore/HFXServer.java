@@ -415,6 +415,64 @@ public class HFXServer extends HFXService {
         return remoteHomeDir;
     }
 
+    /**
+     * 305：断点续传查询。
+     *
+     * <p>把这次要发的文件（目标路径 + 大小 + 修改时间）发给电脑，电脑按它自己的
+     * {@code <文件名>.hfxpart} 位图回答"已经收到哪些块"。返回 目标路径 → 位图。
+     *
+     * <p>必须在电脑端进入 handle_receive 之后立刻发（它就是先读这一帧的）。
+     */
+    private java.util.Map<String, java.util.BitSet> queryResume(List<RemoteFile> files,
+                                                               Directory localDir, Directory remoteDir) throws IOException {
+        java.util.List<String> targets = new java.util.ArrayList<>();
+        java.util.List<RemoteFile> plain = new java.util.ArrayList<>();
+        for (RemoteFile file : files) {
+            if (file.isDirectory()) {
+                continue;
+            }
+            plain.add(file);
+            targets.add(localDir.generateTransferPath(file.getPath(), remoteDir));
+        }
+        java.util.Map<String, java.util.BitSet> result = new java.util.HashMap<>();
+        if (plain.isEmpty()) {
+            return result;
+        }
+        synchronized (controlLock) {
+            // 先把上一轮留下的 PAUSE_REPLY 吃掉，别把它当成位图的长度
+            drainStaleControlFrames();
+            ctChannel.writeShort(ControllerIdentifiers.RESUME_QUERY);
+            ctChannel.writeInt(plain.size());
+            for (int i = 0; i < plain.size(); i++) {
+                ctChannel.writeUTF(targets.get(i));
+                ctChannel.writeLong(plain.get(i).getSize());
+                ctChannel.writeLong(plain.get(i).lastModified());
+            }
+            // 回复是带 opcode 的帧：{i16 RESUME_REPLY}{i32 count}{...}
+            short opcode = ctChannel.readShort();
+            if (opcode != ControllerIdentifiers.RESUME_REPLY) {
+                throw new IOException("expected RESUME_REPLY, got " + opcode);
+            }
+            int count = ctChannel.readInt();
+            for (int i = 0; i < count; i++) {
+                boolean canResume = ctChannel.readBoolean();
+                int length = ctChannel.readInt();
+                int safe = Math.max(0, Math.min(length, 4 * 1024 * 1024));
+                byte[] bits = new byte[safe];
+                if (safe > 0) {
+                    ctChannel.readFully(bits);
+                }
+                if (canResume && i < targets.size() && safe > 0) {
+                    java.util.BitSet set = java.util.BitSet.valueOf(bits);
+                    if (!set.isEmpty()) {
+                        result.put(targets.get(i), set);
+                    }
+                }
+            }
+        }
+        return result;
+    }
+
     public void sendFilesToRemote(List<RemoteFile> files, Directory localDir, Directory remoteDir, TransferFileCallback callback) throws IOException {
         // 304：刚取消过的话先等电脑把通道重建回来（重建要 1~3 秒），
         // 否则用的还是已经关掉的旧通道，用户"取消完立刻再传"必定失败
@@ -425,7 +483,9 @@ public class HFXServer extends HFXService {
             synchronized (controlLock) {
                 ctChannel.writeShort(ControllerIdentifiers.REQUEST_RECEIVE);//请求对方接收
             }
-            sendFiles(files, localDir, remoteDir, callback);
+            // 305：问电脑"这些文件已经收到哪些块了"，能续传的就只补缺的块
+            java.util.Map<String, java.util.BitSet> resume = queryResume(files, localDir, remoteDir);
+            sendFiles(files, localDir, remoteDir, callback, resume);
         } finally {
             endTransfer();
         }
@@ -1030,7 +1090,7 @@ public class HFXServer extends HFXService {
     }
 
     @Override
-    protected ReadFileCall createReadFileCall(LinkedBlockingDeque<ByteBuffer> buffers, List<RemoteFile> files, Directory localDir, Directory remoteDir, int operateThreadCount, String[] channelNames) {
-        return new DroidReadFileCall(ioService,buffers,files,localDir,remoteDir,operateThreadCount, channelNames);
+    protected ReadFileCall createReadFileCall(LinkedBlockingDeque<ByteBuffer> buffers, List<RemoteFile> files, Directory localDir, Directory remoteDir, int operateThreadCount, String[] channelNames, java.util.Map<String, java.util.BitSet> resumeBits) {
+        return new DroidReadFileCall(ioService,buffers,files,localDir,remoteDir,operateThreadCount, channelNames, resumeBits);
     }
 }

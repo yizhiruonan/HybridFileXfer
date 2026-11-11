@@ -53,6 +53,23 @@ public class ControllerIdentifiers {
      */
     public static final short REBUILD_REQ = 26;
     public static final short REBUILD_ACK = 27;
+    /**
+     * 305：断点续传查询（发送方 → 接收方）。
+     *
+     * <pre>
+     * {i32 count}{ (UTF 目标路径, i64 总大小, i64 源修改时间) * count }
+     * </pre>
+     */
+    public static final short RESUME_QUERY = 28;
+    /**
+     * 305：断点续传应答（接收方 → 发送方）。
+     *
+     * <pre>
+     * {i32 count}{ (bool 可续传, i32 位图字节数, byte[位图]) * count }
+     * </pre>
+     * 位图第 i 位 = 第 i 块（1MiB）已经落盘。
+     */
+    public static final short RESUME_REPLY = 29;
 
     //就让魔法打败魔法吧！
     /**

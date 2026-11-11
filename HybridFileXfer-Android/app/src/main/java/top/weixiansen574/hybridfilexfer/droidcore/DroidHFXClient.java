@@ -66,8 +66,8 @@ public class DroidHFXClient extends HFXClient {
     }
 
     @Override
-    protected ReadFileCall createReadFileCall(LinkedBlockingDeque<ByteBuffer> buffers, List<RemoteFile> files, Directory localDir, Directory remoteDir, int operateThreadCount, String[] channelNames) {
-        return new DroidReadFileCall(iioService,buffers,files,localDir,remoteDir,operateThreadCount, channelNames);
+    protected ReadFileCall createReadFileCall(LinkedBlockingDeque<ByteBuffer> buffers, List<RemoteFile> files, Directory localDir, Directory remoteDir, int operateThreadCount, String[] channelNames, java.util.Map<String, java.util.BitSet> resumeBits) {
+        return new DroidReadFileCall(iioService,buffers,files,localDir,remoteDir,operateThreadCount, channelNames, resumeBits);
     }
 
     public void freeBuffers(){
