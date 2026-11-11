@@ -36,8 +36,16 @@ public abstract class HFXService {
      *   <li>每个文件块头多一个 int CRC32 —— 发送端随路算，接收端写盘前校验，坏块立刻中断；</li>
      *   <li>结论帧 RESULT 多一段「文件指纹清单」（字节数 + SHA-256），收尾时两端各自复算整文件哈希比对。</li>
      * </ul>
+     * <p>
+     * 304：取消不断连。
+     * <ul>
+     *   <li>CANCEL 的语义变了：发完 CANCEL <b>只关传输通道</b>，控制通道保持打开 ——
+     *       以前是连控制通道一起关，手机端回主页、电脑端报「连接已断开」再重连，体验很糙；</li>
+     *   <li>新增 REBUILD_REQ / REBUILD_ACK 两个 opcode，电脑收尾完把传输通道重新连一批回来，
+     *       整条会话不断，取消后立刻能再传。</li>
+     * </ul>
      */
-    public static final int VERSION_CODE = 303;
+    public static final int VERSION_CODE = 304;
     protected final LinkedBlockingDeque<ByteBuffer> buffers = new LinkedBlockingDeque<>();
     protected DataByteChannel ctChannel;
     /**
@@ -68,10 +76,47 @@ public abstract class HFXService {
      * 那是预期收尾，不能再弹「通道错误」。
      */
     protected volatile boolean transferCancelled;
+    /**
+     * 304：本次传输被取消，等电脑端把传输通道重建回来（会话不断）。
+     *
+     * <p>取消后控制通道仍然打开，电脑端收尾完会连一批新的传输通道、发 REBUILD_REQ 过来；
+     * 会话线程看到这个标志就去跑重建握手，而不是当成断线。
+     */
+    protected volatile boolean needsRebuild = false;
+    /**
+     * 304：在别的读循环里顺手读到的、还没处理的控制帧头。
+     *
+     * <p>取消/重建期间帧序不是我们预期的（电脑可能在飞 PAUSE_STATE 的回报、也可能已经开始
+     * 重建），读到一帧却又不是当前循环要等的那一种时，把帧头记在这里交给后续循环，
+     * 绝不能丢 —— 丢一个帧头，整条控制通道的帧流就错位了。
+     */
+    protected volatile short pendingOpcode = -1;
+    /** 304：在别的读循环里读到的重建请求通道名，交给 rebuildTransfers 消费 */
+    private final java.util.Queue<String> pendingRebuildNames = new java.util.concurrent.ConcurrentLinkedQueue<>();
 
     /** 本次传输是否被用户主动取消 */
     public boolean isTransferCancelled() {
         return transferCancelled;
+    }
+
+    /** 304：是否需要等电脑端重建传输通道 */
+    public boolean isNeedsRebuild() {
+        return needsRebuild;
+    }
+
+    public void setNeedsRebuild(boolean value) {
+        needsRebuild = value;
+    }
+
+    protected void stashRebuildName(String name) {
+        if (name != null) {
+            pendingRebuildNames.add(name);
+        }
+    }
+
+    /** 取一个提前读到的重建通道名；没有返回 null */
+    public String pollRebuildName() {
+        return pendingRebuildNames.poll();
     }
 
     protected boolean sendFiles(List<RemoteFile> fileList,Directory localDir, Directory remoteDir, TransferFileCallback callback) throws IOException {
@@ -109,13 +154,14 @@ public abstract class HFXService {
         PeerResult pcResult = null;
         try {
             pcResult = readResultFrameOrNull();
-            writeError = pcResult.ok ? null : pcResult.message;
+            writeError = (pcResult.ok || pcResult.cancelled) ? null : pcResult.message;
         } catch (Throwable e) {
             // 用 Throwable：以前只 catch IOException，别的异常（比如缓冲区被并发写坏
             // 引起的 BufferUnderflowException）会从这里抛出去，日志只留下
             // 一句 "result=null"，看不出是异常退出还是真正的成功。
             speedMonitorThread.cancel();
             top.weixiansen574.hybridfilexfer.core.HFXLog.d("sendFiles: readResultFrame failed", e);
+            awaitTransferThreads(readThread, readFileTask, transferTasks, 3000);
             callback.onIncomplete();
             return false;
         } finally {
@@ -123,6 +169,20 @@ public abstract class HFXService {
             top.weixiansen574.hybridfilexfer.core.HFXLog.d("sendFiles: reader=none (sendingFiles=false), result=" + writeError);
         }
         speedMonitorThread.cancel();
+
+        // 304：取消（本端点取消，或电脑端点「中断发送」）：
+        // 这次传输作废，但**不写结论帧** —— 控制通道马上要交给重建握手，
+        // 多写一帧会让电脑端把 REBUILD_ACK 读成别的帧，帧流一错位整条会话就报废。
+        if (pcResult == null || pcResult.cancelled) {
+            top.weixiansen574.hybridfilexfer.core.HFXLog.d("sendFiles: cancelled, skip result frame");
+            // 304：取消后不能立刻返回 —— 读文件线程（FileRead）和发块线程可能还在用
+            // 这条连接共享的 native 缓冲区池。等它们退完，会话线程才会进重建；
+            // 否则"取消完立刻再传"时两批线程抢同一个 ByteBuffer，实测下一次传输
+            // 直接 IllegalArgumentException: newPosition > limit（缓冲区被二次回收/复用）。
+            awaitTransferThreads(readThread, readFileTask, transferTasks, 5000);
+            callback.onIncomplete();
+            return false;
+        }
 
         if (writeError != null) {
             callback.onWriteFileError(writeError);
@@ -222,6 +282,15 @@ public abstract class HFXService {
                 task.get();
             } catch (InterruptedException | ExecutionException e) {
                 speedMonitorThread.cancel();
+                // 304：电脑端点的是「中断发送」时，它会先发一帧 CANCEL 再关传输通道。
+                // 接收期间本线程不读控制通道（读权在电脑那边），所以这里探一下：
+                // 有 CANCEL 就当成"取消"收尾 —— 不写结论帧、不报错，等它重建通道。
+                if (!isTransferCancelled() && probePeerCancel(800)) {
+                    top.weixiansen574.hybridfilexfer.core.HFXLog.d("receiveFiles: peer cancelled");
+                    removeIncompleteFiles(writeFileCall.writtenPaths());
+                    callback.onIncomplete();
+                    return false;
+                }
                 // 用户点了「取消」时控制通道可能已经跟着关了，写结论帧必然失败，
                 // 那是预期内的收尾，不能让它变成异常抛到界面上。
                 if (!isTransferCancelled()) {
@@ -247,6 +316,11 @@ public abstract class HFXService {
         synchronized (controlLock) {
             writeResultFrame(true, null, digests);
             PeerResult pcResult = readResultFrameOrNull();
+            if (pcResult.cancelled) {
+                // 收尾这一瞬间对方把传输作废了（取消/开始重建）：别报"完成"
+                callback.onIncomplete();
+                return false;
+            }
             String readError = pcResult.ok ? null : pcResult.message;
             if (readError == null) {
                 long totalDownloadTraffic = 0;
@@ -356,11 +430,25 @@ public abstract class HFXService {
         public final String message;
         /** 对端产出文件的指纹；本端是发送方时对端没有产出，空表 */
         public final List<FileDigest> digests;
+        /**
+         * 304：这次传输是被取消的（对端发来 CANCEL，或对端已经开始重建通道）。
+         * 本端不要再写结论帧，也不要报成错误。
+         */
+        public final boolean cancelled;
 
         PeerResult(boolean ok, String message, List<FileDigest> digests) {
+            this(ok, message, digests, false);
+        }
+
+        PeerResult(boolean ok, String message, List<FileDigest> digests, boolean cancelled) {
             this.ok = ok;
             this.message = message;
             this.digests = digests;
+            this.cancelled = cancelled;
+        }
+
+        static PeerResult cancelled() {
+            return new PeerResult(false, null, Collections.emptyList(), true);
         }
     }
 
@@ -436,8 +524,11 @@ public abstract class HFXService {
     }
 
     // ------------------------------------------------------------------
-    // 控制通道：单一专职读者
+    // 控制通道
     // ------------------------------------------------------------------
+
+    /** 等控制帧头超时（{@link #readControlHeaderPolled} 的返回值） */
+    public static final short CONTROL_TIMEOUT = -1;
 
     /** 收尾结论：成功 */
     private static final Object RESULT_OK = new Object();
@@ -551,6 +642,205 @@ public abstract class HFXService {
     }
 
     /**
+     * 304：等控制通道上的下一个帧头，但**可被本端取消打断**。
+     *
+     * <p>以前这里直接 {@code readShort()} 死等：发送方向上本线程是控制通道唯一的读者，
+     * 用户点取消后它还在等电脑的结论帧，而电脑那边可能正停在"暂停"里（暂停时它只 peek
+     * 传输通道，读不到我们的 CANCEL），于是两边谁也走不了 —— 实测卡满 15 秒后只能断线重连。
+     * 现在按"至少 2 字节到齐"轮询，取消标志一置就返回 -1，会话线程立刻进入重建。
+     *
+     * <p>先确认 2 字节到齐再读：半个帧头被吃掉的话，剩下的字节会和下一帧的高位拼成
+     * 假 opcode（实测读出 0），整条控制通道会永久错位。
+     *
+     * @return 帧头；本端已取消且通道上没有待处理帧时返回 -1
+     */
+    protected short pollControlOpcode() throws IOException {
+        // 取消标志一置就退出等待（会话线程才好进重建），否则一直等帧头。
+        return readControlHeaderPolled(-1, true);
+    }
+
+    /**
+     * 从控制通道读一个帧头（两字节），**不用 Socket 的 available()**。
+     *
+     * <p>以前判断"有没有数据"用的是 {@code DataByteChannel.available()}，它走的是
+     * Socket 的流式 InputStream；和 SocketChannel 直接读写混用时在真机上会永远返回 0。
+     * 实测电脑端已经把结论帧写出来了（手机内核队列里 860 字节排着），手机这边
+     * available() 一直是 0 → 收尾永久卡在「等待电脑校验」，两边互相等。
+     * 这里直接对 SocketChannel 做非阻塞读，和重建握手用的 readControlOpcode 一致。
+     *
+     * <p>只在一个字节都还没读走时才认取消/超时：读到半个帧头就放弃的话，
+     * 剩下的半个字节会和下一帧拼成假 opcode，整条控制通道永久错位。
+     *
+     * @param timeoutMs  <=0 表示不设超时
+     * @param abortOnCancel 取消/待重建标志置位时是否提前返回 -1
+     * @return 帧头；超时或取消提前退出时返回 {@link #CONTROL_TIMEOUT}
+     */
+    protected short readControlHeaderPolled(long timeoutMs, boolean abortOnCancel) throws IOException {
+        DataByteChannel channel = ctChannel;
+        if (channel == null) {
+            // 会话线程已经 disconnect()（电脑关机/断线）：以前这里直接 NPE。
+            throw new IOException("control channel closed while waiting for control frame");
+        }
+        java.nio.channels.SocketChannel socketChannel = channel.getSocketChannel();
+        if (socketChannel == null) {
+            return channel.readShort();
+        }
+        java.nio.ByteBuffer buffer = java.nio.ByteBuffer.allocate(2);
+        long deadline = timeoutMs <= 0 ? Long.MAX_VALUE : System.currentTimeMillis() + timeoutMs;
+        socketChannel.configureBlocking(false);
+        try {
+            while (true) {
+                int read = socketChannel.read(buffer);
+                if (read < 0) {
+                    throw new java.io.EOFException("control channel closed by peer");
+                }
+                if (buffer.position() >= 2) {
+                    break;
+                }
+                if (buffer.position() == 0) {
+                    if (abortOnCancel && (transferCancelled || needsRebuild)) {
+                        return CONTROL_TIMEOUT;
+                    }
+                    if (System.currentTimeMillis() >= deadline) {
+                        return CONTROL_TIMEOUT;
+                    }
+                }
+                try {
+                    Thread.sleep(15);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("interrupted while waiting for control frame", e);
+                }
+            }
+        } finally {
+            try {
+                socketChannel.configureBlocking(true);
+            } catch (IOException ignored) {
+                // 通道已经断了，下一轮读会报出来
+            }
+        }
+        buffer.flip();
+        return buffer.getShort();
+    }
+
+    /**
+     * 发请求前先把控制通道里"上一轮留下的"帧吃掉。
+     *
+     * <p>传输期间会话线程只写 PAUSE_STATE、不读回报（{@code writePauseStateOnly}），
+     * 电脑回的那些 PAUSE_REPLY 会排在通道里。收尾后界面刷新目录，直接在 controlLock
+     * 里发 LIST_FILES 并把残留的 PAUSE_REPLY 当成"列表长度"读走 —— 帧流一错位，
+     * 读线程就卡在 readUTF 上，还握着 controlLock，会话线程连心跳都发不出去，
+     * 电脑端 100 秒后判超时断线（真机实测）。
+     *
+     * <p>调用方必须已经持有 {@link #controlLock}。遇到重建/取消帧就地处理，
+     * 遇到不认识的帧记进 pendingOpcode 后返回。
+     */
+    protected void drainStaleControlFrames() {
+        while (true) {
+            short opcode;
+            try {
+                opcode = readControlHeaderPolled(80, false);
+            } catch (Throwable e) {
+                return;
+            }
+            if (opcode == CONTROL_TIMEOUT) {
+                return;
+            }
+            try {
+                switch (opcode) {
+                    case ControllerIdentifiers.PAUSE_REPLY:
+                        applyPcPause(ctChannel.readBoolean());
+                        break;
+                    case ControllerIdentifiers.PING:
+                        break;
+                    case ControllerIdentifiers.RESULT:
+                        // 上一次传输的收尾结论：没人要了，读干净丢掉
+                        discardResultPayload(ctChannel);
+                        break;
+                    case ControllerIdentifiers.REBUILD_REQ:
+                        stashRebuildName(ctChannel.readUTF());
+                        needsRebuild = true;
+                        return;
+                    case ControllerIdentifiers.CANCEL:
+                        transferCancelled = true;
+                        needsRebuild = true;
+                        return;
+                    default:
+                        pendingOpcode = opcode;
+                        return;
+                }
+            } catch (Throwable e) {
+                return;
+            }
+        }
+    }
+
+    /**
+     * 304：读掉一帧 RESULT 的载荷（这次传输已经作废，只求帧流不错位）。
+     *
+     * <p>格式与 {@link #writeResultFrame} 一致：
+     * {@code [i16 RESULT][bool ok][i32 n][(i64 size, 32B sha256) * n][UTF 错误信息?]}。
+     *
+     * <p>用它的场合都是"结论帧已经没人要了"：电脑端的收尾结论可能在我们按取消的
+     * 前一刻就写了出来。只丢帧头不读载荷，载荷会和下一个帧头拼成假 opcode。
+     */
+    protected void discardResultPayload(DataByteChannel channel) throws IOException {
+        boolean ok = channel.readBoolean();
+        int count = channel.readInt();
+        if (count < 0) {
+            count = 0;
+        }
+        byte[] sha256 = new byte[32];
+        for (int i = 0; i < count; i++) {
+            channel.readLong();
+            channel.readFully(sha256);
+        }
+        if (!ok) {
+            channel.readUTF();
+        }
+        top.weixiansen574.hybridfilexfer.core.HFXLog.d("discarded stale RESULT frame");
+    }
+
+    /**
+     * 304：等这次传输的线程真正退出（有界等待）。
+     *
+     * <p>读文件线程和发块线程共用这条连接缓冲池里的 {@link java.nio.ByteBuffer}。
+     * 取消 / 出错后不等它们退出就返回，下一次传输就会和它们抢同一个缓冲区
+     * （实测 {@code IllegalArgumentException: newPosition > limit}，一次取消把后续
+     * 传输全废掉）。正常情况几毫秒就退完；退不完也不能把界面卡死，所以给上限。
+     */
+    private void awaitTransferThreads(Thread readThread, FutureTask<Void> readFileTask,
+                                     List<FutureTask<Void>> transferTasks, long timeoutMs) {
+        if (readThread != null) {
+            // 读线程可能正阻塞在 buffers.take() 上（池子空了）——打断它让它自己退出
+            try {
+                readThread.interrupt();
+            } catch (Throwable ignored) {
+            }
+        }
+        long deadline = System.currentTimeMillis() + Math.max(0, timeoutMs);
+        if (transferTasks != null) {
+            for (FutureTask<Void> task : transferTasks) {
+                long left = deadline - System.currentTimeMillis();
+                if (left <= 0) {
+                    return;
+                }
+                try {
+                    task.get(left, TimeUnit.MILLISECONDS);
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+        long left = deadline - System.currentTimeMillis();
+        if (readFileTask != null && left > 0) {
+            try {
+                readFileTask.get(left, TimeUnit.MILLISECONDS);
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    /**
      * 302：读一帧结论，返回 null 表示对端成功，否则是对端的错误信息。
      *
      * <p>读的过程中遇到 PAUSE_REPLY（电脑回答会话线程刚才那条 PAUSE_STATE）就地应用，
@@ -558,10 +848,35 @@ public abstract class HFXService {
      */
     protected PeerResult readResultFrameOrNull() throws IOException {
         while (true) {
-            short opcode = ctChannel.readShort();
+            // 304：帧头可能是别的读循环提前读到的（取消/重建期间帧序不固定），优先消费它
+            short opcode = pendingOpcode >= 0 ? pendingOpcode : pollControlOpcode();
+            pendingOpcode = -1;
+            // 本端已经取消、且对端一个字节都没发来：不能再死等结论帧。
+            // 电脑端这时可能还停在"暂停"里没读到我们的 CANCEL（它暂停时只 peek 传输通道），
+            // 死等的话控制通道一直被这个线程占着，会话线程进不了重建，最后只能整条断掉。
+            if (opcode < 0) {
+                top.weixiansen574.hybridfilexfer.core.HFXLog.d("readResultFrame: local cancel, stop waiting");
+                return PeerResult.cancelled();
+            }
             if (opcode == ControllerIdentifiers.PAUSE_REPLY) {
                 applyPcPause(ctChannel.readBoolean());
                 continue;
+            }
+            // 304：电脑端点「中断发送」= 先来一帧 CANCEL。
+            // 这次传输就地作废：置取消标志（界面显示"已取消传输"），并且等它重建通道。
+            if (opcode == ControllerIdentifiers.CANCEL) {
+                top.weixiansen574.hybridfilexfer.core.HFXLog.d("readResultFrame: peer CANCEL");
+                transferCancelled = true;
+                needsRebuild = true;
+                return PeerResult.cancelled();
+            }
+            // 304：电脑已经开始重建了（理论上 CANCEL 在它前面，这里只是兜底）
+            if (opcode == ControllerIdentifiers.REBUILD_REQ) {
+                String name = ctChannel.readUTF();
+                top.weixiansen574.hybridfilexfer.core.HFXLog.d("readResultFrame: REBUILD_REQ " + name);
+                stashRebuildName(name);
+                needsRebuild = true;
+                return PeerResult.cancelled();
             }
             if (opcode == ControllerIdentifiers.RESULT) {
                 boolean ok = ctChannel.readBoolean();
@@ -581,6 +896,76 @@ public abstract class HFXService {
             top.weixiansen574.hybridfilexfer.core.HFXLog.d(
                     "readResultFrame: BAD opcode=" + opcode);
             throw new IOException("unexpected control frame while waiting for RESULT: " + opcode);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 304：取消 / 重建
+    // ------------------------------------------------------------------
+
+    /**
+     * 收尾时看一眼控制通道有没有 CANCEL（电脑端点「中断发送」）。
+     *
+     * <p>接收方向传输期间控制通道的读取权在电脑那边（它 poll 暂停同步），
+     * 手机这边只写不读；所以电脑点了「中断发送」之后，这一帧没人接。
+     * 传输线程收尾时在这里探一下：有 CANCEL 就当"取消"收尾，别报成断线。
+     *
+     * <p>用 {@link DataByteChannel#available()} 先确认帧头到齐了再读，
+     * 绝不把半个帧头吃掉（吃掉就会和下一个帧头拼成假 opcode）。
+     *
+     * @return true 表示对端取消了这次传输
+     */
+    protected boolean probePeerCancel(long timeoutMs) {
+        DataByteChannel channel = ctChannel;
+        if (channel == null) {
+            return false;
+        }
+        long deadline = System.currentTimeMillis() + Math.max(0, timeoutMs);
+        while (true) {
+            long left = deadline - System.currentTimeMillis();
+            if (left <= 0) {
+                return false;
+            }
+            try {
+                // 用直接读 SocketChannel 的方式等帧头：Socket 的 available() 在混用
+                // SocketChannel 时会一直返回 0（真机实测），拿它当"有没有数据"会永远等不到。
+                short opcode = readControlHeaderPolled(left, false);
+                if (opcode == CONTROL_TIMEOUT) {
+                    return false;
+                }
+                // 帧头 + 载荷必须在同一把锁里读完：只读帧头就松手，载荷会留到
+                // 下一个读循环，和下一帧的帧头拼成假 opcode（实测读出 0 / 28513）。
+                synchronized (controlLock) {
+                    switch (opcode) {
+                        case ControllerIdentifiers.CANCEL:
+                            transferCancelled = true;
+                            needsRebuild = true;
+                            return true;
+                        case ControllerIdentifiers.REBUILD_REQ:
+                            // 电脑已经开始重建传输通道：这次传输同样作废
+                            stashRebuildName(channel.readUTF());
+                            transferCancelled = true;
+                            needsRebuild = true;
+                            return true;
+                        case ControllerIdentifiers.PAUSE_REPLY:
+                            applyPcPause(channel.readBoolean());
+                            return false;
+                        case ControllerIdentifiers.RESULT:
+                            // 电脑端的收尾结论：这次传输已经作废，读干净丢掉
+                            discardResultPayload(channel);
+                            return false;
+                        case ControllerIdentifiers.PING:
+                            return false;
+                        default:
+                            // 不认识的帧：帧头不能丢，记下来交给后续的读循环
+                            pendingOpcode = opcode;
+                            return false;
+                    }
+                }
+            } catch (Throwable e) {
+                // 通道断了 / 被打断：都当"没探到取消"，交给上层按原路径收尾
+                return false;
+            }
         }
     }
 

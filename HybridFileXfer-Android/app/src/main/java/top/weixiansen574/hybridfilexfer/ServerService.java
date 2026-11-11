@@ -37,6 +37,7 @@ import java.util.concurrent.atomic.AtomicLong;
 
 import rikka.shizuku.Shizuku;
 import top.weixiansen574.hybridfilexfer.aidl.IIOService;
+import top.weixiansen574.hybridfilexfer.core.ControllerIdentifiers;
 import top.weixiansen574.hybridfilexfer.core.bean.ServerNetInterface;
 import top.weixiansen574.hybridfilexfer.core.bean.TrafficInfo;
 import top.weixiansen574.hybridfilexfer.droidcore.HFXServer;
@@ -168,8 +169,11 @@ public class ServerService extends Service implements ServiceConnection {
 
     /**
      * 取消某台电脑上正在进行的传输。
-     * 传输线程是阻塞读写的，没有单独的取消协议——直接断开这条连接，
-     * 对端（电脑）会立刻收到断线、停止发送，然后按自己的重连逻辑连回来。
+     *
+     * <p>304：取消<b>不再拆会话</b>。以前这里是"取消 = 断开这条连接"，电脑端看到断线、
+     * 报「连接已断开」再重连，手机端传输页也随连接一起卸载回主页 —— 取消完还得等一个
+     * 来回才能再传。现在只关传输通道、控制通道留着，电脑端收尾完把通道重建回来，
+     * 会话不断，取消后立刻能再传。
      */
     public static void cancelTransfer(int connectionId) {
         HFXServer target = HFXServer.getById(connectionId);
@@ -177,14 +181,13 @@ public class ServerService extends Service implements ServiceConnection {
             return;
         }
         try {
-            // 先叫醒可能正停在暂停里的线程，再关 socket
+            // 先叫醒可能正停在暂停里的线程，再关传输通道
             target.resumeTransfer();
             // 标记"用户取消"：收尾时不要自动删半成品，交给界面问用户保不保留
             liveFor(connectionId).userCancelled = true;
-            // 只关 socket，让传输线程抛异常退出；缓冲区由会话线程收尾时释放，
+            // 只关传输通道，让传输线程抛异常退出；控制通道和缓冲区都留给会话线程收尾，
             // 这里绝不能调 disconnect()（会 free 掉正在用的 native 内存）
             target.abortTransfer();
-            HFXServer.unregister(target);
         } catch (Throwable ignored) {
         }
     }
@@ -943,15 +946,29 @@ public class ServerService extends Service implements ServiceConnection {
         }
     }
 
-    /** 一台电脑一条会话线程：心跳 + 拉取电脑推送的文件。断开只影响这一台。 */
+    /** 一台电脑一条会话线程：心跳 + 暂停同步 + 拉取电脑推送的文件。断开只影响这一台。 */
     private void sessionLoop(HFXServer server, int gen) {
         int id = server.getId();
+        // 重建传输通道要 accept（只能由 accept 线程做），这里拿的是"挂号"用的监听器
+        ServerListener acceptListener = this.listener;
         try {
             long lastPing = SystemClock.elapsedRealtime();
             while (active && gen == generation && server.isAlive()) {
                 SystemClock.sleep(250);
                 if (!active || gen != generation || !server.isAlive()) {
                     break;
+                }
+                // 304：用户取消后电脑会把传输通道重建回来。这一步必须排在暂停同步前面 ——
+                // 重建期间控制通道归这条线程读，再去跑 exchangePause 就会把
+                // REBUILD_REQ 读成"意外的暂停回报"，一次擦肩而过就把会话打掉了。
+                if (server.isNeedsRebuild()) {
+                    if (!rebuildTransfers(server, acceptListener)) {
+                        Log.i(TAG, "rebuild failed (" + server.getDisplayName() + "), disconnecting");
+                        break;
+                    }
+                    // 重建刚花掉几秒，心跳重新计时，别立刻又发一条
+                    lastPing = SystemClock.elapsedRealtime();
+                    continue;
                 }
                 // 暂停状态同步：每轮（约 250ms）都做一次，传输中也要同步 ——
                 // 电脑端点暂停，这边 250ms 内就跟着变；这边点暂停，电脑也会立刻收到。
@@ -983,6 +1000,12 @@ public class ServerService extends Service implements ServiceConnection {
                     Log.i(TAG, "heartbeat failed (" + server.getDisplayName() + "): " + e);
                     break;
                 }
+                // 传输中 / 待重建时，传输通道的状态由传输线程和重建流程负责，
+                // 这里既不能探死通道（取消时通道本来就是我们自己关的），
+                // 也不能去拉"电脑推送的文件"（会和正在进行的传输打架）。
+                if (server.isTransferring() || server.isNeedsRebuild()) {
+                    continue;
+                }
                 // 拔数据线/掉 WiFi 时控制通道可能还活着（走的是别的链路），
                 // 但某些传输通道已经被对端关掉了——探到就断开这条连接，让电脑重连，
                 // 否则界面上会一直挂着已经死掉的通道。
@@ -993,10 +1016,6 @@ public class ServerService extends Service implements ServiceConnection {
                     }
                 } catch (Throwable e) {
                     debugFile("channel probe failed: " + e);
-                }
-                // 传输期间不要再拉"电脑推送的文件"（会和正在进行的传输打架）
-                if (server.isTransferring()) {
-                    continue;
                 }
                 // 问一下电脑有没有"发送到手机"推过来的文件，有就直接拉下来
                 try {
@@ -1022,6 +1041,125 @@ public class ServerService extends Service implements ServiceConnection {
                 setState(HFXServer.count() > 0 ? STATE_CONNECTED : STATE_WAITING);
             }
         }
+    }
+
+    /** 304：取消后等电脑把通道重建回来的总窗口 */
+    private static final long REBUILD_WINDOW_MS = 30000;
+    /** 已经恢复出通道之后，多久没有新的 REBUILD_REQ 就认为电脑发完了 */
+    private static final long REBUILD_IDLE_MS = 5000;
+
+    /**
+     * 304：取消之后等电脑把传输通道重建回来（会话不断）。
+     *
+     * <p>流程：等传输线程彻底退出（它可能还停在控制通道的结论帧上，两个读者会各吃半帧）
+     * → 在监听器上挂号（这之后 accept 线程收到的安静连接不再丢，是电脑刚发起的传输通道）
+     * → 一帧一帧读 REBUILD_REQ，每收到一条就向 accept 线程要一条通道，
+     * 收下就回 REBUILD_ACK{true}，要不到就回 {false} 让电脑跳过这条。
+     *
+     * <p>帧必须带 opcode：手机随时可能在飞 PAUSE_STATE，裸 bool 握手会和它的帧头撞车，
+     * 帧流一错位整条会话就报废（这就是 304 不用"裸 bool 重建握手"的原因）。
+     *
+     * @return true 表示至少恢复了一条通道（会话继续）；false 表示该断线重连了
+     */
+    private boolean rebuildTransfers(HFXServer server, ServerListener listener) {
+        if (listener == null) {
+            debugFile("rebuild: no listener (" + server.getDisplayName() + ")");
+            return false;
+        }
+        // 1) 等传输线程交出控制通道的读权
+        long waitDeadline = System.currentTimeMillis() + 15000;
+        while ((server.isTransferring() || server.isSendingFiles())
+                && System.currentTimeMillis() < waitDeadline) {
+            SystemClock.sleep(50);
+        }
+        if (server.isTransferring() || server.isSendingFiles()) {
+            // 传输线程还没退出就抢控制通道 = 两个读者各吃半帧，整条会话必废。
+            // 宁可断线重连，也不要把帧流搞错位。
+            debugFile("rebuild: transfer thread still owns the control channel");
+            return false;
+        }
+        int want = server.beginRebuild();
+        if (want <= 0) {
+            debugFile("rebuild: no channel to restore (" + server.getDisplayName() + ")");
+            return false;
+        }
+        debugFile("rebuild: waiting for " + want + " channel(s) from " + server.getDisplayName());
+        listener.wantTransfers(want);
+        int got = 0;
+        long deadline = System.currentTimeMillis() + REBUILD_WINDOW_MS;
+        long idleUntil = Long.MAX_VALUE;
+        try {
+            while (got < want) {
+                long now = System.currentTimeMillis();
+                if (now > deadline || now > idleUntil) {
+                    break;
+                }
+                // 别的读循环提前读到的重建请求（exchangePause 兜底里收的）
+                String name = server.pollRebuildName();
+                if (name == null) {
+                    short opcode;
+                    try {
+                        opcode = server.readControlOpcode(1000);
+                    } catch (IOException e) {
+                        debugFile("rebuild: control channel gone: " + e);
+                        return false;
+                    }
+                    if (opcode == HFXServer.CONTROL_TIMEOUT) {
+                        continue;
+                    }
+                    if (opcode == ControllerIdentifiers.PING
+                            || opcode == ControllerIdentifiers.CANCEL
+                            || opcode == ControllerIdentifiers.REBUILD_ACK
+                            || opcode == ControllerIdentifiers.RESULT) {
+                        // 心跳 / 重复的取消帧：读到就行。
+                        // RESULT 是电脑在取消前一刻已经写出来的收尾结论（载荷已在
+                        // readControlOpcode 的锁里读掉丢掉），不能让它打断重建。
+                        continue;
+                    }
+                    if (opcode == ControllerIdentifiers.PAUSE_REPLY) {
+                        // 载荷（电脑是否暂停）已经在 readControlOpcode 的锁里读掉并应用了
+                        continue;
+                    }
+                    if (opcode != ControllerIdentifiers.REBUILD_REQ) {
+                        // 不是重建握手：帧序已经乱了，别硬撑，交给会话重连
+                        debugFile("rebuild: unexpected opcode " + opcode);
+                        return false;
+                    }
+                    // 通道名已经在 readControlOpcode 的锁里读出来存好了
+                    name = server.pollRebuildName();
+                    if (name == null) {
+                        debugFile("rebuild: REBUILD_REQ without channel name");
+                        continue;
+                    }
+                }
+                SocketChannel socket = listener.takeTransferChannel(12000);
+                boolean accepted = socket != null;
+                try {
+                    if (accepted) {
+                        server.addRebuiltConnection(name, socket);
+                    }
+                    server.writeRebuildAck(accepted);
+                } catch (IOException e) {
+                    debugFile("rebuild: ack failed: " + e);
+                    return got > 0;
+                }
+                if (accepted) {
+                    got++;
+                    idleUntil = System.currentTimeMillis() + REBUILD_IDLE_MS;
+                    debugFile("rebuild: channel " + name + " restored (" + got + "/" + want + ")");
+                } else {
+                    debugFile("rebuild: channel " + name + " refused (no socket)");
+                }
+            }
+        } finally {
+            listener.endWantTransfers();
+            server.setNeedsRebuild(false);
+        }
+        if (got > 0) {
+            Log.i(TAG, "rebuilt " + got + "/" + want + " channel(s) with " + server.getDisplayName());
+            debugFile("rebuild: done " + got + "/" + want);
+        }
+        return got > 0;
     }
 
     private StartServerCallback newSessionCallback(HFXServer server) {

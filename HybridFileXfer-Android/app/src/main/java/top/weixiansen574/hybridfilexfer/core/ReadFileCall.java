@@ -43,10 +43,23 @@ public abstract class ReadFileCall implements Callable<Void> {
         return pause;
     }
 
+    /**
+     * 这次传输已经被取消 / 通道出错：读文件的线程必须自己停下来。
+     *
+     * <p>以前只把队列里的块"回收"进缓冲池就完事，读线程照旧往下读文件、占着同一批
+     * {@link ByteBuffer}。取消后再传一次时，两个读线程抢同一个缓冲区 —— 实测第二次
+     * 传输直接 {@code IllegalArgumentException: newPosition > limit}（缓冲区被另一条
+     * 线程 flip 过），一次取消把后续传输全废掉。
+     */
+    private volatile boolean shutdown;
+
     @Override
     public Void call() throws Exception {
         try {
             for (RemoteFile file : files) {
+                if (shutdown) {
+                    return null;
+                }
                 if (!fileExists(file.getPath())) {
                     continue;
                 }
@@ -54,6 +67,9 @@ public abstract class ReadFileCall implements Callable<Void> {
                 if (file.isDirectory()) {
                     listFilesAndRead(file);
                 }
+            }
+            if (shutdown) {
+                return null;
             }
             for (int i = 0; i < operateThreadCount; i++) {
                 deque.add(END_POINT);
@@ -107,12 +123,22 @@ public abstract class ReadFileCall implements Callable<Void> {
         }
         int i = 0;
         while (remaining > 0){
+            if (shutdown) {
+                closeFile();
+                return;
+            }
             TransferPause gate = pause();
             if (gate != null) {
                 gate.awaitResume();
             }
             int blkSize = (int) Math.min(remaining,FileBlock.BLOCK_SIZE);
             ByteBuffer buffer = buffers.take();
+            if (shutdown) {
+                // 等到缓冲区的这一瞬间整个传输已经取消了：立刻还回去，别再往里读
+                buffers.add(buffer);
+                closeFile();
+                return;
+            }
             buffer.clear();
             buffer.limit(blkSize);
             while (buffer.hasRemaining()) {
@@ -142,6 +168,7 @@ public abstract class ReadFileCall implements Callable<Void> {
 
     //当对方写入时发生错误时
     public void shutdownByWriteError() {
+        shutdown = true;
         recycleAllBuffer();
         for (int i = 0; i < operateThreadCount; i++) {
             deque.addFirst(WRITE_ERROR);
@@ -150,14 +177,24 @@ public abstract class ReadFileCall implements Callable<Void> {
 
     //当其中任意一条通道断开时
     public void shutdownByConnectionBreak() {
+        shutdown = true;
         recycleAllBuffer();
         for (int i = 0; i < operateThreadCount - 1; i++) {
             deque.addFirst(INTERRUPT);
         }
     }
 
+    /**
+     * 把队列里还没人领的块全部取出来、把缓冲区还回池子。
+     *
+     * <p>必须"取出来"而不是"遍历"：只遍历不摘除的话，这些块还留在队列里，
+     * 另一条发块线程照样能 take 到它们 —— 可它们的缓冲区已经回到池子里、
+     * 可能正被别的线程写入（cancel 后尤其明显），写出去的就是垃圾，
+     * 甚至直接 {@code IllegalArgumentException: newPosition > limit}。
+     */
     private void recycleAllBuffer() {
-        for (FileBlock fileBlock : deque) {
+        FileBlock fileBlock;
+        while ((fileBlock = deque.pollFirst()) != null) {
             if (fileBlock.data != null) {
                 recycleBuffer(fileBlock.data);
             }

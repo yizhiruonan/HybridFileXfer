@@ -365,6 +365,15 @@ impl Receiver {
         self.files.load(Ordering::Relaxed)
     }
 
+    /// 一次新的接收开始：把"本次已接收字节 / 文件数"清零。
+    ///
+    /// 不清的话跨多次传输一直累加：收尾日志和界面会显示
+    /// 「4 个文件 5.48 GB」（其实这次只传了 800MB），速率也跟着算飞。
+    pub fn reset_session_counters(&self) {
+        self.bytes.store(0, Ordering::Relaxed);
+        self.files.store(0, Ordering::Relaxed);
+    }
+
     /// 303：本次会话落盘的文件列表（收尾算整文件校验和用）。
     /// 必须在 finish_with() 之前调用 —— 它会把这些条目清空。
     pub fn received_files(&self) -> Vec<PathBuf> {

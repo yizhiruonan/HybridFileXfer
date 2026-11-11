@@ -437,10 +437,12 @@ internal fun ReceiveProgressPanel(
             Spacer(Modifier.height(10.dp))
             Text(
                 humanSize(animatedDone.toLong()) + " / " + humanSize(state.xferTotal) +
-                    "   ·   " + if (state.xferPaused) {
-                    "已暂停"
-                } else {
-                    (if (state.xferCount > 1) "合计 " else "") + formatSpeed(animatedSpeed.toLong())
+                    "   ·   " + when {
+                    state.xferPaused -> "已暂停"
+                    // 数据已经发完、电脑在算整文件 SHA-256：这里必须有个说法，
+                    // 否则界面就是"79x/800 MB · 0 KB/s"一动不动，看着像卡死（实测卡 2 分钟）
+                    state.xferNote.isNotEmpty() -> state.xferNote
+                    else -> (if (state.xferCount > 1) "合计 " else "") + formatSpeed(animatedSpeed.toLong())
                 },
                 fontSize = 12.sp,
                 color = colorScheme.onSurfaceVariantSummary,

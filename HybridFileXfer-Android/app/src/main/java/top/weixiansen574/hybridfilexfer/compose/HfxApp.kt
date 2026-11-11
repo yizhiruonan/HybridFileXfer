@@ -147,6 +147,8 @@ internal data class UiState(
     val xferLabel: String = "",
     val xferSegments: List<SegInfo> = emptyList(),
     val xferChannels: List<ChannelStat> = emptyList(),
+    /** 进度弹窗里的状态提示（例如"等待电脑校验…"），非空时顶替速率显示 */
+    val xferNote: String = "",
     val mode: Int = 0,
     val autoConnect: Boolean = true,
     val localBuffer: Int = 256,

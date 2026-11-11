@@ -39,6 +39,20 @@ public class ControllerIdentifiers {
      * 就地置取消标志，各通道干净退出、界面上也不报错。
      */
     public static final short CANCEL = 25;
+    /**
+     * 304：取消后重建传输通道。手机发完 CANCEL 只关传输通道、保留控制通道，
+     * 电脑收尾完再连一批新的传输通道，会话不断。
+     *
+     * <p>两个方向都带 opcode 分帧，不能用裸 bool —— 手机端随时可能在飞 PAUSE_STATE，
+     * 裸 bool 会和它的帧头撞车，帧流一错位整条会话就报废。
+     *
+     * <pre>
+     * 电脑 → 手机：{i16 REBUILD_REQ}{UTF 通道名}
+     * 手机 → 电脑：{i16 REBUILD_ACK}{bool 是否接受}
+     * </pre>
+     */
+    public static final short REBUILD_REQ = 26;
+    public static final short REBUILD_ACK = 27;
 
     //就让魔法打败魔法吧！
     /**

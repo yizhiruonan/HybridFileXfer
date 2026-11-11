@@ -2,6 +2,7 @@ package top.weixiansen574.hybridfilexfer.droidcore;
 
 import android.os.RemoteException;
 
+import java.io.EOFException;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
@@ -11,6 +12,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.LinkedBlockingDeque;
@@ -55,6 +57,14 @@ public class HFXServer extends HFXService {
     /** 传输通道探测锁：探测期间不允许开始新传输，避免把数据读走 */
     private final Object channelProbeLock = new Object();
     private volatile boolean transferring;
+    /**
+     * 本会话的控制通道分类器（accept 线程持有）。
+     *
+     * <p>304：取消后要重建传输通道，而 accept 只能在 accept 线程做，
+     * 所以给它留个引用：重建前先在监听器上"挂个号"，让新连进来的静默连接别被当成
+     * 上一轮的残留直接关掉（那是电脑刚为重连发起的传输通道）。
+     */
+    private volatile ServerListener listener;
 
     private final int id = NEXT_ID.getAndIncrement();
     private volatile String displayName = "";
@@ -194,7 +204,12 @@ public class HFXServer extends HFXService {
                                List<ServerNetInterface> interfaceList, int localBufferCount,
                                int remoteBufferCount, StartServerCallback callback) throws IOException {
         DataByteChannel ctChannel = new DataByteChannel(control.socket);
+        // 控制通道上的读必须有个上限：帧一旦对不上（残留的 PAUSE_REPLY 被当成目录列表长度之类），
+        // 以前会永久卡在 readUTF 里，而且握着 controlLock，会话线程连心跳都发不出去 ——
+        // 电脑端 100 秒后判超时断线（实测一次正常传输收尾后界面刷新目录就触发）。
+        ctChannel.setReadTimeout(30000);
         this.ctChannel = ctChannel;
+        this.listener = listener;
         List<TransferConnection> connections = null;
         boolean success = false;
         try {
@@ -230,7 +245,9 @@ public class HFXServer extends HFXService {
             //连接传输通道
             //允许部分通道失败：对方（电脑）可能连不上某张网卡（比如不在同一个WIFI），
             //此时只要还有一条通道可用就继续，用于"USB + WIFI 同时传输"这种自适应场景。
-            connections = new ArrayList<>(interfaceList.size());
+            // 写时复制：304 取消后重建通道时会在会话线程里往里加，
+            // 而 getChannelDetails() / hasDeadChannel() 会在界面线程并发读它
+            connections = new CopyOnWriteArrayList<>();
             for (int i = 0; i < interfaceList.size(); i++) {
                 //对方连接通道是否成功
                 boolean succeed = ctChannel.readBoolean();
@@ -378,6 +395,8 @@ public class HFXServer extends HFXService {
      */
     public List<RemoteFile> checkPending() throws IOException {
         synchronized (controlLock) {
+            // 上一轮传输留下的 PAUSE_REPLY 先吃掉，别把它当成"待推送文件数量"
+            drainStaleControlFrames();
             ctChannel.writeShort(ControllerIdentifiers.CHECK_PENDING);
             int count = ctChannel.readInt();
             List<RemoteFile> files = new ArrayList<>();
@@ -397,6 +416,9 @@ public class HFXServer extends HFXService {
     }
 
     public void sendFilesToRemote(List<RemoteFile> files, Directory localDir, Directory remoteDir, TransferFileCallback callback) throws IOException {
+        // 304：刚取消过的话先等电脑把通道重建回来（重建要 1~3 秒），
+        // 否则用的还是已经关掉的旧通道，用户"取消完立刻再传"必定失败
+        awaitRebuild(10000);
         beginTransfer();
         try {
             // 只在发请求时拿控制锁；整个传输期间不占着，会话线程才能跑暂停状态同步
@@ -410,6 +432,8 @@ public class HFXServer extends HFXService {
     }
 
     public void sendFilesToShelf(List<RemoteFile> files, Directory localDir, Directory remoteDir, TransferFileCallback callback) throws IOException {
+        // 304：同上，等重建完成再开始
+        awaitRebuild(10000);
         beginTransfer();
         try {
             // 只在发请求时拿控制锁；整个传输期间不占着，会话线程才能跑暂停状态同步
@@ -434,14 +458,254 @@ public class HFXServer extends HFXService {
         return transferring;
     }
 
+    /** 当前有多少条传输通道（含已经被取消关掉的，重建时按它算要恢复几条） */
+    public int getTransferCount() {
+        List<TransferConnection> list = connections;
+        return list == null ? 0 : list.size();
+    }
+
+    // ------------------------------------------------------------------
+    // 304：取消后重建传输通道
+    // ------------------------------------------------------------------
 
     /**
-     * 中止正在进行的传输：只关 socket，**不动缓冲区**。
+     * 开始重建：记下取消前有几条通道，并把已经关掉的通道从表里摘掉。
      *
-     * <p>传输线程还在用缓冲区块，如果这里像 {@link #disconnect()} 那样释放，
+     * <p>列表换成写时复制：界面线程（getChannelDetails / getChannelNames）会并发读它。
+     *
+     * @return 取消前的通道数（重建的目标条数）
+     */
+    public synchronized int beginRebuild() {
+        List<TransferConnection> old = connections;
+        CopyOnWriteArrayList<TransferConnection> live = new CopyOnWriteArrayList<>();
+        int count = 0;
+        if (old != null) {
+            for (TransferConnection connection : old) {
+                if (connection == null) {
+                    continue;
+                }
+                count++;
+                if (connection.channel != null && connection.channel.isOpen()) {
+                    live.add(connection);
+                }
+            }
+        }
+        connections = live;
+        return count;
+    }
+
+    /** 重建时收下一条新的传输通道 */
+    public synchronized void addRebuiltConnection(String name, SocketChannel socket) throws IOException {
+        List<TransferConnection> list = connections;
+        if (list == null) {
+            list = new CopyOnWriteArrayList<>();
+            connections = list;
+        }
+        list.add(new TransferConnection(name, new DataByteChannel(socket)));
+    }
+
+    /** 回一帧 REBUILD_ACK：这条通道收不收（收不下来时电脑会跳过它） */
+    public void writeRebuildAck(boolean accepted) throws IOException {
+        synchronized (controlLock) {
+            byte[] frame = new byte[3];
+            frame[0] = (byte) (ControllerIdentifiers.REBUILD_ACK >> 8);
+            frame[1] = (byte) ControllerIdentifiers.REBUILD_ACK;
+            frame[2] = (byte) (accepted ? 1 : 0);
+            ctChannel.writeFully(frame);
+        }
+    }
+
+    /**
+     * 等一帧控制指令的 opcode；超时返回 {@link #CONTROL_TIMEOUT}。
+     *
+     * <p>只在会话线程、且确认没有别的读者时调用（重建握手期间控制通道归会话线程）。
+     * SocketChannel 的阻塞读没有超时，这里临时切成非阻塞自己轮询 —— 否则重建窗口
+     * 一到就只能靠关 socket 才能醒过来。
+     */
+    public short readControlOpcode(int timeoutMs) throws IOException {
+        // 整个"读一帧"必须和界面的请求/应答互斥。界面线程在传输/重建期间也会发
+        // LIST_FILES / CHECK_PENDING，并且是在 controlLock 里等应答的；
+        // 重建循环若不持锁就去读，会把界面的应答帧当成重建帧读走 ——
+        // 帧流一错位，两边从此只能读到垃圾（实测 opcode 变成 28513、29299 这种）。
+        synchronized (controlLock) {
+            return readControlOpcodeLocked(timeoutMs);
+        }
+    }
+
+    /** 调用方必须已经持有 {@link #controlLock} */
+    private short readControlOpcodeLocked(int timeoutMs) throws IOException {
+        // 别的读循环提前读到的帧头不能丢
+        short pending = pendingOpcode;
+        if (pending >= 0) {
+            pendingOpcode = -1;
+            return pending;
+        }
+        DataByteChannel channel = ctChannel;
+        if (channel == null) {
+            throw new IOException("control channel is not connected");
+        }
+        SocketChannel socketChannel = channel.getSocketChannel();
+        if (socketChannel == null) {
+            return channel.readShort();
+        }
+        ByteBuffer buffer = ByteBuffer.allocate(2);
+        long deadline = System.currentTimeMillis() + Math.max(0, timeoutMs);
+        socketChannel.configureBlocking(false);
+        try {
+            while (true) {
+                int read = socketChannel.read(buffer);
+                if (read < 0) {
+                    throw new EOFException("control channel closed by peer");
+                }
+                if (buffer.position() >= 2) {
+                    break;
+                }
+                if (System.currentTimeMillis() >= deadline) {
+                    return CONTROL_TIMEOUT;
+                }
+                try {
+                    Thread.sleep(15);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("interrupted while waiting for control frame", e);
+                }
+            }
+        } finally {
+            try {
+                socketChannel.configureBlocking(true);
+            } catch (IOException ignored) {
+                // 通道已经断了，下一轮读会报出来
+            }
+        }
+        buffer.flip();
+        short opcode = buffer.getShort();
+        // 载荷必须在同一个锁里读掉：松手让界面线程去读，帧流立刻错位
+        if (opcode == ControllerIdentifiers.REBUILD_REQ) {
+            stashRebuildName(channel.readUTF());
+        } else if (opcode == ControllerIdentifiers.PAUSE_REPLY) {
+            applyPcPause(channel.readBoolean());
+        } else if (opcode == ControllerIdentifiers.RESULT) {
+            // 电脑端的收尾结论帧可能在我们取消之前一刻已经写出来了（它那时正在算
+            // SHA-256 / 等我们的结论，用户随时可能按取消）。重建握手收到它不能当成
+            // "帧序错位" 直接断线（实测 opcode 23 就是这么把会话打掉的），
+            // 也不能只读两个字节就把载荷留在通道里 —— 那会和下一个帧头拼成假 opcode。
+            // 这次传输已经作废，结论帧没人要了，就地读干净丢掉。
+            discardResultPayload(channel);
+        }
+        if (opcode != ControllerIdentifiers.PAUSE_REPLY
+                && opcode != ControllerIdentifiers.REBUILD_REQ
+                && opcode != ControllerIdentifiers.REBUILD_ACK
+                && opcode != ControllerIdentifiers.PING
+                && opcode != ControllerIdentifiers.CANCEL) {
+            // 帧流错位排查用：把原始两字节打出来（正常帧不会走到这里）
+            top.weixiansen574.hybridfilexfer.core.HFXLog.d(String.format(
+                    "readControlOpcode: unexpected %d bytes=%02x %02x",
+                    (int) opcode, buffer.get(0), buffer.get(1)));
+        }
+        return opcode;
+    }
+
+    /** 读一帧 PAUSE_REPLY 的载荷（电脑是否暂停）并应用 */
+    public void readAndApplyPauseReply() throws IOException {
+        applyPcPause(ctChannel.readBoolean());
+    }
+
+    /** 读一帧 REBUILD_REQ 的通道名 */
+    public String readRebuildName() throws IOException {
+        return ctChannel.readUTF();
+    }
+
+    /**
+     * 取消后等电脑把通道重建回来再开始新的传输。
+     * 重建一批通道要 1~3 秒（每条都要过 400ms 的连接分类窗口），
+     * 不等的话用户"取消完立刻再传"会撞上已经关掉的旧通道，直接失败。
+     */
+    private void awaitRebuild(long timeoutMs) {
+        long deadline = System.currentTimeMillis() + Math.max(0, timeoutMs);
+        while (needsRebuild && System.currentTimeMillis() < deadline) {
+            try {
+                Thread.sleep(50);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
+    }
+
+
+    /**
+     * 取消正在进行的传输：**只关传输通道，控制通道留着**（304 取消不断连）。
+     *
+     * <p>以前这里连控制通道一起关，于是取消 = 整条会话拆除：手机端回主页、
+     * 电脑端报「连接已断开」再重连，取消完还得等一个来回才能再传。
+     * 现在：发一帧 CANCEL（让电脑知道这是取消不是断线）→ 只关传输通道 →
+     * 置 needsRebuild，会话线程等电脑把通道重建回来，会话本身不断。
+     *
+     * <p>传输线程还在用缓冲区块，所以这里**不能**像 {@link #disconnect()} 那样释放缓冲：
      * 会把正在读写的 native 内存 free 掉（崩溃）。关掉通道后传输线程会抛
      * AsynchronousCloseException，等会话线程收尾时再统一释放。
      */
+    public void abortTransfer() {
+        top.weixiansen574.hybridfilexfer.core.HFXLog.d("abortTransfer: close transfer channels only",
+                new Exception("abortTransfer caller"));
+        transferCancelled = true;
+        needsRebuild = true;
+        // 取消时把暂停闸门也放开：不放开的话 isTransferPaused() 一直是 true，
+        // 会话线程会一直向电脑端上报"手机暂停了"，电脑端就停在暂停里（界面也停在
+        // 已暂停）。下一次传输虽然会换新的闸门，但在这之前两边状态是不一致的。
+        resumeTransfer();
+        // 先给监听器"挂个号"再去通知电脑：电脑收到 CANCEL 会立刻连一批新通道过来，
+        // 这期间 accept 线程要是还没被告知"有人在等传输通道"，那批连接会被当成
+        // 上一轮的残留直接关掉，重建就永远等不到通道了。
+        ServerListener current = listener;
+        if (current != null) {
+            current.wantTransfers(getTransferCount());
+        }
+        // 读写 socket 放到工作线程：本方法由界面线程调用（TransferScreen 的取消按钮），
+        // 主线程碰网络会直接被 StrictMode 拦下抛 NetworkOnMainThreadException ——
+        // 表现就是 CANCEL 一帧都没发出去，电脑端只能靠"通道被关"去猜，取消照样断连。
+        List<TransferConnection> list = connections;
+        Thread worker = new Thread(() -> {
+            DataByteChannel notify = ctChannel;
+            if (notify != null && notify.isOpen()) {
+                try {
+                    synchronized (controlLock) {
+                        // DataByteChannel 直接写 socket，没有缓冲，不需要 flush
+                        notify.writeShort(top.weixiansen574.hybridfilexfer.core.ControllerIdentifiers.CANCEL);
+                    }
+                    top.weixiansen574.hybridfilexfer.core.HFXLog.d("abortTransfer: CANCEL written");
+                } catch (Throwable e) {
+                    // 电脑可能已经不在了，发失败无所谓；下面照样关传输通道
+                    top.weixiansen574.hybridfilexfer.core.HFXLog.d("abortTransfer: CANCEL write failed", e);
+                }
+            } else {
+                top.weixiansen574.hybridfilexfer.core.HFXLog.d("abortTransfer: control channel already closed, skip CANCEL");
+            }
+            int closedChannels = 0;
+            if (list != null) {
+                for (TransferConnection connection : list) {
+                    try {
+                        // 先打标再关：SendFileCall / ReceiveFileCall 的 catch 据此
+                        // 把这次的异常当"取消"而不是"通道错误"
+                        connection.markCancelled();
+                        connection.close();
+                        closedChannels++;
+                    } catch (IOException ignored) {
+                    }
+                }
+            }
+            top.weixiansen574.hybridfilexfer.core.HFXLog.d("abortTransfer: closed " + closedChannels
+                    + " transfer channels, wantTransfers pending");
+        }, "hfx-cancel");
+        worker.start();
+        try {
+            // 只等一小会儿：关通道本身很快，等不到也不影响后面（会话线程会等 needsRebuild）
+            worker.join(1500);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
     /** 暂停当前传输（传输线程每块检查一次，期间不读不写） */
     public void pauseTransfer() {
         pauseGate.pause();
@@ -454,43 +718,6 @@ public class HFXServer extends HFXService {
 
     public boolean isTransferPaused() {
         return pauseGate.isPaused();
-    }
-
-    public void abortTransfer() {
-        top.weixiansen574.hybridfilexfer.core.HFXLog.d("abortTransfer: CLOSING all channels",
-                new Exception("abortTransfer caller"));
-        transferCancelled = true;
-        // 303：先尽量发一帧「取消」，让电脑端干净退出（置取消标志、不报错）。
-        // 电脑可能已经不在了，发失败无所谓，后面照样关 socket。
-        DataByteChannel notify = ctChannel;
-        if (notify != null && notify.isOpen()) {
-            try {
-                synchronized (controlLock) {
-                    // DataByteChannel 直接写 socket，没有缓冲，不需要 flush
-                    notify.writeShort(top.weixiansen574.hybridfilexfer.core.ControllerIdentifiers.CANCEL);
-                }
-            } catch (Throwable ignored) {
-            }
-        }
-        DataByteChannel control = ctChannel;
-        if (control != null) {
-            try {
-                control.close();
-            } catch (IOException ignored) {
-            }
-        }
-        List<TransferConnection> list = connections;
-        if (list != null) {
-            for (TransferConnection connection : list) {
-                try {
-                    // 先打标再关：SendFileCall / ReceiveFileCall 的 catch 据此
-                    // 把这次的异常当"取消"而不是"通道错误"
-                    connection.markCancelled();
-                    connection.close();
-                } catch (IOException ignored) {
-                }
-            }
-        }
     }
 
     private void beginTransfer() {
@@ -608,6 +835,13 @@ public class HFXServer extends HFXService {
             // 302：回报带 opcode（以前是裸 bool，传输期间会被结论帧读串）
             short opcode = ctChannel.readShort();
             if (opcode != ControllerIdentifiers.PAUSE_REPLY) {
+                // 304：取消 / 重建期间读到"不是暂停回报"的帧是正常的 ——
+                // 用户可能刚好在这一刻点了取消（电脑回的是 CANCEL），也可能电脑
+                // 已经收尾完、开始发 REBUILD_REQ。这两种都要就地收下，
+                // 不能抛异常，否则一次擦肩而过的帧就把整条会话打掉了。
+                if (handleUnexpectedControlFrame(opcode)) {
+                    return lastPcPaused;
+                }
                 top.weixiansen574.hybridfilexfer.core.HFXLog.d("exchangePause: BAD opcode=" + opcode + " sendingFiles=" + sendingFiles);
                 throw new IOException("unexpected pause reply opcode " + opcode);
             }
@@ -629,6 +863,32 @@ public class HFXServer extends HFXService {
                 throw new IOException("control channel is not connected");
             }
             writePauseStateLocked(phonePaused);
+        }
+    }
+
+    /**
+     * 304：暂停回报之外的控制帧，在"取消 / 重建"窗口里是正常现象，就地处理掉。
+     *
+     * @return true 表示这一帧已经处理完（调用方继续正常返回，别抛异常）
+     */
+    private boolean handleUnexpectedControlFrame(short opcode) throws IOException {
+        switch (opcode) {
+            case ControllerIdentifiers.CANCEL:
+                // 电脑端点的是「中断发送」：这次传输作废，等它重建通道
+                top.weixiansen574.hybridfilexfer.core.HFXLog.d("exchangePause: peer CANCEL");
+                transferCancelled = true;
+                needsRebuild = true;
+                return true;
+            case ControllerIdentifiers.REBUILD_REQ: {
+                // 电脑已经开始重建了：通道名先收好，交给 rebuildTransfers 用
+                String name = ctChannel.readUTF();
+                top.weixiansen574.hybridfilexfer.core.HFXLog.d("exchangePause: REBUILD_REQ " + name);
+                stashRebuildName(name);
+                needsRebuild = true;
+                return true;
+            }
+            default:
+                return false;
         }
     }
 
@@ -655,6 +915,9 @@ public class HFXServer extends HFXService {
 
     public List<RemoteFile> listClientFiles(String path) throws IOException {
         synchronized (controlLock) {
+            // 传输刚结束就刷新目录时，通道里还排着电脑回的 PAUSE_REPLY；
+            // 不先吃掉的话会被当成"列表长度"，读线程卡死在 readUTF（真机实测）。
+            drainStaleControlFrames();
             return doListClientFiles(path);
         }
     }
@@ -685,6 +948,7 @@ public class HFXServer extends HFXService {
 
     public boolean deleteRemoteFile(String file) throws IOException {
         synchronized (controlLock) {
+            drainStaleControlFrames();
             ctChannel.writeShort(ControllerIdentifiers.DELETE_FILE);
             ctChannel.writeUTF(file);
             return ctChannel.readBoolean();
@@ -693,6 +957,7 @@ public class HFXServer extends HFXService {
 
     public boolean createRemoteDir(String parent, String child) throws IOException {
         synchronized (controlLock) {
+            drainStaleControlFrames();
             ctChannel.writeShort(ControllerIdentifiers.MKDIR);
             ctChannel.writeUTF(parent);
             ctChannel.writeUTF(child);

@@ -43,6 +43,10 @@ pub struct Session {
     /// 传输结束后由主循环按原顺序继续处理
     pending_opcode: Option<i16>,
     pub interfaces: Vec<PeerInterface>,
+    /// 手机监听的端口（非回环网卡上的传输通道重连要用）
+    port: u16,
+    /// adb 转发给这台手机的本地端口（回环通道重连要用）
+    local_port: u16,
 }
 
 pub enum SessionEnd {
@@ -233,6 +237,8 @@ impl Session {
             transfers,
             pending_opcode: None,
             interfaces,
+            port,
+            local_port,
         })
     }
 
@@ -315,6 +321,170 @@ impl Session {
         }
     }
 
+    /// 304：取消之后把传输通道重新连回来（会话不断）。
+    ///
+    /// 手机端发完 CANCEL 只关传输通道、控制通道留着，就在这儿等我们连回去。
+    /// 每条通道：connect → 发 REBUILD_REQ{名字} → 等 REBUILD_ACK{bool}；
+    /// 等 ACK 期间手机端的暂停同步可能还在飞，就地处理掉，别让帧序错位。
+    ///
+    /// 一条都没恢复就返回错误：留着一条都传不了的会话，界面会一直显示"已连接"、
+    /// 一传就失败，还不如老老实实断线重连。
+    fn rebuild_transfers(&mut self) -> io::Result<usize> {
+        // 先告诉手机"这是取消，不是断线" —— 本机点「中断发送」时它还不知道；
+        // 手机自己点的取消，这一帧重复一次也无害（它是幂等的）。
+        log::warn(crate::i18n::tr(
+            "开始重建传输通道（已通知手机端取消）",
+            "rebuilding the transfer channels",
+        ));
+        let _ = proto::write_i16(&mut self.writer, controller::CANCEL);
+        let _ = self.writer.flush();
+        // 叫醒还卡在读写里的传输线程（它们退出前不能被回收，下面的 join 已经做过了）
+        for (_, stream) in self.transfers.iter() {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+        let names: Vec<String> = self.transfers.iter().map(|(name, _)| name.clone()).collect();
+        if names.is_empty() {
+            return Ok(0);
+        }
+        let _ = self
+            .reader
+            .set_read_timeout(Some(Duration::from_secs(20)));
+        let mut rebuilt: Vec<(String, TcpStream)> = Vec::with_capacity(names.len());
+        for name in names {
+            let interface = match self.interfaces.iter().find(|iface| iface.name == name) {
+                Some(interface) => interface.clone(),
+                None => {
+                    log::warn(&format!("rebuild: unknown channel {name}"));
+                    continue;
+                }
+            };
+            // 回环通道走 adb 转发的本地端口，其它网卡走手机监听的端口
+            let port = if interface.address.is_loopback() {
+                self.local_port
+            } else {
+                self.port
+            };
+            let target = SocketAddr::new(interface.address, port);
+            let stream = match TcpStream::connect_timeout(&target, CONNECT_TIMEOUT) {
+                Ok(stream) => stream,
+                Err(e) => {
+                    log::warn(&format!(
+                        "{} {}: {} — {}",
+                        crate::i18n::tr("重建通道失败", "cannot rebuild channel"),
+                        name,
+                        target,
+                        e
+                    ));
+                    continue;
+                }
+            };
+            let _ = stream.set_nodelay(true);
+            let _ = stream.set_read_timeout(Some(TRANSFER_TIMEOUT));
+            let _ = stream.set_write_timeout(Some(TRANSFER_TIMEOUT));
+            proto::write_i16(&mut self.writer, controller::REBUILD_REQ)?;
+            proto::write_utf(&mut self.writer, &name)?;
+            self.writer.flush()?;
+            loop {
+                let id = match self.pending_opcode.take() {
+                    Some(id) => id,
+                    None => proto::read_i16(&mut self.reader)?,
+                };
+                match id {
+                    controller::REBUILD_ACK => {
+                        if proto::read_bool(&mut self.reader)? {
+                            log::debug(&format!("rebuild: channel {} is back", name));
+                            rebuilt.push((name.clone(), stream));
+                        } else {
+                            log::warn(&format!(
+                                "{} {}",
+                                crate::i18n::tr("手机端没有收下通道", "the phone refused the channel"),
+                                name
+                            ));
+                        }
+                        break;
+                    }
+                    controller::RESULT => self.discard_result()?,
+                    // 重建期间手机端照旧会发暂停同步、翻目录、取消：必须当场应答，
+                    // 否则它那边会卡在 controlLock 上等应答（界面的目录请求），
+                    // 重建循环也跟着停摆。以前这里一律 break + 不读载荷，帧流直接错位。
+                    controller::PING
+                    | controller::CANCEL
+                    | controller::PAUSE_STATE
+                    | controller::LIST_FILES
+                    | controller::DELETE_FILE
+                    | controller::MKDIR
+                    | controller::CHECK_PENDING => self.handle_control_frame(id)?,
+                    other => {
+                        log::warn(&format!(
+                            "{} {}",
+                            crate::i18n::tr(
+                                "重建通道时收到意外的控制帧（已放弃重建）",
+                                "unexpected frame while waiting for REBUILD_ACK",
+                            ),
+                            other
+                        ));
+                        break;
+                    }
+                }
+            }
+        }
+        if rebuilt.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "no transfer channel could be rebuilt",
+            ));
+        }
+        let count = rebuilt.len();
+        self.transfers = rebuilt;
+        // 回到主循环前把轮询用的超时恢复过来
+        let _ = self
+            .reader
+            .set_read_timeout(Some(Duration::from_millis(500)));
+        Ok(count)
+    }
+
+    /// 304：传输线程都退出了，但手机的 CANCEL 可能还在路上
+    /// （它先写 CANCEL 再关传输通道，两个 socket 之间没有先后保证）。
+    /// 收尾前再轮询一小会儿，别把"取消"误判成"断线"。
+    fn grace_poll_cancel(&mut self, budget_ms: u64) {
+        if crate::control::cancelled() {
+            return;
+        }
+        let deadline = Instant::now() + Duration::from_millis(budget_ms);
+        while Instant::now() < deadline {
+            if self.poll_control_during_transfer().is_err() {
+                return;
+            }
+            if crate::control::cancelled() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(30));
+        }
+    }
+
+    /// 取消收尾：把传输通道重建回来（会话不断）；重建失败才真的断线。
+    fn finish_cancelled(&mut self) -> io::Result<()> {
+        match self.rebuild_transfers() {
+            Ok(count) => {
+                log::info(&format!(
+                    "{} {} {} {}",
+                    crate::i18n::tr("取消后已重建通道", "rebuilt after cancel:"),
+                    count,
+                    crate::i18n::tr("条，会话保持连接", "channel(s), the session stays up"),
+                    "",
+                ));
+                Ok(())
+            }
+            Err(e) => {
+                log::warn(&format!(
+                    "{}: {}",
+                    crate::i18n::tr("重建传输通道失败", "rebuilding the transfer channels failed"),
+                    e
+                ));
+                Err(e)
+            }
+        }
+    }
     fn handle_list_files(&mut self) -> io::Result<()> {
         let path = proto::read_utf(&mut self.reader)?;
         let entries = list_directory(&path);
@@ -411,6 +581,7 @@ impl Session {
                 Some(id) => id,
                 None => proto::read_i16(&mut self.reader)?,
             };
+            log::debug(&format!("waiting phone RESULT: frame {}", id));
             match id {
                 controller::RESULT => {
                     let ok = proto::read_bool(&mut self.reader)?;
@@ -434,6 +605,7 @@ impl Session {
                         ok,
                         message,
                         digests,
+                        cancelled: false,
                     });
                 }
                 controller::PAUSE_STATE => {
@@ -441,6 +613,31 @@ impl Session {
                     self.apply_pause_state(phone)?;
                 }
                 controller::PING => {}
+                // 304：手机在这个窗口里点取消是正常的 —— 数据可能已经收全、本端正在
+                // 算 SHA-256 / 等它的结论帧，用户完全可能这时候按取消。以前这里把它当
+                // 「帧序错位」直接断开整条会话（实测日志：unexpected control frame 25
+                // while waiting for RESULT），取消又变成断线。现在置取消标志，
+                // 由调用方走「取消后重建通道」的收尾。
+                controller::CANCEL => {
+                    log::warn(crate::i18n::tr(
+                        "手机端取消了传输",
+                        "the phone cancelled the transfer",
+                    ));
+                    crate::control::cancel();
+                    return Ok(PeerResult::cancelled());
+                }
+                // 收尾 / 算校验这两分钟里手机界面照样会翻目录、问待推送文件，而且它
+                // 是在自己的锁里等应答：必须当场回，否则它卡住、重建也跟着停摆。
+                controller::LIST_FILES => self.handle_list_files()?,
+                controller::DELETE_FILE => self.handle_delete()?,
+                controller::MKDIR => self.handle_mkdir()?,
+                controller::CHECK_PENDING => self.handle_check_pending()?,
+                controller::SHUTDOWN => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "phone shut the session down",
+                    ))
+                }
                 other => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -527,6 +724,20 @@ impl Session {
             return Ok(());
         }
         let id = proto::read_i16(&mut self.reader)?;
+        let result = self.handle_control_frame(id);
+        let _ = self
+            .reader
+            .set_read_timeout(Some(Duration::from_secs(120)));
+        result?;
+        Ok(())
+    }
+
+    /// 传输 / 重建期间收到一帧控制指令。
+    ///
+    /// 能当场处理的必须当场处理：手机界面在传输和重建期间照样会发
+    /// LIST_FILES / CHECK_PENDING，并且在它自己的锁里等应答 —— 推迟处理就会把
+    /// 手机端那个调用堵死，连带把暂停同步和写侧一起堵住（实测卡 100 秒）。
+    fn handle_control_frame(&mut self, id: i16) -> io::Result<()> {
         match id {
             controller::PING => {}
             controller::CHECK_PENDING => self.handle_check_pending()?,
@@ -550,12 +761,19 @@ impl Session {
                 // 载荷由收尾时的 read_result() 接着读，不能当成不相干的指令丢掉
                 self.pending_opcode = Some(controller::RESULT);
             }
-            // 手机界面在传输期间也会翻目录/改文件，这些同步命令必须当场应答：
-            // 推迟到传输结束的话，手机端那个调用会一直阻塞在 controlLock 上
-            // （实测会卡住 100 秒，并连带把暂停同步和写侧全堵死）。
+            // 手机界面在传输期间也会翻目录/改文件，这些同步命令必须当场应答
             controller::LIST_FILES => self.handle_list_files()?,
             controller::DELETE_FILE => self.handle_delete()?,
             controller::MKDIR => self.handle_mkdir()?,
+            // 手机端正常断开前会先发一帧 SHUTDOWN：留成 pending 会让轮询永久
+            // 「有货待处理」而不再读通道，连 EOF 都发现不了，等待循环就永远转下去
+            // （实测卡死 3 分钟以上，传输线程也醒不过来）。直接当断线报上去。
+            controller::SHUTDOWN => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "phone shut the session down",
+                ))
+            }
             other => {
                 // 传输期间正常不会出现别的指令；先记下来，传输结束后处理
                 log::warn(&format!(
@@ -566,9 +784,6 @@ impl Session {
                 self.pending_opcode = Some(other);
             }
         }
-        let _ = self
-            .reader
-            .set_read_timeout(Some(Duration::from_secs(120)));
         Ok(())
     }
 
@@ -677,6 +892,8 @@ impl Session {
 
         let mut hard_error: Option<String> = None;
         // 等各通道结束的同时继续服务控制通道：暂停同步不能等整个传输结束
+        let channel_count = handles.len();
+        let mut peer_closed = 0usize;
         let mut finished = vec![false; handles.len()];
         let mut remaining = handles.len();
         while remaining > 0 {
@@ -714,6 +931,7 @@ impl Session {
                         || e.kind() == io::ErrorKind::Interrupted
                         || is_disconnect(&e)
                     {
+                        peer_closed += 1;
                         log::debug(&format!("{}: cancelled ({})", name, e));
                     } else {
                         log::error(&format!("{}: {}", name, e));
@@ -749,12 +967,19 @@ impl Session {
             reset_send_segments();
         }
 
-        if crate::control::cancelled() {
-            // 取消后控制通道通常也断了：别再去读结论帧，直接当成一次干净的中止
+        // 304：取消标记可能还差几毫秒才到（手机先写 CANCEL 再关传输通道，
+        // 两个 socket 之间没有先后保证），收尾前再等一会儿，别把取消当断线。
+        self.grace_poll_cancel(600);
+        // 手机端取消只关传输通道：所有通道都是被对端关掉 / 中断退出，也算取消，
+        // 哪怕 CANCEL 帧丢了（它先写 CANCEL 再关通道，两个 socket 没有先后保证）。
+        let peer_went_away = hard_error.is_none() && peer_closed > 0 && peer_closed >= channel_count;
+        if crate::control::cancelled() || peer_went_away {
+            // 别再去读结论帧：手机端这次传输也作废了，不会写。
+            // 304：它只关了传输通道、控制通道留着，正等着我们把通道连回去。
             log::warn(crate::i18n::tr("发送已取消", "the transfer was cancelled"));
             crate::receiver::PROGRESS.reset();
             reset_send_segments();
-            return Ok(());
+            return self.finish_cancelled();
         }
 
         // 303：本端是发送方，先把自己发出去的文件算一遍指纹（和手机端算它落盘
@@ -766,6 +991,16 @@ impl Session {
         };
         let mut verify_error: Option<String> = None;
         match self.read_result() {
+            // 304：手机在等结论的窗口里取消（数据已经发完）—— 重建通道，会话不断
+            Ok(peer) if peer.cancelled => {
+                log::warn(crate::i18n::tr(
+                    "发送已取消",
+                    "the transfer was cancelled",
+                ));
+                crate::receiver::PROGRESS.reset();
+                reset_send_segments();
+                return self.finish_cancelled();
+            }
             Ok(peer) => {
                 if let Some(message) = peer.message.clone().filter(|_| !peer.ok) {
                     log::error(&format!(
@@ -825,6 +1060,8 @@ impl Session {
             ));
         }
         log::info(crate::i18n::tr("手机开始发送文件", "the phone is sending files"));
+        // 本次接收从头计数：上一次传过的字节/文件不能算进来（否则收尾日志会写「4 个文件 5.48 GB」）
+        receiver.reset_session_counters();
         // 接收方向没有发送计划：清掉上一次的发送分段，界面改按"谁写了第几块"还原
         reset_send_segments();
         // 每次接收都要重置进度：不清的话上一条会话里传过的文件还留在 files 表里，
@@ -854,6 +1091,7 @@ impl Session {
         let mut hard_error: Option<String> = None;
         let mut aborts: Vec<String> = Vec::new();
         // 等各通道结束的同时继续服务控制通道：手机端的暂停同步不能等整个传输结束
+        let channel_count = handles.len();
         let mut finished = vec![false; handles.len()];
         let mut remaining = handles.len();
         while remaining > 0 {
@@ -917,6 +1155,14 @@ impl Session {
         }
         monitor_stop.store(true, Ordering::Relaxed);
         let _ = monitor.join();
+        // 304：传输线程退出了，但手机的 CANCEL 可能还在路上，先等一小会儿再判"是不是取消"
+        if !aborts.is_empty() && !crate::control::cancelled() {
+            self.grace_poll_cancel(600);
+        }
+        // 手机端"取消"只会关传输通道：所有通道都是被对端关掉退出（不是本地磁盘错），
+        // 那就一定是取消 —— 哪怕 CANCEL 帧丢了（手机暂停时我们读不到控制通道，
+        // 它发完 CANCEL 就关通道也是可能的）。真断线的话下面重建会失败，照样重连。
+        let peer_went_away = !aborts.is_empty() && aborts.len() >= channel_count;
 
         let bytes = receiver.bytes();
         let files = receiver.file_count();
@@ -925,6 +1171,16 @@ impl Session {
         let complete = hard_error.is_none() && aborts.is_empty();
         // 303：先把落盘文件列表记下来，finish_with() 会把条目清空
         let received = receiver.received_files();
+        // 收尾阶段的可观测性：收尾时两边都在等对方，卡住时日志必须能指出卡在哪一步
+        // （实测出现过「PC 界面已显示 800.0 MB 收满、手机停在等待校验」的僵持，日志里却什么都没有）
+        log::info(&format!(
+            "{} ({} {} / {} {})",
+            crate::i18n::tr("收尾：数据收齐，开始落盘收尾", "finalising transfer"),
+            files,
+            crate::i18n::tr("个文件", "file(s)"),
+            crate::receiver::human_bytes(bytes),
+            ""
+        ));
         match receiver.finish_with(complete) {
             Ok((removed, lost)) if removed > 0 => log::warn(&format!(
                 "{} {} · {}",
@@ -938,20 +1194,30 @@ impl Session {
 
         // 303：整文件 SHA-256 复算（本端是接收方，算自己落盘的文件）。
         // 和手机端算它发出去的文件同时进行，收尾只多这一遍读盘。
+        log::info(&format!(
+            "{} ({} {})",
+            crate::i18n::tr("收尾：开始计算 SHA-256", "hashing received files"),
+            received.len(),
+            crate::i18n::tr("个文件", "file(s)")
+        ));
         let digests = if complete {
             digest_files(&received)
         } else {
             Vec::new()
         };
+        log::info(crate::i18n::tr("收尾：SHA-256 计算完成", "hashing done"));
 
-        if hard_error.is_none() && !aborts.is_empty() && crate::control::cancelled() {
-            // 手机端点了取消：没有错，只是这次传输作废（半截文件上一步已经删掉）。
-            // 控制通道多半也跟着关了，别再往里写结论帧。
+        if hard_error.is_none() && !aborts.is_empty() && (crate::control::cancelled() || peer_went_away)
+        {
+            // 取消：没有错，只是这次传输作废（半截文件上一步已经删掉）。
+            // 不写结论帧（手机端不会读），304：把传输通道重建回来，会话不断。
             log::warn(crate::i18n::tr(
                 "接收已取消",
                 "the transfer was cancelled",
             ));
-            return Ok(());
+            crate::receiver::PROGRESS.reset();
+            reset_send_segments();
+            return self.finish_cancelled();
         }
 
         if let Some(error) = hard_error {
@@ -967,8 +1233,31 @@ impl Session {
 
         // 与手机端 sendFiles 对齐：电脑先报"落盘结论 + 文件指纹"，再读手机"读文件结论"。
         // 传输期间手机端的 PAUSE_STATE 还在飞，read_result 会就地处理掉。
+        log::info(crate::i18n::tr(
+            "收尾：回结论帧并等手机端结论",
+            "sending RESULT and waiting for the phone's RESULT",
+        ));
         self.write_result(true, None, &digests)?;
+        log::info(crate::i18n::tr(
+            "收尾：结论帧已写出，正在等手机端",
+            "RESULT sent, waiting for the phone",
+        ));
         let peer = self.read_result()?;
+        log::info(crate::i18n::tr(
+            "收尾：收到手机端结论",
+            "got the phone's RESULT",
+        ));
+        if peer.cancelled {
+            // 304：数据已经收全（上面那帧结论也写出去了），手机却在这一步点了取消。
+            // 按「取消后重建通道」收尾，会话不断；那帧结论会被手机的重建握手丢弃。
+            log::warn(crate::i18n::tr(
+                "接收已取消",
+                "the transfer was cancelled",
+            ));
+            crate::receiver::PROGRESS.reset();
+            reset_send_segments();
+            return self.finish_cancelled();
+        }
         if let Some(message) = peer.message.clone().filter(|_| !peer.ok) {
             log::error(&format!(
                 "{}: {}",
@@ -1038,6 +1327,21 @@ pub struct PeerResult {
     pub message: Option<String>,
     /// 对端产出的文件指纹；本端是发送方时对端为空表
     pub digests: Vec<FileDigest>,
+    /// 304：还没等到结论帧，手机先取消了这次传输（等结论的窗口里点取消）。
+    /// 调用方据此走「取消后重建通道」，而不是把它当成帧序错位去断开整条会话。
+    pub cancelled: bool,
+}
+
+impl PeerResult {
+    /// 304：手机在等结论的窗口里取消了这次传输
+    fn cancelled() -> PeerResult {
+        PeerResult {
+            ok: false,
+            message: None,
+            digests: Vec::new(),
+            cancelled: true,
+        }
+    }
 }
 
 /// 算一个文件的 SHA-256 和大小（流式读，1MiB 一块，边读边算）

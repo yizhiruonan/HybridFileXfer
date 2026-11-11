@@ -53,6 +53,25 @@ public class DataByteChannel implements ByteChannel, DataInput, DataOutput {
         return null;
     }
 
+    /**
+     * 通道里已经到达、还没读走的字节数（0 表示暂时没有数据）。
+     *
+     * <p>给"先确认整帧到齐再读"的场合用：不能直接读，否则半个帧头会被吃掉，
+     * 剩下的半个字节会和下一个帧头拼成一个假 opcode，整条控制通道从此错位。
+     * 通道处于非阻塞模式时拿不到流，返回 0。
+     */
+    public int available() {
+        java.nio.channels.SocketChannel socketChannel = getSocketChannel();
+        if (socketChannel == null) {
+            return 0;
+        }
+        try {
+            return socketChannel.socket().getInputStream().available();
+        } catch (Throwable e) {
+            return 0;
+        }
+    }
+
     @Override
     public int read(ByteBuffer dst) throws IOException {
         return origin.read(dst);
@@ -89,11 +108,60 @@ public class DataByteChannel implements ByteChannel, DataInput, DataOutput {
         }
     }
 
+    /**
+     * 读超时（毫秒）。小于等于 0 表示一直等（传输通道用：大块数据本来就要等）。
+     *
+     * <p>控制通道设一个上限：以前这里是无上限的阻塞读，只要有一个帧对不上
+     * （比如把残留的 PAUSE_REPLY 当成目录列表的长度），读线程就会永久卡住 ——
+     * 它往往还握着 controlLock，会话线程连心跳都发不出去，电脑端 100 秒后就判超时断线。
+     * 实测：一次正常传输收尾后界面刷新目录，就这么把整条会话拖死了。
+     */
+    private volatile int readTimeoutMs = 0;
+
+    public void setReadTimeout(int timeoutMs) {
+        this.readTimeoutMs = timeoutMs;
+    }
+
     public void readFully(ByteBuffer dst) throws IOException {
+        int timeout = readTimeoutMs;
+        java.nio.channels.SocketChannel socketChannel =
+                timeout > 0 ? getSocketChannel() : null;
+        if (socketChannel == null) {
+            synchronized (readLock) {
+                while (dst.hasRemaining()) {
+                    if (origin.read(dst) == -1) {
+                        throw new EOFException();
+                    }
+                }
+            }
+            return;
+        }
         synchronized (readLock) {
-            while (dst.hasRemaining()) {
-                if (origin.read(dst) == -1) {
-                    throw new EOFException();
+            long deadline = System.currentTimeMillis() + timeout;
+            socketChannel.configureBlocking(false);
+            try {
+                while (dst.hasRemaining()) {
+                    int read = socketChannel.read(dst);
+                    if (read < 0) {
+                        throw new EOFException();
+                    }
+                    if (read == 0) {
+                        if (System.currentTimeMillis() >= deadline) {
+                            throw new java.net.SocketTimeoutException(
+                                    "control channel read timed out after " + timeout + "ms");
+                        }
+                        try {
+                            Thread.sleep(5);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            throw new IOException("interrupted while reading control frame", e);
+                        }
+                    }
+                }
+            } finally {
+                try {
+                    socketChannel.configureBlocking(true);
+                } catch (IOException ignored) {
                 }
             }
         }

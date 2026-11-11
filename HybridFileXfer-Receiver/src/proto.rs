@@ -17,7 +17,12 @@ pub const CLIENT_HEADER: &[u8; 4] = b"HFXC";
 /// 302 → 303：完整性校验。
 ///  - 每个文件块头多一个 i32 CRC32（发送端随路算、接收端写盘前校验，坏块立刻报错）；
 ///  - 结论帧 RESULT 多一段「文件指纹清单」，收尾时双方各自复算整文件 SHA-256 比对。
-pub const VERSION_CODE: i32 = 303;
+///
+/// 303 → 304：取消不断连。
+///  - CANCEL 的语义变了：手机发完 CANCEL 只关传输通道，控制通道保持打开
+///    （以前连控制通道一起关，于是取消 = 整条会话拆除，两端都要重连）；
+///  - 新增 REBUILD_REQ / REBUILD_ACK：电脑收尾完把传输通道重新连一批回来，会话不断。
+pub const VERSION_CODE: i32 = 304;
 
 pub const BLOCK_SIZE: u64 = 1024 * 1024;
 
@@ -52,6 +57,15 @@ pub const PAUSE_REPLY: i16 = 24;
 ///
 /// 现在取消先发这一帧（不带载荷），电脑端就地置取消标志，各通道干净退出。
 pub const CANCEL: i16 = 25;
+    /// 304：取消后重建传输通道。手机发完 CANCEL 只关传输通道、保留控制通道，
+    /// 电脑收尾完再连一批新的传输通道回来，会话不断。
+    ///
+    /// 两个方向都带 opcode 分帧，不能用裸 bool —— 手机端随时可能在飞 PAUSE_STATE，
+    /// 裸 bool 会和它的帧头撞车，帧流一错位整条会话就报废：
+    ///   电脑 → 手机：{i16 REBUILD_REQ}{UTF 通道名}
+    ///   手机 → 电脑：{i16 REBUILD_ACK}{bool 是否接受}
+    pub const REBUILD_REQ: i16 = 26;
+    pub const REBUILD_ACK: i16 = 27;
 }
 
 pub mod transfer {

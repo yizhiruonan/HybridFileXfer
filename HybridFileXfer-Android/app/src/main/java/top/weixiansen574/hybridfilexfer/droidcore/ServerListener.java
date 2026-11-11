@@ -61,6 +61,22 @@ public class ServerListener implements AutoCloseable {
     private final ArrayDeque<PendingControl> stashed = new ArrayDeque<>();
     private final ByteBuffer headerBuffer = ByteBuffer.allocate(4);
 
+    /**
+     * 304：取消后重建时，已经接入但还没被会话领走的传输通道。
+     *
+     * <p>以前空闲时收到"安静"连接（没先说协议头）一律当成上一轮的残留关掉。
+     * 那个假设在重建时不成立：电脑收到 CANCEL 之后会立刻连一批新的传输通道过来，
+     * 而这时手机这边还在等 CANCEL 的收尾，accept 线程照旧把它们关掉的话，
+     * 重建就永远等不到通道（每一条都要等满超时才放弃）。
+     *
+     * <p>所以挂上"有人在等传输通道"的号之后，安静连接先留着等人来领；
+     * 号撤销时（重建结束/超时）统一关掉。
+     */
+    private final ArrayDeque<SocketChannel> spareTransfers = new ArrayDeque<>();
+    /** 当前有多少条传输通道被等着的会话预定了（>0 时安静连接不再丢弃） */
+    private int transfersWanted = 0;
+    private static final int MAX_SPARE = 16;
+
     public ServerListener(ServerSocketChannel shared) {
         this.shared = shared;
     }
@@ -84,9 +100,65 @@ public class ServerListener implements AutoCloseable {
             if (kind == KIND_CONTROL) {
                 return new PendingControl(socket, takeHeader());
             }
+            // 304：有会话在等重建的传输通道时，安静连接先存着，别当成残留关掉
+            if (kind == KIND_TRANSFER && stashTransfer(socket)) {
+                continue;
+            }
             closeQuietly(socket);
         }
         return null;
+    }
+
+    // ------------------------------------------------------------------
+    // 304：取消后重建传输通道
+    // ------------------------------------------------------------------
+
+    /** 会话准备重建：宣布要 count 条传输通道（在通知电脑之前调用） */
+    public synchronized void wantTransfers(int count) {
+        transfersWanted = Math.max(transfersWanted, Math.max(0, count));
+    }
+
+    /** 重建结束：撤销预定，把没人领的连接关掉 */
+    public synchronized void endWantTransfers() {
+        transfersWanted = 0;
+        SocketChannel socket;
+        while ((socket = spareTransfers.pollFirst()) != null) {
+            closeQuietly(socket);
+        }
+    }
+
+    /**
+     * 会话线程取一条已经接入的传输通道；超时返回 null。
+     *
+     * <p>只在 accept 线程里 accept/分类，所以这里只能等 accept 线程把连接放进队列。
+     * 等待期间不持有 this 的锁 —— 持有的话 accept 线程就进不来，连接永远进不了队列。
+     */
+    public SocketChannel takeTransferChannel(long timeoutMs) {
+        long deadline = System.currentTimeMillis() + Math.max(0, timeoutMs);
+        do {
+            synchronized (this) {
+                SocketChannel socket = spareTransfers.pollFirst();
+                if (socket != null) {
+                    return socket;
+                }
+            }
+            try {
+                Thread.sleep(20);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return null;
+            }
+        } while (System.currentTimeMillis() < deadline);
+        return null;
+    }
+
+    /** accept 线程：把一条安静的连接存进待领队列（没有预定或队列满时返回 false） */
+    private synchronized boolean stashTransfer(SocketChannel socket) {
+        if (transfersWanted <= 0 || spareTransfers.size() >= MAX_SPARE) {
+            return false;
+        }
+        spareTransfers.addLast(socket);
+        return true;
     }
 
     /**
@@ -124,6 +196,13 @@ public class ServerListener implements AutoCloseable {
         PendingControl pending;
         while ((pending = stashed.pollFirst()) != null) {
             closeQuietly(pending.socket);
+        }
+        synchronized (this) {
+            transfersWanted = 0;
+            SocketChannel socket;
+            while ((socket = spareTransfers.pollFirst()) != null) {
+                closeQuietly(socket);
+            }
         }
     }
 

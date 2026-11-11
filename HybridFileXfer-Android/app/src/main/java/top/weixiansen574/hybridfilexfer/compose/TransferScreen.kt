@@ -134,6 +134,11 @@ internal fun TransferScreen(
     // 每条通道的累计已传字节。注意 onSpeedInfo 给的是"这一秒的流量"（resetCurrentTrafficInfo 会清零），
     // 不能直接当成已传总量 —— 否则进度条每秒钟都被重置回零点几百分比，看着就是不涨。
     val xferPopupCumulative = remember { HashMap<String, Long>() }
+    // 304：数据发完之后电脑要算整文件 SHA-256（800MB 实测 1~2 分钟）。这段时间界面必须有个说法，
+    // 否则就是"791.0 MB / 800.0 MB · 0 KB/s"一动不动，用户以为是卡死（实测被当成 bug 报上来）。
+    var xferPopupWaiting by remember { mutableStateOf(false) }
+    /** 已经发完的通道名（onChannelComplete 回调），用来判断"数据阶段结束" */
+    val xferPopupDoneNames = remember { HashSet<String>() }
 
     // 返回键：先关弹窗/菜单 → 取消焦点窗口的多选 → 最后才退出传输页
     androidx.activity.compose.BackHandler(enabled = true) {
@@ -210,7 +215,8 @@ internal fun TransferScreen(
                     val cum = (xferPopupCumulative[key] ?: 0L) + info.uploadTraffic + info.downloadTraffic
                     xferPopupCumulative[key] = cum
                     done += cum
-                    ChannelStat(key, cum, 0, false)
+                    // 已经发完的通道显示"已完成"，而不是一直"正在发送数据…"
+                    ChannelStat(key, cum, 0, xferPopupDoneNames.contains(key))
                 }
                 if (xferPopupLastAt > 0 && now > xferPopupLastAt) {
                     val instant = delta * 1000L / (now - xferPopupLastAt)
@@ -219,17 +225,20 @@ internal fun TransferScreen(
                 }
                 xferPopupLastTraffic = done
                 xferPopupLastAt = now
+                // 数据发完之后进入"等待电脑校验"，进度条补满，别被后面 0 速率的采样打回去
+                val shown = if (xferPopupWaiting) xferPopupTotal else done
                 // 累计值以回调为准（真值），两次回调之间的推进交给下面的 100ms 插值
-                xferPopupDone = done
+                xferPopupDone = shown
                 xferPopupChannels = channels
                 GlobalTransferOverlay.reportSend(
                     UiState(
                         xferActive = true,
                         xferName = xferPopupName,
-                        xferDone = done,
+                        xferDone = shown,
                         xferTotal = xferPopupTotal,
-                        xferBytes = done,
+                        xferBytes = shown,
                         xferChannels = channels,
+                        xferNote = if (xferPopupWaiting) "等待电脑校验…" else "",
                         xferCount = 1,
                         xferLabel = server.displayName,
                         xferId = -1,
@@ -238,7 +247,22 @@ internal fun TransferScreen(
             }
         }
 
-        override fun onChannelComplete(iName: String?, traffic: Long, time: Long) {}
+        override fun onChannelComplete(iName: String?, traffic: Long, time: Long) {
+            val key = iName ?: ""
+            main.post {
+                xferPopupDoneNames.add(key)
+                if (!xferPopupWaiting && xferPopupSending) {
+                    val total = xferPopupChannels.size
+                    if (total > 0 && xferPopupDoneNames.size >= total) {
+                        // 所有通道的 EOF 都发出去了 = 数据全部写完。之后到电脑回结论帧之前
+                        // 只有电脑在算 SHA-256，界面切到"等待电脑校验…"并把进度条补满，
+                        // 否则就是"791.0 MB / 800.0 MB · 0 KB/s"一动不动（实测被当成卡死）。
+                        xferPopupWaiting = true
+                        if (xferPopupTotal > 0) xferPopupDone = xferPopupTotal
+                    }
+                }
+            }
+        }
 
         override fun onChannelError(iName: String?, errorType: Int, message: String?) {
             // 用户主动取消时通道是我们自己关掉的，收尾异常不该报成"通道错误"；
@@ -274,6 +298,7 @@ internal fun TransferScreen(
                 busy = false
                 statusText = ""
                 xferPopup = false
+                xferPopupWaiting = false
                 GlobalTransferOverlay.reportSend(null)
                 // 取消和真中断要分开显示：取消是用户自己点的，别写成"传输中断"
                 message = if (server.isTransferCancelled()) "已取消传输" else "传输中断"
@@ -300,6 +325,8 @@ internal fun TransferScreen(
         xferPopupLastTraffic = 0
         xferPopupLastAt = 0
         xferPopupCumulative.clear()
+        xferPopupWaiting = false
+        xferPopupDoneNames.clear()
         xferPopup = true
         scope.launch(Dispatchers.IO) {
             try {
@@ -310,7 +337,11 @@ internal fun TransferScreen(
                 } else {
                     server.sendFilesToShelf(files, localDir, remoteDir, callback(false))
                 }
-                if (move) {
+                // 取消时 sendFilesToRemote/Shelf 是正常返回的，靠这个标志区分
+                val cancelled = server.isTransferCancelled()
+                // 取消的这次传输不能删源文件：不判这一下，"移动"就会在传了一半的情况下
+                // 把源文件删掉
+                if (move && !cancelled) {
                     files.forEach { file ->
                         if (fromLeft) server.deleteLocalFile(file.path) else server.deleteRemoteFile(file.path)
                     }
@@ -321,13 +352,19 @@ internal fun TransferScreen(
                 main.post {
                     busy = false
                     statusText = ""
-                    if (xferPopupTotal > 0) xferPopupDone = xferPopupTotal
+                    if (!cancelled && xferPopupTotal > 0) xferPopupDone = xferPopupTotal
                 }
                 kotlinx.coroutines.delay(600)
                 main.post {
                     xferPopup = false
                     GlobalTransferOverlay.reportSend(null)
-                    message = if (move) "移动完成" else "复制完成"
+                    // 用户取消后这里以前无条件写"复制完成"，界面就弹「复制完成」——
+                    // 实际文件只传了一半，用户还以为是电脑端的问题。
+                    message = when {
+                        cancelled -> "已取消传输"
+                        move -> "移动完成"
+                        else -> "复制完成"
+                    }
                     refreshTick++
                 }
             } catch (e: Throwable) {
@@ -618,6 +655,8 @@ internal fun TransferScreen(
                 xferSegments = popupSegments,
                 xferChannels = xferPopupChannels,
                 xferPaused = xferPopupPaused,
+                // 数据已发完、电脑在算 SHA-256：显示"等待电脑校验…"，别让它看着像卡死
+                xferNote = if (xferPopupWaiting) "等待电脑校验…" else "",
                 xferCount = 1,
                 xferLabel = server.displayName,
                 xferId = -1,
