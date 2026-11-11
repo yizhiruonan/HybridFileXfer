@@ -817,6 +817,65 @@ public abstract class HFXService {
     }
 
     /**
+     * 305：解析"不带 opcode 的应答"之前，先把混在应答前面的控制帧吃掉。
+     *
+     * <p>典型场景：电脑刚在收尾/重建（它的事件循环可能卡在 connect 上几秒），
+     * 它对我们早先那帧 PAUSE_STATE 的 PAUSE_REPLY 会晚到 —— 正好落在"发了 LIST_FILES、
+     * 还没读到应答"之间。应答本身不带 opcode，直接 readInt 就把 PAUSE_REPLY 的两个字节
+     * 当成数量，帧流一错位，界面线程就卡在 readUTF 上、还握着 controlLock。
+     *
+     * <p>做法：非阻塞试探两个字节，是已知帧头就吃掉（该读载荷的读掉），不是就退回
+     * {@link DataByteChannel} 的退字缓冲，交给调用方按应答解析。
+     *
+     * <p>调用方必须已经持有 {@link #controlLock}。
+     */
+    protected void skipStaleFramesBeforeReply() {
+        if (ctChannel == null) {
+            return;
+        }
+        try {
+            while (true) {
+                int have = ctChannel.pollPushback(2, 150);
+                if (have < 2) {
+                    // 没有帧头，或者只有 1 个字节（DELETE_FILE / MKDIR 的 bool 应答）
+                    return;
+                }
+                int hi = ctChannel.peekPushback(0) & 0xFF;
+                int lo = ctChannel.peekPushback(1) & 0xFF;
+                short opcode = (short) ((hi << 8) | lo);
+                switch (opcode) {
+                    case ControllerIdentifiers.PAUSE_REPLY:
+                        ctChannel.consumePushback(2);
+                        applyPcPause(ctChannel.readBoolean());
+                        break;
+                    case ControllerIdentifiers.PING:
+                        ctChannel.consumePushback(2);
+                        break;
+                    case ControllerIdentifiers.RESULT:
+                        ctChannel.consumePushback(2);
+                        discardResultPayload(ctChannel);
+                        break;
+                    case ControllerIdentifiers.REBUILD_REQ:
+                        ctChannel.consumePushback(2);
+                        stashRebuildName(ctChannel.readUTF());
+                        needsRebuild = true;
+                        break;
+                    case ControllerIdentifiers.CANCEL:
+                        ctChannel.consumePushback(2);
+                        transferCancelled = true;
+                        needsRebuild = true;
+                        break;
+                    default:
+                        // 这就是应答的开头：留着让调用方读
+                        return;
+                }
+            }
+        } catch (Throwable e) {
+            // 探不动就按原路径继续（下面的读会带着超时报错）
+        }
+    }
+
+    /**
      * 304：读掉一帧 RESULT 的载荷（这次传输已经作废，只求帧流不错位）。
      *
      * <p>格式与 {@link #writeResultFrame} 一致：

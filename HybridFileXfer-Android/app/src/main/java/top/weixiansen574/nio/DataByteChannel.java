@@ -122,12 +122,95 @@ public class DataByteChannel implements ByteChannel, DataInput, DataOutput {
         this.readTimeoutMs = timeoutMs;
     }
 
+    /**
+     * 应答解析前的"退字"缓冲。
+     *
+     * <p>控制通道的应答大多不带 opcode（例如目录列表直接就是 {i32 数量}）。要判断
+     * "这两个字节到底是应答，还是混在前面的 PAUSE_REPLY 帧头"，只能先试探读、不是帧
+     * 再退回来 —— 没有这个缓冲，退回去的字节就丢了，帧流立刻错位。
+     */
+    private final byte[] pushback = new byte[8];
+    private int pushbackLen;
+
+    /** 非阻塞地往退字缓冲里补最多 max 个字节；返回缓冲里现有的字节数 */
+    public int pollPushback(int max, long timeoutMs) throws IOException {
+        synchronized (readLock) {
+            java.nio.channels.SocketChannel socketChannel = getSocketChannel();
+            if (socketChannel == null) {
+                return pushbackLen;
+            }
+            long deadline = System.currentTimeMillis() + Math.max(0, timeoutMs);
+            socketChannel.configureBlocking(false);
+            try {
+                while (pushbackLen < max && pushbackLen < pushback.length) {
+                    int read = socketChannel.read(ByteBuffer.wrap(pushback, pushbackLen, pushback.length - pushbackLen));
+                    if (read < 0) {
+                        throw new EOFException();
+                    }
+                    if (read > 0) {
+                        pushbackLen += read;
+                    } else {
+                        if (System.currentTimeMillis() >= deadline) {
+                            break;
+                        }
+                        try {
+                            Thread.sleep(5);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            throw new IOException("interrupted while peeking control frame", e);
+                        }
+                    }
+                }
+            } finally {
+                try {
+                    socketChannel.configureBlocking(true);
+                } catch (IOException ignored) {
+                }
+            }
+            return pushbackLen;
+        }
+    }
+
+    /** 看退字缓冲里第 index 个字节（越界返回 0） */
+    public byte peekPushback(int index) {
+        synchronized (readLock) {
+            return index >= 0 && index < pushbackLen ? pushback[index] : 0;
+        }
+    }
+
+    public int pushbackCount() {
+        synchronized (readLock) {
+            return pushbackLen;
+        }
+    }
+
+    /** 从退字缓冲里消耗 count 个字节 */
+    public void consumePushback(int count) {
+        synchronized (readLock) {
+            int n = Math.max(0, Math.min(count, pushbackLen));
+            System.arraycopy(pushback, n, pushback, 0, pushbackLen - n);
+            pushbackLen -= n;
+        }
+    }
+
+    /** 先把退字缓冲里的字节喂给 dst（调用方必须持有 readLock） */
+    private void drainPushbackLocked(ByteBuffer dst) {
+        if (pushbackLen <= 0) {
+            return;
+        }
+        int n = Math.min(pushbackLen, dst.remaining());
+        dst.put(pushback, 0, n);
+        System.arraycopy(pushback, n, pushback, 0, pushbackLen - n);
+        pushbackLen -= n;
+    }
+
     public void readFully(ByteBuffer dst) throws IOException {
         int timeout = readTimeoutMs;
         java.nio.channels.SocketChannel socketChannel =
                 timeout > 0 ? getSocketChannel() : null;
         if (socketChannel == null) {
             synchronized (readLock) {
+                drainPushbackLocked(dst);
                 while (dst.hasRemaining()) {
                     if (origin.read(dst) == -1) {
                         throw new EOFException();
@@ -137,6 +220,10 @@ public class DataByteChannel implements ByteChannel, DataInput, DataOutput {
             return;
         }
         synchronized (readLock) {
+            drainPushbackLocked(dst);
+            if (!dst.hasRemaining()) {
+                return;
+            }
             long deadline = System.currentTimeMillis() + timeout;
             socketChannel.configureBlocking(false);
             try {

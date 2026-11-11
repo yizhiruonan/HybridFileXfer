@@ -398,6 +398,7 @@ public class HFXServer extends HFXService {
             // 上一轮传输留下的 PAUSE_REPLY 先吃掉，别把它当成"待推送文件数量"
             drainStaleControlFrames();
             ctChannel.writeShort(ControllerIdentifiers.CHECK_PENDING);
+            skipStaleFramesBeforeReply();
             int count = ctChannel.readInt();
             List<RemoteFile> files = new ArrayList<>();
             for (int i = 0; i < count; i++) {
@@ -985,6 +986,8 @@ public class HFXServer extends HFXService {
     private List<RemoteFile> doListClientFiles(String path) throws IOException {
         ctChannel.writeShort(ControllerIdentifiers.LIST_FILES);
         ctChannel.writeUTF(path);
+        // 应答不带 opcode：先把可能混在前面的 PAUSE_REPLY 之类吃掉，别把它当成列表长度
+        skipStaleFramesBeforeReply();
         int listSize = ctChannel.readInt();
         if (listSize == -1) {
             return null;
@@ -1011,6 +1014,7 @@ public class HFXServer extends HFXService {
             drainStaleControlFrames();
             ctChannel.writeShort(ControllerIdentifiers.DELETE_FILE);
             ctChannel.writeUTF(file);
+            skipStaleFramesBeforeReply();
             return ctChannel.readBoolean();
         }
     }
@@ -1021,6 +1025,7 @@ public class HFXServer extends HFXService {
             ctChannel.writeShort(ControllerIdentifiers.MKDIR);
             ctChannel.writeUTF(parent);
             ctChannel.writeUTF(child);
+            skipStaleFramesBeforeReply();
             return ctChannel.readBoolean();
         }
     }
