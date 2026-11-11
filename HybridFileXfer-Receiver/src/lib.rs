@@ -8,6 +8,7 @@ pub mod control;
 pub mod discovery;
 pub mod engine;
 pub mod i18n;
+pub mod journal;
 pub mod log;
 pub mod proto;
 pub mod receiver;

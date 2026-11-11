@@ -1030,7 +1030,7 @@ public class HFXServer extends HFXService {
     }
 
     @Override
-    protected ReadFileCall createReadFileCall(LinkedBlockingDeque<ByteBuffer> buffers, List<RemoteFile> files, Directory localDir, Directory remoteDir, int operateThreadCount) {
-        return new DroidReadFileCall(ioService,buffers,files,localDir,remoteDir,operateThreadCount);
+    protected ReadFileCall createReadFileCall(LinkedBlockingDeque<ByteBuffer> buffers, List<RemoteFile> files, Directory localDir, Directory remoteDir, int operateThreadCount, String[] channelNames) {
+        return new DroidReadFileCall(ioService,buffers,files,localDir,remoteDir,operateThreadCount, channelNames);
     }
 }

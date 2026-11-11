@@ -11,13 +11,17 @@ public class SendFileCall implements Callable<Void> {
     private final TransferConnection connection;
     private final TransferFileCallback callback;
     private final TransferPause pause;
+    /** 这条通道在分段计划里的序号（自己只领自己那段的块） */
+    private final int channelIndex;
 
-    public SendFileCall(ReadFileCall readFileCall, TransferConnection connection, TransferFileCallback callback, TransferPause pause) {
+    public SendFileCall(ReadFileCall readFileCall, TransferConnection connection,
+                        TransferFileCallback callback, TransferPause pause, int channelIndex) {
         this.readFileCall = readFileCall;
         this.connection = connection;
         this.channel = connection.channel;
         this.callback = callback;
         this.pause = pause;
+        this.channelIndex = channelIndex;
         connection.resetTotalTrafficInfo();
     }
 
@@ -30,8 +34,29 @@ public class SendFileCall implements Callable<Void> {
                 if (pause != null) {
                     pause.awaitResume();
                 }
-                fileBlock = readFileCall.takeBlock();
-                if (fileBlock != null && fileBlock.isFile && fileBlock.data != null) {
+                // 只领自己那一段的块；没有就看看能不能把别人没产出的段切一半过来。
+                // 都干完了（读文件线程也结束了）就发 EOF 收工 —— 空闲通道必须收工，
+                // 否则电脑端会一直等这条通道的 EOF，整个传输收不了尾。
+                FileBlock block = readFileCall.pollOwnBlock(channelIndex, 5);
+                if (block == null) {
+                    block = readFileCall.pollSpecialBlock();
+                }
+                if (block == null) {
+                    if (readFileCall.trySteal(channelIndex)) {
+                        continue;
+                    }
+                    if (readFileCall.isReaderFinished()) {
+                        channel.writeShort(TransferIdentifiers.EOF);
+                        callback.onChannelComplete(connection.iName,
+                                connection.getTotalTraffic().uploadTraffic,
+                                System.currentTimeMillis() - startTime);
+                        break;
+                    }
+                    Thread.sleep(2);
+                    continue;
+                }
+                fileBlock = block;
+                if (fileBlock.isFile && fileBlock.data != null) {
                     SpeedLimiter.throttle(fileBlock.data.capacity());
                 }
                 //-1为特殊块

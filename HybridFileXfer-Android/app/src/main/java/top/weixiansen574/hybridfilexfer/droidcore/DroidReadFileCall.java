@@ -25,6 +25,14 @@ public class DroidReadFileCall extends ReadFileCall {
         this.ioService = ioService;
     }
 
+    /** 305：带通道名（发送方向按分段计划投递块，进度条用它画动态切割线） */
+    public DroidReadFileCall(IIOService ioService, LinkedBlockingDeque<ByteBuffer> buffers,
+                             List<RemoteFile> files, Directory localDir, Directory remoteDir,
+                             int operateThreadCount, String[] channelNames) {
+        super(buffers, files, localDir, remoteDir, operateThreadCount, channelNames);
+        this.ioService = ioService;
+    }
+
     @Override
     protected boolean fileExists(String path) throws Exception {
         return ioService.fileExists(path);

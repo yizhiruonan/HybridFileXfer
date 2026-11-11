@@ -1052,6 +1052,61 @@ impl Session {
         Ok(())
     }
 
+    /// 305：读手机的续传查询，回每个文件"已经收到哪些块"的位图。
+    ///
+    /// 帧格式见 {@link proto::controller::RESUME_QUERY} / {@link proto::controller::RESUME_REPLY}。
+    /// 手机端在 `REQUEST_RECEIVE` 之后立刻发这一帧，所以这里可以同步读。
+    fn handle_resume_query(&mut self, receiver: &Arc<Receiver>) -> io::Result<()> {
+        let id = proto::read_i16(&mut self.reader)?;
+        if id != controller::RESUME_QUERY {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("expected RESUME_QUERY, got {}", id),
+            ));
+        }
+        let count = proto::read_i32(&mut self.reader)?.max(0) as usize;
+        let mut entries: Vec<(String, u64, i64)> = Vec::with_capacity(count.min(4096));
+        for _ in 0..count {
+            let path = proto::read_utf(&mut self.reader)?;
+            let size = proto::read_i64(&mut self.reader)?.max(0) as u64;
+            let mtime = proto::read_i64(&mut self.reader)?;
+            entries.push((path, size, mtime));
+        }
+        proto::write_i16(&mut self.writer, controller::RESUME_REPLY)?;
+        proto::write_i32(&mut self.writer, entries.len() as i32)?;
+        let mut resumed = 0usize;
+        for (path, size, mtime) in &entries {
+            match receiver.resume_bitmap(path, *size, *mtime) {
+                Some(bitmap) => {
+                    resumed += 1;
+                    let done = bitmap.iter().map(|b| b.count_ones() as u64).sum::<u64>();
+                    log::info(&format!(
+                        "{} {} ({} {})",
+                        crate::i18n::tr("续传：已有块", "resume: blocks already on disk"),
+                        done,
+                        crate::receiver::human_bytes(*size),
+                        path
+                    ));
+                    proto::write_bool(&mut self.writer, true)?;
+                    proto::write_i32(&mut self.writer, bitmap.len() as i32)?;
+                    self.writer.write_all(&bitmap)?;
+                }
+                None => {
+                    proto::write_bool(&mut self.writer, false)?;
+                    proto::write_i32(&mut self.writer, 0)?;
+                }
+            }
+        }
+        self.writer.flush()?;
+        log::info(&format!(
+            "{} {}/{}",
+            crate::i18n::tr("续传：可续传的文件", "resumable files"),
+            resumed,
+            entries.len()
+        ));
+        Ok(())
+    }
+
     fn handle_receive(&mut self, receiver: &Arc<Receiver>) -> io::Result<()> {
         if self.transfers.is_empty() {
             return Err(io::Error::new(
@@ -1060,6 +1115,9 @@ impl Session {
             ));
         }
         log::info(crate::i18n::tr("手机开始发送文件", "the phone is sending files"));
+        // 305：手机发完 REQUEST_RECEIVE 会立刻来一帧 RESUME_QUERY（这次要传的文件清单），
+        // 这里读它、回每个文件"已经收到哪些块"的位图，发送端据此跳过已收到的块。
+        self.handle_resume_query(receiver)?;
         // 本次接收从头计数：上一次传过的字节/文件不能算进来（否则收尾日志会写「4 个文件 5.48 GB」）
         receiver.reset_session_counters();
         // 接收方向没有发送计划：清掉上一次的发送分段，界面改按"谁写了第几块"还原
@@ -1182,11 +1240,14 @@ impl Session {
             ""
         ));
         match receiver.finish_with(complete) {
-            Ok((removed, lost)) if removed > 0 => log::warn(&format!(
+            Ok((kept, kept_bytes)) if kept > 0 => log::warn(&format!(
                 "{} {} · {}",
-                crate::i18n::tr("删除未接收完的文件", "removed incomplete files"),
-                removed,
-                crate::receiver::human_bytes(lost)
+                crate::i18n::tr(
+                    "保留未接收完的文件（可续传）",
+                    "kept incomplete files (resumable)"
+                ),
+                kept,
+                crate::receiver::human_bytes(kept_bytes)
             )),
             Ok(_) => {}
             Err(e) => log::warn(&format!("finish(): {}", e)),

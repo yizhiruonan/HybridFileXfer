@@ -93,6 +93,14 @@ public abstract class HFXService {
     protected volatile short pendingOpcode = -1;
     /** 304：在别的读循环里读到的重建请求通道名，交给 rebuildTransfers 消费 */
     private final java.util.Queue<String> pendingRebuildNames = new java.util.concurrent.ConcurrentLinkedQueue<>();
+    /** 本次发送的读文件任务：界面从它拿"当前文件被切成哪几段"画动态进度条 */
+    private volatile ReadFileCall currentReadFileCall;
+
+    /** 发送方向当前的分段（进度条切割线）；没有传输时返回空表 */
+    public java.util.List<SendRanges.Segment> currentSendSegments() {
+        ReadFileCall call = currentReadFileCall;
+        return call == null ? java.util.Collections.emptyList() : call.segments();
+    }
 
     /** 本次传输是否被用户主动取消 */
     public boolean isTransferCancelled() {
@@ -124,7 +132,14 @@ public abstract class HFXService {
         SpeedLimiter.resetWindow();
         pauseGate = new TransferPause();
         lastPcPaused = false;
-        ReadFileCall readFileCall = createReadFileCall(buffers, fileList, localDir, remoteDir, connections.size());
+        // 通道名按 connections 的顺序给"分段计划"用（进度条上的 owner 就是它）
+        String[] channelNames = new String[connections.size()];
+        for (int i = 0; i < connections.size(); i++) {
+            channelNames[i] = connections.get(i).iName;
+        }
+        ReadFileCall readFileCall = createReadFileCall(buffers, fileList, localDir, remoteDir, connections.size(), channelNames);
+        // 界面画"动态分段进度条"要读它：当前文件被切成了哪几段、每段归哪条通道
+        this.currentReadFileCall = readFileCall;
         readFileCall.setPause(pauseGate);
         FutureTask<Void> readFileTask = new FutureTask<>(readFileCall);
         Thread readThread = new Thread(readFileTask);
@@ -136,8 +151,9 @@ public abstract class HFXService {
         speedMonitorThread.start();
         long startTime = System.currentTimeMillis();
         List<FutureTask<Void>> transferTasks = new ArrayList<>(connections.size());
-        for (TransferConnection connection : connections) {
-            FutureTask<Void> task = new FutureTask<>(new SendFileCall(readFileCall, connection, callback, pauseGate));
+        for (int i = 0; i < connections.size(); i++) {
+            TransferConnection connection = connections.get(i);
+            FutureTask<Void> task = new FutureTask<>(new SendFileCall(readFileCall, connection, callback, pauseGate, i));
             transferTasks.add(task);
             Thread thread = new Thread(task);
             thread.setName("UL_" + connection.iName);
@@ -971,6 +987,6 @@ public abstract class HFXService {
 
     protected abstract WriteFileCall createWriteFileCall(LinkedBlockingDeque<ByteBuffer> buffers, int dequeCount);
 
-    protected abstract ReadFileCall createReadFileCall(LinkedBlockingDeque<ByteBuffer> buffers, List<RemoteFile> files, Directory localDir, Directory remoteDir, int operateThreadCount);
+    protected abstract ReadFileCall createReadFileCall(LinkedBlockingDeque<ByteBuffer> buffers, List<RemoteFile> files, Directory localDir, Directory remoteDir, int operateThreadCount, String[] channelNames);
 
 }

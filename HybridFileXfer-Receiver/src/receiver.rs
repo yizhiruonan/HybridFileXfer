@@ -22,6 +22,8 @@ struct FileState {
     total: u64,
     /// 已写入字节（判断收没收完）
     done: AtomicU64,
+    /// 305：断点续传日志（已经收到哪些块）。收尾时按它决定删除日志还是留着重传。
+    journal: Mutex<Option<crate::journal::ReceiveJournal>>,
 }
 
 /// 接收目录，运行时可改（手机端浏览电脑文件夹后可以切换）。
@@ -413,7 +415,7 @@ impl Receiver {
         data: &[u8],
     ) -> io::Result<()> {
         let target = self.resolve(raw_path);
-        let state = self.state_for(&target, total_size)?;
+        let state = self.state_for(&target, total_size, modified_ms)?;
         let offset = index as u64 * BLOCK_SIZE;
         let current = state.modified_ms.load(Ordering::Relaxed);
         if modified_ms > current {
@@ -432,6 +434,12 @@ impl Receiver {
         }
         self.bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
         state.done.fetch_add(data.len() as u64, Ordering::Relaxed);
+        // 305：记下这一块已经落盘（下次中断时就能从这里续上）
+        if let Ok(mut journal) = state.journal.lock() {
+            if let Some(journal) = journal.as_mut() {
+                journal.mark(index as u64);
+            }
+        }
 
         // ---- 进度上报 ----
         // 本设备的进度（设备小卡片） + 全局进度（GUI 大卡片读这一份）
@@ -448,7 +456,7 @@ impl Receiver {
         Ok(())
     }
 
-    fn state_for(&self, target: &Path, total_size: u64) -> io::Result<Arc<FileState>> {
+    fn state_for(&self, target: &Path, total_size: u64, modified_ms: i64) -> io::Result<Arc<FileState>> {
         {
             let entries = self
                 .entries
@@ -467,11 +475,15 @@ impl Receiver {
             .write(true)
             .open(target)?;
         file.set_len(total_size)?;
+        // 有匹配的续传日志就接着用（同一路径、同样大小、同样修改时间），否则新建一份
+        let journal = crate::journal::ReceiveJournal::load(target, total_size, modified_ms, BLOCK_SIZE)
+            .or_else(|| Some(crate::journal::ReceiveJournal::new(total_size, modified_ms, BLOCK_SIZE)));
         let state = Arc::new(FileState {
             file,
             modified_ms: std::sync::atomic::AtomicI64::new(0),
             total: total_size,
             done: AtomicU64::new(0),
+            journal: Mutex::new(journal),
         });
         let mut entries = self
             .entries
@@ -493,10 +505,13 @@ impl Receiver {
     }
 
     /// 收尾：恢复修改时间、放掉所有文件句柄。
-    /// `keep_incomplete == false`（传输中断/出错）时，把这次没接收完的半截文件删掉，
-    /// 免得电脑上留一堆"传了一半"的文件。返回（删掉的文件数, 丢掉的字节）。
-    pub fn finish_with(&self, keep_incomplete: bool) -> io::Result<(usize, u64)> {
-        let mut remove: Vec<(PathBuf, u64)> = Vec::new();
+    ///
+    /// 305：没传完的文件**不再删除** —— 把"已经收到哪些块"的日志写到旁边
+    /// （`<文件名>.hfxpart`），下次同一个文件（大小/修改时间一致）再传时从这里续上。
+    /// 有位图就不会出现 303 当初担心的"大小对、内容有洞"的假文件。
+    /// 返回（保留的未完成文件数, 这些文件已经收到的字节数）。
+    pub fn finish_with(&self, _keep_incomplete: bool) -> io::Result<(usize, u64)> {
+        let mut kept: Vec<(PathBuf, u64)> = Vec::new();
         {
             let mut entries = self
                 .entries
@@ -508,32 +523,55 @@ impl Receiver {
                 {
                     crate::log::debug(&format!("cannot set modification time: {}", e));
                 }
-                let total = state.total;
                 let got = state.done.load(Ordering::Relaxed);
-                if !keep_incomplete && total > 0 && got < total {
-                    remove.push((path.clone(), got));
+                let mut journal = state
+                    .journal
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                match journal.as_mut() {
+                    Some(journal) if !journal.all_done() => {
+                        if let Err(e) = journal.save(path) {
+                            crate::log::warn(&format!(
+                                "{} {}: {}",
+                                crate::i18n::tr("续传日志写入失败", "cannot write resume journal"),
+                                path.display(),
+                                e
+                            ));
+                        } else {
+                            kept.push((path.clone(), got));
+                            crate::log::warn(&format!(
+                                "{} {}",
+                                crate::i18n::tr(
+                                    "保留未接收完的文件（下次可续传）",
+                                    "kept the incomplete file so it can resume"
+                                ),
+                                path.display()
+                            ));
+                        }
+                    }
+                    // 传完了：续传日志不再需要
+                    _ => crate::journal::ReceiveJournal::remove(path),
                 }
             }
             // 句柄必须全部放掉：Windows 上还开着的文件删不掉
             let _handles: Vec<_> = entries.drain().collect();
         }
-        let mut files = 0usize;
-        let mut bytes = 0u64;
-        for (path, got) in remove {
-            match fs::remove_file(&path) {
-                Ok(_) => {
-                    files += 1;
-                    bytes += got;
-                    crate::log::warn(&format!(
-                        "{} {}",
-                        crate::i18n::tr("删除未接收完的文件", "removed incomplete file"),
-                        path.display()
-                    ));
-                }
-                Err(e) => crate::log::warn(&format!("{}: {}", path.display(), e)),
-            }
+        Ok((kept.len(), kept.iter().map(|(_, got)| *got).sum()))
+    }
+
+    /// 305：这个文件已经收到哪些块（续传用）。返回位图；None 表示不能续传（当新文件传）。
+    pub fn resume_bitmap(&self, raw_path: &str, total_size: u64, modified_ms: i64) -> Option<Vec<u8>> {
+        let target = self.resolve(raw_path);
+        let journal = crate::journal::ReceiveJournal::load(&target, total_size, modified_ms, BLOCK_SIZE)?;
+        // 日志说收到过，但文件不见了 / 大小不对：别信它，从头传
+        let metadata = fs::metadata(&target).ok()?;
+        if metadata.len() != total_size {
+            return None;
         }
-        Ok((files, bytes))
+        if journal.blocks_done() == 0 {
+            return None;
+        }
+        Some(journal.bits.clone())
     }
 }
 

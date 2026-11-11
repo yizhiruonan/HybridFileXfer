@@ -137,6 +137,8 @@ internal fun TransferScreen(
     // 304：数据发完之后电脑要算整文件 SHA-256（800MB 实测 1~2 分钟）。这段时间界面必须有个说法，
     // 否则就是"791.0 MB / 800.0 MB · 0 KB/s"一动不动，用户以为是卡死（实测被当成 bug 报上来）。
     var xferPopupWaiting by remember { mutableStateOf(false) }
+    /** 这次只传一个文件：进度条可以按 SendRanges 的真实分段画（多文件时退回等分近似） */
+    var xferPopupSingleFile by remember { mutableStateOf(false) }
     /** 已经发完的通道名（onChannelComplete 回调），用来判断"数据阶段结束" */
     val xferPopupDoneNames = remember { HashSet<String>() }
 
@@ -327,6 +329,7 @@ internal fun TransferScreen(
         xferPopupCumulative.clear()
         xferPopupWaiting = false
         xferPopupDoneNames.clear()
+        xferPopupSingleFile = files.size == 1 && !files[0].isDirectory
         xferPopup = true
         scope.launch(Dispatchers.IO) {
             try {
@@ -619,14 +622,31 @@ internal fun TransferScreen(
     }
 
     if (xferPopup) {
-        // 双窗口没有 BlockProgress 的区间信息，按通道数切出等分段落，填充跟随总进度：
-        // 视觉上和主页接收弹窗的分块进度条一致
-        val popupSegments = if (xferPopupChannels.isNotEmpty() && xferPopupTotal > 0) {
-            // 和主页一样：每一块（这里按通道分）同时增长。
-            // 每块负责总量/通道数，填充 = 该通道已收 / 它那一份
+        // 发送方向：读文件任务按 SendRanges 把文件切成"一条通道一段"的连续区间，
+        // 某条通道先干完还会把别人还没产出的那段尾巴切一半过来 —— 段数会随传输变多，
+        // 进度条上就出现新的切割线（IDM 那种效果）。这里直接画真实分段。
+        val planSegments = if (xferPopupSending && xferPopupSingleFile) server.currentSendSegments() else emptyList()
+        val popupSegments = if (planSegments.isNotEmpty() && xferPopupTotal > 0) {
+            val complete = xferPopupDone >= xferPopupTotal
+            planSegments.map { seg ->
+                // 这一段负责的字节数 = 它占的百分比 × 总量；填充 = 该通道实际发出的字节 / 这一段的份额
+                val rangeBytes = ((seg.end - seg.start) / 100f * xferPopupTotal).toLong()
+                val ownerBytes = xferPopupCumulative[seg.owner] ?: 0L
+                val filled = when {
+                    complete -> 1f
+                    rangeBytes > 0 -> (ownerBytes.toFloat() / rangeBytes).coerceIn(0f, 1f)
+                    else -> 0f
+                }
+                SegInfo(
+                    owner = seg.owner,
+                    start = seg.start.toInt(),
+                    end = seg.end.toInt().coerceAtLeast(seg.start.toInt() + 1),
+                    filled = filled,
+                )
+            }
+        } else if (xferPopupChannels.isNotEmpty() && xferPopupTotal > 0) {
+            // 多文件传输 / 接收方向：没有单文件的分段信息，退回"按通道等分"的近似画法
             val count = xferPopupChannels.size
-            // 每段宽度是全长的 1/count，所以"段内填充 = 本通道已传 / 每段应传份额"，
-            // 整条填充面积才等于 done/total（直接拿 cum/total 会把整条压小 count 倍，看着又像不涨）。
             val share = xferPopupTotal.toFloat() / count
             val complete = xferPopupDone >= xferPopupTotal
             List(count) { index ->
