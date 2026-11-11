@@ -346,9 +346,12 @@ impl Session {
         if names.is_empty() {
             return Ok(0);
         }
+        // 等手机端 ACK 的总窗口。手机那边要"等传输线程退出（最长 15s）+ 每条新通道
+        // 400ms 分类 + takeTransferChannel"，6 条要 2~12 秒；以前只给 20 秒，
+        // 实测（PC 端「中断发送」）会超时把整条会话拆掉。给到 45 秒，超时仍然按失败处理。
         let _ = self
             .reader
-            .set_read_timeout(Some(Duration::from_secs(20)));
+            .set_read_timeout(Some(Duration::from_secs(45)));
         let mut rebuilt: Vec<(String, TcpStream)> = Vec::with_capacity(names.len());
         for name in names {
             let interface = match self.interfaces.iter().find(|iface| iface.name == name) {
