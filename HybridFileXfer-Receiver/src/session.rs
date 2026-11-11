@@ -829,6 +829,34 @@ impl Session {
         Ok(())
     }
 
+    /// 306：读手机作为接收端上报的"已经收到哪些块"（电脑→手机方向的续传）
+    fn read_resume_state(&mut self) -> io::Result<HashMap<String, Vec<u8>>> {
+        let id = proto::read_i16(&mut self.reader)?;
+        if id != controller::RESUME_STATE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("expected RESUME_STATE, got {}", id),
+            ));
+        }
+        let count = proto::read_i32(&mut self.reader)?.max(0) as usize;
+        let mut map: HashMap<String, Vec<u8>> = HashMap::new();
+        for _ in 0..count {
+            let dest = proto::read_utf(&mut self.reader)?;
+            let _size = proto::read_i64(&mut self.reader)?;
+            let _mtime = proto::read_i64(&mut self.reader)?;
+            let len = proto::read_i32(&mut self.reader)?.max(0) as usize;
+            let len = len.min(4 * 1024 * 1024);
+            let mut bits = vec![0u8; len];
+            if len > 0 {
+                self.reader.read_exact(&mut bits)?;
+            }
+            if !bits.is_empty() {
+                map.insert(dest, bits);
+            }
+        }
+        Ok(map)
+    }
+
     fn handle_send(&mut self) -> io::Result<()> {
         // 手机来拉了，队列清空，避免重复推送
         let _ = crate::pending::take_for(&self.device);
@@ -840,6 +868,8 @@ impl Session {
         let phone_dir = proto::read_utf(&mut self.reader)?;
         let _phone_fs = proto::read_i32(&mut self.reader)?;
         let _pc_dir = proto::read_utf(&mut self.reader)?;
+        // 306：手机紧接着回一帧"我已经有哪些块"（电脑→手机方向的断点续传）
+        let resume = self.read_resume_state()?;
 
         if self.transfers.is_empty() {
             return Err(io::Error::new(
@@ -863,8 +893,32 @@ impl Session {
         for source in &sources {
             collect_send_tasks(Path::new(source), &base, Path::new(source), &mut tasks, &mut next_index);
         }
-        if tasks.is_empty() {
-            log::warn(crate::i18n::tr("没有可发送的文件", "nothing to send"));
+        // 收尾算 SHA-256 用：按"这次涉及的全部文件"算，不能按过滤后的任务算 ——
+        // 已经全在手机上的文件不会产生任何块任务，但它照样要参与两端比对。
+        let all_files = source_files_of(&tasks);
+        if resume.is_empty() {
+            if tasks.is_empty() {
+                log::warn(crate::i18n::tr("没有可发送的文件", "nothing to send"));
+            }
+        } else {
+            let mut skipped = 0usize;
+            tasks.retain(|task| match task {
+                SendTask::Block { dest, index, .. } => match resume.get(dest) {
+                    Some(bits) if resume_has_block(bits, *index) => {
+                        skipped += 1;
+                        false
+                    }
+                    _ => true,
+                },
+                _ => true,
+            });
+            log::info(&format!(
+                "{} {} {} {}",
+                crate::i18n::tr("续传：跳过已有块", "resume: skipping blocks already on the phone"),
+                skipped,
+                crate::i18n::tr("块，剩余待发", "block(s), tasks left:"),
+                tasks.len()
+            ));
         }
 
         // IDM 式动态分段：一开始按通道数把任务表切成连续区间（一条通道一段），
@@ -988,7 +1042,7 @@ impl Session {
         // 303：本端是发送方，先把自己发出去的文件算一遍指纹（和手机端算它落盘
         // 文件的指纹同时进行），再读手机的结论帧比对。
         let mine = if hard_error.is_none() {
-            digest_files(&source_files_of(tasks.as_slice()))
+            digest_files(&all_files)
         } else {
             Vec::new()
         };
@@ -2142,6 +2196,12 @@ fn send_channel(
     proto::write_i16(&mut stream, transfer::EOF)?;
     stream.flush()?;
     Ok(written)
+}
+
+/// 306：位图第 index 位是否为 1（那块已经在接收端了）
+fn resume_has_block(bits: &[u8], index: u32) -> bool {
+    let byte = index as usize / 8;
+    byte < bits.len() && (bits[byte] & (1u8 << (index % 8))) != 0
 }
 
 /// 发一条任务（文件夹 / 一个文件块），返回这一块写了多少字节

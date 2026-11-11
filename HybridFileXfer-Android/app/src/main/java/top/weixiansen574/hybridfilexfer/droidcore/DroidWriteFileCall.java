@@ -21,6 +21,13 @@ public class DroidWriteFileCall extends WriteFileCall {
         this.ioService = ioService;
     }
 
+    /** 306：带续传位图（接收方向要记"哪些块已经收到"） */
+    public DroidWriteFileCall(LinkedBlockingDeque<ByteBuffer> buffers, int dequeCount, IIOService ioService,
+                              java.util.Map<String, java.util.BitSet> resumeBits) {
+        super(buffers, dequeCount, resumeBits);
+        this.ioService = ioService;
+    }
+
     @Override
     protected void createParentDirIfNotExists(String path) throws Exception {
         String exception = ioService.createParentDirIfNotExists(path);

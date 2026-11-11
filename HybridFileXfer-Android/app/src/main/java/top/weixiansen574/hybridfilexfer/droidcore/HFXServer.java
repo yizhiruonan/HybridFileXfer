@@ -25,6 +25,7 @@ import top.weixiansen574.hybridfilexfer.core.ControllerIdentifiers;
 import top.weixiansen574.hybridfilexfer.core.FileBlock;
 import top.weixiansen574.hybridfilexfer.core.HFXService;
 import top.weixiansen574.hybridfilexfer.core.ReadFileCall;
+import top.weixiansen574.hybridfilexfer.core.ResumeJournal;
 import top.weixiansen574.hybridfilexfer.core.ReceiveFileCall;
 import top.weixiansen574.hybridfilexfer.core.SendFileCall;
 import top.weixiansen574.hybridfilexfer.core.SpeedMonitorThread;
@@ -492,6 +493,82 @@ public class HFXServer extends HFXService {
         }
     }
 
+    /** 306：一个文件的续传信息（目标路径 + 大小 + 修改时间 + 位图） */
+    private static final class ResumeEntry {
+        final String target;
+        final long size;
+        final long mtime;
+        final java.util.BitSet bits;
+
+        ResumeEntry(String target, long size, long mtime, java.util.BitSet bits) {
+            this.target = target;
+            this.size = size;
+            this.mtime = mtime;
+            this.bits = bits;
+        }
+    }
+
+    /**
+     * 306：这次要拉的文件里，手机本地已经收到一部分的（按 <文件名>.hfxpart 日志判断）。
+     *
+     * <p>只处理"顶层文件"：目录里的子文件的目标路径要靠电脑端遍历才能算出来，
+     * 这里不做，所以选文件夹拉取时不会续传（单文件拉取是最常见的场景）。
+     */
+    private java.util.List<ResumeEntry> buildResumeState(List<RemoteFile> files, Directory localDir) {
+        java.util.List<ResumeEntry> result = new java.util.ArrayList<>();
+        for (RemoteFile file : files) {
+            if (file.isDirectory() || file.getSize() <= 0) {
+                continue;
+            }
+            String target = localDir.path + file.getName();
+            ResumeJournal journal = ResumeJournal.load(target, file.getSize(),
+                    file.lastModified(), FileBlock.BLOCK_SIZE);
+            if (journal == null || journal.blocksDone() == 0) {
+                continue;
+            }
+            result.add(new ResumeEntry(target, file.getSize(), file.lastModified(), journal.bitset()));
+            top.weixiansen574.hybridfilexfer.core.HFXLog.d("resume: phone already has "
+                    + journal.blocksDone() + " block(s) of " + target);
+        }
+        return result;
+    }
+
+    /** 306：把"我已经有哪些块"发给电脑（即使一条都没有也要发，电脑在等这一帧） */
+    private void sendResumeState(java.util.List<ResumeEntry> resume) throws IOException {
+        synchronized (controlLock) {
+            ctChannel.writeShort(ControllerIdentifiers.RESUME_STATE);
+            ctChannel.writeInt(resume.size());
+            for (ResumeEntry entry : resume) {
+                // 位图按"整字节"发（BitSet.toByteArray 会去掉尾部 0 字节，长度按它算就行）
+                byte[] bits = entry.bits.toByteArray();
+                long blocks = (entry.size + FileBlock.BLOCK_SIZE - 1) / FileBlock.BLOCK_SIZE;
+                int needed = (int) ((blocks + 7) / 8);
+                if (bits.length < needed) {
+                    byte[] grown = new byte[needed];
+                    System.arraycopy(bits, 0, grown, 0, bits.length);
+                    bits = grown;
+                }
+                ctChannel.writeUTF(entry.target);
+                ctChannel.writeLong(entry.size);
+                ctChannel.writeLong(entry.mtime);
+                ctChannel.writeInt(bits.length);
+                if (bits.length > 0) {
+                    ctChannel.writeFully(bits);
+                }
+            }
+        }
+    }
+
+    private static java.util.Map<String, java.util.BitSet> toResumeMap(java.util.List<ResumeEntry> entries) {
+        java.util.Map<String, java.util.BitSet> map = new java.util.HashMap<>();
+        for (ResumeEntry entry : entries) {
+            if (!entry.bits.isEmpty()) {
+                map.put(entry.target, entry.bits);
+            }
+        }
+        return map;
+    }
+
     public void sendFilesToShelf(List<RemoteFile> files, Directory localDir, Directory remoteDir, TransferFileCallback callback) throws IOException {
         // 304：同上，等重建完成再开始
         awaitRebuild(10000);
@@ -508,7 +585,10 @@ public class HFXServer extends HFXService {
                 ctChannel.writeInt(localDir.fileSystem);
                 ctChannel.writeUTF(remoteDir.path);
             }
-            receiveFiles(callback);
+            // 306：告诉电脑"这些文件我已经收到哪些块"（电脑看完才开始发，只补缺的）
+            java.util.List<ResumeEntry> resume = buildResumeState(files, localDir);
+            sendResumeState(resume);
+            receiveFiles(callback, toResumeMap(resume));
         } finally {
             endTransfer();
         }
@@ -1090,8 +1170,8 @@ public class HFXServer extends HFXService {
     }
 
     @Override
-    protected WriteFileCall createWriteFileCall(LinkedBlockingDeque<ByteBuffer> buffers, int dequeCount) {
-        return new DroidWriteFileCall(buffers, dequeCount, ioService);
+    protected WriteFileCall createWriteFileCall(LinkedBlockingDeque<ByteBuffer> buffers, int dequeCount, java.util.Map<String, java.util.BitSet> resumeBits) {
+        return new DroidWriteFileCall(buffers, dequeCount, ioService, resumeBits);
     }
 
     @Override

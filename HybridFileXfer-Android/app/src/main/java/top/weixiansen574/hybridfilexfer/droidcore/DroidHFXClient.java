@@ -61,8 +61,8 @@ public class DroidHFXClient extends HFXClient {
     }
 
     @Override
-    protected WriteFileCall createWriteFileCall(LinkedBlockingDeque<ByteBuffer> buffers, int dequeCount) {
-        return new DroidWriteFileCall(buffers,dequeCount,iioService);
+    protected WriteFileCall createWriteFileCall(LinkedBlockingDeque<ByteBuffer> buffers, int dequeCount, java.util.Map<String, java.util.BitSet> resumeBits) {
+        return new DroidWriteFileCall(buffers,dequeCount,iioService, resumeBits);
     }
 
     @Override

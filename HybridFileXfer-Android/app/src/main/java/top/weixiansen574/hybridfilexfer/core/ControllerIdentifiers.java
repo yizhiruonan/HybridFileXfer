@@ -70,6 +70,14 @@ public class ControllerIdentifiers {
      * 位图第 i 位 = 第 i 块（1MiB）已经落盘。
      */
     public static final short RESUME_REPLY = 29;
+    /**
+     * 306：手机（接收端）上报"这些文件我已经收到哪些块"，电脑按它只补缺的块。
+     *
+     * <pre>
+     * {i32 count}{ (UTF 目标路径, i64 总大小, i64 源修改时间, i32 位图字节数, byte[位图]) * count }
+     * </pre>
+     */
+    public static final short RESUME_STATE = 30;
 
     //就让魔法打败魔法吧！
     /**

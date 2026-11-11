@@ -53,7 +53,7 @@ public abstract class HFXService {
      *   <li>取消/中断时半截文件不再删除，留着下次续传。</li>
      * </ul>
      */
-    public static final int VERSION_CODE = 305;
+    public static final int VERSION_CODE = 306;
     protected final LinkedBlockingDeque<ByteBuffer> buffers = new LinkedBlockingDeque<>();
     protected DataByteChannel ctChannel;
     /**
@@ -279,11 +279,21 @@ public abstract class HFXService {
     }
 
     protected boolean receiveFiles(TransferFileCallback callback) throws IOException {
+        return receiveFiles(callback, null);
+    }
+
+    /**
+     * 306：带续传位图的接收。
+     *
+     * @param resumeBits 目标路径 → 接收端已有的块（null/空 = 全新传输）
+     */
+    protected boolean receiveFiles(TransferFileCallback callback,
+                                   java.util.Map<String, java.util.BitSet> resumeBits) throws IOException {
         // 对称：接收方向的限速计时窗也随传输重置（PC 端若实现限速时同样受益）
         SpeedLimiter.resetWindow();
         pauseGate = new TransferPause();
         lastPcPaused = false;
-        WriteFileCall writeFileCall = createWriteFileCall(buffers, connections.size());
+        WriteFileCall writeFileCall = createWriteFileCall(buffers, connections.size(), resumeBits);
         long startTime = System.currentTimeMillis();
 
         SpeedMonitorThread speedMonitorThread = new SpeedMonitorThread(connections, callback);
@@ -312,8 +322,8 @@ public abstract class HFXService {
             synchronized (controlLock) {
                 writeResultFrame(false, ex, null);
             }
-            // 写盘线程挂了：文件可能只写了一半，删掉（见 removeIncompleteFiles 注释）
-            removeIncompleteFiles(writeFileCall.writtenPaths());
+            // 306：写盘线程挂了也保留半截文件，位图落盘，下次同一个文件从这里续上
+            writeFileCall.saveJournals();
             callback.onWriteFileError(ex);
             return true;
         }
@@ -328,7 +338,8 @@ public abstract class HFXService {
                 // 有 CANCEL 就当成"取消"收尾 —— 不写结论帧、不报错，等它重建通道。
                 if (!isTransferCancelled() && probePeerCancel(800)) {
                     top.weixiansen574.hybridfilexfer.core.HFXLog.d("receiveFiles: peer cancelled");
-                    removeIncompleteFiles(writeFileCall.writtenPaths());
+                    // 306：半截文件 + 续传日志都保留，下次同一个文件只补缺的块
+                    writeFileCall.saveJournals();
                     callback.onIncomplete();
                     return false;
                 }
@@ -343,17 +354,19 @@ public abstract class HFXService {
                     } catch (IOException ignored) {
                     }
                 }
-                // 落盘到一半的文件必须删掉才能走：createAndOpenFile() 一开始就把文件
-                // 预设成最终长度，留着就是一个"大小正常、内容有洞"的假文件 ——
-                // 用户看不出坏在哪，还会拿去转发/播放。和电脑端 finish_with(complete=false) 对齐。
-                removeIncompleteFiles(writeFileCall.writtenPaths());
+                // 306：不再删半截文件 —— 续传日志（<文件名>.hfxpart）记着哪些块已经落盘，
+                // 下次同一个文件（大小/修改时间一致）只补缺的块，不会出现"大小对、内容有洞"的假文件。
+                writeFileCall.saveJournals();
                 callback.onIncomplete();
                 return false;
             }
         }
         speedMonitorThread.cancel();
-        // 303 收尾：先报"落盘结论 + 落盘文件的指纹"，再读电脑端的读文件结论
-        List<FileDigest> digests = digestOf(writeFileCall.writtenPaths());
+        // 306：收尾时把续传日志结清（传完的文件删掉 sidecar）
+        writeFileCall.finish();
+        // 303 收尾：先报"落盘结论 + 落盘文件的指纹"，再读电脑端的读文件结论。
+        // 306：要算的文件里包含"续传时已经全在手机上"的那些（它们这次一块都没收）
+        List<FileDigest> digests = digestOf(writeFileCall.digestPaths());
         synchronized (controlLock) {
             writeResultFrame(true, null, digests);
             PeerResult pcResult = readResultFrameOrNull();
@@ -1096,7 +1109,7 @@ public abstract class HFXService {
         }
     }
 
-    protected abstract WriteFileCall createWriteFileCall(LinkedBlockingDeque<ByteBuffer> buffers, int dequeCount);
+    protected abstract WriteFileCall createWriteFileCall(LinkedBlockingDeque<ByteBuffer> buffers, int dequeCount, java.util.Map<String, java.util.BitSet> resumeBits);
 
     protected abstract ReadFileCall createReadFileCall(LinkedBlockingDeque<ByteBuffer> buffers, List<RemoteFile> files, Directory localDir, Directory remoteDir, int operateThreadCount, String[] channelNames, java.util.Map<String, java.util.BitSet> resumeBits);
 

@@ -23,12 +23,16 @@ pub const CLIENT_HEADER: &[u8; 4] = b"HFXC";
 ///    （以前连控制通道一起关，于是取消 = 整条会话拆除，两端都要重连）；
 ///  - 新增 REBUILD_REQ / REBUILD_ACK：电脑收尾完把传输通道重新连一批回来，会话不断。
 ///
+/// 305 → 306：电脑→手机方向的断点续传。
+///  - 手机（接收端）在 REQUEST_SEND 之后回一帧 RESUME_STATE：每个文件"已经收到哪些块"；
+///  - 电脑按它跳过已经收到的块，只补缺的。
+///
 /// 304 → 305：断点续传。
 ///  - 接收方给每个文件留一份 `<文件名>.hfxpart`（已完成块的位图）；
 ///  - 发送方开传之前先发 RESUME_QUERY（文件清单），接收方回 RESUME_REPLY（每个文件的位图），
 ///    发送方把已经收到的块跳过，只补缺的；
 ///  - 取消/中断时半截文件不再删除，留着下次续传（有位图就不会出现"大小对但内容有洞"的假文件）。
-pub const VERSION_CODE: i32 = 305;
+pub const VERSION_CODE: i32 = 306;
 
 pub const BLOCK_SIZE: u64 = 1024 * 1024;
 
@@ -81,6 +85,10 @@ pub const CANCEL: i16 = 25;
     /// `{i32 count}{ (bool 可续传, i32 位图字节数, u8[位图]) * count }`
     /// 位图第 i 位 = 第 i 块（1MiB）已经落盘。
     pub const RESUME_REPLY: i16 = 29;
+    /// 306：手机 → 电脑，手机作为接收端上报自己已经收到哪些块（电脑→手机方向的续传）
+    ///
+    /// `{i32 count}{ (UTF 目标路径, i64 总大小, i64 源修改时间, i32 位图字节数, u8[位图]) * count }`
+    pub const RESUME_STATE: i16 = 30;
 }
 
 pub mod transfer {
