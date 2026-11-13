@@ -48,7 +48,7 @@ public class SendFileCall implements Callable<Void> {
                     if (readFileCall.isReaderFinished()) {
                         channel.writeShort(TransferIdentifiers.EOF);
                         callback.onChannelComplete(connection.iName,
-                                connection.getTotalTraffic().uploadTraffic,
+                                connection.getUploadedBytes(),
                                 System.currentTimeMillis() - startTime);
                         break;
                     }
@@ -64,7 +64,7 @@ public class SendFileCall implements Callable<Void> {
                     if (fileBlock == ReadFileCall.END_POINT) {
                         channel.writeShort(TransferIdentifiers.EOF);
                         callback.onChannelComplete(connection.iName,
-                                connection.getTotalTraffic().uploadTraffic,
+                                connection.getUploadedBytes(),
                                 System.currentTimeMillis() - startTime);
                     } else if (fileBlock == ReadFileCall.INTERRUPT) {
                         channel.writeShort(TransferIdentifiers.END_OF_INTERRUPTED);

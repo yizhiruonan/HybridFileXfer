@@ -110,6 +110,48 @@ public abstract class HFXService {
         return call == null ? java.util.Collections.emptyList() : call.segments();
     }
 
+    /** 界面高频轮询用的单通道流量快照（累计真值，只读副本） */
+    public static final class ChannelTrafficSnapshot {
+        public final String name;
+        public final long uploaded;
+        public final long downloaded;
+
+        ChannelTrafficSnapshot(String name, long uploaded, long downloaded) {
+            this.name = name;
+            this.uploaded = uploaded;
+            this.downloaded = downloaded;
+        }
+    }
+
+    /**
+     * 取一次所有传输通道的累计流量快照（发送/接收方向通用）。
+     *
+     * <p>界面以前靠 {@code onSpeedInfo} 每秒一次的"这一秒流量"自己累加，再把累计值
+     * 当进度用 —— 两次回调之间只能拿速率去猜，猜不准就出现"每秒回跳一格"。
+     * 这里直接给真值，界面 80~100ms 轮询一次即可，和接收方向（按块统计的 done）同一套口径。
+     *
+     * <p>顺序与 {@code connections} 一致：进度条分段的 owner 就是这里的 name。
+     */
+    public java.util.List<ChannelTrafficSnapshot> trafficSnapshot() {
+        List<TransferConnection> list = connections;
+        if (list == null || list.isEmpty()) {
+            return java.util.Collections.emptyList();
+        }
+        java.util.ArrayList<ChannelTrafficSnapshot> out = new java.util.ArrayList<>(list.size());
+        try {
+            for (TransferConnection connection : list) {
+                if (connection == null) {
+                    continue;
+                }
+                top.weixiansen574.hybridfilexfer.core.bean.TrafficInfo info = connection.snapshotTotalTraffic();
+                out.add(new ChannelTrafficSnapshot(info.iName, info.uploadTraffic, info.downloadTraffic));
+            }
+        } catch (Exception ignored) {
+            // 304：取消后重建会把 connections 整体换掉，读到一半抛异常就当这一帧没取到
+        }
+        return out;
+    }
+
     /** 本次传输是否被用户主动取消 */
     public boolean isTransferCancelled() {
         return transferCancelled;

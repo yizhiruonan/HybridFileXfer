@@ -128,12 +128,6 @@ internal fun TransferScreen(
     var xferPopupTotal by remember { mutableLongStateOf(0L) }
     var xferPopupChannels by remember { mutableStateOf<List<ChannelStat>>(emptyList()) }
     var xferPopupPaused by remember { mutableStateOf(false) }
-    var xferPopupSpeed by remember { mutableLongStateOf(0L) }
-    var xferPopupLastTraffic by remember { mutableLongStateOf(0L) }
-    var xferPopupLastAt by remember { mutableLongStateOf(0L) }
-    // 每条通道的累计已传字节。注意 onSpeedInfo 给的是"这一秒的流量"（resetCurrentTrafficInfo 会清零），
-    // 不能直接当成已传总量 —— 否则进度条每秒钟都被重置回零点几百分比，看着就是不涨。
-    val xferPopupCumulative = remember { HashMap<String, Long>() }
     // 304：数据发完之后电脑要算整文件 SHA-256（800MB 实测 1~2 分钟）。这段时间界面必须有个说法，
     // 否则就是"791.0 MB / 800.0 MB · 0 KB/s"一动不动，用户以为是卡死（实测被当成 bug 报上来）。
     var xferPopupWaiting by remember { mutableStateOf(false) }
@@ -198,57 +192,29 @@ internal fun TransferScreen(
     }
 
     fun callback(isUpload: Boolean): TransferFileCallback = object : TransferFileCallback {
+        // onFileUploading / onFileDownloading 是按"块"回调的（1MiB 一块，80MB/s 就是每秒 80 次），
+        // 每次都往主线程 post 一次会把消息队列堵满、界面卡顿。文件名只在换文件时变，比一下再投递。
+        private val shownName = java.util.concurrent.atomic.AtomicReference("")
+
+        private fun showName(path: String?) {
+            val value = path ?: ""
+            if (shownName.getAndSet(value) == value) return
+            main.post { xferPopupName = value }
+        }
+
         override fun onFileUploading(iName: String?, path: String?, targetSize: Long, totalSize: Long) {
-            main.post { xferPopupName = path ?: "" }
+            showName(path)
         }
 
         override fun onFileDownloading(iName: String?, path: String?, targetSize: Long, totalSize: Long) {
-            main.post { xferPopupName = path ?: "" }
+            showName(path)
         }
 
         override fun onSpeedInfo(trafficInfoList: List<TrafficInfo>?) {
-            val list = trafficInfoList ?: return
-            // onSpeedInfo 每秒回调一次，每条通道给的是"这一秒的流量"（TransferConnection.resetCurrentTrafficInfo 已经清零），
-            // 所以这里自己累加出"已传总量"；之前直接把一秒的流量当已传量用，进度条每秒归零重来，看着永远不涨。
-            val delta = list.sumOf { it.uploadTraffic + it.downloadTraffic }
-            val now = android.os.SystemClock.elapsedRealtime()
-            main.post {
-                var done = xferPopupResumeBase
-                val channels = list.map { info ->
-                    val key = info.iName ?: ""
-                    val cum = (xferPopupCumulative[key] ?: 0L) + info.uploadTraffic + info.downloadTraffic
-                    xferPopupCumulative[key] = cum
-                    done += cum
-                    // 已经发完的通道显示"已完成"，而不是一直"正在发送数据…"
-                    ChannelStat(key, cum, 0, xferPopupDoneNames.contains(key))
-                }
-                if (xferPopupLastAt > 0 && now > xferPopupLastAt) {
-                    val instant = delta * 1000L / (now - xferPopupLastAt)
-                    // 指数平滑：瞬时速率会在 4～80MB/s 之间乱跳，直接显示就是"一顿一顿"的来源
-                    xferPopupSpeed = if (xferPopupSpeed <= 0) instant else (xferPopupSpeed * 3 + instant * 2) / 5
-                }
-                xferPopupLastTraffic = done
-                xferPopupLastAt = now
-                // 数据发完之后进入"等待电脑校验"，进度条补满，别被后面 0 速率的采样打回去
-                val shown = if (xferPopupWaiting) xferPopupTotal else done
-                // 累计值以回调为准（真值），两次回调之间的推进交给下面的 100ms 插值
-                xferPopupDone = shown
-                xferPopupChannels = channels
-                GlobalTransferOverlay.reportSend(
-                    UiState(
-                        xferActive = true,
-                        xferName = xferPopupName,
-                        xferDone = shown,
-                        xferTotal = xferPopupTotal,
-                        xferBytes = shown,
-                        xferChannels = channels,
-                        xferNote = if (xferPopupWaiting) "等待电脑校验…" else "",
-                        xferCount = 1,
-                        xferLabel = server.displayName,
-                        xferId = -1,
-                    ),
-                )
-            }
+            // 进度条不再吃这个每秒采样：它给的是"这一秒的流量"，两次采样之间只能拿速率去猜，
+            // 猜不准就是"每秒回跳一格"。现在改成下面 LaunchedEffect 里 100ms 一次读累计真值，
+            // 和接收方向（HfxApp 每 50ms 读按块统计的 done）同一套口径。
+            // 这个回调保留空实现，别把接口删了 —— 通知栏/统计以后还要用。
         }
 
         override fun onResumeSkipped(bytes: Long) {
@@ -330,12 +296,7 @@ internal fun TransferScreen(
         xferPopupTotal = files.sumOf { if (it.size > 0) it.size else 0L }
         xferPopupChannels = emptyList()
         xferPopupPaused = false
-        // 速率/累计/采样时间都必须清掉：上一次传输的速率留着的话，
-        // 弹窗一开就按旧速率往前插值，数字会一路虚高（进度条却还是空的）。
-        xferPopupSpeed = 0
-        xferPopupLastTraffic = 0
-        xferPopupLastAt = 0
-        xferPopupCumulative.clear()
+        // 上一次传输的完成通道表必须清掉，否则新传输还没发就先显示"已完成"
         xferPopupWaiting = false
         xferPopupDoneNames.clear()
         xferPopupSingleFile = files.size == 1 && !files[0].isDirectory
@@ -614,20 +575,84 @@ internal fun TransferScreen(
         }
     }
 
-    // 弹窗显示期间把已传字节按最近速率平滑推进：回调是每秒级的，直接设值会一顿一顿
-    LaunchedEffect(xferPopup) {
-        var last = android.os.SystemClock.elapsedRealtime()
-        while (xferPopup) {
+    // 传输期间的进度：100ms 一次读"每条通道累计发出的字节"这个真值（HFXService.trafficSnapshot）。
+    //
+    // 以前是「每秒一次 onSpeedInfo 累加 + 100ms 用速率合成插值」：插值把 done 往前推，
+    // 下一秒真值再盖回来 —— 只要真实速率低于插值速率，进度条就回跳一格、再被 tween 拉回来，
+    // 看着就是"一顿一顿、每秒跳一下"。接收方向从来不吃这套（它每 50ms 读按块统计的真值），
+    // 所以两个方向手感不一样。现在两端同一套口径：只喂真值，平滑全部交给面板的 200ms tween。
+    LaunchedEffect(busy) {
+        // 上一帧的累计字节（算速率）、已经显示过的累计字节（防回退）、低通后的速率
+        val previous = HashMap<String, Long>()
+        val shownBytes = HashMap<String, Long>()
+        val smoothedSpeed = HashMap<String, Long>()
+        var previousAt = android.os.SystemClock.elapsedRealtime()
+        var lastDone = 0L
+        while (busy) {
             kotlinx.coroutines.delay(100)
+            // delay 期间传输可能已经收尾了，这时候不能再拿旧快照覆盖收尾补满的进度
+            if (!busy) break
             // 电脑端点暂停/继续时，这里的暂停闸门会被会话线程改掉，弹窗跟着显示"已暂停"
             xferPopupPaused = server.isTransferPaused
             val now = android.os.SystemClock.elapsedRealtime()
-            val dt = (now - last).coerceAtLeast(1)
-            last = now
-            if (!xferPopupPaused && xferPopupSpeed > 0 && xferPopupTotal > 0 && xferPopupDone < xferPopupTotal) {
-                val step = xferPopupSpeed * dt / 1000
-                if (step > 0) xferPopupDone = minOf(xferPopupTotal, xferPopupDone + step)
+            val dt = (now - previousAt).coerceAtLeast(1)
+            previousAt = now
+            // 只读字段，别在主线程上做 IO；重建期间 connections 可能被整体换掉，取不到就当这一帧空
+            val snapshot = try {
+                server.trafficSnapshot()
+            } catch (e: Throwable) {
+                emptyList()
             }
+            var sum = 0L
+            val channels = snapshot.map { channel ->
+                val bytes = if (xferPopupSending) channel.uploaded else channel.downloaded
+                sum += bytes
+                val before = previous[channel.name]
+                previous[channel.name] = bytes
+                // 各通道行也按真值做差算速率，和主进度条同一个来源（以前这列恒为 0，只有每秒一次的字节数在动）
+                val instant = if (before != null && bytes >= before) (bytes - before) * 1000L / dt else 0L
+                // 100ms 采样太碎：一条通道常有"这一拍还没写完一块"的空拍，直接用瞬时值
+                // 就会在"38 MB/s"和"正在发送数据…"之间闪。做 1 秒的一阶低通（和接收方向
+                // 用 1 秒流量算通道速率的口径一致），空拍只是慢慢衰减，不会掉到 0。
+                val lastSpeed = smoothedSpeed[channel.name] ?: 0L
+                // 暂停期间没有字节进来，速率直接归零：否则低通衰减会残留一个 "8 B/s" 这种
+                // 看着像出错的数字（接收方向此时也是 0，行里显示"正在发送数据…"）
+                val speed = if (xferPopupPaused) 0L
+                else (lastSpeed + (instant - lastSpeed) * dt / 1000L).coerceAtLeast(0L)
+                smoothedSpeed[channel.name] = speed
+                // 收尾时传输核心会把每通道累计值清零（resetTotalTrafficInfo），
+                // 已经显示过的数字不能跟着抹掉，否则"各通道进度"在等待校验时会全变 0 B
+                val held = maxOf(shownBytes[channel.name] ?: 0L, bytes)
+                shownBytes[channel.name] = held
+                ChannelStat(channel.name, held, speed, xferPopupDoneNames.contains(channel.name))
+            }
+            val done = xferPopupResumeBase + sum
+            val shown = when {
+                // 数据发完、电脑在算 SHA-256：钉在 total 上，别被不再增长的真值拉回去
+                xferPopupWaiting && xferPopupTotal > 0 -> xferPopupTotal
+                // 真值偶发回退（重建换掉 connections、每块计数器重新开始）时不回跳，等它追上来
+                done < lastDone -> lastDone
+                else -> done
+            }
+            lastDone = shown
+            xferPopupDone = shown
+            xferPopupChannels = channels
+            // 应用外悬浮窗：只有切出去（appVisible=false）时才显示，跟着这份快照走
+            GlobalTransferOverlay.reportSend(
+                UiState(
+                    xferActive = true,
+                    xferName = xferPopupName,
+                    xferDone = shown,
+                    xferTotal = xferPopupTotal,
+                    xferBytes = shown,
+                    xferChannels = channels,
+                    xferSegments = emptyList(),
+                    xferNote = if (xferPopupWaiting) "等待电脑校验…" else "",
+                    xferCount = 1,
+                    xferLabel = server.displayName,
+                    xferId = -1,
+                ),
+            )
         }
     }
 
@@ -643,7 +668,7 @@ internal fun TransferScreen(
             planSegments.map { seg ->
                 // 这一段负责的字节数 = 它占的百分比 × 总量；填充 = 该通道实际发出的字节 / 这一段的份额
                 val rangeBytes = ((seg.end - seg.start) / 100f * xferPopupTotal).toLong()
-                val ownerBytes = xferPopupCumulative[seg.owner] ?: 0L
+                val ownerBytes = xferPopupChannels.firstOrNull { it.name == seg.owner }?.bytes ?: 0L
                 val filled = when {
                     complete -> 1f
                     rangeBytes > 0 -> (ownerBytes.toFloat() / rangeBytes).coerceIn(0f, 1f)

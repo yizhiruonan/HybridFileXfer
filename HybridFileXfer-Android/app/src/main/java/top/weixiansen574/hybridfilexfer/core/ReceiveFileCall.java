@@ -85,7 +85,7 @@ public class ReceiveFileCall implements Callable<Void> {
                         //System.out.println(iName + " 接收完成");
                         writeFileCall.finishChannel(tIndex);
                         callback.onChannelComplete(iName,
-                                connection.getTotalTraffic().downloadTraffic,
+                                connection.getDownloadedBytes(),
                                 System.currentTimeMillis() - startTime);
                         return null;
                     case TransferIdentifiers.END_OF_INTERRUPTED:
