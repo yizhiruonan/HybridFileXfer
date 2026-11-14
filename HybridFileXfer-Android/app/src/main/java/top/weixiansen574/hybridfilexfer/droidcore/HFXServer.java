@@ -264,6 +264,8 @@ public class HFXServer extends HFXService {
             // 写时复制：304 取消后重建通道时会在会话线程里往里加，
             // 而 getChannelDetails() / hasDeadChannel() 会在界面线程并发读它
             connections = new CopyOnWriteArrayList<>();
+            // 握手期间也要开号：先到、但还不该取的那几条连接要能存住（原来只有"重建"才开号）
+            listener.wantTransfers(interfaceList.size());
             long transferBudgetEnd = System.currentTimeMillis() + TRANSFER_WAIT_TOTAL_MS;
             for (int i = 0; i < interfaceList.size(); i++) {
                 //对方连接通道是否成功
@@ -275,9 +277,21 @@ public class HFXServer extends HFXService {
                 if (succeed) {
                     //从共享套接字上取一条传输通道（别的电脑的控制通道会被暂存，不会认错）
                     long left = Math.min(TRANSFER_WAIT_MS, transferBudgetEnd - System.currentTimeMillis());
-                    SocketChannel socket = left <= 0 ? null : listener.takeTransfer(left);
-                    top.weixiansen574.hybridfilexfer.core.HFXLog.d("握手：" + name + " 传输通道 " + (socket != null ? "已到" : "等超时")
-                            + "，等了 " + (System.currentTimeMillis() - nameAt) + "ms");
+                    // 按网段认人：电脑并行连的，先到的未必就是这一条（否则界面上的名字和速率对不上）
+                    SocketChannel socket = left <= 0 ? null
+                            : listener.takeTransferFor(interfaceList.get(i).address, left);
+                    if (socket != null) {
+                        java.net.SocketAddress remote = null;
+                        try {
+                            remote = socket.getRemoteAddress();
+                        } catch (Exception ignored) {
+                        }
+                        top.weixiansen574.hybridfilexfer.core.HFXLog.d("握手：" + name + " 传输通道 已到（远端 "
+                                + remote + "，等了 " + (System.currentTimeMillis() - nameAt) + "ms）");
+                    } else {
+                        top.weixiansen574.hybridfilexfer.core.HFXLog.d("握手：" + name + " 传输通道 等超时，等了 "
+                                + (System.currentTimeMillis() - nameAt) + "ms");
+                    }
                     if (socket == null) {
                         // 只回绝这一条，别把整次握手带崩：走蓝牙时经常有一条通道卡住，
                         // 以前会让电脑重连，重连又卡在同一条上，一分钟都连不进来
@@ -293,6 +307,8 @@ public class HFXServer extends HFXService {
                     callback.onAcceptFailed(name);
                 }
             }
+            // 手头的通道收完了，剩下没主的连接（电脑多连了、或网段对不上）全部关掉
+            listener.endWantTransfers();
             if (connections.isEmpty()) {
                 //一条都没连上，本次握手放弃；监听还在，电脑会重连
                 return false;

@@ -194,6 +194,99 @@ public class ServerListener implements AutoCloseable {
         return null;
     }
 
+    /**
+     * 取一条「来自指定网卡」的传输通道。
+     *
+     * <p>为什么不能按到达顺序拿：电脑端是**并行**连所有通道的（这样某条连不上只等 1.5 秒，
+     * 而不是一条条累加），到达顺序和手机广播的网卡顺序毫无关系。以前 accept 线程按先来后到
+     * 交出去，手机再把「电脑报的名字」贴上去 —— 名字和实际链路就对不上了：
+     * 用户看到的「bt-pan 18MB/s / wlan0#3 18B/s」，其实是蓝牙那条被贴了无线的名字。
+     *
+     * <p>现在按**远端地址所在网段**认人：电脑连 192.168.44.1 时源地址一定是 192.168.44.x，
+     * 连 192.168.3.117 时源地址一定在 192.168.3.0/24。对不上的先存起来，留给下一轮再取。
+     */
+    public SocketChannel takeTransferFor(java.net.InetAddress wanted, long timeoutMs) throws IOException {
+        long deadline = System.currentTimeMillis() + Math.max(0, timeoutMs);
+        while (System.currentTimeMillis() < deadline) {
+            SocketChannel stashedSocket = takeStashed(wanted);
+            if (stashedSocket != null) {
+                return stashedSocket;
+            }
+            SocketChannel socket = accept(deadline);
+            if (socket == null) {
+                continue;
+            }
+            int kind = classify(socket);
+            if (kind == KIND_TRANSFER) {
+                if (sameSubnet(socket, wanted)) {
+                    return socket;
+                }
+                // 不是这一条网卡的：先存着，等轮到它对应的网卡时再取
+                if (!stashTransfer(socket)) {
+                    closeQuietly(socket);
+                }
+                continue;
+            }
+            if (kind == KIND_CONTROL) {
+                PendingControl pending = new PendingControl(socket, takeHeader());
+                if (stashed.size() < MAX_STASHED) {
+                    stashed.addLast(pending);
+                } else {
+                    closeQuietly(socket);
+                }
+                continue;
+            }
+            closeQuietly(socket);
+        }
+        return null;
+    }
+
+    /** 从待领队列里挑一条和 wanted 同网段的 */
+    private SocketChannel takeStashed(java.net.InetAddress wanted) {
+        synchronized (this) {
+            if (spareTransfers.isEmpty()) {
+                return null;
+            }
+            java.util.Iterator<SocketChannel> it = spareTransfers.iterator();
+            while (it.hasNext()) {
+                SocketChannel socket = it.next();
+                if (sameSubnet(socket, wanted)) {
+                    it.remove();
+                    return socket;
+                }
+            }
+        }
+        return null;
+    }
+
+    /** 这条连接的远端地址是不是和想要的网卡在同一网段（回环按回环比） */
+    private static boolean sameSubnet(SocketChannel socket, java.net.InetAddress wanted) {
+        if (wanted == null) {
+            return true;
+        }
+        java.net.InetAddress remote;
+        try {
+            java.net.SocketAddress address = socket.getRemoteAddress();
+            if (!(address instanceof java.net.InetSocketAddress)) {
+                return false;
+            }
+            remote = ((java.net.InetSocketAddress) address).getAddress();
+        } catch (Exception e) {
+            return false;
+        }
+        if (remote == null) {
+            return false;
+        }
+        if (wanted.isLoopbackAddress() || remote.isLoopbackAddress()) {
+            return wanted.isLoopbackAddress() && remote.isLoopbackAddress();
+        }
+        byte[] a = wanted.getAddress();
+        byte[] b = remote.getAddress();
+        // 只比 /24：一个 /24 里就是同一张物理网卡（多开几条通道时它们本来就一样）
+        return a.length == 4 && b.length == 4
+                && a[0] == b[0] && a[1] == b[1] && a[2] == b[2];
+    }
+
     /** 关掉暂存的控制通道；共享监听套接字由 HFXServer 负责关闭。 */
     @Override
     public void close() {
