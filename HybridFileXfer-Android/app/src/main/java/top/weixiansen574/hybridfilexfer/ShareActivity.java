@@ -3,6 +3,8 @@ package top.weixiansen574.hybridfilexfer;
 import android.content.ClipData;
 import android.content.Intent;
 import android.database.Cursor;
+import android.graphics.Color;
+import android.graphics.drawable.ColorDrawable;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -16,7 +18,6 @@ import android.provider.OpenableColumns;
 import android.text.TextUtils;
 import android.util.Log;
 import android.view.ViewGroup;
-import android.widget.Button;
 import android.widget.Toast;
 
 import androidx.appcompat.app.AppCompatActivity;
@@ -44,6 +45,7 @@ import top.weixiansen574.hybridfilexfer.core.bean.TrafficInfo;
 import top.weixiansen574.hybridfilexfer.core.callback.TransferFileCallback;
 import top.weixiansen574.hybridfilexfer.compose.ChannelStat;
 import top.weixiansen574.hybridfilexfer.compose.SegInfo;
+import top.weixiansen574.hybridfilexfer.compose.ShareActions;
 import top.weixiansen574.hybridfilexfer.compose.ShareProgress;
 import top.weixiansen574.hybridfilexfer.droidcore.HFXServer;
 import top.weixiansen574.hybridfilexfer.tasks.BTransferFileCallback;
@@ -95,9 +97,6 @@ public class ShareActivity extends AppCompatActivity {
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final Queue<Group> groups = new ConcurrentLinkedQueue<>();
-
-    /** 底部的「取消 / 关闭」按钮：面板只管进度，按钮还在 Activity 自己的布局里 */
-    private Button actionButton;
 
     private volatile boolean cancelled;
     private volatile boolean finished;
@@ -197,45 +196,23 @@ public class ShareActivity extends AppCompatActivity {
         targetConnectionId = getIntent().getIntExtra(EXTRA_CONNECTION_ID, -1);
 
         // 进度界面只有一套：把双窗口弹窗 / 应用外悬浮窗用的那个 Compose 面板塞进布局里的占位容器。
-        // 面板自己会画标题、分段进度条、已发/总量、速率、各通道明细，底部按钮仍由这个布局提供。
+        // 面板自己会画标题、分段进度条、已发/总量、速率、各通道明细，底部的「暂停发送 / 继续 /
+        // 取消发送 / 关闭」也由面板自己画 —— 这个页面里再没有别的控件了。
         ViewGroup panelHost = findViewById(R.id.share_panel);
         panelHost.addView(ShareProgress.host(this));
-        // 宽度铺满：面板本身是一张居中的 340dp 卡片，窄屏上左右各少几十像素，
-        // 分段条和「各通道进度」那几列就挤不下了。
-        // 高度跟着内容走（WRAP_CONTENT）：内容少的时候不留一大块空白，内容多了由面板自己
-        // 按屏高 70% 封顶并在内部滚动（见 ShareProgress.host）。
-        android.util.DisplayMetrics metrics = getResources().getDisplayMetrics();
+        // 面板那几颗按钮接到本页自己的逻辑上（取消 = 以前底部 share_action 按钮干的那一套）
+        ShareProgress.setActions(new ShareActions(
+                this::dismissPanel,
+                this::cancelTransfer,
+                this::pauseTransfer,
+                this::resumeTransfer));
+        // 窗口跟着卡片走：宽高都 WRAP_CONTENT，背景和四周压暗全部去掉 —— 屏幕上只剩那张卡片，
+        // 和双窗口弹窗里看到的是同一张（窗口自带的圆角背景 + 压暗会变成「一个白框套着卡片」）。
+        getWindow().setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+        getWindow().setDimAmount(0f);
         getWindow().setLayout(
-                metrics.widthPixels,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT);
-        actionButton = findViewById(R.id.share_action);
-        actionButton.setText(R.string.cancel);
-        actionButton.setOnClickListener(v -> {
-            if (finished) {
-                finish();
-                return;
-            }
-            if (transferring) {
-                // 传输线程是阻塞读写的，没有单独的取消指令：直接断开这条连接，
-                // 电脑端会立刻停止并自动重连；半截文件留在电脑上（电脑端自己清理）
-                cancelled = true;
-                finished = true;
-                transferring = false;
-                if (server != null) {
-                    ServerService.cancelTransfer(server.getId());
-                }
-                // 采样循环先停：后面那一次「清零」不能被下一拍的真值又盖回去
-                frameClock.stop();
-                // 面板最后刷一次：进度清零、速率收起、文案换成「已取消」
-                flushPanel(getString(R.string.share_cancelled), true);
-                actionButton.setText(R.string.close);
-                actionButton.setOnClickListener(x -> finish());
-                handler.postDelayed(this::finish, 800);
-                return;
-            }
-            cancelled = true;
-            finish();
-        });
 
         handleIntent(getIntent());
     }
@@ -248,6 +225,75 @@ public class ShareActivity extends AppCompatActivity {
             return;
         }
         handleIntent(intent);
+    }
+
+    // ------------------------------------------------------------------
+    // 面板上的按钮（由 ShareProgress.setActions 接进来）
+    // ------------------------------------------------------------------
+
+    /**
+     * 面板上的「关闭」按钮，以及点面板外面：传输中就提示稍候，传完了就关窗口。
+     *
+     * <p>以前这是底部那颗 share_action 按钮的活；按钮现在归面板画，判断逻辑仍然在这里。
+     */
+    private void dismissPanel() {
+        if (finished) {
+            finish();
+            return;
+        }
+        if (transferring) {
+            Toast.makeText(this, R.string.share_busy, Toast.LENGTH_SHORT).show();
+            return;
+        }
+        cancelled = true;
+        finish();
+    }
+
+    /**
+     * 面板上的「取消发送」：原来 share_action 按钮里那段取消逻辑原样搬过来。
+     *
+     * <p>传输线程是阻塞读写的，没有单独的取消指令：直接断开这条连接，
+     * 电脑端会立刻停止并自动重连；半截文件留在电脑上（电脑端自己清理）。
+     */
+    private void cancelTransfer() {
+        if (finished) {
+            finish();
+            return;
+        }
+        cancelled = true;
+        finished = true;
+        transferring = false;
+        if (server != null) {
+            ServerService.cancelTransfer(server.getId());
+        }
+        // 采样循环先停：后面那一次「清零」不能被下一拍的真值又盖回去
+        frameClock.stop();
+        // 面板最后刷一次：进度清零、速率收起、文案换成「已取消」
+        flushPanel(getString(R.string.share_cancelled), true);
+        handler.postDelayed(this::finish, 800);
+    }
+
+    /** 面板上的「暂停发送」：和双窗口弹窗一样，直接叫 HFXServer 关上暂停闸门 */
+    private void pauseTransfer() {
+        HFXServer srv = server;
+        if (srv != null) {
+            srv.pauseTransfer();
+        }
+    }
+
+    /** 面板上的「继续」：放开暂停闸门 */
+    private void resumeTransfer() {
+        HFXServer srv = server;
+        if (srv != null) {
+            srv.resumeTransfer();
+        }
+    }
+
+    /** 收尾之后放开「点窗口外面关闭」：传输中不允许，免得一不小心把传输丢在半路 */
+    private void enableDismissOutside() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            setFinishOnTouchOutside(true);
+        }
     }
 
     private void handleIntent(Intent intent) {
@@ -524,8 +570,8 @@ public class ShareActivity extends AppCompatActivity {
                 shownBytes = truthTotal;
             }
             flushPanel(getString(R.string.share_complete_files, summary, Utils.formatSpeed(peakForToast)), false);
-            actionButton.setText(R.string.close);
-            actionButton.setOnClickListener(v -> finish());
+            // 传完了：面板只剩结果文案，点窗口外面或返回键都能退出（这里也会自动关）
+            enableDismissOutside();
             handler.postDelayed(this::finish, 1500);
         });
         Toast.makeText(getApplicationContext(),
@@ -544,8 +590,8 @@ public class ShareActivity extends AppCompatActivity {
             frameClock.stop();
             // 失败：进度清零、速率收起、文案换成失败原因
             flushPanel(getString(R.string.share_failed, message), true);
-            actionButton.setText(R.string.close);
-            actionButton.setOnClickListener(v -> finish());
+            // 失败后窗口留着让人看清原因：点窗口外面或返回键都能退出
+            enableDismissOutside();
         });
     }
 
@@ -1021,8 +1067,11 @@ public class ShareActivity extends AppCompatActivity {
 
     /** 把当前状态推给面板（active=true 表示正在传输，面板那边只用来判断要不要画底部按钮） */
     private void pushPanel(boolean active, List<SegInfo> segments, List<ChannelStat> channels) {
+        HFXServer srv = server;
         ShareProgress.update(
                 active,
+                // 和双窗口弹窗读的是同一个闸门：暂停后那行写「已暂停」，按钮变成「继续」
+                active && srv != null && srv.isTransferPaused(),
                 currentFileName,
                 shownBytes,
                 truthTotal,

@@ -1,43 +1,17 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-    分享发送页：只剩下「进度面板」和底部按钮。
-    面板（share_panel）由 ShareActivity 在 onCreate 里塞进 ShareProgress.host(this) 造的 ComposeView，
+    分享发送页：整个界面就是一张进度面板，别的一律没有。
+    面板由 ShareActivity 在 onCreate 里塞进 ShareProgress.host(this) 造的 ComposeView，
     渲染的就是双窗口弹窗 / 应用外悬浮窗用的那个 ReceiveProgressPanel —— 标题「正在发送文件」、
-    电脑名 · 文件名、分段进度条、已发/总量、速率、各通道明细都在里面，所以上面不再单独放图标和
-    「发送到电脑」（那句话面板自己已经说了，重复）。
+    电脑名 · 文件名、分段进度条、已发/总量、速率、各通道明细，以及底部的
+    「暂停发送 / 继续 / 取消发送 / 关闭」按钮，全都在面板里面。
 
-    高度一律 wrap_content：窗口跟着内容长（ShareActivity 把窗口高度设成 WRAP_CONTENT），
-    面板自己按屏幕高度的 70% 封顶（见 ShareProgress.host），内容再多就在面板内部滚动。
+    所以这里只是一块占位容器：没有图标、没有标题，也不再有自己的按钮
+    （底部那颗「取消」已经删掉，免得和面板自带的按钮重复）。
+
+    窗口是 WRAP_CONTENT + 透明背景（见 ShareActivity.onCreate），屏幕上只看得到那张卡片。
 -->
-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
-    xmlns:app="http://schemas.android.com/apk/res-auto"
-    android:layout_width="match_parent"
-    android:layout_height="wrap_content"
-    android:orientation="vertical"
-    android:paddingTop="16dp"
-    android:paddingBottom="20dp">
-
-    <!-- 进度面板的占位容器：宽度铺满，高度跟着 Compose 内容走 -->
-    <FrameLayout
-        android:id="@+id/share_panel"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content" />
-
-    <com.google.android.material.button.MaterialButton
-        android:id="@+id/share_action"
-        android:layout_width="match_parent"
-        android:layout_height="48dp"
-        android:layout_marginStart="24dp"
-        android:layout_marginTop="16dp"
-        android:layout_marginEnd="24dp"
-        android:insetTop="0dp"
-        android:insetBottom="0dp"
-        android:minHeight="48dp"
-        android:text="@string/cancel"
-        android:textColor="@color/accent"
-        android:textSize="15sp"
-        app:cornerRadius="14dp"
-        app:strokeColor="@color/divider"
-        app:strokeWidth="1dp"
-        style="@style/Widget.MaterialComponents.Button.OutlinedButton" />
-</LinearLayout>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/share_panel"
+    android:layout_width="wrap_content"
+    android:layout_height="wrap_content" />

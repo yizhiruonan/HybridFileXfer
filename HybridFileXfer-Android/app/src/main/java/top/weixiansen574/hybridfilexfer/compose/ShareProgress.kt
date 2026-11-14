@@ -2,12 +2,8 @@ package top.weixiansen574.hybridfilexfer.compose
 
 import android.content.Context
 import android.util.Log
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.ComposeView
-import androidx.compose.ui.platform.LocalDensity
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.LifecycleRegistry
@@ -24,13 +20,46 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
 import top.yukonga.miuix.kmp.theme.ThemeController
 
 /**
- * 「分享发送」页的进度面板：把和应用内弹窗、双窗口、应用外悬浮窗<b>完全同一个</b>
- * [ReceiveProgressPanel] 塞进 ShareActivity 那条 Java 流程里。
+ * 面板上那几颗按钮（暂停发送 / 继续 / 取消发送）点下去要做什么。
+ *
+ * 由 [ShareProgress.setActions] 一次性装进来；[onPause] / [onResume] 传 null 时
+ * 面板就不画暂停那一颗（和双窗口弹窗传 null 时的表现完全一样）。
+ */
+class ShareActions(
+    val onDismiss: Runnable,
+    val onCancel: Runnable,
+    val onPause: Runnable?,
+    val onResume: Runnable?,
+)
+
+/**
+ * 「分享发送」页的进度面板：把双窗口弹窗 / 应用外悬浮窗用的那个 [ReceiveProgressPanel]
+ * <b>原样</b>塞进 ShareActivity 这条 Java 流程里，参数和 TransferScreen.kt 里
+ * `if (xferPopup) { ReceiveProgressPanel(...) }` 那段一一对应：
+ *
+ * | 参数 | 双窗口 | 这里 |
+ * | --- | --- | --- |
+ * | state | UiState(...) | 同一个 UiState，字段含义一致（见下面的 update） |
+ * | onDismiss | { xferPopup = false } | ShareActivity 的 dismissPanel（关闭窗口） |
+ * | sending | xferPopupSending | true（这个页面永远是「发」） |
+ * | onPause | server.pauseTransfer() | server.pauseTransfer() |
+ * | onResume | server.resumeTransfer() | server.resumeTransfer() |
+ * | onCancel | server.abortTransfer() + Toast | ShareActivity 原来的取消逻辑 |
+ * | bare | 不传（= false） | <b>true</b>（唯一的不同，原因见下） |
+ * | showFooter | 不传（= true） | 不传（= true） |
+ *
+ * 为什么 bare 必须是 true：`ReceiveProgressPanel` 的 bare=false 分支根本不画遮罩框，
+ * 它是一整个 `Box(Modifier.fillMaxSize().background(黑 35%))` —— 双窗口那边它铺在
+ * 整页的 Composable 里所以正好是全屏压暗；而在 ShareActivity 这种 WRAP_CONTENT 的窗口里，
+ * fillMaxSize 会把这个小窗口直接撑成满屏 + 一层 35% 黑，也就是「一整块黑」。
+ * 所以这里走 bare=true：只画那张卡片（卡片和双窗口那边是同一个 composable，像素级一样），
+ * 窗口自己按卡片大小包住它，不铺任何遮罩。
  *
  * 用法（ShareActivity）：
  * 1. onCreate 里 `((ViewGroup) findViewById(R.id.share_panel)).addView(ShareProgress.host(this))`；
- * 2. 每 100ms 采样到真值后调 [update]，只喂真值，补间由面板自己做；
- * 3. onDestroy 里调 [release]（owner 变 DESTROYED，顺手把状态清掉）。
+ * 2. 同一处调 [setActions] 把按钮接到自己的取消 / 暂停逻辑上；
+ * 3. 每 100ms 采样到真值后调 [update]，只喂真值，补间由面板自己做；
+ * 4. onDestroy 里调 [release]（owner 变 DESTROYED，顺手把状态清掉）。
  *
  * 这个 ComposeView 挂在 Activity 的普通 ViewGroup 里，但 Compose 需要三个 owner
  * （Lifecycle / ViewModelStore / SavedStateRegistry）。Activity 的 DecorView 上虽然有一套，
@@ -42,6 +71,9 @@ internal object ShareProgress {
 
     /** 面板现在看到的状态：Compose 侧读它的 value，[update] 写它的 value */
     private val state = mutableStateOf(UiState())
+
+    /** 面板按钮的落点，[setActions] 之前是 null（点了也不会有反应，不会崩） */
+    private val actions = mutableStateOf<ShareActions?>(null)
 
     private var owner: Owner? = null
 
@@ -66,29 +98,30 @@ internal object ShareProgress {
             setViewTreeSavedStateRegistryOwner(lifecycleOwner)
             setContent {
                 MiuixTheme(controller = controller) {
-                    // 窗口高度是 WRAP_CONTENT（内容多高窗口多高），但面板最多占屏幕高度的 70%：
-                    // 再高就由 ReceiveProgressPanel 卡片自己的 verticalScroll 在里面滚，
-                    // 免得一张长列表把窗口顶出屏幕。注意别只给个死高度——内容少的时候
-                    // 底部会留一大块空白（真机上见过）。
-                    val metrics = context.resources.displayMetrics
-                    val maxPanelHeight = with(LocalDensity.current) {
-                        (metrics.heightPixels * 0.70f).toDp()
-                    }
-                    Box(Modifier.heightIn(max = maxPanelHeight)) {
-                        // sending=true → 标题「正在发送文件」；bare=true → 不铺遮罩；
-                        // showFooter=false → 底部的暂停/取消/关闭整块不画（按钮在 activity_share.xml 里）
-                        ReceiveProgressPanel(
-                            state = state.value,
-                            sending = true,
-                            bare = true,
-                            showFooter = false,
-                        )
-                    }
+                    // 和 TransferScreen.kt 里双窗口那段一比一：
+                    // sending=true / showFooter 不传（默认 true，底部按钮由面板自己画）/
+                    // bare=true（唯一的不同，见类注释：false 会把小窗口撑成满屏黑）
+                    val current = actions.value
+                    ReceiveProgressPanel(
+                        state = state.value,
+                        onDismiss = { current?.onDismiss?.run() },
+                        sending = true,
+                        onPause = { current?.onPause?.run() },
+                        onResume = { current?.onResume?.run() },
+                        onCancel = { current?.onCancel?.run() },
+                        bare = true,
+                    )
                 }
             }
         }
         owner = lifecycleOwner
         return compose
+    }
+
+    /** 把面板那几颗按钮接到 Activity 自己的逻辑上（在 [host] 之后随时可调） */
+    @JvmStatic
+    fun setActions(next: ShareActions) {
+        actions.value = next
     }
 
     /** 把最新的 UiState 推进面板（快照写入，任何线程调都安全；实际调用都在主线程） */
@@ -102,10 +135,14 @@ internal object ShareProgress {
      *
      * [UiState] 有四十多个字段，从 Java 直接构造太容易错位，这里只暴露进度相关的那几个，
      * 剩下的（连接列表、配置项……）保持默认值 —— 面板只读这几个字段。
+     *
+     * @param active true = 传输中：面板底部画「暂停发送」（暂停后是「继续」+「取消发送」）
+     * @param paused 电脑端 / HFXServer 那边的暂停闸门现在是关着的（和双窗口读 isTransferPaused 一样）
      */
     @JvmStatic
     fun update(
         active: Boolean,
+        paused: Boolean,
         name: String,
         done: Long,
         total: Long,
@@ -127,10 +164,9 @@ internal object ShareProgress {
             xferNote = note,
             xferCount = 1,
             xferLabel = label,
-            // 分享页没有「暂停/取消」这条面板内的路子（onPause/onCancel 都没传），
-            // xferId 保持 -1，面板不会去碰 ServerService 的传输控制
+            // 暂停/取消走 ShareActivity 传进来的回调，面板不用去碰 ServerService 的传输控制
             xferId = -1,
-            xferPaused = false,
+            xferPaused = paused,
         )
     }
 
@@ -139,6 +175,7 @@ internal object ShareProgress {
     fun release() {
         val current = owner
         owner = null
+        actions.value = null
         current?.stop()
         state.value = UiState()
     }
