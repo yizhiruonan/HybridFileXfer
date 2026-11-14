@@ -631,16 +631,21 @@ internal fun TransferScreen(
                 // 就会在"38 MB/s"和"正在发送数据…"之间闪。做 1 秒的一阶低通（和接收方向
                 // 用 1 秒流量算通道速率的口径一致），空拍只是慢慢衰减，不会掉到 0。
                 val lastSpeed = smoothedSpeed[channel.name] ?: 0L
-                // 暂停期间没有字节进来，速率直接归零：否则低通衰减会残留一个 "8 B/s" 这种
-                // 看着像出错的数字（接收方向此时也是 0，行里显示"正在发送数据…"）
-                val speed = if (xferPopupPaused) 0L
+                // 这条通道已经收尾了吗（EOF 发完了）：之后它不会再有字节流动
+                val finished = xferPopupDoneNames.contains(channel.name)
+                // 暂停/已收尾/等待电脑校验：这三段时间里没有字节在流动，速率必须归零。
+                // 不停在归零会出两个问题：低通衰减残留一个 "8 B/s" 这种看着像出错的数字；
+                // 更要紧的是行里的显示顺序是「速率>0 就显示速率，否则才显示已完成」——
+                // 速率一直不归零，已经传完的通道就永远挂着最后一个 MB/s 数字，
+                // 永远不显示"已完成"（用户报的"传输结束后各通道速率没有归零"）。
+                val speed = if (xferPopupPaused || xferPopupWaiting || finished) 0L
                 else (lastSpeed + (instant - lastSpeed) * dt / 1000L).coerceAtLeast(0L)
                 smoothedSpeed[channel.name] = speed
                 // 收尾时传输核心会把每通道累计值清零（resetTotalTrafficInfo），
                 // 已经显示过的数字不能跟着抹掉，否则"各通道进度"在等待校验时会全变 0 B
                 val held = maxOf(shownBytes[channel.name] ?: 0L, bytes)
                 shownBytes[channel.name] = held
-                ChannelStat(channel.name, held, speed, xferPopupDoneNames.contains(channel.name))
+                ChannelStat(channel.name, held, speed, finished)
             }
             // 单文件才有"整条进度条 = 这一个文件的块空间"这回事，分段才画得出来。
             // 多文件/文件夹没有跨文件的块空间，退回整条连续进度（老代码按通道等分画的是假分段）。
@@ -690,6 +695,28 @@ internal fun TransferScreen(
                     xferChannels = channels,
                     xferSegments = segments,
                     xferNote = if (xferPopupWaiting) "等待电脑校验…" else "",
+                    xferCount = 1,
+                    xferLabel = server.displayName,
+                    xferId = -1,
+                ),
+                sending = xferPopupSending,
+            )
+        }
+        // 收尾再投一帧：把各通道速率清零。busy 变 false 以后轮询就停了，
+        // 不补这一帧的话弹窗/悬浮窗会一直停在最后那个"某某 MB/s"上（用户报的第二个问题）。
+        // 字节数保留（等待校验时要看得见每条通道传了多少），只清速率。
+        val tail = xferPopupChannels.map { it.copy(speed = 0) }
+        if (tail.isNotEmpty()) {
+            xferPopupChannels = tail
+            GlobalTransferOverlay.reportSend(
+                UiState(
+                    xferActive = false,
+                    xferName = xferPopupName,
+                    xferDone = xferPopupDone,
+                    xferTotal = xferPopupTotal,
+                    xferBytes = xferPopupDone,
+                    xferChannels = tail,
+                    xferSegments = xferPopupSegments,
                     xferCount = 1,
                     xferLabel = server.displayName,
                     xferId = -1,
@@ -942,8 +969,22 @@ private fun FilePane(
     val colorScheme = MiuixTheme.colorScheme
     val folders = files.count { it.isDirectory }
     val fileCount = files.size - folders
+    // 焦点：在这个窗格里**碰到或滑动**就切过来（不必先选中文件）。
+    // 以前只有点行/点标题才会 onFocus()，用户想对另一边按「新建」「删除」时
+    // 得先随便点个文件，很反直觉。这里在 Initial 阶段看按下事件、不消费，
+    // 所以滚动、横滑选择、长按都能顺带切换焦点。
+    val paneFocus = Modifier.pointerInput(Unit) {
+        awaitPointerEventScope {
+            while (true) {
+                val event = awaitPointerEvent(androidx.compose.ui.input.pointer.PointerEventPass.Initial)
+                if (event.changes.any { it.pressed }) {
+                    onFocus()
+                }
+            }
+        }
+    }
     Column(
-        modifier.fillMaxHeight().background(
+        modifier.fillMaxHeight().then(paneFocus).background(
             if (focused) colorScheme.primary.copy(alpha = 0.04f) else Color.Transparent,
         ),
     ) {

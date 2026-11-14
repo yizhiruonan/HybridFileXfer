@@ -310,6 +310,14 @@ public class ServerService extends Service implements ServiceConnection {
             }
         }
 
+        /** 整次传输结束：所有通道的速率都要归零，否则界面上会停在最后一秒的数字上 */
+        synchronized void finishAllChannels() {
+            for (ChannelLive channel : channels.values()) {
+                channel.speed = 0;
+                channel.finished = true;
+            }
+        }
+
         public synchronized java.util.List<ChannelLive> channelSnapshot() {
             return new ArrayList<>(channels.values());
         }
@@ -465,6 +473,9 @@ public class ServerService extends Service implements ServiceConnection {
                         }
                         public void onComplete(boolean isUpload, long traffic, long time) {
                             debugFile("complete: " + traffic + " bytes -> " + dir);
+                            // 收尾时把每通道速率清零：速率监视线程停了以后没人再更新，
+                            // 不清就是"传输结束各通道还挂着 MB/s"（用户报的）
+                            live.finishAllChannels();
                             live.active = false;
                         }
                         public void onIncomplete() {

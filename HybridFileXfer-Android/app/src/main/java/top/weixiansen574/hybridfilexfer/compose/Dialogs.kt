@@ -573,8 +573,11 @@ internal fun ReceiveProgressPanel(
  * 以前一格是一个 Composable + 各自的 animateFloatAsState，而 forEachIndexed 没有 key，
  * Compose 是按**位置**复用动画状态的：段一合并（格子数量变少），合并后的整格会继承旧第 1 格
  * 已经走到 1.0 的动画值，于是"进度先跳到 100% 再滑回来"——实测每次合并闪一下，
- * 段被新通道拆开时同样闪。现在没有格子、没有按位置复用的动画状态，合并只让一条竖线消失，
- * 任何一个像素的位置都不变。平滑交给数据本身：50ms 一帧、每帧前进 2~3 像素，本来就是连续的。
+ * 段被新通道拆开时同样闪。现在没有格子、没有按位置复用的动画状态，合并只让一条竖线消失。
+ *
+ * 平滑：只有**一个**标量做补间（"该画到多少"），它和段的个数/位置无关，所以合并不会串状态；
+ * 补间比真值慢一点时，把差值按"缺口比例"从还没填满的段上扣掉 —— 填充前沿平滑地跟在真值后面，
+ * 已经填满的段不受影响（不会出现"传完的段又缩回去"）。
  */
 @Composable
 private fun SegmentedProgressBar(
@@ -585,14 +588,14 @@ private fun SegmentedProgressBar(
     divider: Color,
 ) {
     val shape = RoundedCornerShape(50)
-    // 只有"没有分段"（多文件/文件夹）时才用整条的补间动画：那是一条连续的进度，不存在段的变化
-    val animatedFallback by androidx.compose.animation.core.animateFloatAsState(
+    // 单一标量补间：与段的个数/位置无关，段合并或拆开都不会让动画状态串位置
+    val animated by androidx.compose.animation.core.animateFloatAsState(
         targetValue = fallback.coerceIn(0f, 1f),
         animationSpec = androidx.compose.animation.core.tween(
-            durationMillis = 200,
+            durationMillis = 120,
             easing = androidx.compose.animation.core.LinearEasing,
         ),
-        label = "barFallback",
+        label = "barProgress",
     )
     Box(
         modifier = Modifier
@@ -605,21 +608,35 @@ private fun SegmentedProgressBar(
             val width = size.width
             val height = size.height
             if (segments.isEmpty()) {
-                if (animatedFallback > 0f) {
-                    drawRect(color, size = Size(width * animatedFallback, height))
+                if (animated > 0f) {
+                    drawRect(color, size = Size(width * animated, height))
                 }
                 return@Canvas
             }
+            val spans = IntArray(segments.size) { (segments[it].end - segments[it].start).coerceAtLeast(1) }
             var spanSum = 0L
-            segments.forEach { spanSum += (it.end - it.start).coerceAtLeast(1) }
+            for (s in spans) spanSum += s
             val totalSpan = spanSum.toFloat().coerceAtLeast(1f)
+            val fills = FloatArray(segments.size) { segments[it].filled.coerceIn(0f, 1f) }
+            // 平滑：补间值比真值慢的时候，把差值按"缺口比例"从还没填满的段上扣掉。
+            // 已经填满的段（缺口为 0）不动，所以不会出现"传完的段又缩回去"；
+            // totalSpan、fills 都和段的划分方式无关，合并前后扣掉的量完全一样 → 合并不跳变。
+            val target = fallback.coerceIn(0f, 1f)
+            val deficit = (target - animated) * totalSpan
+            if (deficit > 0f) {
+                var room = 0f
+                for (i in fills.indices) room += (1f - fills[i]) * spans[i]
+                if (room > 0f) {
+                    val k = minOf(deficit, room) / room
+                    for (i in fills.indices) fills[i] = (fills[i] - (1f - fills[i]) * k).coerceIn(0f, 1f)
+                }
+            }
             val dividerWidth = 1.dp.toPx()
             var x = 0f
             segments.forEachIndexed { index, seg ->
-                val span = (seg.end - seg.start).coerceAtLeast(1)
                 // 最后一段吃掉浮点误差，别在右端留一条缝
-                val segWidth = if (index == segments.size - 1) width - x else width * span / totalSpan
-                val fill = seg.filled.coerceIn(0f, 1f)
+                val segWidth = if (index == segments.size - 1) width - x else width * spans[index] / totalSpan
+                val fill = fills[index]
                 if (fill > 0f) {
                     drawRect(
                         color = color,
