@@ -652,6 +652,10 @@ public class ServerService extends Service implements ServiceConnection {
         intent.putExtra(EXTRA_MODE, mode);
         java.util.ArrayList<ServerNetInterface> expanded = new java.util.ArrayList<>();
         for (ServerNetInterface netInterface : serverInterfaces) {
+            // 蓝牙共享网络不参与传输（太慢，会拖住收尾）；老配置里如果还留着 bt-pan 通道名，这里直接跳过
+            if (NetInterfaces.isBluetooth(netInterface.name)) {
+                continue;
+            }
             // 自动配置：WIFI 链路带宽高，多开几条通道；USB 通道受 adb 限制，开 2 条足够
             String lower = netInterface.name == null ? "" : netInterface.name.toLowerCase(java.util.Locale.ROOT);
             int channelsPerInterface = (lower.contains("wlan") || lower.contains("wifi") || lower.contains("wlan0")) ? 4 : 2;

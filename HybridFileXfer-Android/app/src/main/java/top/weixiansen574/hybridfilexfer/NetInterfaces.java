@@ -44,7 +44,10 @@ public final class NetInterfaces {
                 // 高通/联发科/三星的蜂窝网卡名字分别是 rmnet*、ccmni*、pdp_ip*
                 boolean cellular = ifName.startsWith("rmnet") || ifName.startsWith("ccmni")
                         || ifName.startsWith("pdp_ip");
-                if (!address.isLoopbackAddress() && address instanceof Inet4Address && !cellular) {
+                // 蓝牙共享网络（PAN）实测只有 0.2~0.3 MB/s：多轨切分时它永远是最慢的那一条，
+                // 收尾要等它、还会占掉一个通道名额，得不偿失，所以干脆不参与传输、也不列进计划。
+                boolean bluetooth = isBluetooth(ifName);
+                if (!address.isLoopbackAddress() && address instanceof Inet4Address && !cellular && !bluetooth) {
                     NetInterfaceInfo item = new NetInterfaceInfo(networkInterface.getDisplayName(), address);
                     //VPN开的虚拟网卡，默认不勾选
                     if (item.name.startsWith("tun")) {

@@ -326,11 +326,12 @@ private fun formatSpeed(bytesPerSecond: Long): String {
         return "无记录"
     }
     val mb = bytesPerSecond / 1024.0 / 1024.0
-    // 一位小数就够：两位小数时 106.48 → 107.02 这种末位变化看着像在抖
-    return if (mb >= 1) {
-        String.format(java.util.Locale.US, "%.1f MB/s", mb)
-    } else {
-        String.format(java.util.Locale.US, "%.0f KB/s", bytesPerSecond / 1024.0)
+    // 一位小数就够：两位小数时 106.48 → 107.02 这种末位变化看着像在抖。
+    // 不足 1 KB/s 的别四舍五入成 0 KB/s（蓝牙、限速很低的时候会显示成 0，像断了）
+    return when {
+        mb >= 1 -> String.format(java.util.Locale.US, "%.1f MB/s", mb)
+        bytesPerSecond >= 1024 -> String.format(java.util.Locale.US, "%.0f KB/s", bytesPerSecond / 1024.0)
+        else -> bytesPerSecond.toString() + " B/s"
     }
 }
 

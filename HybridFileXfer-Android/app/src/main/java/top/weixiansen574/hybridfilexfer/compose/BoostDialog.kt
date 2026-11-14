@@ -127,19 +127,6 @@ private fun runShizuku(cmd: String): Boolean = try {
 /** 先 root，再 Shizuku/adb；两条路都不通就当没权限 */
 private fun runShell(cmd: String): Boolean = runSu(cmd) || runShizuku(cmd)
 
-/**
- * 蓝牙共享网络：root 能开的都试一遍。
- * 蓝牙本身 → 蓝牙服务 → 蓝牙网络共享 → 兜底把 bt-pan 拉起来。
- * 安卓并没有开放「让手机主动去连电脑的 PAN」的接口（BluetoothPan.connect 要平台签名，
- * 而且那是客户端角色，电脑得有 NAP 主机），所以能做的只有把 tethering 这一步推起来。
- */
-private fun kickBluetooth() {
-    runShell("svc bluetooth enable")
-    runShell("cmd bluetooth_manager enable")
-    runShell("cmd tethering start bt")
-    runShell("ip link set bt-pan up")
-}
-
 private fun buildSlots(): List<BoostSlot> = listOf(
     BoostSlot(
         key = "wifi",
@@ -175,17 +162,9 @@ private fun buildSlots(): List<BoostSlot> = listOf(
             runShell("cmd usb setFunctions rndis")
         },
     ),
-    BoostSlot(
-        key = "bt",
-        title = "蓝牙共享网络",
-        reason = "无线备用通道（速度慢，Wi-Fi 断了也能传）",
-        ready = { ctx -> anyOf(interfaceNames(ctx), "bt-pan", "bt_pan", "bnep", "btpan") },
-        open = { ctx ->
-            startActivityQuietly(ctx, Intent("android.settings.TETHER_SETTINGS"))
-                || startActivityQuietly(ctx, Intent(Settings.ACTION_WIRELESS_SETTINGS))
-        },
-        kick = { kickBluetooth() },
-    ),
+    // 蓝牙共享网络（bt-pan）不参与传输了：实测只有 0.2~0.3 MB/s，多轨切分时它是最慢那条，
+    // 收尾要等它、还占一个通道名额，得不偿失（NetInterfaces.enumerate 已经把它过滤掉）。
+    // 所以这里也不再引导用户去开蓝牙网络共享。
 )
 
 /** 还有没有可开的链路（全开了就不弹这个引导） */

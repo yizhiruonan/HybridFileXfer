@@ -621,11 +621,16 @@ fun HfxApp(
                     TAB_HOME -> HomePage(
                         state = state,
                         serviceBusy = serviceBusy,
-                        // 空闲时按"预计通道数"显示，和已连接时的口径保持一致：
-                        // 一张 USB 网卡开 2 条通道，一张 WiFi/以太网开 4 条
+                        // 空闲时按"预计通道数"显示，口径必须和 ServerService.startServer 里的一致：
+                        // 只有 WiFi/以太网开 4 条，USB（含 USB 网络共享 rndis0）和蓝牙都只开 2 条。
+                        // 之前这里写的是「非 USB_ADB 一律 4 条」，rndis0 只开 2 条，
+                        // 于是主页一直显示「8 条通道（2 条不通）」——那 2 条根本不存在。
                         plannedChannels = interfaces
                             .filter { it.enabled }
-                            .sumOf { if (it.name.startsWith("USB_ADB")) 2 else 4 },
+                            .sumOf {
+                                val n = it.name.lowercase()
+                                if (n.startsWith("wlan") || n.startsWith("wifi") || n.startsWith("eth")) 4 else 2
+                            },
                         onStart = ::startServer,
                         onStop = {
                             if (serviceBusy == 0) {
