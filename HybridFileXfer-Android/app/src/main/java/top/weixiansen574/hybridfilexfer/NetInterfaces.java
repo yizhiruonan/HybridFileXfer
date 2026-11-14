@@ -57,6 +57,36 @@ public final class NetInterfaces {
         return netInterfaceList;
     }
 
+    /**
+     * 蓝牙共享网络（PAN）的网卡：安卓上一般叫 bt-pan，个别 ROM 是 bnep0。
+     *
+     * <p>它不是"真网卡"：手机开「蓝牙网络共享」、电脑用蓝牙连上手机之后才会出现，
+     * 走的是 BNEP 上的以太网帧，带宽只有几 Mbps（够用但慢），所以只当补充通道。
+     */
+    public static boolean isBluetooth(String ifName) {
+        String name = ifName.toLowerCase(java.util.Locale.US);
+        return name.startsWith("bt-pan") || name.startsWith("bt_pan") || name.startsWith("bnep")
+                || name.startsWith("btpan");
+    }
+
+    /** 设置界面里显示的名字（比 bt-pan / wlan0 好认），传输通道名仍然用原名当键 */
+    public static String label(String ifName) {
+        if (NetInterfaceInfo.USB_ADB.equals(ifName)) {
+            return "USB 数据线";
+        }
+        if (isBluetooth(ifName)) {
+            return "蓝牙共享网络";
+        }
+        String name = ifName.toLowerCase(java.util.Locale.US);
+        if (name.startsWith("wlan") || name.startsWith("wifi")) {
+            return "Wi-Fi";
+        }
+        if (name.startsWith("eth")) {
+            return "以太网";
+        }
+        return ifName;
+    }
+
     /** 数据线插着吗（USB 供电）；查不到时按插着处理，保持旧行为 */
     private static boolean usbCablePresent(Context context) {
         try {
@@ -78,11 +108,16 @@ public final class NetInterfaces {
      */
     public static void applySaved(Context context, List<NetInterfaceInfo> list) {
         Config config = Config.getInstance(context);
-        String enabledNames = config.getEnabledInterfaceNames();
-        if (!TextUtils.isEmpty(enabledNames)) {
-            List<String> names = split(enabledNames, ',');
-            for (NetInterfaceInfo item : list) {
-                item.enabled = names.contains(item.name);
+        // 记住的是「被关掉的」，不是「被开着的」：蓝牙共享网络（bt-pan / bnep0）这类网卡是随用随出现的，
+        // 用户以前保存的启用列表里永远不会有它，按老逻辑就一辈子开不起来（用户要的「加上蓝牙通道」）。
+        String disabledNames = config.getDisabledInterfaceNames();
+        boolean hasSaved = !TextUtils.isEmpty(disabledNames);
+        List<String> disabled = hasSaved ? split(disabledNames, ',') : new ArrayList<String>();
+        for (NetInterfaceInfo item : list) {
+            item.enabled = !hasSaved || !disabled.contains(item.name);
+            // 还没手动配置过时沿用老默认：VPN 的 tun 网卡不勾
+            if (!hasSaved && item.name.startsWith("tun")) {
+                item.enabled = false;
             }
         }
         String binds = config.getInterfaceBindAddresses();
@@ -108,6 +143,7 @@ public final class NetInterfaces {
      */
     public static void save(Context context, List<NetInterfaceInfo> list) {
         StringBuilder enabled = new StringBuilder();
+        StringBuilder disabled = new StringBuilder();
         StringBuilder binds = new StringBuilder();
         for (NetInterfaceInfo item : list) {
             if (item.enabled) {
@@ -122,9 +158,16 @@ public final class NetInterfaces {
                 }
                 binds.append(item.name).append('=').append(item.bindAddress.trim());
             }
+            if (!item.enabled) {
+                if (disabled.length() > 0) {
+                    disabled.append(',');
+                }
+                disabled.append(item.name);
+            }
         }
         Config config = Config.getInstance(context);
         config.setEnabledInterfaceNames(enabled.toString());
+        config.setDisabledInterfaceNames(disabled.toString());
         config.setInterfaceBindAddresses(binds.toString());
     }
 
@@ -149,14 +192,8 @@ public final class NetInterfaces {
     public static List<ServerNetInterface> forAutoConnect(Context context)
             throws SocketException, UnknownHostException {
         List<NetInterfaceInfo> list = enumerate(context);
-        if (TextUtils.isEmpty(Config.getInstance(context).getEnabledInterfaceNames())) {
-            for (NetInterfaceInfo item : list) {
-                // VPN 的 tun 网卡默认不用
-                item.enabled = !item.name.startsWith("tun");
-            }
-        } else {
-            applySaved(context, list);
-        }
+        // 勾选状态只有一处来源：没被显式关掉的都算启用（tun 除外，见 applySaved）
+        applySaved(context, list);
         return selected(list);
     }
 

@@ -907,10 +907,15 @@ private fun ConnectionsPage(
                             SwitchPreference(
                                 checked = iface.enabled,
                                 onCheckedChange = { checked -> onToggleInterface(iface.name, checked) },
-                                title = iface.name,
-                                summary = iface.address.hostAddress,
+                                // 显示「蓝牙共享网络」这种好认的名字，通道名仍然是 bt-pan / wlan0 当键
+                                title = top.weixiansen574.hybridfilexfer.NetInterfaces.label(iface.name),
+                                summary = iface.address.hostAddress + "   " + iface.name,
                             )
-                            val channelCount = if (iface.name.startsWith("USB_ADB")) 2 else 4
+                            // 和 ServerService.startServer 的分通道数保持一致：
+                            // Wi-Fi 链路能压满，开 4 条；USB 数据线受 adb 限制、蓝牙共享网络只有几 Mbps，2 条足够
+                            val lower = iface.name.lowercase()
+                            val channelCount =
+                                if (lower.contains("wlan") || lower.contains("wifi")) 4 else 2
                             for (index in 1..channelCount) {
                                 val channel = if (index == 1) iface.name else iface.name + "#" + index
                                 SwitchPreference(

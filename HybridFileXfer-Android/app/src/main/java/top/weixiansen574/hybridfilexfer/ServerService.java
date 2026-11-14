@@ -242,6 +242,45 @@ public class ServerService extends Service implements ServiceConnection {
         return interfaceNames;
     }
 
+    /** 有会话正在传文件吗（收尾也算）：这时候不要改通道列表，会把传输打断 */
+    public static boolean isBusy() {
+        for (HFXServer server : HFXServer.snapshot()) {
+            if (server.isTransferring()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * 正在监听的通道是否已经覆盖了这些网卡（每个网卡至少有第一通道在跑）。
+     *
+     * <p>给「网卡是后来才出现的」这种场景用：手机开「蓝牙网络共享」、电脑用蓝牙连上之后
+     * 才会冒出 bt-pan，后台服务已经在跑，得按新列表重启一次监听才能把蓝牙通道加进来，
+     * 否则用户必须杀掉应用重开（用户要的「加上蓝牙通道」就是这个）。
+     * 用户自己在设置里关掉的通道（disabled_channels）不算缺，避免反复重启。
+     */
+    public static boolean coversAll(Context context, List<ServerNetInterface> wanted) {
+        java.util.Set<String> disabled = Config.getInstance(context).getDisabledChannels();
+        List<String> running = interfaceNames;
+        for (ServerNetInterface item : wanted) {
+            if (item.name == null || disabled.contains(item.name)) {
+                continue;
+            }
+            boolean found = false;
+            for (String name : running) {
+                if (name.equals(item.name) || name.startsWith(item.name + "#")) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     /** 所有电脑的通道明细，按"电脑 A · 通道名\t地址"聚合（不同电脑的同名通道靠前缀区分）。 */
     public static List<String> getChannelDetails() {
         List<String> details = new ArrayList<>();

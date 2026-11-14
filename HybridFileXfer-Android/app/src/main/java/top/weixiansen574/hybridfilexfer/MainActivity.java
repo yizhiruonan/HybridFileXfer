@@ -223,7 +223,7 @@ public class MainActivity extends AppCompatActivity implements View.OnClickListe
      * 允许自动连接时，打开应用就让后台服务开始监听，电脑一连上就能传文件。
      */
     private void autoStartServerIfNeeded() {
-        if (!config.isAutoConnectEnabled() || ServerService.isRunning()) {
+        if (!config.isAutoConnectEnabled()) {
             return;
         }
         if (!hasStoragePermission()) {
@@ -233,6 +233,14 @@ public class MainActivity extends AppCompatActivity implements View.OnClickListe
             List<ServerNetInterface> interfaces = NetInterfaces.forAutoConnect(context);
             if (interfaces.isEmpty()) {
                 return;
+            }
+            if (ServerService.isRunning()) {
+                // 服务已经在跑：网卡是会变的（插拔数据线、开关 Wi-Fi、开「蓝牙网络共享」再让电脑连上），
+                // 新出现的网卡要能自动并进来，不然得杀掉应用重开才看得到蓝牙通道。
+                // 正在传文件时不动（会打断传输），等下一次回到前台再补。
+                if (ServerService.isBusy() || ServerService.coversAll(context, interfaces)) {
+                    return;
+                }
             }
             ServerService.startServer(context, config.getMode(), interfaces,
                     config.getLocalBufferCount(), config.getRemoteBufferCount());

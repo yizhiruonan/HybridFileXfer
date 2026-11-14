@@ -201,6 +201,21 @@ public class Config {
         preferences.edit().putString("enabled_interfaces", names).apply();
     }
 
+    /**
+     * 被用户显式关掉的网卡名（逗号分隔）。
+     *
+     * <p>和 {@link #getEnabledInterfaceNames()} 的区别是「没记录的网卡默认开着」：
+     * 蓝牙共享网络（bt-pan）、后插的网卡这类通道是后来才出现的，用户以前保存的启用列表里没有它，
+     * 按老逻辑就永远冒不出来。只有用户自己在设置里取消勾选，才会写进这里。
+     */
+    public String getDisabledInterfaceNames() {
+        return preferences.getString("disabled_interfaces", "");
+    }
+
+    public void setDisabledInterfaceNames(String names) {
+        preferences.edit().putString("disabled_interfaces", names).apply();
+    }
+
     /** 各网卡指定的电脑IP，格式 "wlan0=192.168.1.100;wlan1=" */
     public String getInterfaceBindAddresses() {
         return preferences.getString("interface_bind_addresses", "");

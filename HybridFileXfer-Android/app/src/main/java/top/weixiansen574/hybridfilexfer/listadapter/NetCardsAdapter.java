@@ -55,7 +55,7 @@ public class NetCardsAdapter extends RecyclerView.Adapter<NetCardsAdapter.ViewHo
     @Override
     public void onBindViewHolder(@NonNull ViewHolder holder, int position) {
         NetInterfaceInfo item = netInterfaceList.get(position);
-        holder.txvNameAndState.setText(item.name + " | " + item.state);
+        holder.txvNameAndState.setText(NetInterfaces.label(item.name) + " | " + item.state);
         holder.txvIP.setText(item.address.getHostAddress());
         boolean enableBindIpInput = !item.isUsbAdb();
         holder.imgInterfaceType.setImageDrawable(context.getDrawable(NetCardIcon.matchIdForIName(item.name)));
