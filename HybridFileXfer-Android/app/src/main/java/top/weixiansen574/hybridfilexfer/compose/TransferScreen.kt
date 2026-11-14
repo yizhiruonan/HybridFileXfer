@@ -95,8 +95,11 @@ internal fun TransferScreen(
     val scope = rememberCoroutineScope()
     val main = remember { Handler(Looper.getMainLooper()) }
 
+    // 两个窗格的起点（返回键判断"还能不能退回上级"用：回到起点就算退到底，再按才退出页面）
+    val localRoot = remember { startLocal }
+    val remoteRoot = remember { server.remoteHomeDir.ifEmpty { "/" } }
     var localPath by remember { mutableStateOf(startLocal) }
-    var remotePath by remember { mutableStateOf(server.remoteHomeDir.ifEmpty { "/" }) }
+    var remotePath by remember { mutableStateOf(remoteRoot) }
     val localFiles = remember { mutableStateListOf<RemoteFile>() }
     val remoteFiles = remember { mutableStateListOf<RemoteFile>() }
     val localSel = remember { mutableStateListOf<String>() }
@@ -140,26 +143,6 @@ internal fun TransferScreen(
     /** 已经发完的通道名（onChannelComplete 回调），用来判断"数据阶段结束" */
     val xferPopupDoneNames = remember { HashSet<String>() }
 
-    // 返回键：先关弹窗/菜单 → 取消焦点窗口的多选 → 最后才退出传输页
-    androidx.activity.compose.BackHandler(enabled = true) {
-        when {
-            menuFile != null -> menuFile = null
-            renameFile != null -> renameFile = null
-            propsFile != null -> propsFile = null
-            mkdirDialog -> mkdirDialog = false
-            message.isNotEmpty() -> message = ""
-            focusRight && remoteSel.isNotEmpty() -> {
-                remoteSel.clear()
-                remoteBlockStart = -1
-            }
-            !focusRight && localSel.isNotEmpty() -> {
-                localSel.clear()
-                localBlockStart = -1
-            }
-            else -> onClose()
-        }
-    }
-
     fun toast(text: String) {
         main.post { message = text }
     }
@@ -186,6 +169,41 @@ internal fun TransferScreen(
             remotePath = path
             remoteFiles.addAll(list.sortedWith(compareByDescending<RemoteFile> { it.isDirectory }.thenBy { it.name.lowercase() }))
         }.onFailure { toast("读取电脑目录失败：" + it.message) }
+    }
+
+    // 返回键：先关弹窗/菜单 → 焦点窗格退回上级目录 → 取消该窗格的多选 → 最后才退出传输页
+    //
+    // 用户反馈「在双窗口里打开文件夹后按返回，应该退回上级目录，而不是回到主页」：
+    // 以前返回键只看弹窗和选择，进到子目录以后按返回直接退出整个页面，等于"一层都退不了"。
+    // （放在 loadLocal/loadRemote 之后：Kotlin 的局部函数不能先用后声明）
+    androidx.activity.compose.BackHandler(enabled = true) {
+        // 焦点窗格还能不能往上退：已经在起点目录（手机是起始目录、电脑是对方的主目录）就不算，
+        // 再按一次返回才退出页面（和底部工具条的「↑ 上级」行为一致）
+        val focusPath = if (focusRight) remotePath else localPath
+        val focusRoot = if (focusRight) remoteRoot else localRoot
+        // 比路径要去掉末尾的分隔符：电脑端主目录带不带结尾的反斜杠都见过
+        // （`...\HybridFileXfer\` 与 `...\HybridFileXfer`），直接比字符串会把"已经在起点"
+        // 判成"还能往上"，于是返回键一路往上爬（实测从 HybridFileXfer 爬到 C:\Users\nil 还停不下来）
+        val focusUp =
+            if (normalizePath(focusPath) != normalizePath(focusRoot)) parentOf(focusPath) else null
+        when {
+            menuFile != null -> menuFile = null
+            renameFile != null -> renameFile = null
+            propsFile != null -> propsFile = null
+            mkdirDialog -> mkdirDialog = false
+            message.isNotEmpty() -> message = ""
+            // 打开了文件夹：返回 = 回上级目录（loadXxx 里会顺手清掉选择）
+            focusUp != null -> scope.launch { if (focusRight) loadRemote(focusUp) else loadLocal(focusUp) }
+            focusRight && remoteSel.isNotEmpty() -> {
+                remoteSel.clear()
+                remoteBlockStart = -1
+            }
+            !focusRight && localSel.isNotEmpty() -> {
+                localSel.clear()
+                localBlockStart = -1
+            }
+            else -> onClose()
+        }
     }
 
     LaunchedEffect(refreshTick) {
@@ -1171,6 +1189,12 @@ private fun shortName(path: String?): String {
 
 private fun toggle(list: MutableList<String>, path: String) {
     if (path in list) list.remove(path) else list.add(path)
+}
+
+/** 比较路径用：去掉末尾的分隔符（"D:\" 这类根目录本身会被压成 "D:"） */
+private fun normalizePath(path: String): String {
+    val trimmed = path.trimEnd('/', '\\')
+    return if (trimmed.isEmpty()) "/" else trimmed
 }
 
 private fun parentOf(path: String): String? {
