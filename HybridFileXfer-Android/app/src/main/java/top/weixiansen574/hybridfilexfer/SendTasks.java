@@ -2,11 +2,15 @@ package top.weixiansen574.hybridfilexfer;
 
 import android.content.Context;
 import android.content.Intent;
+import android.os.SystemClock;
 
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -108,6 +112,7 @@ public final class SendTasks {
             return;
         }
         TASKS.remove(task.getTaskId());
+        SPEEDS.remove(task.getTaskId());
     }
 
     private static void prune() {
@@ -121,8 +126,234 @@ public final class SendTasks {
                     || state == SendTask.STATE_SUSPENDED
                     || state == SendTask.STATE_WAITING) {
                 TASKS.remove(task.getTaskId());
+                SPEEDS.remove(task.getTaskId());
             }
         }
+    }
+
+    // ------------------------------------------------------------------
+    // 「任务队列」：面板和通知读的只读快照
+    // ------------------------------------------------------------------
+
+    /**
+     * 队列里的一行，<b>只读</b>：字段全是 final，取的时候一次性拷好，
+     * 界面线程读它不会读到任务状态改到一半的中间态（任务字段本身是跨线程读写）。
+     */
+    public static final class TaskInfo {
+        public final int taskId;
+        /** 文件名：正在传的那个，还没开传就用准备阶段记下的第一个 */
+        public final String fileName;
+        public final long totalBytes;
+        /** 已传字节：只算自己的账本（排队的任务读不到正在传那个任务的账本） */
+        public final long doneBytes;
+        public final int state;
+        /** 目标电脑名（还没连上是空串） */
+        public final String label;
+        /** 同一条连接上「前面还有几个任务」（含正在传的那个） */
+        public final int aheadCount;
+        /** 排队中的第几个（0 = 下一个就轮到它）；没在排队是 -1 */
+        public final int queueIndex;
+        /** 速率（字节/秒，只有正在传的那个才有值） */
+        public final long speed;
+
+        TaskInfo(int taskId, String fileName, long totalBytes, long doneBytes, int state,
+                 String label, int aheadCount, int queueIndex, long speed) {
+            this.taskId = taskId;
+            this.fileName = fileName == null ? "" : fileName;
+            this.totalBytes = totalBytes;
+            this.doneBytes = doneBytes;
+            this.state = state;
+            this.label = label == null ? "" : label;
+            this.aheadCount = aheadCount;
+            this.queueIndex = queueIndex;
+            this.speed = speed;
+        }
+
+        /** 正在用这条连接的发送通道：在传 / 暂停着占通道 / 让出通道 */
+        public boolean isActive() {
+            return state == SendTask.STATE_SENDING || state == SendTask.STATE_PAUSED
+                    || state == SendTask.STATE_SUSPENDED;
+        }
+
+        /** 还在排队（准备中 / 等通道） */
+        public boolean isQueued() {
+            return state == SendTask.STATE_WAITING || state == SendTask.STATE_PREPARING;
+        }
+
+        public boolean isFinished() {
+            return state == SendTask.STATE_DONE || state == SendTask.STATE_FAILED
+                    || state == SendTask.STATE_CANCELLED;
+        }
+
+        public int percent() {
+            if (totalBytes <= 0L) {
+                return 0;
+            }
+            return (int) Math.max(0, Math.min(100, doneBytes * 100L / totalBytes));
+        }
+    }
+
+    /**
+     * 队列里的速率采样（每个任务一份）。
+     *
+     * <p>面板每 100ms 取一次快照、通知每 500ms 取一次，两边共用一个采样点：
+     * 只有两次间隔够长时才重算，别让高频调用把间隔切碎、算出一串离谱值。
+     */
+    private static final Map<Integer, SpeedSample> SPEEDS = new ConcurrentHashMap<>();
+    private static final long SPEED_MIN_INTERVAL_MS = 200L;
+
+    private static final class SpeedSample {
+        long bytes;
+        long at;
+        long speed;
+    }
+
+    private static long sampleSpeed(int taskId, long done, boolean active, long now) {
+        if (!active) {
+            // 没在传就不是「速率」，顺手把采样点扔掉（下次开传从 0 起算）
+            SPEEDS.remove(taskId);
+            return 0L;
+        }
+        SpeedSample sample = SPEEDS.get(taskId);
+        if (sample == null) {
+            sample = new SpeedSample();
+            sample.bytes = done;
+            sample.at = now;
+            SPEEDS.put(taskId, sample);
+            return 0L;
+        }
+        // 换文件 / 续传重算时 done 会变小：重新起算，别把上一段算进这一秒
+        if (done < sample.bytes) {
+            sample.bytes = done;
+            sample.at = now;
+            sample.speed = 0L;
+            return 0L;
+        }
+        long elapsed = now - sample.at;
+        if (elapsed < SPEED_MIN_INTERVAL_MS) {
+            return sample.speed;
+        }
+        long instant = (done - sample.bytes) * 1000L / Math.max(1L, elapsed);
+        sample.speed = sample.speed <= 0L ? instant : (sample.speed * 2L + instant) / 3L;
+        sample.bytes = done;
+        sample.at = now;
+        return sample.speed;
+    }
+
+    /** 队列的展示顺序：正在传的最前，然后排队中的（按创建顺序），收尾了的垫底 */
+    private static int rank(int state) {
+        switch (state) {
+            case SendTask.STATE_SENDING:
+                return 0;
+            case SendTask.STATE_PAUSED:
+                return 1;
+            case SendTask.STATE_SUSPENDED:
+                return 2;
+            case SendTask.STATE_WAITING:
+                return 3;
+            case SendTask.STATE_PREPARING:
+                return 4;
+            default:
+                return 5;
+        }
+    }
+
+    /** 这个任务占的是哪条连接的通道（还没连上是 -1，都归到「未知」那一组） */
+    private static int connectionKey(SendTask task) {
+        int slot = task.getSlotConnectionId();
+        if (slot >= 0) {
+            return slot;
+        }
+        HFXServer srv = task.getServer();
+        return srv == null ? -1 : srv.getId();
+    }
+
+    /**
+     * 任务队列快照：<b>只读</b>，面板（ShareActivity）和通知（ServerService）都读它。
+     *
+     * <p>顺序就是队列顺序：正在传的在最前，然后按创建顺序排队（= 「谁在前」），
+     * 已经收尾但面板还开着的垫底。
+     *
+     * <p>「前面还有几个」按<b>同一条连接</b>算：闸门（{@link Gate}）是一条连接一把，
+     * 打到不同电脑上的任务是并发的，彼此不算在对方的队列里。
+     */
+    public static List<TaskInfo> queueSnapshot() {
+        List<SendTask> tasks = snapshot();
+        if (tasks.isEmpty()) {
+            return Collections.emptyList();
+        }
+        // 先按连接分组，组内排出「谁占着、谁第几个等」：位置下标就是「前面还有几个」
+        Map<Integer, List<SendTask>> groups = new LinkedHashMap<>();
+        for (SendTask task : tasks) {
+            int key = connectionKey(task);
+            List<SendTask> group = groups.get(key);
+            if (group == null) {
+                group = new ArrayList<>();
+                groups.put(key, group);
+            }
+            group.add(task);
+        }
+        Map<Integer, int[]> positions = new HashMap<>();
+        for (List<SendTask> group : groups.values()) {
+            Collections.sort(group, (a, b) -> {
+                int rankA = rank(a.getState());
+                int rankB = rank(b.getState());
+                if (rankA != rankB) {
+                    return Integer.compare(rankA, rankB);
+                }
+                return Integer.compare(a.getTaskId(), b.getTaskId());
+            });
+            int queueIndex = 0;
+            for (int i = 0; i < group.size(); i++) {
+                SendTask task = group.get(i);
+                int state = task.getState();
+                boolean queued = state == SendTask.STATE_WAITING || state == SendTask.STATE_PREPARING;
+                positions.put(task.getTaskId(), new int[]{queued ? i : 0, queued ? queueIndex : -1});
+                if (queued) {
+                    queueIndex++;
+                }
+            }
+        }
+        long now = SystemClock.elapsedRealtime();
+        List<TaskInfo> out = new ArrayList<>(tasks.size());
+        for (SendTask task : tasks) {
+            int[] position = positions.get(task.getTaskId());
+            int state = task.getState();
+            long done = task.getQueueDoneBytes();
+            out.add(new TaskInfo(
+                    task.getTaskId(),
+                    task.getDisplayFileName(),
+                    task.getTotalBytes(),
+                    done,
+                    state,
+                    task.getLabel(),
+                    position == null ? 0 : position[0],
+                    position == null ? -1 : position[1],
+                    sampleSpeed(task.getTaskId(), done, state == SendTask.STATE_SENDING, now)));
+        }
+        Collections.sort(out, (a, b) -> {
+            int rankA = rank(a.state);
+            int rankB = rank(b.state);
+            if (rankA != rankB) {
+                return Integer.compare(rankA, rankB);
+            }
+            return Integer.compare(a.taskId, b.taskId);
+        });
+        return out;
+    }
+
+    /**
+     * 某个任务前面还有几个任务（面板上「排队中（前面还有 N 个任务）」用它）。
+     *
+     * <p>任务已经不在表里（刚收尾）时返回 0：文案里少一个数字比抛异常好。
+     */
+    public static int aheadCount(int taskId) {
+        for (TaskInfo info : queueSnapshot()) {
+            if (info.taskId == taskId) {
+                return info.aheadCount;
+            }
+        }
+        return 0;
     }
 
     // ------------------------------------------------------------------
@@ -132,7 +363,7 @@ public final class SendTasks {
     /**
      * 申请某台电脑的发送通道，拿到返回 true；任务被取消返回 false。
      *
-     * <p>排队期间任务的状态是 WAITING（面板上写着「等待其他任务完成…」），不是失败。
+     * <p>排队期间任务的状态是 WAITING（面板上写着「排队中（前面还有 N 个任务）」），不是失败。
      *
      * <p><b>让出</b>：如果此刻占着通道的那个任务正被用户暂停着（闸门关着、传输线程阻塞在读块上），
      * 它不主动退出就谁也进不来。这里发现这种情况就请它让出（{@link SendTask#requestHandover()}：

@@ -386,6 +386,16 @@ internal fun ReceiveProgressPanel(
      * 窄屏兜底：实际宽度最多「屏宽 - 32dp」（左右各留 16dp），免得两边被裁掉。
      */
     widthDp: Dp = 340.dp,
+    /**
+     * 「任务队列」：多任务发到同一台电脑时，同一时刻只有一个在传，其余在排队。
+     * 空列表（默认）= 不画这一段，双窗口 / 悬浮窗 / 应用内接收那三处一个像素都不变；
+     * 只有分享发送页（ShareProgress）多任务时会传进来。
+     */
+    queue: List<QueueRow> = emptyList(),
+    /** 点队列里的某一行：切到那个任务的面板 */
+    onQueueOpen: ((Int) -> Unit)? = null,
+    /** 点队列行上的「取消」：取消那个任务（排队中的也走这个） */
+    onQueueCancel: ((Int) -> Unit)? = null,
 ) {
     val colorScheme = MiuixTheme.colorScheme
     val haptic = LocalHapticFeedback.current
@@ -605,6 +615,10 @@ internal fun ReceiveProgressPanel(
                     }
                 }
             }
+            // 任务队列：多任务排队时才有（单个任务显示不出来，保持原来的面板不变）
+            if (queue.size > 1) {
+                QueueSection(queue = queue, onOpen = onQueueOpen, onCancel = onQueueCancel)
+            }
             // 暂停/取消：双窗口（onPause）由调用方控制；应用内接收走 ServerService；
             // 都没有时发送卡片只给「关闭」。
             // showFooter=false（分享发送页）：整块不画，底部按钮由 Activity 的布局自己提供
@@ -674,6 +688,119 @@ internal fun ReceiveProgressPanel(
             Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.35f)).clickable { onDismiss() },
             contentAlignment = Alignment.Center,
         ) { card() }
+    }
+}
+
+/**
+ * 「任务队列」那一段：一行一个任务，按队列顺序（正在传的在最前，然后是谁在前）。
+ *
+ * 每行 = 位次 · 文件名（第二行：目标电脑 · 已传/总量）· 右边一句状态
+ * （正在发送 45% / 等待中（前面还有 1 个）/ 已暂停 / 已完成）。
+ * 当前这个面板对应的任务高亮，点别的行切到那个任务的面板；能取消的行右边给一颗小小的「取消」。
+ *
+ * <b>最多画 3 行</b>，多出来的折成「还有 N 个任务」：卡片高度上限 560dp，卡片自己可滚
+ * （外层 Column 已经是 verticalScroll），这里再套一个滚动容器会和它打架 —— 所以是固定行数 + 折叠。
+ */
+@Composable
+private fun QueueSection(
+    queue: List<QueueRow>,
+    onOpen: ((Int) -> Unit)?,
+    onCancel: ((Int) -> Unit)?,
+) {
+    val colorScheme = MiuixTheme.colorScheme
+    val haptic = LocalHapticFeedback.current
+    Spacer(Modifier.height(14.dp))
+    Box(Modifier.fillMaxWidth().height(1.dp).background(colorScheme.surfaceVariant))
+    Spacer(Modifier.height(10.dp))
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Text(
+            "任务队列",
+            fontSize = 12.sp,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier.weight(1f),
+        )
+        Text(
+            queue.size.toString() + " 个任务",
+            fontSize = 11.sp,
+            color = colorScheme.onSurfaceVariantSummary,
+        )
+    }
+    Spacer(Modifier.height(4.dp))
+    val shown = if (queue.size > 3) 3 else queue.size
+    for (i in 0 until shown) {
+        val row = queue[i]
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(10.dp))
+                .background(
+                    if (row.current) colorScheme.primary.copy(alpha = 0.12f) else Color.Transparent,
+                )
+                .clickable(enabled = !row.current && onOpen != null) {
+                    if (!row.current && onOpen != null) {
+                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                        onOpen.invoke(row.taskId)
+                    }
+                }
+                .padding(horizontal = 8.dp, vertical = 5.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                row.index.toString(),
+                fontSize = 11.sp,
+                color = colorScheme.onSurfaceVariantSummary,
+                modifier = Modifier.width(16.dp),
+            )
+            Column(Modifier.weight(1f)) {
+                Text(
+                    row.title.ifEmpty { "…" },
+                    fontSize = 12.sp,
+                    fontWeight = if (row.current) FontWeight.Bold else FontWeight.Normal,
+                    color = if (row.current) colorScheme.primary else colorScheme.onSurface,
+                    maxLines = 1,
+                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                )
+                if (row.subtitle.isNotEmpty()) {
+                    Text(
+                        row.subtitle,
+                        fontSize = 10.sp,
+                        color = colorScheme.onSurfaceVariantSummary,
+                        maxLines = 1,
+                        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                    )
+                }
+            }
+            Spacer(Modifier.width(6.dp))
+            Text(
+                row.status,
+                fontSize = 11.sp,
+                maxLines = 1,
+                color = if (row.current) colorScheme.primary else colorScheme.onSurfaceVariantSummary,
+            )
+            if (row.cancellable && onCancel != null) {
+                Spacer(Modifier.width(2.dp))
+                Text(
+                    "取消",
+                    fontSize = 11.sp,
+                    color = colorScheme.primary,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(8.dp))
+                        .clickable {
+                            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            onCancel.invoke(row.taskId)
+                        }
+                        .padding(horizontal = 6.dp, vertical = 4.dp),
+                )
+            }
+        }
+    }
+    if (queue.size > shown) {
+        Text(
+            "还有 " + (queue.size - shown) + " 个任务",
+            fontSize = 10.sp,
+            color = colorScheme.onSurfaceVariantSummary,
+            modifier = Modifier.fillMaxWidth().padding(start = 24.dp, top = 2.dp),
+        )
     }
 }
 

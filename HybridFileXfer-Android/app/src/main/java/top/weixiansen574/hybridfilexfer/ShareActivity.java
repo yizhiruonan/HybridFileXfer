@@ -23,10 +23,12 @@ import java.util.List;
 import java.util.Map;
 
 import top.weixiansen574.hybridfilexfer.compose.ChannelStat;
+import top.weixiansen574.hybridfilexfer.compose.QueueRow;
 import top.weixiansen574.hybridfilexfer.compose.SegInfo;
 import top.weixiansen574.hybridfilexfer.compose.ShareActions;
 import top.weixiansen574.hybridfilexfer.compose.SharePanel;
 import top.weixiansen574.hybridfilexfer.core.BlockProgress;
+import top.weixiansen574.hybridfilexfer.core.Utils;
 import top.weixiansen574.hybridfilexfer.core.HFXLog;
 import top.weixiansen574.hybridfilexfer.core.HFXService;
 import top.weixiansen574.hybridfilexfer.droidcore.HFXServer;
@@ -169,7 +171,10 @@ public class ShareActivity extends AppCompatActivity {
                 this::cancelTransfer,
                 this::pauseTransfer,
                 this::resumeTransfer));
+        // 取消确认框按「要取消哪个任务」收尾（面板自己的取消按钮、队列行上的取消，同一个框）
         panel.setCancelHandlers(this::cancelKeepingProgress, this::cancelDiscardingProgress);
+        // 队列列表的两个落点：点一行切到那个任务的面板；点行上的「取消」取消那个任务
+        panel.setQueueActions(this::switchToTask, this::cancelQueueTask);
 
         SendTask target = taskId < 0 ? createTaskFromIntent() : SendTasks.get(taskId);
         if (target == null) {
@@ -351,18 +356,80 @@ public class ShareActivity extends AppCompatActivity {
             return;
         }
         if (panel != null) {
-            panel.showCancelConfirm();
+            panel.showCancelConfirm(taskId);
         }
     }
 
+    /**
+     * 队列行上的「取消」。
+     *
+     * <p>和面板上「取消发送」同一个出口，只是作用在<b>那一行的任务</b>上：
+     * <ul>
+     *   <li>已经收尾：什么都不做（那一行本来也不给取消入口）；</li>
+     *   <li>排队中 / 准备中（还没开传）：直接取消并保留进度 —— 和面板对「还没开传」的处理一致
+     *       （电脑上还没有半截文件，没什么可问的）；</li>
+     *   <li>正在传 / 暂停着：弹同一个「保留进度 / 不保留」确认框，只是记的是那个任务的 taskId。</li>
+     * </ul>
+     */
+    private void cancelQueueTask(int targetTaskId) {
+        if (targetTaskId == taskId) {
+            cancelTransfer();
+            return;
+        }
+        SendTask target = SendTasks.get(targetTaskId);
+        if (target == null || target.isTerminal()) {
+            return;
+        }
+        if (!target.isTransferActive()) {
+            target.cancel(true);
+            HFXLog.d("share: 队列里取消排队任务 " + targetTaskId + "（保留进度）");
+            return;
+        }
+        if (panel != null) {
+            panel.showCancelConfirm(targetTaskId);
+        }
+    }
+
+    /**
+     * 队列里点了别的任务：打开那个任务的面板。
+     *
+     * <p>走现成的 {@link SendTasks#openPanel}：它按 taskId 路由（{@code ShareActivity} 里
+     * {@code EXTRA_TASK_ID} → {@code SendTasks.get}），排队中的任务也有同样的记录，
+     * 所以「点队列里的排队任务 → 落到那个任务的面板」和点通知回来是同一条路。
+     *
+     * <p>这里<b>不动</b>当前这个面板：它是当前任务的视图，关掉它等于
+     * {@code SendTask.unbind} —— 排队中的任务会在那里被取消，用户只是「看一眼别人」不该这样。
+     */
+    private void switchToTask(int targetTaskId) {
+        if (targetTaskId == taskId) {
+            return;
+        }
+        HFXLog.d("share: 从队列切到 taskId=" + targetTaskId);
+        SendTasks.openPanel(this, targetTaskId);
+    }
+
     /** 确认框里选了「保留进度」：电脑上的半截文件留着下次续传 */
-    private void cancelKeepingProgress() {
-        doCancelTransfer(true);
+    private void cancelKeepingProgress(int targetTaskId) {
+        doCancelTask(targetTaskId, true);
     }
 
     /** 确认框里选了「不保留」：让电脑端把这次的不完整文件和续传记录删掉 */
-    private void cancelDiscardingProgress() {
-        doCancelTransfer(false);
+    private void cancelDiscardingProgress(int targetTaskId) {
+        doCancelTask(targetTaskId, false);
+    }
+
+    /** 确认框收尾：取消「框里记的那个任务」（可能是本面板的，也可能是队列里别的） */
+    private void doCancelTask(int targetTaskId, boolean keepProgress) {
+        if (targetTaskId == taskId || targetTaskId < 0) {
+            doCancelTransfer(keepProgress);
+            return;
+        }
+        SendTask target = SendTasks.get(targetTaskId);
+        if (target == null) {
+            return;
+        }
+        target.cancel(keepProgress);
+        HFXLog.d("share: 队列里取消任务 " + targetTaskId + "，keep=" + keepProgress);
     }
 
     private void doCancelTransfer(boolean keepProgress) {
@@ -783,7 +850,86 @@ public class ShareActivity extends AppCompatActivity {
                 segments,
                 channels,
                 currentNote(current),
-                current.getLabel());
+                current.getLabel(),
+                buildQueueRows(current));
+    }
+
+    // ------------------------------------------------------------------
+    // 任务队列列表（面板里「任务队列」那一段）
+    // ------------------------------------------------------------------
+
+    /**
+     * 队列列表要的行，每帧从 {@link SendTasks#queueSnapshot()} 取一次。
+     *
+     * <p>快照是只读的（字段都拷好了），顺序就是队列顺序：正在传的在最前，然后按创建顺序排队，
+     * 已经收尾但面板还开着的垫底。
+     *
+     * <p><b>单任务时返回空列表</b>：面板上就不画「任务队列」这一段，
+     * 单任务的面板和改造前一个像素都不差。
+     */
+    private List<QueueRow> buildQueueRows(SendTask current) {
+        if (current == null) {
+            return Collections.emptyList();
+        }
+        List<SendTasks.TaskInfo> infos = SendTasks.queueSnapshot();
+        if (infos.size() < 2) {
+            return Collections.emptyList();
+        }
+        List<QueueRow> rows = new ArrayList<>(infos.size());
+        for (int i = 0; i < infos.size(); i++) {
+            SendTasks.TaskInfo info = infos.get(i);
+            rows.add(new QueueRow(
+                    info.taskId,
+                    i + 1,
+                    info.fileName,
+                    queueSubtitle(info),
+                    queueStatus(info),
+                    info.taskId == current.getTaskId(),
+                    !info.isFinished()));
+        }
+        return rows;
+    }
+
+    /** 队列行第二行小字：目标电脑 · 已传/总量（正在传的那行再带一个速率） */
+    private String queueSubtitle(SendTasks.TaskInfo info) {
+        String label = info.label == null || info.label.isEmpty() ? "等待电脑" : info.label;
+        if (info.totalBytes <= 0L) {
+            return label;
+        }
+        StringBuilder text = new StringBuilder(label);
+        text.append(" · ").append(Utils.formatFileSize(info.doneBytes))
+                .append(" / ").append(Utils.formatFileSize(info.totalBytes));
+        if (info.state == SendTask.STATE_SENDING && info.speed > 0L) {
+            text.append(" · ").append(Utils.formatSpeed(info.speed));
+        }
+        return text.toString();
+    }
+
+    /** 队列行右边那句状态 */
+    private String queueStatus(SendTasks.TaskInfo info) {
+        switch (info.state) {
+            case SendTask.STATE_SENDING:
+                return "正在发送 " + info.percent() + "%";
+            case SendTask.STATE_PAUSED:
+            case SendTask.STATE_SUSPENDED:
+                return info.percent() > 0 ? "已暂停 " + info.percent() + "%" : "已暂停";
+            case SendTask.STATE_WAITING:
+                // N = 同一条连接上排在它前面的任务数（含正在传的那个）；
+                // N = 0 说明它自己就是队头，那句「还有 0 个」就不写了
+                return info.aheadCount <= 0
+                        ? "等待中"
+                        : "等待中（前面还有 " + info.aheadCount + " 个）";
+            case SendTask.STATE_PREPARING:
+                return "准备中";
+            case SendTask.STATE_DONE:
+                return "已完成";
+            case SendTask.STATE_FAILED:
+                return "发送失败";
+            case SendTask.STATE_CANCELLED:
+                return "已取消";
+            default:
+                return "";
+        }
     }
 
     // ------------------------------------------------------------------

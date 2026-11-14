@@ -232,7 +232,7 @@ public final class SendTask {
             }
             if (state == STATE_SUSPENDED) {
                 state = STATE_WAITING;
-                statusText = "正在等待其他任务让出通道…";
+                statusText = queueNote();
                 restart = true;
             }
         }
@@ -367,7 +367,9 @@ public final class SendTask {
                 return;
             }
             state = STATE_WAITING;
-            statusText = "正在等待其他任务完成…";
+            // 这里在闸门锁里（SendTasks#acquire 的 synchronized(gate)）：不去算队列位次，
+            // 文案由 getStatusText() 按当前位次现取
+            statusText = "";
         }
         if (srv != null) {
             HFXLog.d("task " + taskId + ": 排队等 " + srv.getDisplayName() + " 的发送通道");
@@ -1104,7 +1106,20 @@ public final class SendTask {
     }
 
     public String getStatusText() {
+        // 排队中那句「排队中（前面还有 N 个任务）」里的 N 是会变的：
+        // 位次当场从队列快照里取，别用开始排队那一刻记下的旧数字
+        if (state == STATE_WAITING) {
+            return queueNote();
+        }
         return statusText;
+    }
+
+    /** 排队中面板上那一行：「排队中（前面还有 N 个任务）」，N = 同一条连接上排在它前面的任务数 */
+    private String queueNote() {
+        int ahead = SendTasks.aheadCount(taskId);
+        // N = 0 说明它自己就是队头（在等的是电脑上的别的传输，不是本队列里的任务）：
+        // 「前面还有 0 个任务」读着别扭，就说「排队中」
+        return ahead <= 0 ? "排队中" : "排队中（前面还有 " + ahead + " 个任务）";
     }
 
     public String getResultText() {
@@ -1152,6 +1167,32 @@ public final class SendTask {
             }
         }
         return done;
+    }
+
+    /**
+     * 队列 / 通知用的已传字节。
+     *
+     * <p>和 {@link #getDoneBytes()} 的区别：{@code sendProgress} 是<b>这条连接上正在传的那个任务</b>
+     * 的账本，排队的任务读它会把别人的进度算成自己的。所以只有「正在用这本账」的任务
+     * （在传 / 暂停着占着通道）才加上它，其余只报自己已经整组发完的字节。
+     */
+    public long getQueueDoneBytes() {
+        int current = state;
+        if (current == STATE_SENDING || current == STATE_PAUSED) {
+            return getDoneBytes();
+        }
+        return completedBytes + resumeSkipped;
+    }
+
+    /** 队列 / 通知要的文件名：正在传的那个，还没开传就用准备阶段记下的第一个 */
+    public String getDisplayFileName() {
+        String current = currentFileName;
+        if (current != null && !current.isEmpty()) {
+            return current;
+        }
+        synchronized (sentFileNames) {
+            return sentFileNames.isEmpty() ? "" : sentFileNames.get(0);
+        }
     }
 
     /** 当前拍的块快照（分段进度条用），取不到返回 null */

@@ -36,6 +36,41 @@ class ShareActions(
 )
 
 /**
+ * 「任务队列」列表里的一行。
+ *
+ * 由 Java 侧的 ShareActivity 每帧组装好（文案、百分比、位次都在那边算），面板只负责画：
+ * 面板不知道任务状态机，也就不需要跟着任务的变化去改。
+ *
+ * 字段全是 val 且由 Java 直接构造，所以不是 data class（不需要 copy/equals，每帧本来就是新的一行）。
+ */
+class QueueRow(
+    /** 这一行是哪个任务：点它切面板、取消它都按这个 taskId 走 */
+    @JvmField val taskId: Int,
+    /** 行首位次（1 开始） */
+    @JvmField val index: Int,
+    /** 文件名 */
+    @JvmField val title: String,
+    /** 第二行小字：目标电脑 · 已传/总量 */
+    @JvmField val subtitle: String,
+    /** 右边那句话：正在发送 45% / 等待中（前面还有 1 个）/ 已暂停 / 已完成 */
+    @JvmField val status: String,
+    /** 就是当前这个面板对应的任务（高亮，点了不跳） */
+    @JvmField val current: Boolean,
+    /** 这一行能不能「取消」（已收尾的不能） */
+    @JvmField val cancellable: Boolean,
+)
+
+/**
+ * 队列行上的两个落点。
+ *
+ * 用 fun interface 而不是 (Int) -> Unit：Java 侧才能直接写 {@code this::switchToTask}
+ * 这种方法引用（Kotlin 的函数类型到 Java 是 Function1，那不是 SAM，Java 没法用 lambda）。
+ */
+fun interface QueueAction {
+    fun onTask(targetTaskId: Int)
+}
+
+/**
  * 「分享发送」页的进度面板：把双窗口弹窗 / 应用外悬浮窗用的那个 [ReceiveProgressPanel]
  * 原样塞进 ShareActivity 这条 Java 流程里。
  *
@@ -75,14 +110,23 @@ internal class SharePanel(context: Context) {
     private val actions = mutableStateOf<ShareActions?>(null)
 
     /**
-     * 「取消发送」的确认框现在是不是开着（已传的部分要不要保留）。
-     * 框开着的时候传输还在跑（用户可以选「继续传输」回去）。
+     * 「取消发送」的确认框现在针对哪个任务（-1 = 框没开）。
+     *
+     * 以前是一个 Boolean：框只可能针对「这个面板的任务」。做了任务队列之后，队列行上的
+     * 「取消」也要用同一个框（不另造一套），所以这里记 taskId，确认时按它去取消那个任务。
      */
-    private val cancelConfirm = mutableStateOf(false)
+    private val cancelConfirmTask = mutableStateOf(-1)
 
-    /** 确认框的两个落点 */
-    private var cancelKeep: Runnable? = null
-    private var cancelDiscard: Runnable? = null
+    /** 确认框的两个落点（参数 = 要取消的那个 taskId） */
+    private var cancelKeep: QueueAction? = null
+    private var cancelDiscard: QueueAction? = null
+
+    /** 任务队列（多任务时才非空；空列表 = 面板和以前一模一样，不画这一段） */
+    private val queue = mutableStateOf<List<QueueRow>>(emptyList())
+
+    /** 队列行上的落点：切到那个任务的面板 / 取消那个任务（setQueueActions 之前是 null） */
+    private val queueOpen = mutableStateOf<QueueAction?>(null)
+    private val queueCancel = mutableStateOf<QueueAction?>(null)
 
     private val owner = Owner().also { it.start() }
 
@@ -102,6 +146,8 @@ internal class SharePanel(context: Context) {
                     // closeWhenIdle=true（准备 / 等连接 / 复制 阶段补一颗「关闭」）。
                     // widthDp=390dp：只把卡片放宽（双窗口是 340dp），窄屏时面板自己按「屏宽 - 32dp」兜底。
                     val current = actions.value
+                    val openQueue = queueOpen.value
+                    val cancelQueue = queueCancel.value
                     ReceiveProgressPanel(
                         state = state.value,
                         onDismiss = { current?.onDismiss?.run() },
@@ -112,20 +158,25 @@ internal class SharePanel(context: Context) {
                         bare = true,
                         closeWhenIdle = true,
                         widthDp = 390.dp,
+                        // 任务队列：只有多任务时非空（单个任务的面板和以前一个像素都不差）
+                        queue = queue.value,
+                        onQueueOpen = { id -> openQueue?.onTask(id) },
+                        onQueueCancel = { id -> cancelQueue?.onTask(id) },
                     )
                     // 取消确认框：和双窗口那边是同一个 composable（Dialogs.kt）
-                    if (cancelConfirm.value) {
+                    val confirming = cancelConfirmTask.value
+                    if (confirming >= 0) {
                         CancelTransferDialog(
                             sending = true,
                             onKeep = {
-                                cancelConfirm.value = false
-                                cancelKeep?.run()
+                                cancelConfirmTask.value = -1
+                                cancelKeep?.onTask(confirming)
                             },
                             onDiscard = {
-                                cancelConfirm.value = false
-                                cancelDiscard?.run()
+                                cancelConfirmTask.value = -1
+                                cancelDiscard?.onTask(confirming)
                             },
-                            onDismiss = { cancelConfirm.value = false },
+                            onDismiss = { cancelConfirmTask.value = -1 },
                         )
                     }
                 }
@@ -141,21 +192,35 @@ internal class SharePanel(context: Context) {
     /**
      * 装「取消发送」确认框的两个落点。
      *
+     * 参数是 QueueAction（不是 Runnable）：队列行上的「取消」也要走这个框，
+     * 确认时得知道取消的是**哪个任务**（面板上的「取消发送」传的就是本面板的 taskId）。
+     *
      * @param keep 用户选了「保留进度」：电脑上的半截文件留着下次续传
      * @param discard 用户选了「不保留」：让电脑端把不完整文件和续传记录删掉
      */
-    fun setCancelHandlers(keep: Runnable?, discard: Runnable?) {
+    fun setCancelHandlers(keep: QueueAction?, discard: QueueAction?) {
         cancelKeep = keep
         cancelDiscard = discard
     }
 
-    /** 弹「取消发送」确认框（面板上的「取消发送」按一下就走这里） */
-    fun showCancelConfirm() {
-        runOnMain { cancelConfirm.value = true }
+    /** 装队列行上的两个落点：点一行切到那个任务的面板 / 点「取消」取消那个任务 */
+    fun setQueueActions(open: QueueAction?, cancel: QueueAction?) {
+        queueOpen.value = open
+        queueCancel.value = cancel
+    }
+
+    /**
+     * 弹「取消发送」确认框。
+     *
+     * @param targetTaskId 要取消哪个任务（面板上的「取消发送」= 本面板的 taskId；
+     *                     队列行上的「取消」= 那一行的 taskId）
+     */
+    fun showCancelConfirm(targetTaskId: Int) {
+        runOnMain { cancelConfirmTask.value = targetTaskId }
     }
 
     fun hideCancelConfirm() {
-        runOnMain { cancelConfirm.value = false }
+        runOnMain { cancelConfirmTask.value = -1 }
     }
 
     private fun runOnMain(block: Runnable) {
@@ -186,7 +251,10 @@ internal class SharePanel(context: Context) {
         channels: List<ChannelStat>,
         note: String,
         label: String,
+        queueRows: List<QueueRow>,
     ) {
+        // 队列是另一份状态（UiState 在 HfxApp.kt 里，这次不动它）：每帧一起换掉
+        runOnMain { queue.value = queueRows }
         // 每次都是一份**完整**的 UiState（其余字段走默认值）：面板不可能从上一帧
         // 继承到 xferNote / xferPaused / 通道明细之类的旧值。
         update(UiState(
@@ -215,11 +283,14 @@ internal class SharePanel(context: Context) {
     fun release() {
         runOnMain {
             actions.value = null
-            cancelConfirm.value = false
+            cancelConfirmTask.value = -1
+            queue.value = emptyList()
             state.value = UiState()
         }
         cancelKeep = null
         cancelDiscard = null
+        queueOpen.value = null
+        queueCancel.value = null
         owner.stop()
     }
 

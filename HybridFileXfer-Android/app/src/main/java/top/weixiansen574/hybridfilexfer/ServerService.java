@@ -1741,9 +1741,10 @@ public class ServerService extends Service implements ServiceConnection {
     private TransferView currentTransferView() {
         // 0) 分享发送任务（多任务会话表 SendTasks）：有任务在传就以任务为准 ——
         //    这条通知的 contentIntent 要落到「这个任务」的面板（用户报的「点通知回不到任务1」）。
-        java.util.List<SendTask> tasks = SendTasks.transferringTasks();
-        if (!tasks.isEmpty()) {
-            return sendTaskView(tasks);
+        //    读的是队列快照（只读）：顺序就是队列顺序 —— 正在传的在最前，排队中的跟在后面。
+        TransferView queueView = sendTaskView(SendTasks.queueSnapshot());
+        if (queueView != null) {
+            return queueView;
         }
         Live live = currentTransfer();
         if (live != null && live.total > 0) {
@@ -1785,50 +1786,95 @@ public class ServerService extends Service implements ServiceConnection {
     }
 
     /**
-     * 把「正在传的几个分享任务」折成一条通知要的视图。
+     * 把「分享发送的这几个任务」折成一条通知要的视图（**队列顺序**：正在传的在最前）。
      *
      * <p>一个任务：就是它自己的进度 + 它自己的速率，点通知回到它。
-     * 多个任务（打在不同电脑上时是真并发）：标题给「N 个任务 · 合计」，展开明细里一行一个任务，
-     * 各算各的速率 —— 面板那边更不用争，每个任务有自己的窗口和 100ms 采样。
+     * 多个任务：标题给「N 个任务 · 合计」，展开明细里一行一个任务、按队列顺序排，
+     * 排队中的标「等待中（前面还有 N 个）」，暂停的标「已暂停」—— 各算各的速率。
+     *
+     * @return null = 眼下没有任务真的占着传输通道（只有准备中 / 只在排队的），
+     *         通知该走原来那套「已连接 / 等待连接」的文案（和以前 transferringTasks() 的口径一致）
      */
-    private TransferView sendTaskView(java.util.List<SendTask> tasks) {
+    private TransferView sendTaskView(java.util.List<SendTasks.TaskInfo> queue) {
+        if (queue == null || queue.isEmpty()) {
+            return null;
+        }
+        java.util.List<SendTasks.TaskInfo> shown = new java.util.ArrayList<>();
+        boolean anyActive = false;
+        for (SendTasks.TaskInfo info : queue) {
+            // 收尾的、还在准备的不进通知：它们还没有进度可言（和以前一样）
+            if (info.isFinished() || info.state == SendTask.STATE_PREPARING) {
+                continue;
+            }
+            if (info.isActive()) {
+                anyActive = true;
+            }
+            shown.add(info);
+        }
+        if (shown.isEmpty() || !anyActive) {
+            return null;
+        }
         long now = SystemClock.elapsedRealtime();
-        if (tasks.size() == 1) {
-            SendTask task = tasks.get(0);
-            long done = task.getDoneBytes();
-            long total = task.getTotalBytes();
-            boolean paused = task.isPausedByUser() || task.isSuspended();
-            return new TransferView(task.getTaskId(), true, shortName(task.getCurrentFileName()),
-                    done, total, paused ? 0L : sampleTaskSpeed(task.getTaskId(), done, now), 1, "",
-                    paused);
+        if (shown.size() == 1) {
+            SendTasks.TaskInfo info = shown.get(0);
+            boolean paused = info.state == SendTask.STATE_PAUSED
+                    || info.state == SendTask.STATE_SUSPENDED;
+            return new TransferView(info.taskId, true, shortName(info.fileName), info.doneBytes,
+                    info.totalBytes, paused ? 0L : taskSpeed(info, now), 1, "", paused);
         }
         long doneSum = 0L;
         long totalSum = 0L;
         long speedSum = 0L;
         StringBuilder detail = new StringBuilder();
-        for (SendTask task : tasks) {
-            long done = task.getDoneBytes();
-            long total = task.getTotalBytes();
-            long speed = sampleTaskSpeed(task.getTaskId(), done, now);
-            doneSum += done;
-            totalSum += total;
+        for (int i = 0; i < shown.size(); i++) {
+            SendTasks.TaskInfo info = shown.get(i);
+            long speed = taskSpeed(info, now);
+            doneSum += info.doneBytes;
+            totalSum += info.totalBytes;
             speedSum += speed;
             if (detail.length() > 0) {
                 detail.append('\n');
             }
-            int pct = total <= 0 ? 0 : (int) Math.max(0, Math.min(100, done * 100 / total));
-            detail.append("任务").append(task.getTaskId())
-                    .append(" · ").append(shortName(task.getCurrentFileName()))
-                    .append(" · ").append(pct).append('%');
-            if (task.isPausedByUser() || task.isSuspended()) {
-                detail.append(" · 已暂停");
-            } else if (speed > 0) {
-                detail.append(" · ").append(GlobalProgress.formatSpeed(speed));
+            // 序号 = 队列位次（1 开始）：展开明细和面板上那个列表是同一个顺序
+            detail.append(i + 1).append(". ").append(shortName(info.fileName))
+                    .append(" · ");
+            if (info.state == SendTask.STATE_WAITING) {
+                // 排队中：没有进度可言，就说清「前面还有几个」（0 = 它自己就是队头）
+                if (info.aheadCount <= 0) {
+                    detail.append("等待中");
+                } else {
+                    detail.append("等待中（前面还有 ").append(info.aheadCount).append(" 个）");
+                }
+            } else if (speed > 0L) {
+                detail.append(info.percent()).append('%')
+                        .append(" · ").append(GlobalProgress.formatSpeed(speed));
+            } else {
+                detail.append(info.percent()).append('%');
+                if (info.state != SendTask.STATE_SENDING) {
+                    detail.append(" · 已暂停");
+                }
             }
         }
-        // 点通知落到最近创建的那个任务的面板（transferringTasks 已经按 taskId 倒序）
-        return new TransferView(tasks.get(0).getTaskId(), true, "", doneSum, totalSum, speedSum,
-                tasks.size(), detail.toString());
+        // 点通知落到队列头的那个任务（正在传的那个，队列快照已经把它排在最前）
+        return new TransferView(shown.get(0).taskId, true, "", doneSum, totalSum, speedSum,
+                shown.size(), detail.toString());
+    }
+
+    /**
+     * 通知明细里那一行的速率。
+     *
+     * <p>队列快照里已经采好了（{@link SendTasks#queueSnapshot()} 按 taskId 各采各的）；
+     * 拿不到就退回本类原来那套 {@link #sampleTaskSpeed}，别让明细里出现一个空缺。
+     * 暂停 / 让出通道 / 排队中的一律 0：它们本来就没有数据在流动。
+     */
+    private long taskSpeed(SendTasks.TaskInfo info, long now) {
+        if (info.state != SendTask.STATE_SENDING) {
+            return 0L;
+        }
+        if (info.speed > 0L) {
+            return info.speed;
+        }
+        return sampleTaskSpeed(info.taskId, info.doneBytes, now);
     }
 
     /**
