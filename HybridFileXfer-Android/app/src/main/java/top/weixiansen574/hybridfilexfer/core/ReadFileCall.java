@@ -296,16 +296,7 @@ public abstract class ReadFileCall implements Callable<Void> {
         if (channel < 0 || channel >= operateThreadCount) {
             return false;
         }
-        // 卡死：3 秒一个字节都没发出去。这种通道速度还停在 0，速度判据完全看不见它
-        // （speed<=0 被当成"还没测出来"，反而给它满窗口），实测就是它们把收尾拖了两分钟。
-        long now = System.currentTimeMillis();
-        if (now - transferStartedAt > STALL_MS && now - lastProgressAt[channel] >= STALL_MS) {
-            if (!hopelessLogged[channel]) {
-                hopelessLogged[channel] = true;
-                HFXLog.d("卡住的通道 " + (channelNames != null && channel < channelNames.length
-                        ? channelNames[channel] : String.valueOf(channel))
-                        + " 已 " + (now - lastProgressAt[channel]) / 1000 + " 秒没发出字节，预读窗口降到 1");
-            }
+        if (isStalledChannel(channel)) {
             return true;
         }
         double speed = channelSpeed[channel];
@@ -332,9 +323,54 @@ public abstract class ReadFileCall implements Callable<Void> {
         return hopeless;
     }
 
-    /** 这条通道还有没有可能把块发出去（不慢、也没卡死） */
+    /**
+     * 这条通道是不是**卡死**了（3 秒一个字节都没发出去）。
+     *
+     * <p>和「慢」要分开：慢通道（蓝牙 0.1~0.5MB/s）也是用户特意开出来的通道，
+     * 该给它分一份活干；卡死的通道才是真的不能喂（喂了也发不出去，只能靠救回）。
+     * 两者以前混在一个判据里，结果蓝牙被当成卡死，一个字节都分不到。
+     */
+    private boolean isStalledChannel(int channel) {
+        if (channel < 0 || channel >= operateThreadCount) {
+            return false;
+        }
+        long now = System.currentTimeMillis();
+        long limit = stallLimitMs(channel);
+        if (now - transferStartedAt <= limit || now - lastProgressAt[channel] < limit) {
+            return false;
+        }
+        if (!hopelessLogged[channel]) {
+            hopelessLogged[channel] = true;
+            HFXLog.d("卡住的通道 " + (channelNames != null && channel < channelNames.length
+                    ? channelNames[channel] : String.valueOf(channel))
+                    + " 已 " + (now - lastProgressAt[channel]) / 1000 + " 秒没发出字节，先不给它派活");
+        }
+        return true;
+    }
+
+    /**
+     * 「多久没进展算卡死」的时限：按这条通道自己的速度算。
+     *
+     * <p>固定 3 秒对蓝牙是错的：0.1MB/s 的通道发一块（1MiB）本来就要 10 秒，
+     * 按 3 秒判就把它当卡死、一个字节都不派给它（实测日志里就是
+     * 「卡住的通道 bt-pan 已 3 秒没发出字节」）。现在按「发完 3 块该用的时间」算，
+     * 最多 60 秒 —— 真死了（拔网线/BNEP 断）也还是会在 3 秒内发现，因为那时速度已经测出来了。
+     */
+    private long stallLimitMs(int channel) {
+        double speed = channelSpeed[channel];
+        if (speed <= 0) {
+            // 速度还没测出来（它一块都还没发完）：这时候不能按 3 秒判死。
+            // 蓝牙 0.1MB/s 发完第一块就要 10 秒，按 3 秒判就会把活通道当死通道，
+            // 结果一个字节都分不到（实测日志「卡住的通道 bt-pan 已 3 秒没发出字节」）。
+            return channelBytes[channel] <= 0 ? 15000L : STALL_MS;
+        }
+        long perBlock = (long) (FileBlock.BLOCK_SIZE / speed);
+        return Math.min(60000L, Math.max(STALL_MS, perBlock * 3));
+    }
+
+    /** 这条通道还有没有可能把块发出去（没卡死） */
     private boolean couldSend(int channel) {
-        return !isHopelessChannel(channel);
+        return !isStalledChannel(channel);
     }
 
     /** 队里至少有一条还能发的通道 */
@@ -361,7 +397,7 @@ public abstract class ReadFileCall implements Callable<Void> {
             return;
         }
         for (int ch = 0; ch < operateThreadCount; ch++) {
-            if (queues[ch].isEmpty() || now - lastProgressAt[ch] < STALL_MS) {
+            if (queues[ch].isEmpty() || now - lastProgressAt[ch] < stallLimitMs(ch)) {
                 continue;
             }
             // 直接塞给最闲的健康通道的队列：它们的发送线程阻塞在自己队列的 poll 上，
@@ -557,10 +593,9 @@ public abstract class ReadFileCall implements Callable<Void> {
             // 全队都停了就别再挑三拣四，谁都得喂（否则谁也产不出块，直接死等）
             boolean anyHealthy = hasHealthyChannel();
             for (int ch = 0; ch < operateThreadCount; ch++) {
-                // 停住的通道（卡死/慢到没意义）不再给它产出：产出来也只能压在它手里，
-                // 还得靠 rescueStalledBlocks 再搬一次。让它那一段留在"还没产出"的状态，
-                // 快通道 trySteal 会直接把这段尾巴接走 —— 这才是真正并行。
-                if (anyHealthy && !couldSend(ch)) {
+                // 只跳**卡死**的通道：产出来它一个字节也发不出去，只能靠 rescueStalledBlocks 再搬回来。
+                // 慢通道（蓝牙）照常喂 —— 用户特意开的通道就得让它干活，它的段由 trySteal 在收尾阶段接手。
+                if (anyHealthy && isStalledChannel(ch)) {
                     continue;
                 }
                 // 一次把这条通道补到它自己的窗口：快通道给满 8 块（刚抢到新段的下一轮就能连读几块），
