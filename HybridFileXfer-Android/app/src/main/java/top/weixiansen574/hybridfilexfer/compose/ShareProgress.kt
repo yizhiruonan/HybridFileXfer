@@ -2,8 +2,12 @@ package top.weixiansen574.hybridfilexfer.compose
 
 import android.content.Context
 import android.util.Log
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.ComposeView
+import androidx.compose.ui.platform.LocalDensity
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.LifecycleRegistry
@@ -62,14 +66,24 @@ internal object ShareProgress {
             setViewTreeSavedStateRegistryOwner(lifecycleOwner)
             setContent {
                 MiuixTheme(controller = controller) {
-                    // sending=true → 标题「正在发送文件」；bare=true → 不铺遮罩；
-                    // showFooter=false → 底部的暂停/取消/关闭整块不画（按钮在 activity_share.xml 里）
-                    ReceiveProgressPanel(
-                        state = state.value,
-                        sending = true,
-                        bare = true,
-                        showFooter = false,
-                    )
+                    // 窗口高度是 WRAP_CONTENT（内容多高窗口多高），但面板最多占屏幕高度的 70%：
+                    // 再高就由 ReceiveProgressPanel 卡片自己的 verticalScroll 在里面滚，
+                    // 免得一张长列表把窗口顶出屏幕。注意别只给个死高度——内容少的时候
+                    // 底部会留一大块空白（真机上见过）。
+                    val metrics = context.resources.displayMetrics
+                    val maxPanelHeight = with(LocalDensity.current) {
+                        (metrics.heightPixels * 0.70f).toDp()
+                    }
+                    Box(Modifier.heightIn(max = maxPanelHeight)) {
+                        // sending=true → 标题「正在发送文件」；bare=true → 不铺遮罩；
+                        // showFooter=false → 底部的暂停/取消/关闭整块不画（按钮在 activity_share.xml 里）
+                        ReceiveProgressPanel(
+                            state = state.value,
+                            sending = true,
+                            bare = true,
+                            showFooter = false,
+                        )
+                    }
                 }
             }
         }

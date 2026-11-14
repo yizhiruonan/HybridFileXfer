@@ -1,66 +1,27 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+    分享发送页：只剩下「进度面板」和底部按钮。
+    面板（share_panel）由 ShareActivity 在 onCreate 里塞进 ShareProgress.host(this) 造的 ComposeView，
+    渲染的就是双窗口弹窗 / 应用外悬浮窗用的那个 ReceiveProgressPanel —— 标题「正在发送文件」、
+    电脑名 · 文件名、分段进度条、已发/总量、速率、各通道明细都在里面，所以上面不再单独放图标和
+    「发送到电脑」（那句话面板自己已经说了，重复）。
+
+    高度一律 wrap_content：窗口跟着内容长（ShareActivity 把窗口高度设成 WRAP_CONTENT），
+    面板自己按屏幕高度的 70% 封顶（见 ShareProgress.host），内容再多就在面板内部滚动。
+-->
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
-    android:layout_height="match_parent"
+    android:layout_height="wrap_content"
     android:orientation="vertical"
-    android:paddingTop="22dp"
+    android:paddingTop="16dp"
     android:paddingBottom="20dp">
 
-    <androidx.core.widget.NestedScrollView
-        android:id="@+id/share_scroll"
+    <!-- 进度面板的占位容器：宽度铺满，高度跟着 Compose 内容走 -->
+    <FrameLayout
+        android:id="@+id/share_panel"
         android:layout_width="match_parent"
-        android:layout_height="0dp"
-        android:layout_weight="1"
-        android:overScrollMode="never"
-        android:scrollbars="none">
-
-        <LinearLayout
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:orientation="vertical">
-
-            <FrameLayout
-                android:layout_width="60dp"
-                android:layout_height="60dp"
-                android:layout_gravity="center_horizontal"
-                android:background="@drawable/bg_circle_green">
-
-                <ImageView
-                    android:layout_width="32dp"
-                    android:layout_height="32dp"
-                    android:layout_gravity="center"
-                    android:contentDescription="@string/send_to_computer"
-                    android:src="@drawable/baseline_upload_24"
-                    app:tint="@color/accent" />
-            </FrameLayout>
-
-            <TextView
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="10dp"
-                android:gravity="center"
-                android:text="@string/send_to_computer"
-                android:textColor="@color/text_primary"
-                android:textSize="20sp"
-                android:textStyle="bold" />
-
-            <!--
-                进度面板的占位容器：ShareActivity 在 onCreate 里把
-                ShareProgress.host(this) 造出来的 ComposeView 加进来。
-                面板就是双窗口弹窗 / 应用外悬浮窗用的那个 ReceiveProgressPanel
-                （标题、分段进度条、已发/总量、速率、各通道明细都在里面），
-                以后只有这一套进度界面。
-                宽度铺满：面板内部自己是一张居中的 340dp 卡片，外面再套 Activity 的左右 padding
-                会被挤窄（窄屏上分段条和各通道那几列就挤不下了），所以左右留白交给按钮自己加。
-            -->
-            <FrameLayout
-                android:id="@+id/share_panel"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="8dp" />
-        </LinearLayout>
-    </androidx.core.widget.NestedScrollView>
+        android:layout_height="wrap_content" />
 
     <com.google.android.material.button.MaterialButton
         android:id="@+id/share_action"

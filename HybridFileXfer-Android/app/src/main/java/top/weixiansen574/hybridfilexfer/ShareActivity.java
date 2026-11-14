@@ -171,6 +171,16 @@ public class ShareActivity extends AppCompatActivity {
     private final java.util.Map<String, Double> channelSpeeds = new java.util.LinkedHashMap<>();
     private long startTime;
 
+    // ---- 面板那一行说明（xferNote）的取值来源，见 currentNote() ----
+    /** 准备 / 等待电脑连接 / 正在复制这类过程状态（传输中不占这行） */
+    private String statusText = "";
+    /** 完成 / 失败 / 取消这类最终结果：一出现就压住其它所有提示 */
+    private String resultText = "";
+    /** 电脑上的目标目录（和实际发送用的是同一份计算，见 resolveRemoteBase） */
+    private String remoteTarget = "";
+    /** 数据已经发完、还在等电脑端复算整文件校验和 */
+    private boolean waitingPc;
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         requestWindowFeature(android.view.Window.FEATURE_NO_TITLE);
@@ -190,13 +200,14 @@ public class ShareActivity extends AppCompatActivity {
         // 面板自己会画标题、分段进度条、已发/总量、速率、各通道明细，底部按钮仍由这个布局提供。
         ViewGroup panelHost = findViewById(R.id.share_panel);
         panelHost.addView(ShareProgress.host(this));
-        // 面板本身是一张居中的 340dp 卡片：窗口给足宽度它才不被挤窄
-        // （窄屏上左右各少几十像素，分段条和「各通道进度」那几列就挤不下了）。
-        // 高度比以前高一点：面板比原来的「一行状态 + 一条细杆」占地方
+        // 宽度铺满：面板本身是一张居中的 340dp 卡片，窄屏上左右各少几十像素，
+        // 分段条和「各通道进度」那几列就挤不下了。
+        // 高度跟着内容走（WRAP_CONTENT）：内容少的时候不留一大块空白，内容多了由面板自己
+        // 按屏高 70% 封顶并在内部滚动（见 ShareProgress.host）。
         android.util.DisplayMetrics metrics = getResources().getDisplayMetrics();
         getWindow().setLayout(
                 metrics.widthPixels,
-                (int) (metrics.heightPixels * 0.60f));
+                ViewGroup.LayoutParams.WRAP_CONTENT);
         actionButton = findViewById(R.id.share_action);
         actionButton.setText(R.string.cancel);
         actionButton.setOnClickListener(v -> {
@@ -331,13 +342,15 @@ public class ShareActivity extends AppCompatActivity {
         // 「0 B / 12.3 MB · 正在等待电脑连接…」，比一条 0 B / 0 B 有信息量（下一拍采样会覆盖它）
         truthTotal = total;
 
-        // 面板只有「一句话说明」的位置（以前是 status + hint 两行），
-        // 目标目录这类附加信息不再单独占一行，文件会发到电脑端接收器设置的目录。
         showStatus(getString(R.string.share_waiting_pc));
         if (!ensureConnected()) {
             fail(getString(R.string.share_pc_not_connected));
             return;
         }
+        // 连上了：把「文件会存到电脑上的哪个目录」算出来（以前是 share_hint 那行），
+        // 面板那行说明会以「保存到：电脑名 目录」的形式显示它（见 currentNote）。
+        // 和 startNextGroup 里真正用来发的是同一个方法，不会显示一个目录、实际发到另一个。
+        remoteTarget = resolveRemoteBase();
 
         // 同一个文件夹里的文件一起发，这样电脑上的文件名保持原样
         Map<String, List<RemoteFile>> byParent = new LinkedHashMap<>();
@@ -405,6 +418,41 @@ public class ShareActivity extends AppCompatActivity {
         return false;
     }
 
+    /**
+     * 电脑上的目标目录：{@code AbsDir}（为空时用接收器的 home）+ {@code SubDir}。
+     *
+     * <p>只有一个实现：{@link #prepareAndSend} 拿它给面板显示「保存到：…」，
+     * {@link #startNextGroup} 拿它真正去建 {@link Directory}，两边绝不会不一致。
+     * 取不到（还没连上）时返回空串。
+     */
+    private String resolveRemoteBase() {
+        HFXServer srv = server;
+        if (srv == null) {
+            return "";
+        }
+        String remoteBase = Config.getInstance(this).getRemoteAbsDir();
+        if (remoteBase == null || remoteBase.trim().isEmpty()) {
+            remoteBase = srv.getRemoteHomeDir();
+        }
+        if (remoteBase == null) {
+            return "";
+        }
+        String subDir = Config.getInstance(this).getRemoteSubDir();
+        if (subDir != null && !subDir.trim().isEmpty()) {
+            String sub = subDir.replace('\\', '/');
+            while (sub.startsWith("/")) sub = sub.substring(1);
+            while (sub.endsWith("/")) sub = sub.substring(0, sub.length() - 1);
+            if (!sub.isEmpty()) {
+                if (remoteBase.endsWith("/") || remoteBase.endsWith("\\")) {
+                    remoteBase = remoteBase + sub;
+                } else {
+                    remoteBase = remoteBase + "/" + sub;
+                }
+            }
+        }
+        return remoteBase;
+    }
+
     private void startNextGroup() {
         if (finished) {
             return;
@@ -435,23 +483,12 @@ public class ShareActivity extends AppCompatActivity {
         frameClock.start();
         try {
             Directory localDir = new Directory(group.dir, Directory.getCurrentFileSystem());
-            String remoteBase = Config.getInstance(this).getRemoteAbsDir();
-            if (remoteBase == null || remoteBase.trim().isEmpty()) {
+            // 目标目录的计算抽成 resolveRemoteBase()：面板那行「保存到：…」显示的就是它
+            String remoteBase = resolveRemoteBase();
+            if (remoteBase.isEmpty()) {
                 remoteBase = server.getRemoteHomeDir();
             }
-            String subDir = Config.getInstance(this).getRemoteSubDir();
-            if (subDir != null && !subDir.trim().isEmpty()) {
-                String sub = subDir.replace('\\', '/');
-                while (sub.startsWith("/")) sub = sub.substring(1);
-                while (sub.endsWith("/")) sub = sub.substring(0, sub.length() - 1);
-                if (!sub.isEmpty()) {
-                    if (remoteBase.endsWith("/") || remoteBase.endsWith("\\")) {
-                        remoteBase = remoteBase + sub;
-                    } else {
-                        remoteBase = remoteBase + "/" + sub;
-                    }
-                }
-            }
+            remoteTarget = remoteBase;
             Directory remoteDir = new Directory(remoteBase, server.getRemoteFileSystem());
             new SendFilesToRemoteTask(new TransferHandler(), server, group.files, localDir, remoteDir).execute();
         } catch (Throwable e) {
@@ -733,7 +770,7 @@ public class ShareActivity extends AppCompatActivity {
      *   <li>{@code xferTotal}：&lt;= 0 时面板自己走不确定态（只发了文件夹的情况）；</li>
      *   <li>{@code xferSegments}：分段条 = 块空间里「相邻块归属变化」的区间，只有单文件才有意义；</li>
      *   <li>{@code xferChannels}：各通道明细，速率按相邻两拍的增量做低通；</li>
-     *   <li>{@code xferNote}：校验阶段报百分比，数据发完等电脑端时给一句「等待电脑校验…」。</li>
+     *   <li>{@code xferNote}：一句话说明，取值优先级见 {@link #currentNote()}。</li>
      * </ul>
      */
     private void applyToPanel() {
@@ -747,15 +784,7 @@ public class ShareActivity extends AppCompatActivity {
         }
         // 数据已经发完、还在等电脑端复算整文件 SHA-256：这段时间没有字节在流动，
         // 必须给个说法，否则界面就是「79x/800 MB · 0 B/s」一动不动，看着像卡死（实测卡 2 分钟）
-        boolean waiting = !verifyPhase && truthTotal > 0L && truthBytes >= truthTotal && allChannelsFinished;
-        String note;
-        if (verifyPhase) {
-            note = "校验中 " + (truthBytes * 100L / Math.max(1L, truthTotal)) + "%";
-        } else if (waiting) {
-            note = "等待电脑校验…";
-        } else {
-            note = "";
-        }
+        waitingPc = !verifyPhase && truthTotal > 0L && truthBytes >= truthTotal && allChannelsFinished;
         // 多文件/文件夹没有跨文件的块空间，分段画出来会和整条进度对不上，退回整条连续进度
         List<SegInfo> segments;
         BlockProgress.Snapshot snapshot = lastSnapshot;
@@ -771,16 +800,7 @@ public class ShareActivity extends AppCompatActivity {
         } else {
             segments = Collections.emptyList();
         }
-        ShareProgress.update(
-                true,
-                currentFileName,
-                shownBytes,
-                truthTotal,
-                shownBytes,
-                segments,
-                channels,
-                note,
-                server != null ? server.getDisplayName() : "");
+        pushPanel(true, segments, channels);
     }
 
     /**
@@ -845,6 +865,11 @@ public class ShareActivity extends AppCompatActivity {
         channelLastBytes.clear();
         channelLastSpeed.clear();
         channelSampleAt = 0L;
+        // 面板那行的说明也跟着重来：上一次的「已发送/失败」结果、目标目录都不能留着
+        statusText = "";
+        resultText = "";
+        remoteTarget = "";
+        waitingPc = false;
     }
 
     /**
@@ -936,21 +961,90 @@ public class ShareActivity extends AppCompatActivity {
     }
 
     /**
-     * 面板上的「一句话说明」：正在准备 / 正在等待电脑连接 / 已取消 / 已完成 / 失败。
-     *
-     * <p>传输中不用它：那时候面板显示的是校验进度或「等待电脑校验…」（见 {@link #applyToPanel}）。
+     * 面板那一行说明（xferNote）的取值，优先级从高到低：
+     * <ol>
+     *   <li>完成 / 失败 / 取消这类<b>最终结果</b>（它们一出现就该压住别的）；</li>
+     *   <li>校验中 N%（数据发完，两端在算整文件 SHA-256）；</li>
+     *   <li>等待电脑校验…（数据发完、各通道都 EOF，但电脑端还没开始复算）；</li>
+     *   <li>准备 / 等待电脑连接 / 正在复制 这类过程状态文案；</li>
+     *   <li>保存到：电脑名 目标目录（老 share_hint 那行，现在并到这一行）——
+     *       <b>只在数据还没开始跑、也没有别的文案时说</b>。</li>
+     * </ol>
+     * 为什么不把「保存到」常驻：面板那行是「已发 / 总量 · X」，X 的位置
+     * 有 note 就显示 note、没有才显示合计速率。常驻「保存到」等于传输全程看不见速度，
+     * 那是用户最在意的数。所以传输中留空 → 显示速率，等传完/校验中显示的又是别的。
      */
-    private void showStatus(String text) {
-        handler.post(() -> ShareProgress.update(
-                false,
+    private String currentNote() {
+        if (!resultText.isEmpty()) {
+            return resultText;
+        }
+        if (verifyPhase) {
+            return "校验中 " + (truthBytes * 100L / Math.max(1L, truthTotal)) + "%";
+        }
+        if (waitingPc) {
+            return "等待电脑校验…";
+        }
+        if (!statusText.isEmpty()) {
+            return statusText;
+        }
+        return targetNote();
+    }
+
+    /** 「保存到：电脑A /storage/emulated/0/Download」：目录和 startNextGroup 真正发往的是同一份计算 */
+    private String targetNote() {
+        String dir = remoteTarget;
+        HFXServer srv = server;
+        if (dir == null || dir.isEmpty() || srv == null) {
+            return "";
+        }
+        return middleEllipsis("保存到：" + srv.getDisplayName() + " " + dir.replace('\\', '/'), 42);
+    }
+
+    /**
+     * 太长就从中间省略（面板那行放不下）。
+     *
+     * <p>头部多留一点：要保住「保存到：电脑名」，尾部也要保住目录的最后一级 ——
+     * 那才是用户真正想知道"存到哪个文件夹"的部分。
+     */
+    private static String middleEllipsis(String text, int max) {
+        if (text == null) {
+            return "";
+        }
+        if (max <= 1 || text.length() <= max) {
+            return text;
+        }
+        int keep = max - 1;
+        int head = keep * 3 / 5;
+        int tail = keep - head;
+        return text.substring(0, head) + "…" + text.substring(text.length() - tail);
+    }
+
+    /** 把当前状态推给面板（active=true 表示正在传输，面板那边只用来判断要不要画底部按钮） */
+    private void pushPanel(boolean active, List<SegInfo> segments, List<ChannelStat> channels) {
+        ShareProgress.update(
+                active,
                 currentFileName,
                 shownBytes,
                 truthTotal,
                 shownBytes,
-                Collections.emptyList(),
-                buildChannels(true),
-                text,
-                server != null ? server.getDisplayName() : ""));
+                segments,
+                channels,
+                currentNote(),
+                server != null ? server.getDisplayName() : "");
+    }
+
+    /**
+     * 面板上的过程状态：正在准备 / 正在等待电脑连接 / 正在复制。
+     *
+     * <p>只记下来，真正显示什么由 {@link #currentNote()} 按优先级决定
+     * （例如已经知道目标目录时，优先显示「保存到：…」）。
+     */
+    private void showStatus(String text) {
+        handler.post(() -> {
+            statusText = text;
+            resultText = "";
+            pushPanel(false, Collections.emptyList(), buildChannels(true));
+        });
     }
 
     /**
@@ -962,16 +1056,8 @@ public class ShareActivity extends AppCompatActivity {
         if (clearProgress) {
             shownBytes = 0L;
         }
-        ShareProgress.update(
-                false,
-                currentFileName,
-                shownBytes,
-                truthTotal,
-                shownBytes,
-                Collections.emptyList(),
-                buildChannels(true),
-                note,
-                server != null ? server.getDisplayName() : "");
+        resultText = note == null ? "" : note;
+        pushPanel(false, Collections.emptyList(), buildChannels(true));
     }
 
     // ------------------------------------------------------------------
