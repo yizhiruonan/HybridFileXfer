@@ -14,6 +14,14 @@ public class SendFileCall implements Callable<Void> {
     /** 这条通道在分段计划里的序号（自己只领自己那段的块） */
     private final int channelIndex;
 
+    /**
+     * 一块数据分几片写。蓝牙共享网络实测只有 50~60 KB/s，一块 1MB 要写十几秒；
+     * 整块写完才记字节的话，界面上那条通道十几秒都停在「0 B 正在发送数据…」，看着像坏了
+     * （用户报的「蓝牙通道速率开始怎么是 0」）。按 64KB 一片写，边写边记已发字节，
+     * 数字从第一秒就在动，速度也能更早测出来（慢通道降级判断不用等一块）。
+     */
+    private static final int SLICE_WRITE_BYTES = 64 * 1024;
+
     public SendFileCall(ReadFileCall readFileCall, TransferConnection connection,
                         TransferFileCallback callback, TransferPause pause, int channelIndex) {
         this.readFileCall = readFileCall;
@@ -99,12 +107,23 @@ public class SendFileCall implements Callable<Void> {
                 fileBlock.data.flip();
                 // 303：块校验和（CRC32），电脑端写盘前校验这一块
                 channel.writeInt(HFXService.crc32(fileBlock.data));
-                // 一整个块要写满（write 只保证写一部分）
-                channel.writeFully(fileBlock.data);
+                // 一整个块要写满（write 只保证写一部分）；分片写，边写边记字节，
+                // 慢通道（蓝牙）的行才不会十几秒一动不动
+                int blockLimit = fileBlock.data.limit();
+                while (fileBlock.data.position() < blockLimit) {
+                    int from = fileBlock.data.position();
+                    int to = Math.min(blockLimit, from + SLICE_WRITE_BYTES);
+                    fileBlock.data.limit(to);
+                    try {
+                        channel.writeFully(fileBlock.data);
+                    } finally {
+                        fileBlock.data.limit(blockLimit);
+                    }
+                    connection.addUploadedBytes(to - from);
+                    // 汇报这条通道的真实进度，读线程据此判断谁快谁慢（蓝牙那种要特殊对待）
+                    readFileCall.noteChannelBytes(channelIndex, connection.getUploadedBytes());
+                }
                 readFileCall.recycleBuffer(fileBlock.data);
-                connection.addUploadedBytes(fileBlock.getLength());
-                // 汇报这条通道的真实进度，读线程据此判断谁快谁慢（蓝牙那种要特殊对待）
-                readFileCall.noteChannelBytes(channelIndex, connection.getUploadedBytes());
                 // 这一块真的发出去了：进度条按块记真值（分段切割线 + 每段填充都从这里来）
                 readFileCall.noteBlockSent(connection.iName, fileBlock.path,
                         fileBlock.index, fileBlock.totalSize);

@@ -113,24 +113,6 @@ public final class SendRanges {
         return at >= 0 && at < to;
     }
 
-    /**
-     * 快通道们自己那段是不是都产完了（= 收尾阶段）。
-     *
-     * <p>产得快才有"产完"这回事：投递是跟着消费走的（窗口 8 块），所以只有快通道追到自己段尾时
-     * 这段才会变成"全产完"。慢通道的段长期停在没产完的状态，正好用来给"该不该抢慢通道"当判据。
-     */
-    private boolean fastChannelsExhausted() {
-        for (int i = 0; i < channels; i++) {
-            if (isHopeless(i)) {
-                continue;
-            }
-            if (hasUnproduced(starts[i], ends[i])) {
-                return false;
-            }
-        }
-        return true;
-    }
-
     /** 「这条通道慢到不值得再给新活」的判定，由 ReadFileCall 按实测速度提供 */
     public interface HopelessOracle {
         boolean isHopeless(int channel);
@@ -193,11 +175,14 @@ public final class SendRanges {
             if (len <= 0) {
                 continue;
             }
-            // 慢通道的尾巴只在**收尾阶段**才去抢：
-            // 慢通道（蓝牙）也是用户特意开的通道，中途就把它的段全抢走，它一个字节都分不到
-            //（界面上那两行永远是 0）。收尾阶段（快通道自己那段都产完了）再接手，
-            // 才不会出现「最后只剩蓝牙在一块一块吐」。
-            boolean hopeless = isHopeless(i) && fastChannelsExhausted();
+            // 慢通道（蓝牙）的尾巴：闲下来的快通道**立刻**接手，不再等"所有快通道都干完自己那段"。
+            //
+            // 以前要等收尾阶段才抢，结果正好相反 —— 快通道全干完了，最后剩的就是蓝牙那一截，
+            // 它 0.2MB/s，一截尾巴要吐一分多钟（用户的原话：「收尾用蓝牙比较慢」）。
+            // 现在蓝牙的段在开头就被快通道分着接走，它只做完手上已经在传的那几块就收工，
+            // 收尾阶段一条蓝牙都不剩。它也不是完全分不到活：抢是"对半切"，第一次抢它留一半，
+            // 而且要等快通道自己那段产完了才轮得到（见上面 hasUnproduced 那一支）。
+            boolean hopeless = isHopeless(i);
             // 优先抢慢通道的尾巴：它们本来也传不完，早一点把活接过来，收尾就不等它们
             boolean better = best < 0
                     || (hopeless && !bestHopeless)

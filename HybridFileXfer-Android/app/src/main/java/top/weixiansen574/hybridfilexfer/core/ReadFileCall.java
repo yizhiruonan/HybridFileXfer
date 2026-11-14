@@ -454,7 +454,14 @@ public abstract class ReadFileCall implements Callable<Void> {
         }
         double speed = channelSpeed[channel];
         if (speed <= 0) {
-            return max;   // 还没测出来：先给满，别拖慢起步
+            // 速度还没测出来：只给 1 块，不是给满 8 块。
+            //
+            // 起步那一瞬间蓝牙和 wifi 一样"没有速度记录"，给满的话蓝牙队列里会立刻压 8 块，
+            // 而这些块一旦投递进慢通道就再也抢不走 —— 实测收尾为此多等了两分半
+            //（「复制」600MB：12 条通道 8 秒全收工，剩 bt-pan 那 9 块吐了 150 秒）。
+            // 给 1 块：快通道发完这一块几十毫秒就补下一块，慢通道（蓝牙 60KB/s）手上
+            // 最多 1 块在写 —— 1MB 要 17 秒，这就是蓝牙能拖住收尾的上限。
+            return 1;
         }
         // 速度是字节/毫秒 → 1 秒能发多少字节，再折算成块数（向上取整，至少 1 块）
         int window = (int) Math.ceil(speed * 1000 / FileBlock.BLOCK_SIZE);
@@ -498,9 +505,37 @@ public abstract class ReadFileCall implements Callable<Void> {
         if (plan != null) {
             plan.finish();
         }
+        // 收尾前把慢通道/卡死通道队列里还没发出去的块搬到「谁发都行」的队列。
+        // 投递进某条通道队列的块，别的通道再也抢不走（抢段只能抢还没投递的），
+        // 快通道全干完了也只能干等它一块一块吐 —— 实测蓝牙队列里那几块让收尾多等了两分半。
+        drainSlowQueues();
         readerFinished = true;
         for (int i = 0; i < operateThreadCount; i++) {
             queues[i].add(END_POINT);
+        }
+    }
+
+    /** 把慢通道/卡死通道队列里积压的块挪到公共队列，收尾时让快通道接手 */
+    private void drainSlowQueues() {
+        for (int ch = 0; ch < operateThreadCount; ch++) {
+            if (queues[ch].isEmpty()) {
+                continue;
+            }
+            if (!isHopelessChannel(ch) && !isStalledChannel(ch)) {
+                continue;
+            }
+            FileBlock moved = queues[ch].poll();
+            int count = 0;
+            while (moved != null) {
+                specialQueue.add(moved);
+                count++;
+                moved = queues[ch].poll();
+            }
+            if (count > 0) {
+                HFXLog.d("收尾：把慢通道 " + (channelNames != null && ch < channelNames.length
+                        ? channelNames[ch] : String.valueOf(ch)) + " 队列里压着的 " + count
+                        + " 块交给别的通道");
+            }
         }
     }
 
