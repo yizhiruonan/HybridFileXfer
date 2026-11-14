@@ -41,6 +41,14 @@ final class GlobalProgress {
     private long lastNotify;
     private boolean hadTransfer;
 
+    /**
+     * 轮询间隔：应用外的进度窗口要把"和应用内弹窗一样的动画"画出来，
+     * 就必须和应用内的刷新节奏一致 —— 主页的接收进度条是 50ms 读一次按块真值。
+     * 以前这里是 250ms，分段和数字都是一跳一跳地走（200ms 的 tween 补不满 250ms 的窟窿）。
+     * 通知栏那条路径自己有 1 秒一次的门闩，不受影响。
+     */
+    private static final long TICK_MS = 50;
+
     private final Runnable ticker = new Runnable() {
         @Override
         public void run() {
@@ -48,7 +56,7 @@ final class GlobalProgress {
                 tick();
             } catch (Throwable ignored) {
             }
-            handler.postDelayed(this, 250);
+            handler.postDelayed(this, TICK_MS);
         }
     };
 

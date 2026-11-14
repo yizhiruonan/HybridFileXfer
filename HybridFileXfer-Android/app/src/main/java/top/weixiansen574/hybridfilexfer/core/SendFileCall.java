@@ -99,6 +99,9 @@ public class SendFileCall implements Callable<Void> {
                 channel.writeFully(fileBlock.data);
                 readFileCall.recycleBuffer(fileBlock.data);
                 connection.addUploadedBytes(fileBlock.getLength());
+                // 这一块真的发出去了：进度条按块记真值（分段切割线 + 每段填充都从这里来）
+                readFileCall.noteBlockSent(connection.iName, fileBlock.path,
+                        fileBlock.index, fileBlock.totalSize);
             }
         } catch (Exception e) {
             //若发生异常，通知其他传输通道，停止传输

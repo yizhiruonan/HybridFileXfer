@@ -363,17 +363,19 @@ internal fun ReceiveProgressPanel(
     var lastAt by remember { mutableStateOf(System.currentTimeMillis()) }
     var targetSpeed by remember { mutableStateOf(0f) }
 
+    // 速率只在"距上次被采用的采样 ≥100ms"时算一次：基准时刻和基准字节<b>只在采用时前移</b>。
+    // 旧写法是无条件前移基准，于是 50ms 一帧的刷新每次都被判成"间隔太短"直接丢掉 ——
+    // 速率列就再也更新不了（主页/悬浮窗都是 50ms 喂一份，正好踩这个坑）。
     LaunchedEffect(state.xferBytes) {
         val now = System.currentTimeMillis()
-        val dt = (now - lastAt).coerceAtLeast(16L)
-        val instant = if (state.xferBytes >= lastBytes) (state.xferBytes - lastBytes) * 1000f / dt else 0f
-        // 悬浮窗刚弹出来 / 采样间隔太短时会算出十几 GB/s 的离谱值，直接丢掉这次采样
-        val plausible = dt >= 100L && instant <= 2000f * 1024f * 1024f
-        if (plausible) {
+        val dt = now - lastAt
+        val instant = if (dt > 0 && state.xferBytes >= lastBytes) (state.xferBytes - lastBytes) * 1000f / dt else 0f
+        // 悬浮窗刚弹出来时会算出十几 GB/s 的离谱值，丢掉这次采样（基准不动，下次接着算）
+        if (dt >= 100L && instant <= 2000f * 1024f * 1024f) {
             targetSpeed = if (targetSpeed <= 0f) instant else targetSpeed * 0.6f + instant * 0.4f
+            lastBytes = state.xferBytes
+            lastAt = now
         }
-        lastBytes = state.xferBytes
-        lastAt = now
     }
     val animatedSpeed by androidx.compose.animation.core.animateFloatAsState(
         targetValue = targetSpeed,

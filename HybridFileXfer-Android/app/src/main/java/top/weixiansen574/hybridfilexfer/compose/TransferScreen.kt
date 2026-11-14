@@ -127,6 +127,8 @@ internal fun TransferScreen(
     var xferPopupDone by remember { mutableLongStateOf(0L) }
     var xferPopupTotal by remember { mutableLongStateOf(0L) }
     var xferPopupChannels by remember { mutableStateOf<List<ChannelStat>>(emptyList()) }
+    /** 进度条上的分段（一条通道一段，IDM 式）：来自按块真值，和主页接收进度条同一套逻辑 */
+    var xferPopupSegments by remember { mutableStateOf<List<SegInfo>>(emptyList()) }
     var xferPopupPaused by remember { mutableStateOf(false) }
     // 304：数据发完之后电脑要算整文件 SHA-256（800MB 实测 1~2 分钟）。这段时间界面必须有个说法，
     // 否则就是"791.0 MB / 800.0 MB · 0 KB/s"一动不动，用户以为是卡死（实测被当成 bug 报上来）。
@@ -295,6 +297,7 @@ internal fun TransferScreen(
         xferPopupDone = 0
         xferPopupTotal = files.sumOf { if (it.size > 0) it.size else 0L }
         xferPopupChannels = emptyList()
+        xferPopupSegments = emptyList()
         xferPopupPaused = false
         // 上一次传输的完成通道表必须清掉，否则新传输还没发就先显示"已完成"
         xferPopupWaiting = false
@@ -575,12 +578,19 @@ internal fun TransferScreen(
         }
     }
 
-    // 传输期间的进度：100ms 一次读"每条通道累计发出的字节"这个真值（HFXService.trafficSnapshot）。
+    // 传输期间的进度：每 50ms 读一次真值，和主页的接收进度条是同一套口径（同一份数据、同一份画法）。
     //
-    // 以前是「每秒一次 onSpeedInfo 累加 + 100ms 用速率合成插值」：插值把 done 往前推，
-    // 下一秒真值再盖回来 —— 只要真实速率低于插值速率，进度条就回跳一格、再被 tween 拉回来，
-    // 看着就是"一顿一顿、每秒跳一下"。接收方向从来不吃这套（它每 50ms 读按块统计的真值），
-    // 所以两个方向手感不一样。现在两端同一套口径：只喂真值，平滑全部交给面板的 200ms tween。
+    // 数据源只有两个：
+    //   1) server.trafficSnapshot()：每条通道累计发出/收到的字节 —— 画"各通道进度"几行、算速率；
+    //   2) server.sendProgress / blockProgress（{@code BlockProgress}）：按块记的"哪条通道传了第几块"
+    //      —— 画 IDM 式分段进度条：分段 = 相邻块归属变化处，每段填充 = 段内已完成块占比。
+    //
+    // 以前这里有两个错：
+    //   · 分段来自 SendRanges 的"计划区间"，再拿"通道累计字节 ÷ 段份额"当填充 —— 通道累计字节是
+    //     跨段的，一条通道抢了别人的段以后它的累计值早就超过新段的份额，那段一出现就整段填满，
+    //     和主进度条（按累计字节算的 done）也对不上；接收方向则干脆按通道等分画假分段；
+    //   · 每秒一次 onSpeedInfo + 用速率合成插值推 done，下一秒真值再盖回来（每秒回跳一格）。
+    // 现在只喂真值，平滑全部交给面板（200ms tween / 分段 120ms）。
     LaunchedEffect(busy) {
         // 上一帧的累计字节（算速率）、已经显示过的累计字节（防回退）、低通后的速率
         val previous = HashMap<String, Long>()
@@ -589,7 +599,7 @@ internal fun TransferScreen(
         var previousAt = android.os.SystemClock.elapsedRealtime()
         var lastDone = 0L
         while (busy) {
-            kotlinx.coroutines.delay(100)
+            kotlinx.coroutines.delay(50)
             // delay 期间传输可能已经收尾了，这时候不能再拿旧快照覆盖收尾补满的进度
             if (!busy) break
             // 电脑端点暂停/继续时，这里的暂停闸门会被会话线程改掉，弹窗跟着显示"已暂停"
@@ -602,6 +612,12 @@ internal fun TransferScreen(
                 server.trafficSnapshot()
             } catch (e: Throwable) {
                 emptyList()
+            }
+            // 分块真值：发送方向读 sendProgress（块写出去以后才记），接收方向读 blockProgress
+            val blockProgress = try {
+                (if (xferPopupSending) server.sendProgress else server.blockProgress).snapshot()
+            } catch (e: Throwable) {
+                null
             }
             var sum = 0L
             val channels = snapshot.map { channel ->
@@ -626,7 +642,17 @@ internal fun TransferScreen(
                 shownBytes[channel.name] = held
                 ChannelStat(channel.name, held, speed, xferPopupDoneNames.contains(channel.name))
             }
-            val done = xferPopupResumeBase + sum
+            // 单文件才有"整条进度条 = 这一个文件的块空间"这回事，分段才画得出来。
+            // 多文件/文件夹没有跨文件的块空间，退回整条连续进度（老代码按通道等分画的是假分段）。
+            val singleFile = xferPopupSingleFile && blockProgress != null &&
+                blockProgress.totalSize > 0 && blockProgress.doneBlocks > 0
+            val done = when {
+                // 单文件：已完成字节也取按块真值（含续传时跳过的块），和分段条是同一份数据，
+                // 不会出现"进度条满了但数字还差一截"或者反过来
+                singleFile -> maxOf(blockProgress!!.doneBytes, xferPopupResumeBase)
+                    .let { if (xferPopupTotal > 0) it.coerceAtMost(xferPopupTotal) else it }
+                else -> xferPopupResumeBase + sum
+            }
             val shown = when {
                 // 数据发完、电脑在算 SHA-256：钉在 total 上，别被不再增长的真值拉回去
                 xferPopupWaiting && xferPopupTotal > 0 -> xferPopupTotal
@@ -635,9 +661,25 @@ internal fun TransferScreen(
                 else -> done
             }
             lastDone = shown
+            val complete = xferPopupWaiting || (xferPopupTotal > 0 && shown >= xferPopupTotal)
+            val segments = if (singleFile) {
+                blockProgress!!.segments.map { seg ->
+                    SegInfo(
+                        owner = seg.owner,
+                        // start/end 是块索引，分段条只拿它当"宽度权重"，同一份快照里口径一致
+                        start = seg.start,
+                        end = seg.end,
+                        filled = if (complete) 1f else seg.filled,
+                    )
+                }
+            } else {
+                emptyList()
+            }
             xferPopupDone = shown
             xferPopupChannels = channels
+            xferPopupSegments = segments
             // 应用外悬浮窗：只有切出去（appVisible=false）时才显示，跟着这份快照走
+            // （分段也一起给它，悬浮窗和应用内弹窗必须是同一个样子）
             GlobalTransferOverlay.reportSend(
                 UiState(
                     xferActive = true,
@@ -646,62 +688,20 @@ internal fun TransferScreen(
                     xferTotal = xferPopupTotal,
                     xferBytes = shown,
                     xferChannels = channels,
-                    xferSegments = emptyList(),
+                    xferSegments = segments,
                     xferNote = if (xferPopupWaiting) "等待电脑校验…" else "",
                     xferCount = 1,
                     xferLabel = server.displayName,
                     xferId = -1,
                 ),
+                sending = xferPopupSending,
             )
         }
     }
 
     if (xferPopup) {
-        // 发送方向：读文件任务按 SendRanges 把文件切成"一条通道一段"的连续区间，
-        // 某条通道先干完还会把别人还没产出的那段尾巴切一半过来 —— 段数会随传输变多，
-        // 进度条上就出现新的切割线（IDM 那种效果）。这里直接画真实分段。
-        // 续传时分段计划只覆盖"缺的那些块"，和整条进度条的百分比对不上，直接画整条连续进度
-        val planSegments = if (xferPopupSending && xferPopupSingleFile && xferPopupResumeBase <= 0)
-            server.currentSendSegments() else emptyList()
-        val popupSegments = if (planSegments.isNotEmpty() && xferPopupTotal > 0) {
-            val complete = xferPopupDone >= xferPopupTotal
-            planSegments.map { seg ->
-                // 这一段负责的字节数 = 它占的百分比 × 总量；填充 = 该通道实际发出的字节 / 这一段的份额
-                val rangeBytes = ((seg.end - seg.start) / 100f * xferPopupTotal).toLong()
-                val ownerBytes = xferPopupChannels.firstOrNull { it.name == seg.owner }?.bytes ?: 0L
-                val filled = when {
-                    complete -> 1f
-                    rangeBytes > 0 -> (ownerBytes.toFloat() / rangeBytes).coerceIn(0f, 1f)
-                    else -> 0f
-                }
-                SegInfo(
-                    owner = seg.owner,
-                    start = seg.start.toInt(),
-                    end = seg.end.toInt().coerceAtLeast(seg.start.toInt() + 1),
-                    filled = filled,
-                )
-            }
-        } else if (xferPopupChannels.isNotEmpty() && xferPopupTotal > 0) {
-            // 多文件传输 / 接收方向：没有单文件的分段信息，退回"按通道等分"的近似画法
-            val count = xferPopupChannels.size
-            val share = xferPopupTotal.toFloat() / count
-            val complete = xferPopupDone >= xferPopupTotal
-            List(count) { index ->
-                val bytes = xferPopupChannels[index].bytes
-                SegInfo(
-                    owner = "seg" + index,
-                    start = index * 100 / count,
-                    end = (index + 1) * 100 / count,
-                    filled = when {
-                        complete -> 1f
-                        share > 0f -> (bytes / share).coerceIn(0f, 1f)
-                        else -> 0f
-                    },
-                )
-            }
-        } else {
-            emptyList()
-        }
+        // 分段进度条的数据由上面 50ms 的轮询算好（xferPopupSegments）：一条通道一段，
+        // 段宽 = 这一段占多少块，填充 = 段内已完成块占比。和主页接收进度条同一个来源、同一套画法。
         ReceiveProgressPanel(
             state = UiState(
                 xferActive = true,
@@ -709,7 +709,7 @@ internal fun TransferScreen(
                 xferDone = xferPopupDone,
                 xferTotal = xferPopupTotal,
                 xferBytes = xferPopupDone,
-                xferSegments = popupSegments,
+                xferSegments = xferPopupSegments,
                 xferChannels = xferPopupChannels,
                 xferPaused = xferPopupPaused,
                 // 数据已发完、电脑在算 SHA-256：显示"等待电脑校验…"，别让它看着像卡死

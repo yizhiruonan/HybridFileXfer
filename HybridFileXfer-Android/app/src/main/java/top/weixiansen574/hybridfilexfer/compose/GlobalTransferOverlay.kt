@@ -40,9 +40,13 @@ object GlobalTransferOverlay {
     private var owner: Owner? = null
     private var showing = false
 
-    /** 双窗口发送时由界面把合成的进度塞进来，完成后传 null */
+    /** 双窗口里传输时由界面把进度塞进来（发送也一样），完成后传 null */
     @Volatile
     private var sendSnapshot: UiState? = null
+
+    /** 那份快照是"发送中"还是"接收中"：双窗口 ← 复制（拉取）时手机是接收方，别标成"正在发送" */
+    @Volatile
+    private var sendIsSending = true
 
     @Volatile
     private var sendAt = 0L
@@ -50,12 +54,19 @@ object GlobalTransferOverlay {
     /** 上一次尝试失败的时间：失败后隔一会儿再试，别每 250ms 崩一次 */
     private var lastFailure = 0L
 
-    internal fun reportSend(snapshot: UiState?) {
+    internal fun reportSend(snapshot: UiState?, sending: Boolean = true) {
         sendSnapshot = snapshot
+        sendIsSending = sending
         sendAt = System.currentTimeMillis()
     }
 
     fun refresh(context: Context) {
+        // 应用在前台时进度由应用内的弹窗显示，悬浮窗没什么可画的：
+        // 先判掉，别每 50ms 去读一遍全量进度状态（这条路以前是 250ms 一次，现在跟着主页的 50ms 走）
+        if (ServerService.appVisible) {
+            hide()
+            return
+        }
         val recv = try {
             readProgressState(UiState())
         } catch (_: Throwable) {
@@ -64,15 +75,35 @@ object GlobalTransferOverlay {
         val send = sendSnapshot?.takeIf {
             it.xferActive && System.currentTimeMillis() - sendAt < 2500
         }
+        // 电脑推送（后台接收）优先级最高：那份快照本来就是按块统计的真值
         val active = recv.xferActive || send != null
-        if (!active || ServerService.appVisible || !Settings.canDrawOverlays(context)) {
+        if (!active || !canOverlay(context)) {
             hide()
             return
         }
         val snapshot = if (recv.xferActive) recv else send ?: return
         state.value = snapshot
-        sending.value = !recv.xferActive
+        // 双窗口里可能是"← 复制"（手机在收），别再固定写成发送
+        sending.value = if (recv.xferActive) false else sendIsSending
         show(context)
+    }
+
+    /** 悬浮窗权限查询是会走系统服务的，别每 50ms 问一次 */
+    private var overlayAllowed = true
+    private var overlayCheckedAt = 0L
+
+    private fun canOverlay(context: Context): Boolean {
+        val now = System.currentTimeMillis()
+        if (now - overlayCheckedAt < 2000) {
+            return overlayAllowed
+        }
+        overlayCheckedAt = now
+        overlayAllowed = try {
+            Settings.canDrawOverlays(context)
+        } catch (_: Throwable) {
+            false
+        }
+        return overlayAllowed
     }
 
     fun hide() {

@@ -16,9 +16,13 @@ public class ReceiveFileCall implements Callable<Void> {
     private final TransferConnection connection;
     private final String iName;
     private final TransferPause pause;
+    /** 分块进度账本（接收方向），由 HFXService.receiveFiles 注入 */
+    private final BlockProgress progress;
 
-    public ReceiveFileCall(int tIndex, TransferConnection connection,WriteFileCall writeFileCall,TransferFileCallback callback, TransferPause pause) {
+    public ReceiveFileCall(int tIndex, TransferConnection connection, WriteFileCall writeFileCall,
+                           TransferFileCallback callback, TransferPause pause, BlockProgress progress) {
         this.pause = pause;
+        this.progress = progress;
         this.writeFileCall = writeFileCall;
         this.tIndex = tIndex;
         this.connection = connection;
@@ -79,6 +83,10 @@ public class ReceiveFileCall implements Callable<Void> {
                                     + Integer.toHexString(actualCrc) + " != " + Integer.toHexString(expectedCrc) + "）");
                         }
                         writeFileCall.putBlock(new FileBlock(true, fileIndex, path, lastModified, totalSize, index, buffer), tIndex);
+                        if (progress != null) {
+                            // 这一块已经完整收到（校验通过、交给写盘线程）：进度条按块记真值
+                            progress.onBlock(iName, path, index, totalSize);
+                        }
                         break;
                     }
                     case TransferIdentifiers.EOF:

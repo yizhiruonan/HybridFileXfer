@@ -20,7 +20,6 @@ import java.util.concurrent.LinkedBlockingDeque;
 import top.weixiansen574.async.BackstageTask;
 import top.weixiansen574.hybridfilexfer.NativeMemory;
 import top.weixiansen574.hybridfilexfer.aidl.IIOService;
-import top.weixiansen574.hybridfilexfer.core.BlockProgress;
 import top.weixiansen574.hybridfilexfer.core.ControllerIdentifiers;
 import top.weixiansen574.hybridfilexfer.core.FileBlock;
 import top.weixiansen574.hybridfilexfer.core.HFXService;
@@ -51,9 +50,6 @@ public class HFXServer extends HFXService {
     protected final IIOService ioService;
     protected int remoteFileSystem;
     protected String remoteHomeDir;
-
-    /** 电脑推送文件时的分块进度（给进度浮层画分块进度条） */
-    public final BlockProgress blockProgress = new BlockProgress();
 
     /** 传输通道探测锁：探测期间不允许开始新传输，避免把数据读走 */
     private final Object channelProbeLock = new Object();
@@ -437,12 +433,11 @@ public class HFXServer extends HFXService {
             targets.add(localDir.generateTransferPath(file.getPath(), remoteDir));
         }
         java.util.Map<String, java.util.BitSet> result = new java.util.HashMap<>();
-        if (plain.isEmpty()) {
-            return result;
-        }
         synchronized (controlLock) {
             // 先把上一轮留下的 PAUSE_REPLY 吃掉，别把它当成位图的长度
             drainStaleControlFrames();
+            // 电脑端读完 REQUEST_RECEIVE 就同步读这一帧，所以「一个文件都不查」（只发文件夹）
+            // 也必须发出去，只是 count = 0
             ctChannel.writeShort(ControllerIdentifiers.RESUME_QUERY);
             ctChannel.writeInt(plain.size());
             for (int i = 0; i < plain.size(); i++) {
@@ -476,17 +471,27 @@ public class HFXServer extends HFXService {
     }
 
     public void sendFilesToRemote(List<RemoteFile> files, Directory localDir, Directory remoteDir, TransferFileCallback callback) throws IOException {
+        // 进度条的账本从这一刻起归这次传输：界面 50ms 读一次，别让它在等重建的几秒里
+        // 先把上一轮的分段/已完成字节画出来（那几秒正是"看着像在传别的东西"的时段）
+        sendProgress.reset();
+        blockProgress.reset();
         // 304：刚取消过的话先等电脑把通道重建回来（重建要 1~3 秒），
         // 否则用的还是已经关掉的旧通道，用户"取消完立刻再传"必定失败
         awaitRebuild(10000);
         beginTransfer();
         try {
-            // 只在发请求时拿控制锁；整个传输期间不占着，会话线程才能跑暂停状态同步
+            // 「请求接收」和「续传查询」必须在<b>同一次</b>控制通道占用里发出去。
+            //
+            // 电脑端的 handle_receive 读完 REQUEST_RECEIVE 就紧接着同步读 RESUME_QUERY；
+            // 以前这两帧分两次拿锁，中间会话线程（每 250ms 一次暂停同步）会插进一帧
+            // PAUSE_STATE —— 电脑端读到的第一帧成了 22，直接报
+            // "expected RESUME_QUERY, got 22" 并把整条会话断开（实测踩到过）。
+            java.util.Map<String, java.util.BitSet> resume;
             synchronized (controlLock) {
                 ctChannel.writeShort(ControllerIdentifiers.REQUEST_RECEIVE);//请求对方接收
+                // 305：问电脑"这些文件已经收到哪些块了"，能续传的就只补缺的块
+                resume = queryResume(files, localDir, remoteDir);
             }
-            // 305：问电脑"这些文件已经收到哪些块了"，能续传的就只补缺的块
-            java.util.Map<String, java.util.BitSet> resume = queryResume(files, localDir, remoteDir);
             sendFiles(files, localDir, remoteDir, callback, resume);
         } finally {
             endTransfer();
@@ -570,11 +575,17 @@ public class HFXServer extends HFXService {
     }
 
     public void sendFilesToShelf(List<RemoteFile> files, Directory localDir, Directory remoteDir, TransferFileCallback callback) throws IOException {
+        // 同上：这次传输的进度账本从现在开始
+        sendProgress.reset();
+        blockProgress.reset();
         // 304：同上，等重建完成再开始
         awaitRebuild(10000);
         beginTransfer();
         try {
-            // 只在发请求时拿控制锁；整个传输期间不占着，会话线程才能跑暂停状态同步
+            // 306：这些文件我已经收到哪些块（纯本地 IO，放在控制锁外面算，别拖住会话线程）
+            java.util.List<ResumeEntry> resume = buildResumeState(files, localDir);
+            // 同 sendFilesToRemote：请求帧和续传状态帧必须一次发完，中间不能插进 PAUSE_STATE，
+            // 否则电脑端 handle_send 读到的就是错位的帧。
             synchronized (controlLock) {
                 ctChannel.writeShort(ControllerIdentifiers.REQUEST_SEND);
                 ctChannel.writeInt(files.size());
@@ -584,10 +595,9 @@ public class HFXServer extends HFXService {
                 ctChannel.writeUTF(localDir.path);
                 ctChannel.writeInt(localDir.fileSystem);
                 ctChannel.writeUTF(remoteDir.path);
+                // 电脑看完 RESUME_STATE 才开始发，只补缺的块
+                sendResumeState(resume);
             }
-            // 306：告诉电脑"这些文件我已经收到哪些块"（电脑看完才开始发，只补缺的）
-            java.util.List<ResumeEntry> resume = buildResumeState(files, localDir);
-            sendResumeState(resume);
             receiveFiles(callback, toResumeMap(resume));
         } finally {
             endTransfer();

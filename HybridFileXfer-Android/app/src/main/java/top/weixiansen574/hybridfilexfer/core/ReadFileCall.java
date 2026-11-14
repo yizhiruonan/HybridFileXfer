@@ -45,6 +45,15 @@ public abstract class ReadFileCall implements Callable<Void> {
     /** 305：目标路径 → 接收端已经有的块（断点续传时要跳过的块） */
     private final java.util.Map<String, java.util.BitSet> resumeBits;
 
+    /**
+     * 本次传输的分块进度（HFXService.sendProgress）。
+     *
+     * <p>两块来源：一条通道真正把块写出去以后（{@link #noteBlockSent}），
+     * 以及 305 续传时"接收端已经有了"而跳过的块 —— 后者直接算已完成，
+     * 否则进度条会永远差一截（跳到的那几百 MB 永远不会出现在进度里）。
+     */
+    private volatile BlockProgress progress;
+
     /** 这次传输已经被取消 / 通道出错：读文件的线程必须自己停下来 */
     private volatile boolean shutdown;
     /** 读文件线程已经把该产出的块都产完了 */
@@ -83,6 +92,22 @@ public abstract class ReadFileCall implements Callable<Void> {
 
     public void setPause(TransferPause pause) {
         this.pause = pause;
+    }
+
+    /** 分块进度账本（发送方向），由 HFXService.sendFiles 注入 */
+    public void setProgress(BlockProgress progress) {
+        this.progress = progress;
+    }
+
+    /**
+     * 这一块已经真正写到通道上了（SendFileCall 写完数据后回调）。
+     * 进度条只认这个真值：投递进队列的那一刻还不算，队列里可能压着几百 MB。
+     */
+    public void noteBlockSent(String owner, String path, int index, long totalSize) {
+        BlockProgress tracker = progress;
+        if (tracker != null) {
+            tracker.onBlock(owner, path, index, totalSize);
+        }
     }
 
     private TransferPause pause() {
@@ -199,6 +224,12 @@ public abstract class ReadFileCall implements Callable<Void> {
             int blkSize = (int) Math.min(remaining, FileBlock.BLOCK_SIZE);
             if (have != null && have.get(i)) {
                 // 这块接收端已经有了：跳过读取和发送，但文件读位置要往后挪
+                BlockProgress tracker = progress;
+                if (tracker != null) {
+                    // 305：续传跳过的块在进度条上直接算完成（owner 用空串 = "早就传输过了"），
+                    // 否则续传时进度条永远到不了 100%（跳过的那几百 MB 不会再出现在进度里）
+                    tracker.onBlock("", transferPath, i, length);
+                }
                 channel.position(channel.position() + blkSize);
                 remaining -= blkSize;
                 i++;

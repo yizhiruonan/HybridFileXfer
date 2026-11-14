@@ -104,7 +104,27 @@ public abstract class HFXService {
     /** 本次发送的读文件任务：界面从它拿"当前文件被切成哪几段"画动态进度条 */
     private volatile ReadFileCall currentReadFileCall;
 
-    /** 发送方向当前的分段（进度条切割线）；没有传输时返回空表 */
+    /**
+     * 本次传输的分块进度（一块 1MiB，记"哪条通道传了第几块"）。
+     *
+     * <p><b>两个方向各一份，但用的是同一个类、同一套口径</b>：
+     * <ul>
+     *   <li>{@link #blockProgress}：接收方向（电脑推送 / 双窗口「← 复制」拉取）——块到达时记；</li>
+     *   <li>{@link #sendProgress}：发送方向（双窗口「复制 →」）——块真正写出去以后才记
+     *       （不能记"投递进队列"那一刻，队列里可能压着几百 MB，进度条会跑到真值前面）。</li>
+     * </ul>
+     * 界面（双窗口弹窗、应用外悬浮窗）每 50ms 取一次 {@code snapshot()}，和主页接收进度条
+     * 用的是同一份逻辑：分段 = 相邻块归属变化处，每段填充 = 段内已完成块占比。
+     */
+    public final BlockProgress blockProgress = new BlockProgress();
+    public final BlockProgress sendProgress = new BlockProgress();
+
+    /**
+     * 发送方向的分段计划（历史实现：按 SendRanges 的百分比区间画）。
+     *
+     * <p>已被 {@link BlockProgress#snapshot()} 取代 —— 计划里的区间是"打算这么切"，
+     * 而界面要的是"实际谁在传、传了多少"。保留这个访问器只为兼容，别再拿它画进度条。
+     */
     public java.util.List<SendRanges.Segment> currentSendSegments() {
         ReadFileCall call = currentReadFileCall;
         return call == null ? java.util.Collections.emptyList() : call.segments();
@@ -207,6 +227,9 @@ public abstract class HFXService {
         ReadFileCall readFileCall = createReadFileCall(buffers, fileList, localDir, remoteDir, connections.size(), channelNames, resumeBits);
         // 界面画"动态分段进度条"要读它：当前文件被切成了哪几段、每段归哪条通道
         this.currentReadFileCall = readFileCall;
+        // 分块进度换成本次传输的新账本（上一轮的对象可能还有线程在写，别 reset 复用）
+        sendProgress.reset();
+        readFileCall.setProgress(sendProgress);
         readFileCall.setPause(pauseGate);
         FutureTask<Void> readFileTask = new FutureTask<>(readFileCall);
         Thread readThread = new Thread(readFileTask);
@@ -337,6 +360,21 @@ public abstract class HFXService {
         lastPcPaused = false;
         WriteFileCall writeFileCall = createWriteFileCall(buffers, connections.size(), resumeBits);
         long startTime = System.currentTimeMillis();
+        // 分块进度换成本次传输的新账本（和发送方向同一套口径，见 blockProgress 的注释）
+        blockProgress.reset();
+        // 306：手机本地已经有的块也要先记进来。不记的话续传时进度条从 0 开始涨——
+        // 实测 3.25 GB 的文件已有 3.0 GB，浮层却显示「324 MB / 3.25 GB」。
+        // 归属记空串（和发送方向"电脑已收到的块"同一个口径），真实通道的块到了再按通道分段。
+        if (resumeBits != null) {
+            for (java.util.Map.Entry<String, java.util.BitSet> entry : resumeBits.entrySet()) {
+                if (entry.getValue() == null || entry.getValue().isEmpty()) {
+                    continue;
+                }
+                for (int i = entry.getValue().nextSetBit(0); i >= 0; i = entry.getValue().nextSetBit(i + 1)) {
+                    blockProgress.onBlock("", entry.getKey(), i, 0);
+                }
+            }
+        }
 
         SpeedMonitorThread speedMonitorThread = new SpeedMonitorThread(connections, callback);
         speedMonitorThread.setName("SpeedMonitor");
@@ -345,7 +383,7 @@ public abstract class HFXService {
         List<FutureTask<Void>> transferTasks = new ArrayList<>(connections.size());
         for (int i = 0; i < connections.size(); i++) {
             TransferConnection connection = connections.get(i);
-            FutureTask<Void> task = new FutureTask<>(new ReceiveFileCall(i, connection, writeFileCall, callback, pauseGate));
+            FutureTask<Void> task = new FutureTask<>(new ReceiveFileCall(i, connection, writeFileCall, callback, pauseGate, blockProgress));
             transferTasks.add(task);
             Thread thread = new Thread(task);
             thread.setName("DL_" + connection.iName);
