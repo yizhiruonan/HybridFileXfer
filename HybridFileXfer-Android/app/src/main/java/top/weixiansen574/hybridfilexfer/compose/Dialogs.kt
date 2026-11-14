@@ -1,5 +1,6 @@
 package top.weixiansen574.hybridfilexfer.compose
 
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -33,6 +34,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalHapticFeedback
@@ -565,6 +568,13 @@ internal fun ReceiveProgressPanel(
  * 分块进度条：一段 = 一条连接负责的文件区间（IDM / 迅雷 那种）。
  * 外观跟设置页的滑动条一致：整条是圆角胶囊，填充块也是圆头；
  * 段宽按区间块数分配，段数会随"空闲连接去切别人的段"变化。
+ *
+ * 整条画在同一块 Canvas 上，几何**只由当前真值决定**。
+ * 以前一格是一个 Composable + 各自的 animateFloatAsState，而 forEachIndexed 没有 key，
+ * Compose 是按**位置**复用动画状态的：段一合并（格子数量变少），合并后的整格会继承旧第 1 格
+ * 已经走到 1.0 的动画值，于是"进度先跳到 100% 再滑回来"——实测每次合并闪一下，
+ * 段被新通道拆开时同样闪。现在没有格子、没有按位置复用的动画状态，合并只让一条竖线消失，
+ * 任何一个像素的位置都不变。平滑交给数据本身：50ms 一帧、每帧前进 2~3 像素，本来就是连续的。
  */
 @Composable
 private fun SegmentedProgressBar(
@@ -575,6 +585,15 @@ private fun SegmentedProgressBar(
     divider: Color,
 ) {
     val shape = RoundedCornerShape(50)
+    // 只有"没有分段"（多文件/文件夹）时才用整条的补间动画：那是一条连续的进度，不存在段的变化
+    val animatedFallback by androidx.compose.animation.core.animateFloatAsState(
+        targetValue = fallback.coerceIn(0f, 1f),
+        animationSpec = androidx.compose.animation.core.tween(
+            durationMillis = 200,
+            easing = androidx.compose.animation.core.LinearEasing,
+        ),
+        label = "barFallback",
+    )
     Box(
         modifier = Modifier
             .fillMaxWidth()
@@ -582,57 +601,42 @@ private fun SegmentedProgressBar(
             .clip(shape)
             .background(track),
     ) {
-        Row(modifier = Modifier.fillMaxSize()) {
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            val width = size.width
+            val height = size.height
             if (segments.isEmpty()) {
-                ProgressCell(fallback.coerceIn(0f, 1f), Modifier.weight(1f), color, divider, first = true)
-            } else {
-                segments.forEachIndexed { index, seg ->
-                    val span = (seg.end - seg.start).coerceAtLeast(1)
-                    ProgressCell(
-                        fraction = seg.filled.coerceIn(0f, 1f),
-                        modifier = Modifier.weight(span.toFloat()),
+                if (animatedFallback > 0f) {
+                    drawRect(color, size = Size(width * animatedFallback, height))
+                }
+                return@Canvas
+            }
+            var spanSum = 0L
+            segments.forEach { spanSum += (it.end - it.start).coerceAtLeast(1) }
+            val totalSpan = spanSum.toFloat().coerceAtLeast(1f)
+            val dividerWidth = 1.dp.toPx()
+            var x = 0f
+            segments.forEachIndexed { index, seg ->
+                val span = (seg.end - seg.start).coerceAtLeast(1)
+                // 最后一段吃掉浮点误差，别在右端留一条缝
+                val segWidth = if (index == segments.size - 1) width - x else width * span / totalSpan
+                val fill = seg.filled.coerceIn(0f, 1f)
+                if (fill > 0f) {
+                    drawRect(
                         color = color,
-                        divider = divider,
-                        first = index == 0,
+                        topLeft = Offset(x, 0f),
+                        size = Size(segWidth * fill, height),
                     )
                 }
+                if (index > 0) {
+                    // 切分竖线（IDM 那种红线）
+                    drawRect(
+                        color = divider,
+                        topLeft = Offset(x, 0f),
+                        size = Size(dividerWidth, height),
+                    )
+                }
+                x += segWidth
             }
-        }
-    }
-}
-
-/**
- * 一段的填充：整条被外层胶囊裁掉圆角，所以最左/最右自动是圆头，中间是直角。
- * 段与段之间不空开，而是画一条竖线隔开（IDM 那种）。
- */
-@Composable
-private fun ProgressCell(fraction: Float, modifier: Modifier, color: Color, divider: Color, first: Boolean) {
-    // 50ms 采一次样，补 120ms 线性动画：每次只追一小段，看起来是连续流动的
-    val animated by androidx.compose.animation.core.animateFloatAsState(
-        targetValue = fraction.coerceIn(0f, 1f),
-        animationSpec = androidx.compose.animation.core.tween(
-            durationMillis = 120,
-            easing = androidx.compose.animation.core.LinearEasing,
-        ),
-        label = "segmentFill",
-    )
-    Box(modifier = modifier.fillMaxHeight()) {
-        if (animated > 0f) {
-            Box(
-                modifier = Modifier
-                    .fillMaxHeight()
-                    .fillMaxWidth(animated)
-                    .background(color),
-            )
-        }
-        if (!first) {
-            Box(
-                modifier = Modifier
-                    .align(Alignment.CenterStart)
-                    .width(1.dp)
-                    .fillMaxHeight()
-                    .background(divider),
-            )
         }
     }
 }
