@@ -168,6 +168,13 @@ struct AdbCycle {
     last_start_ok: bool,
     /// 上一次打印「adb 连接没成功」的时间，避免每秒刷一行
     last_fail_log: Instant,
+    /// 这一轮「开始接收」里已经连上过手机了。连上过之后再断开（用户在手机上点「停止服务」
+    /// 是最常见的情况）就不再自动拉起手机端服务 —— 否则手机上刚变「启动服务并等待连接」，
+    /// 两三秒后又被电脑拉回来，用户看到的是「点了停止却停不下来」。
+    /// 只在「还没连上过」时自动拉起（刚点开始接收 / 刚插上线，方便用户不用去碰手机）。
+    connected_once: bool,
+    /// 「手机端已停止服务」这条提示已经发给界面了吗（避免每个轮次重复刷）
+    stop_notice_shown: bool,
 }
 
 impl AdbCycle {
@@ -179,6 +186,8 @@ impl AdbCycle {
             seen: false,
             last_start_ok: true,
             last_fail_log: Instant::now() - Duration::from_secs(60),
+            connected_once: false,
+            stop_notice_shown: false,
         }
     }
 
@@ -267,10 +276,21 @@ impl AdbCycle {
             if !sleep_unless_stopped(stop, Duration::from_millis(200)) {
                 return Attempt::Retry;
             }
+        } else if self.connected_once {
+            // 连上过又断了：不自动拉起手机端服务（用户点「停止服务」是明确意图），
+            // 只被动重连 —— 手机上一点「启动服务」，下面这个循环一秒内就接上。
+            if !self.stop_notice_shown {
+                self.stop_notice_shown = true;
+                on_state(EngineState::Waiting(tr(
+                    "手机已断开，在手机上点「启动服务」后会自动连上",
+                    "the phone disconnected; tap Start on the phone to reconnect",
+                ).to_string()));
+            }
         } else {
-            // 手机端服务可能刚被用户停掉（或刚被系统杀掉），所以要定期把它拉起来。
-            // 以前成功过就隔 10 秒才拉，用户看到的是「手机点停止、电脑等十几秒才又连上」；
-            // 现在固定 3 秒，服务本来就活着时 am start-foreground-service 是个很快的空操作。
+            // 这一轮还没连上过（刚点「开始接收」/ 刚插上线）：定期把手机端服务拉起来，
+            // 用户不用去碰手机。间隔 3 秒（以前成功拉过一次之后就隔 10 秒，插上要等十几秒）。
+            // 服务本来就活着时 am start-foreground-service 是个很快的空操作。
+            // 注意：连上过、后来断开的情况走上面那一支，不在这里拉。
             let interval = if self.last_start_ok {
                 Duration::from_secs(3)
             } else {
@@ -298,8 +318,27 @@ impl AdbCycle {
             ) {
                 Ok(mut session) => {
                     session.device = device.serial.clone();
+                    self.connected_once = true;
+                    self.stop_notice_shown = false;
                     report_connected(&session, on_state);
-                    run_session(&mut session, options, stop);
+                    let end = run_session(&mut session, options, stop);
+                    // 断开后立刻把界面切成「等手机点启动服务」：不能一直显示「已连接」，
+                    // 那正是用户报的「手机点停止、电脑端毫无变化」。
+                    let notice = match end {
+                        SessionEnd::Shutdown => Some(tr(
+                            "手机端已停止服务，在手机上点「启动服务」后会自动连上",
+                            "the phone stopped the server; tap Start on the phone to reconnect",
+                        )),
+                        SessionEnd::Disconnected(_) => Some(tr(
+                            "手机已断开，在手机上点「启动服务」后会自动连上",
+                            "the phone disconnected; tap Start on the phone to reconnect",
+                        )),
+                        SessionEnd::Stopped => None,
+                    };
+                    if let Some(notice) = notice {
+                        self.stop_notice_shown = true;
+                        on_state(EngineState::Waiting(notice.to_string()));
+                    }
                     return Attempt::Ran;
                 }
                 Err(e) => {
@@ -409,7 +448,13 @@ fn try_discovery(
     match Session::connect(peer.ip, peer.port, &home_dir(options), 0) {
         Ok(mut session) => {
             report_connected(&session, on_state);
-            run_session(&mut session, options, stop);
+            let end = run_session(&mut session, options, stop);
+            if matches!(end, SessionEnd::Shutdown) {
+                on_state(EngineState::Waiting(tr(
+                    "手机端已停止服务，在手机上点「启动服务」后会自动连上",
+                    "the phone stopped the server; tap Start on the phone to reconnect",
+                ).to_string()));
+            }
             true
         }
         Err(e) => {
@@ -489,8 +534,8 @@ fn run_session(session: &mut Session, options: &EngineOptions, stop: &Arc<Atomic
     match end {
         SessionEnd::Shutdown => {
             log::info(tr(
-                "手机端已停止服务，等待重新连接…",
-                "the phone stopped the server, waiting for a new connection…",
+                "手机端已停止服务，等手机上重新点「启动服务」（不再自动拉起）",
+                "the phone stopped the server; waiting for the phone to start it again",
             ));
             SessionEnd::Shutdown
         }
