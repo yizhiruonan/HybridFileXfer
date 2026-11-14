@@ -42,6 +42,13 @@ public final class SendRanges {
     /** 已投递块数（allProduced 要用 O(1) 判断，别每次扫位图） */
     private long producedCount;
     private boolean finished;
+    /**
+     * 别人的尾巴只剩这么多块时，一次全部接走，不再对半切。
+     *
+     * <p>再切下去每抢一次都要跨线程投递一轮（读线程重新算 takeNext、往队列里放块），
+     * 剩下这几块的传输时间还没这一轮调度长。
+     */
+    private static final long TAIL_LATCH_BLOCKS = 8;
 
     public SendRanges(int channels, long totalBlocks, String[] names) {
         this.channels = Math.max(1, channels);
@@ -87,6 +94,16 @@ public final class SendRanges {
         return producedCount >= totalBlocks;
     }
 
+    /** 已投递出去的块数（排障/日志用） */
+    public synchronized long producedBlocks() {
+        return producedCount;
+    }
+
+    /** 整份文件一共有多少块（排障/日志用） */
+    public long totalBlocks() {
+        return totalBlocks;
+    }
+
     /** [from, to) 里还有没投递出去的块吗（给「自己这段还没产完」判断用） */
     private boolean hasUnproduced(long from, long to) {
         if (to <= from) {
@@ -94,6 +111,23 @@ public final class SendRanges {
         }
         int at = produced.nextClearBit((int) Math.max(0, from));
         return at >= 0 && at < to;
+    }
+
+    /** 「这条通道慢到不值得再给新活」的判定，由 ReadFileCall 按实测速度提供 */
+    public interface HopelessOracle {
+        boolean isHopeless(int channel);
+    }
+
+    private volatile HopelessOracle hopelessOracle;
+
+    /** 装上慢通道判定（读文件线程按 500ms 采样的速度算） */
+    public void setHopelessOracle(HopelessOracle oracle) {
+        this.hopelessOracle = oracle;
+    }
+
+    private boolean isHopeless(int channel) {
+        HopelessOracle oracle = hopelessOracle;
+        return oracle != null && oracle.isHopeless(channel);
     }
 
     /**
@@ -112,7 +146,13 @@ public final class SendRanges {
         if (finished) {
             return false;
         }
+        // 慢通道（蓝牙 0.2MB/s）不再抢新段：抢来也传不完，只会把收尾拖住。
+        // 它自己那段没产出完时上面已经返回 true 了，所以这里不会把它饿死。
+        if (isHopeless(channel)) {
+            return false;
+        }
         int best = -1;
+        boolean bestHopeless = false;
         long bestFrom = 0;
         long bestLen = 1;
         for (int i = 0; i < channels; i++) {
@@ -132,8 +172,17 @@ public final class SendRanges {
                 continue;
             }
             long len = ends[i] - from;
-            if (len > bestLen) {
+            if (len <= 0) {
+                continue;
+            }
+            boolean hopeless = isHopeless(i);
+            // 优先抢慢通道的尾巴：它们本来也传不完，早一点把活接过来，收尾就不等它们
+            boolean better = best < 0
+                    || (hopeless && !bestHopeless)
+                    || (hopeless == bestHopeless && len > bestLen);
+            if (better) {
                 best = i;
+                bestHopeless = hopeless;
                 bestFrom = from;
                 bestLen = len;
             }
@@ -141,12 +190,23 @@ public final class SendRanges {
         if (best < 0) {
             return false;
         }
-        long mid = bestFrom + bestLen / 2;
-        if (mid <= bestFrom) {
+        // 尾巴怎么切：从尾巴那头切一半过来（申请者拿后半，捐献者留前半继续往前推）。
+        //
+        // 慢通道（蓝牙 0.2MB/s）手里那一段以前是「整条被接走」：同时闲下来的快通道有好几条时，
+        // 只有第一条能抢到，其余全空转等它慢慢吐 —— 用户看到的「最后只剩蓝牙在收尾」。
+        // 现在一律对半切，效果是：
+        //   · 几条快通道轮流来抢，几轮就把蓝牙那段尾巴对半分完，尾巴是并行传的；
+        //   · 蓝牙自己只从前往后做（takeNext 永远拿最小块号），快通道从后往前啃，
+        //     它那一小段从两头同时缩，很快就见底；
+        //   · 尾巴只剩最后几块时一次全部接走，不在最后几块上来回切（切一次要跨线程投递一轮，
+        //     比直接传这几块还慢）。
+        long take = bestLen <= TAIL_LATCH_BLOCKS ? bestLen : (bestLen + 1) / 2;
+        long donorEnd = ends[best];
+        long mid = Math.max(bestFrom, donorEnd - take);
+        if (mid >= donorEnd) {
             return false;
         }
         // 把捐献者剩下的后半段 [mid, donorEnd) 划给申请者
-        long donorEnd = ends[best];
         ends[best] = mid;
         starts[channel] = mid;
         ends[channel] = donorEnd;

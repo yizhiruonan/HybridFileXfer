@@ -142,6 +142,16 @@ internal fun TransferScreen(
     var xferPopupResumeBase by remember { mutableLongStateOf(0L) }
     /** 已经发完的通道名（onChannelComplete 回调），用来判断"数据阶段结束" */
     val xferPopupDoneNames = remember { HashSet<String>() }
+    /**
+     * 校验阶段（数据传完、两端在算整文件 SHA-256）的进度。
+     *
+     * <p>用户的要求：校验也要看得见进度，直接复用传输那条总进度条 ——
+     * 传输完进度归零，同一条进度条接着画校验的百分比，不再是一句"等待电脑校验…"干等。
+     */
+    /** 进度条上要显示的总量：传输阶段是文件大小，校验阶段是待校验的字节数 */
+    var xferPopupTotalShown by remember { mutableLongStateOf(0L) }
+    /** 校验百分比；-1 表示当前不在校验 */
+    var xferPopupVerifyPercent by remember { mutableIntStateOf(-1) }
 
     fun toast(text: String) {
         main.post { message = text }
@@ -676,16 +686,35 @@ internal fun TransferScreen(
                     .let { if (xferPopupTotal > 0) it.coerceAtMost(xferPopupTotal) else it }
                 else -> xferPopupResumeBase + sum
             }
+            // 校验阶段：数据已经发完，两端在复算整文件 SHA-256。
+            // 这时候把进度条清零，改用校验的字节数 —— 传输进度和校验进度共用同一条进度条，
+            // 用户看到的是一条连续的线，而不是"传输满了之后干等几分钟"。
+            // 数据阶段结束的判定两个方向不一样：发送方向看"每条通道的 EOF 都发出去了"，
+            // 接收方向没有这个回调，就看按块真值是不是已经满 —— 两边都要能进校验阶段，
+            // 否则接收方向校验时（手机自己在算 SHA-256，最该有进度的那一边）进度条是死的。
+            val dataPhaseDone = xferPopupWaiting ||
+                (xferPopupTotal > 0 && done >= xferPopupTotal)
+            val verifyTotal = if (dataPhaseDone) {
+                top.weixiansen574.hybridfilexfer.core.HFXService.verifyTotalBytes()
+            } else 0L
+            val verifyDone = if (dataPhaseDone) {
+                top.weixiansen574.hybridfilexfer.core.HFXService.verifyDoneBytes()
+            } else 0L
+            val verifying = verifyTotal > 0 && verifyDone < verifyTotal
             val shown = when {
-                // 数据发完、电脑在算 SHA-256：钉在 total 上，别被不再增长的真值拉回去
+                // 校验在跑：条子上只有校验这一段的百分比
+                verifying -> verifyDone
+                // 数据发完、正在等电脑端算完：钉在 total 上，别被不再增长的真值拉回去
                 xferPopupWaiting && xferPopupTotal > 0 -> xferPopupTotal
                 // 真值偶发回退（重建换掉 connections、每块计数器重新开始）时不回跳，等它追上来
                 done < lastDone -> lastDone
                 else -> done
             }
             lastDone = shown
-            val complete = xferPopupWaiting || (xferPopupTotal > 0 && shown >= xferPopupTotal)
-            val segments = if (singleFile) {
+            val shownTotal = if (verifying) verifyTotal else xferPopupTotal
+            val verifyPercent = if (verifying) (verifyDone * 100 / verifyTotal).toInt() else -1
+            val complete = !verifying && (xferPopupWaiting || (xferPopupTotal > 0 && shown >= xferPopupTotal))
+            val segments = if (singleFile && !verifying) {
                 blockProgress!!.segments.map { seg ->
                     SegInfo(
                         owner = seg.owner,
@@ -699,6 +728,8 @@ internal fun TransferScreen(
                 emptyList()
             }
             xferPopupDone = shown
+            xferPopupTotalShown = shownTotal
+            xferPopupVerifyPercent = verifyPercent
             xferPopupChannels = channels
             xferPopupSegments = segments
             // 应用外悬浮窗：只有切出去（appVisible=false）时才显示，跟着这份快照走
@@ -708,11 +739,15 @@ internal fun TransferScreen(
                     xferActive = true,
                     xferName = xferPopupName,
                     xferDone = shown,
-                    xferTotal = xferPopupTotal,
+                    xferTotal = shownTotal,
                     xferBytes = shown,
                     xferChannels = channels,
                     xferSegments = segments,
-                    xferNote = if (xferPopupWaiting) "等待电脑校验…" else "",
+                    xferNote = when {
+                        verifyPercent >= 0 -> "校验中 " + verifyPercent + "%"
+                        xferPopupWaiting -> "等待电脑校验…"
+                        else -> ""
+                    },
                     xferCount = 1,
                     xferLabel = server.displayName,
                     xferId = -1,
@@ -752,13 +787,17 @@ internal fun TransferScreen(
                 xferActive = true,
                 xferName = xferPopupName,
                 xferDone = xferPopupDone,
-                xferTotal = xferPopupTotal,
+                xferTotal = if (xferPopupTotalShown > 0) xferPopupTotalShown else xferPopupTotal,
                 xferBytes = xferPopupDone,
                 xferSegments = xferPopupSegments,
                 xferChannels = xferPopupChannels,
                 xferPaused = xferPopupPaused,
-                // 数据已发完、电脑在算 SHA-256：显示"等待电脑校验…"，别让它看着像卡死
-                xferNote = if (xferPopupWaiting) "等待电脑校验…" else "",
+                // 校验阶段直接报百分比（进度条同时也在走）；只剩等电脑端复算时才是"等待电脑校验…"
+                xferNote = when {
+                    xferPopupVerifyPercent >= 0 -> "校验中 " + xferPopupVerifyPercent + "%"
+                    xferPopupWaiting -> "等待电脑校验…"
+                    else -> ""
+                },
                 xferCount = 1,
                 xferLabel = server.displayName,
                 xferId = -1,

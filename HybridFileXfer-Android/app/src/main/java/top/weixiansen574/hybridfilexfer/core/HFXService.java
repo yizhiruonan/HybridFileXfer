@@ -120,6 +120,34 @@ public abstract class HFXService {
     public final BlockProgress sendProgress = new BlockProgress();
 
     /**
+     * 收尾校验（整文件 SHA-256）的进度：已算字节 / 这一轮要算的总字节。
+     *
+     * <p>校验这一步以前在界面上是"没有进度的等待"（大文件实测一动不动两分钟，被当成卡死）。
+     * 现在界面在数据传完时把总进度条清零，直接拿这两个数接着画校验进度 ——
+     * 传输进度和校验进度复用同一条进度条，用户看到的是一条连续的线。
+     */
+    private static final java.util.concurrent.atomic.AtomicLong VERIFY_DONE =
+            new java.util.concurrent.atomic.AtomicLong();
+    private static final java.util.concurrent.atomic.AtomicLong VERIFY_TOTAL =
+            new java.util.concurrent.atomic.AtomicLong();
+
+    /** 校验已经算完多少字节 */
+    public static long verifyDoneBytes() {
+        return VERIFY_DONE.get();
+    }
+
+    /** 这一轮校验总共要算多少字节；0 表示当前没有校验在进行 */
+    public static long verifyTotalBytes() {
+        return VERIFY_TOTAL.get();
+    }
+
+    /** 新一轮传输开始：把校验进度清零（不然后一次传输会接着上一次的百分比走） */
+    public static void resetVerifyProgress() {
+        VERIFY_DONE.set(0);
+        VERIFY_TOTAL.set(0);
+    }
+
+    /**
      * 发送方向的分段计划（历史实现：按 SendRanges 的百分比区间画）。
      *
      * <p>已被 {@link BlockProgress#snapshot()} 取代 —— 计划里的区间是"打算这么切"，
@@ -620,6 +648,8 @@ public abstract class HFXService {
                 int read;
                 while ((read = in.read(buffer)) > 0) {
                     digest.update(buffer, 0, read);
+                    // 校验进度（界面的进度条读它）
+                    VERIFY_DONE.addAndGet(read);
                 }
             }
             return new FileDigest(file.length(), digest.digest());
@@ -650,6 +680,16 @@ public abstract class HFXService {
         if (paths == null) {
             return new ArrayList<>();
         }
+        // 校验进度：先把这一批要算的字节登记好、已算字节清零（预取阶段算过的那些不重复计）
+        long verifyTotal = 0;
+        for (String path : paths) {
+            File file = new File(path);
+            if (file.isFile()) {
+                verifyTotal += file.length();
+            }
+        }
+        VERIFY_TOTAL.set(verifyTotal);
+        VERIFY_DONE.set(0);
         List<FileDigest> digests = java.util.Collections.synchronizedList(new ArrayList<>());
         List<String> todo = new ArrayList<>();
         for (String path : paths) {
@@ -662,6 +702,8 @@ public abstract class HFXService {
                 FileDigest digest = future.get();
                 if (digest != null) {
                     digests.add(digest);
+                    // 传输时就已经算完的：直接算进进度，别让进度条停在 0% 等电脑端
+                    VERIFY_DONE.addAndGet(digest.size);
                 }
             } catch (Throwable e) {
                 // 后台线程算失败（文件被删/线程池被关）：退回同步算一遍，别静默少一个文件

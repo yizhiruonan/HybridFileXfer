@@ -475,6 +475,7 @@ public class HFXServer extends HFXService {
         // 先把上一轮的分段/已完成字节画出来（那几秒正是"看着像在传别的东西"的时段）
         sendProgress.reset();
         blockProgress.reset();
+        top.weixiansen574.hybridfilexfer.core.HFXService.resetVerifyProgress();
         // 304：刚取消过的话先等电脑把通道重建回来（重建要 1~3 秒），
         // 否则用的还是已经关掉的旧通道，用户"取消完立刻再传"必定失败
         awaitRebuild(10000);
@@ -578,6 +579,7 @@ public class HFXServer extends HFXService {
         // 同上：这次传输的进度账本从现在开始
         sendProgress.reset();
         blockProgress.reset();
+        top.weixiansen574.hybridfilexfer.core.HFXService.resetVerifyProgress();
         // 304：同上，等重建完成再开始
         awaitRebuild(10000);
         beginTransfer();

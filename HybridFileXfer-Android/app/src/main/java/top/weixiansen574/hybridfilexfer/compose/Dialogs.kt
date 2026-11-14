@@ -28,6 +28,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -371,20 +372,46 @@ internal fun ReceiveProgressPanel(
     // 现在窗口取最近 600ms：窗口内的字节差本身就是平均值，尖峰被摊平；
     // 再和上一帧 3:1 混合，只削掉残余抖动，不拖慢响应。
     var lastBytes by remember { mutableStateOf(state.xferBytes) }
+    // 累计字节最后一次「变大」的时刻：用来判断最近窗口内到底有没有数据在流动
+    var lastGrowAt by remember { mutableLongStateOf(System.currentTimeMillis()) }
     var targetSpeed by remember { mutableStateOf(0f) }
     val samples = remember { ArrayDeque<Pair<Long, Long>>() } // (时刻, 累计字节)
     val windowMs = 600L
+    // 闲置判定窗口：比采样窗口略长一点，卡在「字节刚刚长过」那个边界上不会被误判成没流动
+    val idleMs = 700L
 
-    LaunchedEffect(state.xferBytes) {
+    // 重算的节拍。以前这里写的是 LaunchedEffect(state.xferBytes)，整段采样/平滑都由
+    // 「累计字节变了」来驱动。传输末段只剩一条蓝牙（0.2~0.6 MB/s）时，字节是按 1MB 的块记的，
+    // 好久才涨一次 —— key 不变就一次都不重算，targetSpeed 一直钉在最后那次 21 MB/s 上，
+    // animateFloatAsState 也只是把旧值补间到底，于是出现「合计速率基本不动、还显示 21MB/s」。
+    // 改成固定 100ms 自增的 tick 驱动：字节不动时也照常重算，数字才会自己往下衰减、最后归零。
+    var speedTick by remember { mutableLongStateOf(0L) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            kotlinx.coroutines.delay(100L)
+            speedTick++
+        }
+    }
+
+    LaunchedEffect(speedTick) {
         val now = System.currentTimeMillis()
         val bytes = state.xferBytes
-        // 新的一次传输（字节变小）或者隔了很久没刷新：窗口重来
+        // 新的一次传输（字节变小）或者刚进入这一屏：窗口重来
         if (bytes < lastBytes || samples.isEmpty()) {
             samples.clear()
             samples.addLast(now to bytes)
             lastBytes = bytes
+            lastGrowAt = now
             targetSpeed = 0f
             return@LaunchedEffect
+        }
+        // 这一拍字节有没有涨；同时留一份「涨之前的值」和「上一次涨是什么时候」，
+        // 用来处理「一块 1MB 隔了三秒才到」这种稀疏流动（见下面 spanMs）
+        val grew = bytes > lastBytes
+        val previousGrowAt = lastGrowAt
+        val previousBytes = lastBytes
+        if (grew) {
+            lastGrowAt = now
         }
         lastBytes = bytes
         samples.addLast(now to bytes)
@@ -392,11 +419,32 @@ internal fun ReceiveProgressPanel(
         while (samples.size > 2 && now - samples.first().first > windowMs) {
             samples.removeFirst()
         }
+        // 最近 idleMs 内累计字节一点没涨：确实没有数据在流（只剩一条慢通道、暂停、等待校验、
+        // 已经收尾都在这一档）。这里必须按「没流动」直接归零。
+        // 以前没有这一档，只靠下面 0.75/0.25 的平滑往下蹭，而平滑是「每次采样」做一次，
+        // 采样本就稀疏，从 21 MB/s 蹭下来要几十次采样、好几分钟，期间界面一直挂着旧的高值。
+        // 归零后交给外面 220ms 的 animateFloatAsState 补间，所以是滑下去而不是硬跳。
+        if (now - lastGrowAt >= idleMs) {
+            targetSpeed = 0f
+            return@LaunchedEffect
+        }
+        // 这一拍没有新字节：瞬时值本来就是 0，拿它去重算只会得到「块一到就尖峰、块没到就是 0」，
+        // 正是以前用户抱怨的「速率数值跳动僵硬」。所以空拍不重算，保持上一次的值；
+        // 真正「没有数据在流」的情况由上面 700ms 的闲置归零负责。
+        if (!grew) return@LaunchedEffect
         val oldest = samples.first()
         val dt = now - oldest.first
+        // 600ms 的窗口只适合连续流动：只剩一条蓝牙（0.2~0.6 MB/s）时是「三秒才到一块 1MB」，
+        // 这一块整个落进窗口里会被算成 1.7 MB/s，还在后面的几个空拍里被反复放大。
+        // 所以「离上一个数据点已经超过一个窗口」时，改用「这次涨了多少 ÷ 隔了多久」当瞬时值；
+        // 连续传输时间隔只有几十毫秒，走不到这一支，口径和以前完全一样。
+        val gapMs = now - previousGrowAt
+        val sparse = gapMs > windowMs
+        val spanMs = if (sparse) gapMs else dt
+        val deltaBytes = if (sparse) bytes - previousBytes else bytes - oldest.second
         // 悬浮窗刚弹出来 / 中断后重连时会算出十几 GB/s 的离谱值，这种情况不采信
-        if (dt >= 200L && bytes >= oldest.second) {
-            val instant = (bytes - oldest.second) * 1000f / dt
+        if (spanMs >= 200L && deltaBytes >= 0L) {
+            val instant = deltaBytes * 1000f / spanMs
             if (instant <= 2000f * 1024f * 1024f) {
                 targetSpeed = if (targetSpeed <= 0f) instant else targetSpeed * 0.75f + instant * 0.25f
             }

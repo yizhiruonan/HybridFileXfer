@@ -46,6 +46,8 @@ public class SendFileCall implements Callable<Void> {
                         continue;
                     }
                     if (readFileCall.isReaderFinished()) {
+                        top.weixiansen574.hybridfilexfer.core.HFXLog.d("通道收工(无活) " + connection.iName
+                                + " 已发 " + connection.getUploadedBytes() + " 字节");
                         channel.writeShort(TransferIdentifiers.EOF);
                         callback.onChannelComplete(connection.iName,
                                 connection.getUploadedBytes(),
@@ -62,6 +64,8 @@ public class SendFileCall implements Callable<Void> {
                 //-1为特殊块
                 if (fileBlock.fileIndex == -1) {
                     if (fileBlock == ReadFileCall.END_POINT) {
+                        top.weixiansen574.hybridfilexfer.core.HFXLog.d("通道收工(端点) " + connection.iName
+                                + " 已发 " + connection.getUploadedBytes() + " 字节");
                         channel.writeShort(TransferIdentifiers.EOF);
                         callback.onChannelComplete(connection.iName,
                                 connection.getUploadedBytes(),
@@ -99,6 +103,8 @@ public class SendFileCall implements Callable<Void> {
                 channel.writeFully(fileBlock.data);
                 readFileCall.recycleBuffer(fileBlock.data);
                 connection.addUploadedBytes(fileBlock.getLength());
+                // 汇报这条通道的真实进度，读线程据此判断谁快谁慢（蓝牙那种要特殊对待）
+                readFileCall.noteChannelBytes(channelIndex, connection.getUploadedBytes());
                 // 这一块真的发出去了：进度条按块记真值（分段切割线 + 每段填充都从这里来）
                 readFileCall.noteBlockSent(connection.iName, fileBlock.path,
                         fileBlock.index, fileBlock.totalSize);
