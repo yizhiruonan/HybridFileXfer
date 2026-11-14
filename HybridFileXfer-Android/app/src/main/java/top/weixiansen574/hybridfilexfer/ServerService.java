@@ -706,6 +706,31 @@ public class ServerService extends Service implements ServiceConnection {
         }
     }
 
+    /** 应用上下文（onCreate 里存下的），后台线程崩溃后重开会话要用 */
+    private static volatile Context appContext;
+    /** 上次因为后台线程崩溃重开会话的时间，防止一次拔线连着重启好几次 */
+    private static volatile long lastCrashRestart;
+
+    /**
+     * 后台传输/会话线程里没兜住的异常（拔线时最常见的那类空指针）。
+     *
+     * <p>线程已经没了，但它负责的那条通道和这一轮会话都还要重来：这里重开一次会话，
+     * 顺便把异常写进日志。限流 3 秒，免得一次拔线打死好几条线程时反复重启。
+     */
+    public static void onBackgroundThreadCrash(String threadName) {
+        Log.w(TAG, "后台线程异常退出：" + threadName);
+        Context context = appContext;
+        if (context == null || !isRunning()) {
+            return;
+        }
+        long now = SystemClock.elapsedRealtime();
+        if (now - lastCrashRestart < 3000) {
+            return;
+        }
+        lastCrashRestart = now;
+        restartSession(context);
+    }
+
     public static void stopServer(Context context) {
         Intent intent = new Intent(context, ServerService.class);
         intent.setAction(ACTION_STOP);
@@ -743,6 +768,9 @@ public class ServerService extends Service implements ServiceConnection {
     @Override
     public void onCreate() {
         super.onCreate();
+        // 传输线程里没兜住的异常（拔线最常见）只记日志、不带走进程，见 CrashGuard
+        CrashGuard.install();
+        appContext = getApplicationContext();
         config = Config.getInstance(this);
         // 限速是 SpeedLimiter 的静态字段，按进程隔离：本服务跑在独立进程 `:IOService`，
         // 界面进程里的 applySpeedLimit()/静态 startServer() 设的值传不过来。

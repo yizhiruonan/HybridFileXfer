@@ -57,6 +57,8 @@ class MiuixMainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
+        // 后台线程没兜住的异常（拔线那类空指针）别把界面一起带走，见 CrashGuard
+        top.weixiansen574.hybridfilexfer.CrashGuard.install()
         setContent {
             val config = remember { Config.getInstance(this) }
             var themeMode by remember { mutableIntStateOf(config.themeMode) }

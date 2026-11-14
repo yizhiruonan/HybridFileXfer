@@ -238,7 +238,7 @@ internal fun buildPcConnections(servers: List<top.weixiansen574.hybridfilexfer.d
  * 传输中的快速刷新：只读进度相关的轻量状态（端口/权限/版本都不重读），
  * 让进度条和速度每 100 多毫秒就能动一次，避免 800ms 一跳的顿挫感。
  */
-internal fun readProgressState(base: UiState): UiState {
+internal fun readProgressState(base: UiState): UiState = try {
     val connections = buildPcConnections(ServerService.getConnections())
     val current = ServerService.currentTransfer()
     val currentConn = connections.firstOrNull { it.id == (current?.connectionId ?: -1) }
@@ -260,9 +260,17 @@ internal fun readProgressState(base: UiState): UiState {
         xferSegments = currentConn?.segments ?: emptyList(),
         xferChannels = currentConn?.channelStats ?: emptyList(),
     )
+} catch (e: Throwable) {
+    // 拔线那一下会话数据可能正被清空，读到半截就是空指针；
+    // 进度读数出问题最多是数字闪一下，绝不能让异常冒到主线程把界面带走
+    top.weixiansen574.hybridfilexfer.core.HFXLog.d("readProgressState 异常", e)
+    base
 }
 
-internal fun readState(context: Context): UiState {
+/** 上次读到的好状态：拔线时读状态抛异常就退回它，界面不炸 */
+private var lastGoodState: UiState? = null
+
+internal fun readState(context: Context): UiState = try {
     val config = Config.getInstance(context)
     val servers = ServerService.getConnections()
     val connections = buildPcConnections(servers)
@@ -310,7 +318,12 @@ internal fun readState(context: Context): UiState {
         rootState = PrivCheck.rootStatus(),
         shellState = PrivCheck.shizukuStatus(),
         version = versionName(context),
-    )
+    ).also { lastGoodState = it }
+} catch (e: Throwable) {
+    // 传输中拔线、会话刚好被清掉时，读状态里任何一处空指针都会让整个界面闪退
+    // （用户报的就是这个）。这里退回上一次读到的状态，下一轮轮询会自动恢复。
+    top.weixiansen574.hybridfilexfer.core.HFXLog.d("readState 异常", e)
+    lastGoodState ?: UiState()
 }
 
 @Composable

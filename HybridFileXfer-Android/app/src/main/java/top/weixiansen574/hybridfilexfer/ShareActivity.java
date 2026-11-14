@@ -87,6 +87,7 @@ public class ShareActivity extends AppCompatActivity {
     protected void onCreate(Bundle savedInstanceState) {
         requestWindowFeature(android.view.Window.FEATURE_NO_TITLE);
         super.onCreate(savedInstanceState);
+        CrashGuard.install();
         if (getSupportActionBar() != null) {
             getSupportActionBar().hide();
         }
