@@ -41,13 +41,14 @@ class ShareActions(
  * | 参数 | 双窗口 | 这里 |
  * | --- | --- | --- |
  * | state | UiState(...) | 同一个 UiState，字段含义一致（见下面的 update） |
- * | onDismiss | { xferPopup = false } | ShareActivity 的 dismissPanel（关闭窗口） |
+ * | onDismiss | { xferPopup = false } | ShareActivity 的 dismissPanel（准备阶段关窗口 / 传输中收起，传输继续） |
  * | sending | xferPopupSending | true（这个页面永远是「发」） |
  * | onPause | server.pauseTransfer() | server.pauseTransfer() |
  * | onResume | server.resumeTransfer() | server.resumeTransfer() |
  * | onCancel | server.abortTransfer() + Toast | ShareActivity 原来的取消逻辑 |
- * | bare | 不传（= false） | <b>true</b>（唯一的不同，原因见下） |
+ * | bare | 不传（= false） | <b>true</b>（原因见下） |
  * | showFooter | 不传（= true） | 不传（= true） |
+ * | closeWhenIdle | 不传（= false） | <b>true</b>：准备 / 等连接 / 复制 阶段底部补一颗「关闭」 |
  *
  * 为什么 bare 必须是 true：`ReceiveProgressPanel` 的 bare=false 分支根本不画遮罩框，
  * 它是一整个 `Box(Modifier.fillMaxSize().background(黑 35%))` —— 双窗口那边它铺在
@@ -101,7 +102,8 @@ internal object ShareProgress {
                 MiuixTheme(controller = controller) {
                     // 和 TransferScreen.kt 里双窗口那段一比一：
                     // sending=true / showFooter 不传（默认 true，底部按钮由面板自己画）/
-                    // bare=true（唯一的不同，见类注释：false 会把小窗口撑成满屏黑）。
+                    // bare=true（false 会把小窗口撑成满屏黑，见类注释）/
+                    // closeWhenIdle=true（准备 / 等连接 / 复制 阶段底部补一颗「关闭」，见下面）。
                     // widthDp=390dp：只把卡片放宽（双窗口是 340dp）—— 字号、行高、按钮、间距
                     // 一个都不动，窄屏时面板自己按「屏宽 - 32dp」兜底。
                     val current = actions.value
@@ -113,6 +115,9 @@ internal object ShareProgress {
                         onResume = { current?.onResume?.run() },
                         onCancel = { current?.onCancel?.run() },
                         bare = true,
+                        // 只有这一处开：传输还没起来（准备 / 等待电脑连接 / 正在复制）时 xferActive=false，
+                        // 面板底部原本一颗按钮都不画，用户只能按返回键退出。开着它，这几段补一颗「关闭」。
+                        closeWhenIdle = true,
                         widthDp = 390.dp,
                     )
                 }

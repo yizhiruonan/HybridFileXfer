@@ -368,6 +368,19 @@ internal fun ReceiveProgressPanel(
     onResume: (() -> Unit)? = null,
     onCancel: (() -> Unit)? = null,
     /**
+     * 「空闲态也要一颗关闭按钮」：开着它，只要底部画不出「暂停/继续/取消」，就补一颗「关闭」（走 [onDismiss]）。
+     *
+     * 谁需要它：分享发送页（ShareProgress）。它在「准备 / 等待电脑连接 / 正在复制」这三段里
+     * xferActive=false，而这个页面里没有别的控件可以退出（以前只能按返回键）。
+     *
+     * 谁不能开它（所以默认 false，三处老调用方的底部一个像素都不变）：
+     * - 双窗口（TransferScreen）：xferActive 恒为 true，另外它传了 onPause，底部本来就有按钮；
+     * - 应用外悬浮窗（GlobalTransferOverlay）：bare=true，收尾那一帧会喂 xferActive=false，
+     *   但那个窗口是一直挂着的小卡片，给它补一颗「关闭」等于凭空多出一颗按钮；
+     * - 应用内接收（HfxApp）：只在 state.xferActive 为 true 时才显示，走不到空闲态。
+     */
+    closeWhenIdle: Boolean = false,
+    /**
      * 卡片宽度，默认 340dp —— 双窗口弹窗 / 应用外悬浮窗 / 应用内接收都不传，和以前一模一样。
      * 分享发送页传 390dp：**只把卡片放宽**，字号、行高、按钮、间距全都不动。
      * 窄屏兜底：实际宽度最多「屏宽 - 32dp」（左右各留 16dp），免得两边被裁掉。
@@ -634,6 +647,16 @@ internal fun ReceiveProgressPanel(
                         )
                     }
                 } else if (sending && !bare) {
+                    Spacer(Modifier.height(10.dp))
+                    TextButton(
+                        text = "关闭",
+                        onClick = { haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove); onDismiss() },
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                } else if (closeWhenIdle) {
+                    // 新档位（只有分享发送页开着 closeWhenIdle）：准备 / 等待电脑连接 / 正在复制 这几段
+                    // xferActive=false，上面两档都画不出按钮，底部就是空的 —— 这里补一颗「关闭」。
+                    // 传输中走不到这里：那时 showPause 为 true，画的是「暂停发送」（暂停后是「继续 + 取消发送」）。
                     Spacer(Modifier.height(10.dp))
                     TextButton(
                         text = "关闭",

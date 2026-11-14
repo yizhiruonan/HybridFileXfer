@@ -7,7 +7,6 @@ import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.LayerDrawable;
 import android.os.Build;
 import android.os.Handler;
-import android.os.SystemClock;
 import android.provider.Settings;
 import android.text.TextUtils;
 import android.view.Gravity;
@@ -38,8 +37,6 @@ final class GlobalProgress {
     private long lastDone;
     private long lastAt;
     private double speedValue;
-    private long lastNotify;
-    private boolean hadTransfer;
 
     /**
      * 轮询间隔：应用外的进度窗口要把"和应用内弹窗一样的动画"画出来，
@@ -77,31 +74,11 @@ final class GlobalProgress {
     private Boolean lastShow;
 
     private void tick() {
-        ServerService.Live live = ServerService.currentTransfer();
-        boolean show = live != null && live.total > 0 && !ServerService.appVisible;
         // 应用外：用 ComposeView 渲染和应用内完全一样的接收/发送弹窗
         top.weixiansen574.hybridfilexfer.compose.GlobalTransferOverlay.INSTANCE.refresh(service);
-        if (!show) {
-            long now = SystemClock.elapsedRealtime();
-            if (live != null && live.total > 0) {
-                // 浮层收起来了（或在应用内），通知栏继续每秒更新速率
-                hadTransfer = true;
-                if (now - lastNotify >= 1000) {
-                    lastNotify = now;
-                    service.refreshNotification();
-                }
-            } else if (hadTransfer) {
-                hadTransfer = false;
-                service.refreshNotification();
-            }
-            return;
-        }
-        hadTransfer = true;
-        long now = SystemClock.elapsedRealtime();
-        if (now - lastNotify >= 1000) {
-            lastNotify = now;
-            service.refreshNotification();
-        }
+        // 通知栏进度：发送和接收都跟（以前只跟接收，发送方向在通知栏上完全看不到进度）。
+        // 这里每 50ms 调一次，服务内部自己限速成 500ms 一帧；传输结束/停止后它会换回常驻文案。
+        service.refreshProgressNotification();
     }
 
     private boolean ensureView() {

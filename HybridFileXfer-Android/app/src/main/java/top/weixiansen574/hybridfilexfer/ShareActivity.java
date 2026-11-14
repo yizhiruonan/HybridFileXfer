@@ -17,7 +17,9 @@ import android.provider.MediaStore;
 import android.provider.OpenableColumns;
 import android.text.TextUtils;
 import android.util.Log;
+import android.view.MotionEvent;
 import android.view.ViewGroup;
+import android.view.WindowManager;
 import android.widget.Toast;
 
 import androidx.appcompat.app.AppCompatActivity;
@@ -101,6 +103,8 @@ public class ShareActivity extends AppCompatActivity {
     private volatile boolean cancelled;
     private volatile boolean finished;
     private volatile boolean transferring;
+    /** 已经「收起」到后台（传输中点了遮罩 / 返回键）：这时再点什么都不要再把 Activity 收掉 */
+    private boolean collapsed;
     private volatile HFXServer server;
     private int targetConnectionId = -1;
 
@@ -213,6 +217,17 @@ public class ShareActivity extends AppCompatActivity {
         // （双窗口那层 35% 遮罩是 Compose 里 fillMaxSize 的黑 Box，搬到这种 WRAP_CONTENT
         // 小窗口里会把窗口直接撑成满屏，所以这里用 dim 而不是黑 Box。）
         getWindow().setDimAmount(0.35f);
+        // 「点弹窗外面」= 退出这个界面（传输中只是收起，见 dismissPanel / collapsePanel）。
+        // 那块遮罩是 Window 自己的 dim 层，在窗口外面 —— Compose 里既画不到也点不到，
+        // 只能让系统把窗外那一下触摸当成 ACTION_OUTSIDE 递进来（见 dispatchTouchEvent）：
+        //   FLAG_WATCH_OUTSIDE_TOUCH  系统才会送一条 ACTION_OUTSIDE 给我们（一次手势一条）；
+        //   清掉 FLAG_NOT_TOUCH_MODAL 让窗口保持「模态」：遮罩上那一下只到我们这里，
+        //   不会再穿到后面那个应用去（否则点遮罩的同时还会点到分享来源 App 的按钮）。
+        // 这套配置就是系统 Dialog 的「点外面取消」：模态 + 看窗外触摸。
+        // 别改成「Compose 里铺一层 fillMaxSize 的黑 Box」：窗口是 WRAP_CONTENT，
+        // fillMaxSize 会把窗口直接撑成满屏 + 一层 35% 黑（面板这边就是为了这个才走 bare=true 的）。
+        getWindow().clearFlags(WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL);
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH);
         getWindow().setLayout(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT);
@@ -235,9 +250,35 @@ public class ShareActivity extends AppCompatActivity {
     // ------------------------------------------------------------------
 
     /**
-     * 面板上的「关闭」按钮，以及点面板外面：传输中就提示稍候，传完了就关窗口。
+     * 点弹窗外面（那块 dim 遮罩上）：窗口是 WRAP_CONTENT 的小窗，窗外那一下触摸系统只给一条
+     * {@link MotionEvent#ACTION_OUTSIDE}（见 onCreate 里那两个 FLAG_*），在这里接住，
+     * 交给和「关闭」按钮同一个出口 {@link #dismissPanel()}。
      *
-     * <p>以前这是底部那颗 share_action 按钮的活；按钮现在归面板画，判断逻辑仍然在这里。
+     * <p>为什么不用 Activity#setFinishOnTouchOutside(true)：那是让 DecorView 直接 finish()，
+     * 绕不过「传输中只收起、不取消」这条逻辑。
+     */
+    @Override
+    public boolean dispatchTouchEvent(MotionEvent ev) {
+        if (ev.getActionMasked() == MotionEvent.ACTION_OUTSIDE) {
+            dismissPanel();
+            return true;
+        }
+        return super.dispatchTouchEvent(ev);
+    }
+
+    /**
+     * 唯一出口：面板上的「关闭」按钮、点弹窗外面、返回键，三个都走这里。
+     *
+     * <ul>
+     *   <li>已经收尾（完成 / 失败 / 取消）：直接关窗口；</li>
+     *   <li>传输中：<b>收起</b>界面（{@link #collapsePanel()}），传输不取消；</li>
+     *   <li>还没开始传（准备 / 等待电脑连接 / 正在复制）：立 cancelled 让那条准备线程停下，再关窗口。</li>
+     * </ul>
+     *
+     * <p>以前传输中这里是一颗 Toast（share_busy）把人拦回去，点遮罩等于没反应。
+     * 现在发送任务跑在 {@code SendFilesToRemoteTask}（{@code BackstageTask}，TaskManger 的线程池）里，
+     * 它只认 finished / cancelled 两个标志和 server，跟 Activity 是否存活无关 ——
+     * 所以界面收起来以后文件照样发完。
      */
     private void dismissPanel() {
         if (finished) {
@@ -245,11 +286,36 @@ public class ShareActivity extends AppCompatActivity {
             return;
         }
         if (transferring) {
-            Toast.makeText(this, R.string.share_busy, Toast.LENGTH_SHORT).show();
+            collapsePanel();
             return;
         }
         cancelled = true;
         finish();
+    }
+
+    /**
+     * 传输中「收起」界面：不走 finish()，传输线程和这套状态机原样留着。
+     *
+     * <p>为什么用 {@link #moveTaskToBack(boolean)} 而不是 finish()：finish() 会把 Activity 连同
+     * ComposeView、Handler、采样循环一起销毁，后台虽然还能把文件发完（任务线程不依赖 Activity），
+     * 但面板就再也回不来了 ——「回来还能看到进度」这条就做不到。moveTaskToBack 只是把任务挪到后台：
+     * Activity 留在栈里（只走 onPause/onStop，不 onDestroy），传输线程接着发；
+     * 用户回到这个界面时 {@link #onResume()} 会把采样重新起拍并立刻补一帧，面板就是活的。
+     */
+    private void collapsePanel() {
+        if (collapsed) {
+            // 连点两下遮罩：第二下不要再往下走（moveTaskToBack 第二次会返回 false，
+            // 再退到 finish() 就把面板弄没了）
+            return;
+        }
+        collapsed = true;
+        // 界面不可见了就别再占着 vsync：采样只是为了喂面板（onResume 会重新起拍）
+        frameClock.stop();
+        if (!moveTaskToBack(true)) {
+            // 极少数情况下系统不让把这个任务挪到后台（这个 Activity 就是栈底且没有别的界面）：
+            // 退一步直接把窗口收掉。传输照样继续 —— onDestroy 里传输中是不立 cancelled 的。
+            finish();
+        }
     }
 
     /**
@@ -292,9 +358,15 @@ public class ShareActivity extends AppCompatActivity {
         }
     }
 
-    /** 收尾之后放开「点窗口外面关闭」：传输中不允许，免得一不小心把传输丢在半路 */
+    /**
+     * 收尾之后放开「点窗口外面关闭」。
+     *
+     * <p>外面那一下现在统一由 {@link #dispatchTouchEvent} 接（走 dismissPanel）；这里保留只是为了
+     * 兼容系统 DecorView 自己的那套。Activity 可能已经销毁（传输中收起 / 收尾后自动关窗口），
+     * 销毁之后不能再碰 Window，所以先判一下。
+     */
     private void enableDismissOutside() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP && !isFinishing() && !isDestroyed()) {
             setFinishOnTouchOutside(true);
         }
     }
@@ -1248,19 +1320,52 @@ public class ShareActivity extends AppCompatActivity {
         return file;
     }
 
+    /**
+     * 返回键和点遮罩同一套出口（{@link #dismissPanel()}）：
+     * 传输中收起界面、后台继续传，其它情况直接退出。
+     */
     @Override
     public void onBackPressed() {
-        if (transferring) {
-            Toast.makeText(this, R.string.share_busy, Toast.LENGTH_SHORT).show();
+        dismissPanel();
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        // 界面不可见了就别再占着 vsync（传输线程不受影响，通知栏那条进度由 ServerService 出）
+        frameClock.stop();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        collapsed = false;
+        // 从后台回来（收起的界面被重新打开，或切走又切回）：采样重新起拍 + 立刻补一帧，
+        // 否则面板会先停在「离开那一刻」的进度上，等下一拍（100ms）才动。
+        resumePanelUpdates();
+    }
+
+    /** 重新开始往面板推数据（只在传输中才有意义；首次进页面时 transferring 还是 false，直接返回） */
+    private void resumePanelUpdates() {
+        if (finished || !transferring) {
             return;
         }
-        cancelled = true;
-        super.onBackPressed();
+        frameClock.start();
+        // 和 onFrame 同一条时间线（vsync 的 frameTimeNanos / 1e6）
+        long now = System.nanoTime() / 1_000_000L;
+        lastSampleAt = now;
+        sampleTruth(now);
+        applyToPanel();
     }
 
     @Override
     protected void onDestroy() {
-        cancelled = true;
+        // 传输中不立 cancelled：面板收起来（甚至这个 Activity 被系统销毁）之后，
+        // SendFilesToRemoteTask 那条线程还要把剩下的文件发完 —— 它只认这两个标志和 server。
+        // 没在传（准备 / 等连接 / 复制 / 已经收尾）时照旧立起来，把那条准备线程停掉。
+        if (!transferring) {
+            cancelled = true;
+        }
         // 界面没了就别再占着 vsync：Activity 销毁后控件引用也不能再碰
         frameClock.stop();
         // 面板的 ComposeView 跟着 Activity 一起没了：owner 走到 DESTROYED，状态清干净

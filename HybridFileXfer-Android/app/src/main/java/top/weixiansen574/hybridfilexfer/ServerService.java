@@ -71,6 +71,8 @@ public class ServerService extends Service implements ServiceConnection {
     private static final int NOTIFICATION_ID = 5740;
     private static final String CHANNEL_ID = "server";
     private static final long PING_INTERVAL_MS = 3000;
+    /** 「进度帧」的最小间隔：前台服务通知是同一个 id 反复 notify，20Hz 地刷会掉帧、发烫，500ms 一帧够了 */
+    private static final long PROGRESS_NOTIFY_INTERVAL_MS = 500;
 
     private static final CopyOnWriteArrayList<Listener> LISTENERS = new CopyOnWriteArrayList<>();
     private static volatile int state = STATE_STOPPED;
@@ -1555,37 +1557,203 @@ public class ServerService extends Service implements ServiceConnection {
                 .setOnlyAlertOnce(true)
                 .setPriority(NotificationCompat.PRIORITY_LOW)
                 .addAction(0, getString(R.string.notification_stop), stopPendingIntent);
-        // 正在接收时通知栏也显示进度（全局可见，不依赖悬浮窗权限）
-        Live transfer = currentTransfer();
-        if (transfer != null && transfer.total > 0) {
-            long done = transfer.done;
-            HFXServer server = HFXServer.getById(transfer.connectionId);
-            if (server != null) {
-                done = Math.max(done, server.blockProgress.getDoneBytes());
-            }
-            int pct = (int) Math.max(0, Math.min(100, done * 100 / transfer.total));
-            String name = transfer.name;
-            int cut = Math.max(name.lastIndexOf('/'), name.lastIndexOf('\\'));
-            if (cut >= 0) {
-                name = name.substring(cut + 1);
-            }
-            long speedSum = 0;
-            for (ChannelLive channel : transfer.channelSnapshot()) {
-                speedSum += channel.speed;
-            }
-            // 通知栏内容以「接收速率」为主
-            builder.setContentTitle(getString(R.string.notification_receiving) + " · " + pct + "%")
-                    .setContentText("接收速率 " + GlobalProgress.formatSpeed(speedSum)
-                            + "  ·  " + GlobalProgress.formatSize(done) + " / "
-                            + GlobalProgress.formatSize(transfer.total))
-                    .setProgress(100, pct, false);
-        }
+        // 传输中：通知栏直接显示进度（发送/接收挑当前有活动的那一路，全局可见、不依赖悬浮窗权限）
+        applyTransferProgress(builder, currentTransferView());
         return builder.build();
     }
 
-    /** 全局进度每秒钟刷新一次通知栏 */
-    void refreshNotification() {
+    // ------------------------------------------------------------------
+    // 通知栏进度（正在发送/接收 xx%）
+    // ------------------------------------------------------------------
+
+    /** 上次进度帧 post 的时刻（elapsedRealtime；0 表示当前没有在跟进度） */
+    private long progressNotifyAt;
+    /** 速率采样：上次采样的累计已传字节 / 时刻 / 一阶平滑后的速率 */
+    private long sampleBytes;
+    private long sampleAt;
+    private long sampleSpeed;
+    /** 通知栏现在贴的是不是「正在发送/接收 xx%」：传完时靠它触发一次回落到常驻文案 */
+    private volatile boolean progressShown;
+
+    /**
+     * 通知栏要显示的一条传输：哪个方向、当前文件、已传多少、速率。
+     *
+     * <p>发送和接收不会同时进行（一次会话只有一个传输线程），{@link #currentTransferView()}
+     * 挑"当下有活动的那一路"，两者都空就是没有传输。
+     */
+    private static final class TransferView {
+        final boolean sending;
+        final String name;
+        final long done;
+        final long total;
+        final long speed;
+
+        TransferView(boolean sending, String name, long done, long total, long speed) {
+            this.sending = sending;
+            this.name = name == null ? "" : name;
+            this.done = done;
+            this.total = total;
+            this.speed = speed;
+        }
+
+        int percent() {
+            if (total <= 0) {
+                return 0;
+            }
+            return (int) Math.max(0, Math.min(100, done * 100 / total));
+        }
+    }
+
+    /**
+     * 当前该显示在通知栏上的那一路传输，没有就返回 null。
+     *
+     * <p>真值来源（两路都可能活动，谁有数就是谁）：
+     * <ul>
+     *   <li>接收：{@link #currentTransfer()} 的 Live（电脑推送那条路）＋ {@code blockProgress}；</li>
+     *   <li>发送：「复制 →」/分享面板发送，读 {@code server.sendProgress}
+     *       （块真正写出去以后才记，不会跑到真值前面）。</li>
+     * </ul>
+     * {@code sendProgress} 和 {@code blockProgress} 在每次开始传输时都会被 reset，
+     * 所以"有数的那一路"就是正在传的那一路，不会把上一次传输的数字贴上来。
+     */
+    private TransferView currentTransferView() {
+        Live live = currentTransfer();
+        if (live != null && live.total > 0) {
+            long done = live.done;
+            HFXServer server = HFXServer.getById(live.connectionId);
+            if (server != null) {
+                // 按块记的真值比回调里的 targetSize 更贴近"已经落盘"，取大的那个
+                done = Math.max(done, server.blockProgress.getDoneBytes());
+            }
+            long speed = 0;
+            for (ChannelLive channel : live.channelSnapshot()) {
+                speed += channel.speed;
+            }
+            return new TransferView(false, shortName(live.name), done, live.total, speed);
+        }
+        for (HFXServer server : HFXServer.snapshot()) {
+            try {
+                // 只在真传输时读账本：空闲时 snapshot() 没必要（大文件要遍历不少块）
+                if (!server.isTransferring()) {
+                    continue;
+                }
+                top.weixiansen574.hybridfilexfer.core.BlockProgress.Snapshot sent =
+                        server.sendProgress.snapshot();
+                if (sent.totalSize > 0 && sent.doneBytes > 0) {
+                    return new TransferView(true, shortName(server.sendProgress.currentPath()),
+                            sent.doneBytes, sent.totalSize, sampleSpeed);
+                }
+                // 应用内「← 复制」拉取：接收进度记在 blockProgress 上（电脑推送那条路走上面的 Live）
+                top.weixiansen574.hybridfilexfer.core.BlockProgress.Snapshot got =
+                        server.blockProgress.snapshot();
+                if (got.totalSize > 0 && got.doneBytes > 0) {
+                    return new TransferView(false, shortName(server.blockProgress.currentPath()),
+                            got.doneBytes, got.totalSize, sampleSpeed);
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 采样一次速率。
+     *
+     * <p>{@code BlockProgress} 只有"已经传了多少字节"的累计真值，没有速率；通知栏要的 MB/s
+     * 就用两次采样的差算，再做一阶平滑（不平滑的话每帧抖 ±30%，数字根本读不了）。
+     * 换文件 / 续传重算时 done 会变小，这时重新起算，别把上一段的字节算进这一秒。
+     */
+    private void sampleTransferSpeed(long done, long now) {
+        if (sampleAt == 0 || done < sampleBytes) {
+            sampleBytes = done;
+            sampleAt = now;
+            sampleSpeed = 0;
+            return;
+        }
+        long elapsed = now - sampleAt;
+        if (elapsed < PROGRESS_NOTIFY_INTERVAL_MS / 2) {
+            return;
+        }
+        long instant = (done - sampleBytes) * 1000L / elapsed;
+        sampleSpeed = sampleSpeed <= 0 ? instant : (sampleSpeed * 2 + instant) / 3;
+        sampleBytes = done;
+        sampleAt = now;
+    }
+
+    /**
+     * 全局进度每 50ms tick 一次，这里再限速成 500ms 一帧贴到通知栏。
+     *
+     * <p><b>停止流程里一律不 post</b>（和 {@link #updateNotification()} 同一条规矩）：
+     * 否则 stopEverything() 刚 cancel 掉的前台通知会被这一帧重新贴回通知栏，
+     * 用户又得面对一条滑不掉的 ongoing 通知（刚修过的那个 bug）。
+     */
+    void refreshProgressNotification() {
+        if (stopping) {
+            return;
+        }
+        long now = SystemClock.elapsedRealtime();
+        if (progressNotifyAt != 0 && now - progressNotifyAt < PROGRESS_NOTIFY_INTERVAL_MS) {
+            return;
+        }
+        TransferView view = currentTransferView();
+        if (view == null) {
+            if (!progressShown) {
+                return;
+            }
+            // 传输结束 / 取消 / 停止：换回原来的常驻文案（只刷这一次，之后回到"状态变了才刷"）
+            progressShown = false;
+            progressNotifyAt = 0;
+            sampleAt = 0;
+            sampleBytes = 0;
+            sampleSpeed = 0;
+            updateNotification();
+            return;
+        }
+        progressNotifyAt = now;
+        if (view.speed <= 0) {
+            sampleTransferSpeed(view.done, now);
+        }
         updateNotification();
+    }
+
+    /**
+     * 把进度写进通知栏（仍然用同一个常驻通知、同一个渠道，只换标题/正文和进度条）。
+     *
+     * <p>标题：「正在发送文件 · 45%」；正文：「file.mp4 · 12.3 MB / 600 MB · 24.1 MB/s」。
+     * 到 100% 时不写「正在发送 99%」那种残留字面，改成「收尾中」，下一次 tick 就回到常驻文案。
+     * setOngoing(true) / setOnlyAlertOnce(true) 在外面已经设好，这些帧只改内容、不响不弹。
+     */
+    private void applyTransferProgress(NotificationCompat.Builder builder, TransferView view) {
+        if (view == null || view.total <= 0) {
+            return;
+        }
+        int pct = view.percent();
+        String title = view.sending ? "正在发送文件" : getString(R.string.notification_receiving);
+        title = pct >= 100 ? title + " · 收尾中" : title + " · " + pct + "%";
+        StringBuilder detail = new StringBuilder();
+        if (!view.name.isEmpty()) {
+            detail.append(view.name).append(" · ");
+        }
+        detail.append(GlobalProgress.formatSize(Math.min(view.done, view.total)))
+                .append(" / ")
+                .append(GlobalProgress.formatSize(view.total));
+        if (pct < 100 && view.speed > 0) {
+            detail.append(" · ").append(GlobalProgress.formatSpeed(view.speed));
+        }
+        builder.setContentTitle(title)
+                .setContentText(detail.toString())
+                .setStyle(new NotificationCompat.BigTextStyle().bigText(detail.toString()))
+                .setProgress(100, pct, false);
+        progressShown = true;
+    }
+
+    /** 文件名部分（通知栏那一条横排放不下整条路径） */
+    private static String shortName(String path) {
+        if (path == null) {
+            return "";
+        }
+        int cut = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
+        return cut >= 0 ? path.substring(cut + 1) : path;
     }
 
     private void updateNotification() {
