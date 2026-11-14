@@ -356,6 +356,11 @@ internal fun ReceiveProgressPanel(
     sending: Boolean = false,
     /** 全局悬浮窗用：不铺黑色遮罩，只画卡片本身，窗口是 WRAP_CONTENT */
     bare: Boolean = false,
+    /**
+     * 底部按钮区（关闭 / 暂停 / 取消）。
+     * 分享发送页的取消按钮在 Activity 自己的布局里，面板只要进度，这里传 false 整块不画。
+     */
+    showFooter: Boolean = true,
     /** 由调用方自己控制暂停/继续/取消（双窗口、悬浮窗）；为空时走 ServerService 的应用内接收 */
     onPause: (() -> Unit)? = null,
     onResume: (() -> Unit)? = null,
@@ -576,51 +581,54 @@ internal fun ReceiveProgressPanel(
                 }
             }
             // 暂停/取消：双窗口（onPause）由调用方控制；应用内接收走 ServerService；
-            // 都没有时发送卡片只给「关闭」
-            val showPause = state.xferActive && (onPause != null || (!sending && state.xferId >= 0))
-            if (showPause) {
-                Spacer(Modifier.height(10.dp))
-                if (state.xferPaused) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(10.dp),
-                    ) {
-                        Button(
-                            onClick = {
-                                haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                (onResume ?: { ServerService.resumeTransfer(state.xferId) })()
-                            },
-                            modifier = Modifier.weight(1f),
-                            colors = ButtonDefaults.buttonColorsPrimary(),
+            // 都没有时发送卡片只给「关闭」。
+            // showFooter=false（分享发送页）：整块不画，底部按钮由 Activity 的布局自己提供
+            if (showFooter) {
+                val showPause = state.xferActive && (onPause != null || (!sending && state.xferId >= 0))
+                if (showPause) {
+                    Spacer(Modifier.height(10.dp))
+                    if (state.xferPaused) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(10.dp),
                         ) {
-                            Text("继续", color = Color.White)
+                            Button(
+                                onClick = {
+                                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                    (onResume ?: { ServerService.resumeTransfer(state.xferId) })()
+                                },
+                                modifier = Modifier.weight(1f),
+                                colors = ButtonDefaults.buttonColorsPrimary(),
+                            ) {
+                                Text("继续", color = Color.White)
+                            }
+                            TextButton(
+                                text = if (sending) "取消发送" else "取消接收",
+                                onClick = {
+                                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                    (onCancel ?: { ServerService.cancelTransfer(state.xferId) })()
+                                },
+                                modifier = Modifier.weight(1f),
+                            )
                         }
+                    } else {
                         TextButton(
-                            text = if (sending) "取消发送" else "取消接收",
+                            text = if (sending) "暂停发送" else "暂停接收",
                             onClick = {
                                 haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                (onCancel ?: { ServerService.cancelTransfer(state.xferId) })()
+                                (onPause ?: { ServerService.pauseTransfer(state.xferId) })()
                             },
-                            modifier = Modifier.weight(1f),
+                            modifier = Modifier.fillMaxWidth(),
                         )
                     }
-                } else {
+                } else if (sending && !bare) {
+                    Spacer(Modifier.height(10.dp))
                     TextButton(
-                        text = if (sending) "暂停发送" else "暂停接收",
-                        onClick = {
-                            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                            (onPause ?: { ServerService.pauseTransfer(state.xferId) })()
-                        },
+                        text = "关闭",
+                        onClick = { haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove); onDismiss() },
                         modifier = Modifier.fillMaxWidth(),
                     )
                 }
-            } else if (sending && !bare) {
-                Spacer(Modifier.height(10.dp))
-                TextButton(
-                    text = "关闭",
-                    onClick = { haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove); onDismiss() },
-                    modifier = Modifier.fillMaxWidth(),
-                )
             }
         }
     }

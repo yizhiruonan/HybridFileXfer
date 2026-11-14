@@ -9,15 +9,14 @@ import android.os.Bundle;
 import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.provider.DocumentsContract;
 import android.provider.MediaStore;
 import android.provider.OpenableColumns;
 import android.text.TextUtils;
 import android.util.Log;
-import android.view.View;
+import android.view.ViewGroup;
 import android.widget.Button;
-import android.widget.ProgressBar;
-import android.widget.TextView;
 import android.widget.Toast;
 
 import androidx.appcompat.app.AppCompatActivity;
@@ -36,7 +35,6 @@ import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
 
 import top.weixiansen574.hybridfilexfer.core.BlockProgress;
-import top.weixiansen574.hybridfilexfer.core.FileBlock;
 import top.weixiansen574.hybridfilexfer.core.HFXService;
 import top.weixiansen574.hybridfilexfer.core.Utils;
 import top.weixiansen574.hybridfilexfer.core.bean.Directory;
@@ -44,6 +42,9 @@ import top.weixiansen574.hybridfilexfer.core.bean.RemoteFile;
 import top.weixiansen574.hybridfilexfer.core.bean.ServerNetInterface;
 import top.weixiansen574.hybridfilexfer.core.bean.TrafficInfo;
 import top.weixiansen574.hybridfilexfer.core.callback.TransferFileCallback;
+import top.weixiansen574.hybridfilexfer.compose.ChannelStat;
+import top.weixiansen574.hybridfilexfer.compose.SegInfo;
+import top.weixiansen574.hybridfilexfer.compose.ShareProgress;
 import top.weixiansen574.hybridfilexfer.droidcore.HFXServer;
 import top.weixiansen574.hybridfilexfer.tasks.BTransferFileCallback;
 import top.weixiansen574.hybridfilexfer.tasks.SendFilesToRemoteTask;
@@ -60,16 +61,14 @@ public class ShareActivity extends AppCompatActivity {
     private static final long CONNECT_TIMEOUT_MS = 30_000L;
 
     /**
-     * 真值采样节拍：100ms 采一次，只取数、只做算术，不碰控件。
+     * 真值采样节拍：100ms 采一次，只取数、只做算术，不碰界面。
      *
-     * <p>界面本身是<b>每帧</b>刷的（{@link FrameClock}，vsync 约 16.7ms 一次），
-     * 这里只决定「多久重新看一眼真值」。真值是按块统计的（1MiB 一跳），
-     * 100ms 看一眼足够跟上块的变化；屏幕上的连续性交给逐帧死推算
-     * （见 {@link #advanceDisplayed}）。
+     * <p>界面上的补间不在这里了：进度面板（{@code ReceiveProgressPanel}，和双窗口弹窗、
+     * 应用外悬浮窗是同一个组件）内部自己做 200ms 的 tween，这里只要把真值按这个节拍推给它。
+     * 真值是按块统计的（1MiB 一跳），100ms 看一眼足够跟上块的变化。
      *
-     * <p>反过来说，上一版是「100ms 一拍、一拍才推一次显示值」—— 一秒只有 10 帧，
-     * 两个采样点之间的 90ms 屏幕完全静止，这才是「一格一格」的根。
-     * 现在这个 100ms 只负责「看真值」，画由每帧的 {@link FrameClock} 负责。
+     * <p>{@link FrameClock} 的逐帧节拍还留着：vsync 回调天然和屏幕对齐，采样时刻稳定，
+     * 而且它就是「这一屏还活着」的心跳（收尾时停掉）。
      */
     private static final long TICK_MS = 100L;
     /**
@@ -91,47 +90,13 @@ public class ShareActivity extends AppCompatActivity {
     private static final long SPEED_IDLE_MAX_MS = 15_000L;
     /** 速率上限：刚连上/重连那一拍会算出十几 GB/s 的离谱值，这种不采信 */
     private static final long SPEED_MAX_BYTES_PER_SEC = 2000L * 1024 * 1024;
-    /** 显示用的字节数最多落后真值多少；落后更多就先拉近，免得进度条长时间落后于真值 */
-    private static final long MAX_DISPLAY_LAG_BYTES = 8L * 1024 * 1024;
-    /**
-     * 进度条的分辨率（万分比）。
-     *
-     * <p>布局里的 max 是 100：600MB 的文件 1% 就是 6MB，4MB/s 时 1.5 秒才动一格。
-     * 上一版改成 1000 档还不够 —— 一格 0.6MB，8MB/s 时也要 75ms（约 4 帧）才挪一次，
-     * 而且 1000 个整数台阶本来就撑不满 60fps 的平滑度。
-     * ProgressBar 内部把 progress 折算成 drawable 的 level（0~10000），
-     * 所以 max 取 10000 正好用满它的分辨率：600MB 的文件一格是 60KB，条子看起来是连续爬的。
-     */
-    private static final int PROGRESS_MAX = 10000;
-    /**
-     * 速率文字的补间时间常数（ms）。
-     *
-     * <p>目标速率 100ms 才更新一次，直接显示就是「0 → 21.24MB/s」的一跳；
-     * 每帧朝目标逼近 {@code 1-exp(-dt/tau)}，tau=120ms 时约 300ms 贴住目标，
-     * 肉眼看到的是数字在爬而不是在跳，也不至于慢半拍。
-     */
-    private static final double SPEED_TAU_MS = 120.0;
-    /** 单帧最大步长：掉帧/切后台回来时 dt 会很大，夹住它，免得一帧把显示值推出去老远 */
-    private static final long MAX_FRAME_MS = 60L;
-    /** 前瞻余量最多外推多少毫秒的速率 */
-    private static final long LOOKAHEAD_MS = 250L;
-    /**
-     * 前瞻余量的硬上限：一整块（1MiB）。
-     *
-     * <p>真值是按整块记账的（{@code doneBytes} 只认写完整的块），所以显示值最多只允许
-     * 外推「一块」—— 这正好是记账本身的量化误差，越过它就不是补误差而是真撒谎了。
-     */
-    private static final long LOOKAHEAD_MAX_BYTES = FileBlock.BLOCK_SIZE;
     /** 多台电脑时指定发给哪一台（连接号；不传或 -1 表示随便一台） */
     public static final String EXTRA_CONNECTION_ID = "top.weixiansen574.hybridfilexfer.extra.CONNECTION_ID";
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final Queue<Group> groups = new ConcurrentLinkedQueue<>();
 
-    private TextView statusView;
-    private TextView hintView;
-    private TextView speedView;
-    private ProgressBar progressBar;
+    /** 底部的「取消 / 关闭」按钮：面板只管进度，按钮还在 Activity 自己的布局里 */
     private Button actionButton;
 
     private volatile boolean cancelled;
@@ -155,10 +120,10 @@ public class ShareActivity extends AppCompatActivity {
     /** 峰值速率（完成提示里用）：高速段取 {@code onSpeedInfo} 的秒流量，慢速段取下面的平滑速率 */
     private volatile long peakSpeedBytes;
 
-    // ---- 速率 / 显示进度的平滑状态：只在主线程（FrameClock 的每帧回调）里读写，不需要 volatile ----
+    // ---- 进度真值 / 速率状态：只在主线程（FrameClock 的采样拍）里读写，不需要 volatile ----
     /**
-     * 逐帧节拍（vsync）：进度条和两个文字全由它驱动。
-     * 为什么用它、不用 handler 延时也不用 ObjectAnimator，见 {@link FrameClock} 的类注释。
+     * 逐帧节拍（vsync）：每帧看一眼有没有到 100ms 的采样点。
+     * 为什么用它、不用 handler.postDelayed，见 {@link FrameClock} 的类注释。
      */
     private final FrameClock frameClock = new FrameClock(this::onFrame);
     /** (时刻, 已发字节) 采样点，只保留最近 {@link #SPEED_WINDOW_MS} 内的 */
@@ -169,7 +134,7 @@ public class ShareActivity extends AppCompatActivity {
     private long lastGrowAt;
     /** 最近一次「变大」与上一次「变大」的间隔：慢通道（1MB 一颗要好几秒）靠它放宽归零门限 */
     private long lastGrowGapMs;
-    /** 低通后的速率（B/s），也就是「目标速率」：屏幕上的速率会逐帧补间到它，不再用 {@code onSpeedInfo} */
+    /** 合计速率的低通值（B/s）：只用来记峰值，屏幕上的速率由面板自己按字节增量算 */
     private long smoothedSpeed;
     /** 这一拍的真值（数据段 = 已完成组 + 当前组按块已发；校验段 = verifyDone） */
     private long truthBytes;
@@ -177,45 +142,32 @@ public class ShareActivity extends AppCompatActivity {
     private long truthTotal;
     /** 当前这一拍是不是在校验阶段 */
     private boolean verifyPhase;
+    /**
+     * 交给面板的已发字节（B）。
+     *
+     * <p>插值整块删掉了 —— 面板内部自己做 200ms 的 tween，这里只保证<b>只增不减</b>：
+     * 真值按块记账（1MiB 一跳），会往回退的情况只有「换阶段（数据 → 校验）」和
+     * 「账本被重置」两处，那两处由 {@link #resetBaseline} 明确地把基线挪过去。
+     */
+    private long shownBytes;
     /** 上一次采信的那个账本属于哪个文件（{@code BlockProgress#currentPath()}） */
     private String ledgerPath = "";
     /** 已经把字节并进 completedBytes 的那个账本路径；非 null 时说明这个账本的数不能再采信 */
     private String accountedLedgerPath;
-    /** 目标速率（B/s）的 double 版，逐帧补间用 */
-    private double speedTarget;
-    /**
-     * 每帧插值出来的显示速率（B/s）。
-     *
-     * <p>字节推进和速率文字共用这一个值，两处不会出现「数字说 21MB/s、杆子却不动」的错位。
-     */
-    private double speedShown;
-    /**
-     * 显示用的已发字节（double）。
-     *
-     * <p>用 double 是为了保住小数：0.1MB/s 时一帧只前进 1.6KB，取整会被反复抹掉，
-     * 慢链路上就又变成「不连续」。
-     */
-    private double shownBytesF;
-    /** 上一帧已经画出去的显示字节：保证只增不减（进度条绝不回退） */
-    private long shownBytes;
-    /** 上一帧的 vsync 时刻（nanos），算每帧 dt 用 */
-    private long lastFrameNanos;
+    /** 这一拍的分块快照：顺手给面板画分段条，不用再取第二次 */
+    private BlockProgress.Snapshot lastSnapshot;
     /** 上一次真值采样的时刻（ms） */
     private long lastSampleAt;
-    /** 上一次画到进度条上的整数值：没变就不调 setProgress（省掉一次无意义的重绘） */
-    private int lastBarValue = Integer.MIN_VALUE;
-    /** 上一次真的写进 statusView 的字符串：内容一模一样就不 setText（省掉 measure/layout） */
-    private String lastStatusText;
-    /** 上一次真的写进 speedView 的速率字符串（statusView 里也复用它，不重复格式化） */
-    private String lastSpeedText;
-    /** {@code R.string.share_sending} 去掉参数后的前缀：逐帧拼字符串时不用再查资源、再走一遍 format */
-    private String sendingPrefix = "";
-    /** 拼字符串用的复用缓冲：每帧 new 一个 StringBuilder 才是真正会招 GC 的写法 */
-    private final StringBuilder textBuffer = new StringBuilder(160);
-    private final StringBuilder speedBuffer = new StringBuilder(24);
     private boolean speedStateStarted;
+    /** 已经 EOF 的通道名：各通道明细里的「已完成」就是它 */
+    private final java.util.Set<String> doneChannels = new java.util.HashSet<>();
+    /** 各通道上一拍的累计发出字节 / 低通后的速率 / 上一拍的时刻（算通道速率用） */
+    private final java.util.Map<String, Long> channelLastBytes = new java.util.LinkedHashMap<>();
+    private final java.util.Map<String, Long> channelLastSpeed = new java.util.LinkedHashMap<>();
+    private long channelSampleAt;
     private final List<String> sentFileNames = new ArrayList<>();
     private int sentFileCount;
+    /** 每条通道的平均速率（MB/s，完成时记一次，写进配置给主页显示） */
     private final java.util.Map<String, Double> channelSpeeds = new java.util.LinkedHashMap<>();
     private long startTime;
 
@@ -234,20 +186,17 @@ public class ShareActivity extends AppCompatActivity {
         // 界面在多台电脑里选了哪一台，就只发给那一台
         targetConnectionId = getIntent().getIntExtra(EXTRA_CONNECTION_ID, -1);
 
-        statusView = findViewById(R.id.share_status);
-        hintView = findViewById(R.id.share_hint);
-        speedView = findViewById(R.id.share_speed);
-        // 「正在发送：%1$s」把占位参数挖掉，剩下的就是固定前缀（各语言里 %1$s 都在末尾）。
-        // 逐帧要拼几十次字符串，每次去查一遍资源再走 String.format 是纯浪费。
-        sendingPrefix = getString(R.string.share_sending, "");
+        // 进度界面只有一套：把双窗口弹窗 / 应用外悬浮窗用的那个 Compose 面板塞进布局里的占位容器。
+        // 面板自己会画标题、分段进度条、已发/总量、速率、各通道明细，底部按钮仍由这个布局提供。
+        ViewGroup panelHost = findViewById(R.id.share_panel);
+        panelHost.addView(ShareProgress.host(this));
+        // 面板本身是一张居中的 340dp 卡片：窗口给足宽度它才不被挤窄
+        // （窄屏上左右各少几十像素，分段条和「各通道进度」那几列就挤不下了）。
+        // 高度比以前高一点：面板比原来的「一行状态 + 一条细杆」占地方
         android.util.DisplayMetrics metrics = getResources().getDisplayMetrics();
         getWindow().setLayout(
-                (int) (metrics.widthPixels * 0.90f),
-                (int) (metrics.heightPixels * 0.45f));
-        progressBar = findViewById(R.id.share_progress);
-        // 布局里的 max 是 100，这里改成千分比：600MB 的文件 1% 就是 6MB，慢速率下要好几秒才动一格，
-        // 加大分辨率后进度条才跟得上 100ms 的刷新节拍（见 PROGRESS_MAX 的注释）
-        progressBar.setMax(PROGRESS_MAX);
+                metrics.widthPixels,
+                (int) (metrics.heightPixels * 0.60f));
         actionButton = findViewById(R.id.share_action);
         actionButton.setText(R.string.cancel);
         actionButton.setOnClickListener(v -> {
@@ -264,16 +213,10 @@ public class ShareActivity extends AppCompatActivity {
                 if (server != null) {
                     ServerService.cancelTransfer(server.getId());
                 }
-                // 动画循环先停：后面的 setProgress(0) 不能被某一帧的死推算又推回去
+                // 采样循环先停：后面那一次「清零」不能被下一拍的真值又盖回去
                 frameClock.stop();
-                setIndeterminate(false);
-                progressBar.setProgress(0);
-                lastBarValue = Integer.MIN_VALUE;
-                // 取消/失败以后不该再挂着上一拍的速率，那一行直接收起来
-                if (speedView != null) {
-                    speedView.setVisibility(View.GONE);
-                }
-                showStatus(getString(R.string.share_cancelled));
+                // 面板最后刷一次：进度清零、速率收起、文案换成「已取消」
+                flushPanel(getString(R.string.share_cancelled), true);
                 actionButton.setText(R.string.close);
                 actionButton.setOnClickListener(x -> finish());
                 handler.postDelayed(this::finish, 800);
@@ -305,7 +248,6 @@ public class ShareActivity extends AppCompatActivity {
             return;
         }
         showStatus(getString(R.string.share_preparing));
-        progressBar.setIndeterminate(true);
         new Thread(() -> prepareAndSend(uris), "SharePrepare").start();
     }
 
@@ -371,7 +313,7 @@ public class ShareActivity extends AppCompatActivity {
                 return;
             }
             final int index = i + 1;
-            postStatus(getString(R.string.share_resolving_file, index, uris.size()));
+            showStatus(getString(R.string.share_resolving_file, index, uris.size()));
             File file = resolve(uris.get(i));
             if (file != null && file.exists()) {
                 files.add(file);
@@ -385,14 +327,17 @@ public class ShareActivity extends AppCompatActivity {
             return;
         }
         totalBytes = total;
+        // 总量先交给面板：连接电脑可能要等十几秒，这段时间面板上写的是
+        // 「0 B / 12.3 MB · 正在等待电脑连接…」，比一条 0 B / 0 B 有信息量（下一拍采样会覆盖它）
+        truthTotal = total;
 
-        postStatus(getString(R.string.share_waiting_pc));
-        postHint(getString(R.string.share_waiting_pc_hint));
+        // 面板只有「一句话说明」的位置（以前是 status + hint 两行），
+        // 目标目录这类附加信息不再单独占一行，文件会发到电脑端接收器设置的目录。
+        showStatus(getString(R.string.share_waiting_pc));
         if (!ensureConnected()) {
             fail(getString(R.string.share_pc_not_connected));
             return;
         }
-        postHint(server != null ? server.getRemoteHomeDir() : "");
 
         // 同一个文件夹里的文件一起发，这样电脑上的文件名保持原样
         Map<String, List<RemoteFile>> byParent = new LinkedHashMap<>();
@@ -480,12 +425,13 @@ public class ShareActivity extends AppCompatActivity {
         transferring = true;
         currentGroupTotal = group.totalBytes;
         currentGroupSent = 0;
+        // 换文件了：每条通道的「已完成」重新算（面板上这一列是给当前文件看的）
+        doneChannels.clear();
         if (startTime == 0) {
             startTime = System.currentTimeMillis();
         }
-        setIndeterminate(false);
-        // 进度、速率、校验进度全靠这个帧循环（不再信回调里的 position）：
-        // vsync 每帧回调一次，屏幕才可能真的 60fps 连续（见 FrameClock）
+        // 真值、速率、校验进度全靠这个帧循环（不再信回调里的 position）：
+        // vsync 每帧看一眼，到 100ms 就采一次真值推给面板（见 onFrame）
         frameClock.start();
         try {
             Directory localDir = new Directory(group.dir, Directory.getCurrentFileSystem());
@@ -535,20 +481,14 @@ public class ShareActivity extends AppCompatActivity {
         }
         Config.getInstance(this).setChannelSpeeds(speedText.toString());
         handler.post(() -> {
-            // 先把帧循环停掉再把杆子拉满，否则下一帧的死推算会把它改回真值对应的位置
+            // 采样循环先停，再把进度拉满、把完成文案交给面板（面板自己会把进度补间到底）
             frameClock.stop();
-            setIndeterminate(false);
-            progressBar.setProgress(PROGRESS_MAX);
-            lastBarValue = PROGRESS_MAX;
-            showStatus(getString(R.string.share_complete_files, summary, Utils.formatSpeed(peakForToast)));
-            if (hintView != null) {
-                hintView.setVisibility(View.GONE);
+            if (truthTotal > 0L) {
+                shownBytes = truthTotal;
             }
+            flushPanel(getString(R.string.share_complete_files, summary, Utils.formatSpeed(peakForToast)), false);
             actionButton.setText(R.string.close);
             actionButton.setOnClickListener(v -> finish());
-            if (speedView != null) {
-                speedView.setVisibility(View.GONE);
-            }
             handler.postDelayed(this::finish, 1500);
         });
         Toast.makeText(getApplicationContext(),
@@ -565,13 +505,8 @@ public class ShareActivity extends AppCompatActivity {
         Log.w(TAG, "share failed: " + message);
         handler.post(() -> {
             frameClock.stop();
-            setIndeterminate(false);
-            progressBar.setProgress(0);
-            lastBarValue = Integer.MIN_VALUE;
-            if (speedView != null) {
-                speedView.setVisibility(View.GONE);
-            }
-            showStatus(getString(R.string.share_failed, message));
+            // 失败：进度清零、速率收起、文案换成失败原因
+            flushPanel(getString(R.string.share_failed, message), true);
             actionButton.setText(R.string.close);
             actionButton.setOnClickListener(v -> finish());
         });
@@ -588,7 +523,7 @@ public class ShareActivity extends AppCompatActivity {
             // 只记文件名。进度不在这里算：分段发送时 targetSize 是「这一块的末尾位置」，
             // 块是乱序并行到达的，拿它当进度就会跳来跳去、甚至一开始就显示满
             //（用户看到的「600.00MB/600.00MB · 0B/s」就是这个）。进度统一由帧循环
-            // 每 100ms 采一次块计数、再逐帧死推算来刷（见 onFrame）。
+            // 每 100ms 采一次块计数，把真值推给面板（见 onFrame / applyToPanel）。
             currentFileName = new File(path).getName();
         }
 
@@ -611,6 +546,10 @@ public class ShareActivity extends AppCompatActivity {
 
         @Override
         public void onChannelComplete(String iName, long traffic, long time) {
+            if (iName != null) {
+                // 这条通道把当前文件发完了（EOF 已经发出）：面板上这一行显示「已完成」
+                doneChannels.add(iName);
+            }
             if (time > 0) {
                 double mbps = traffic / 1024.0 / 1024.0 / (time / 1000.0);
                 channelSpeeds.put(iName, mbps);
@@ -679,20 +618,15 @@ public class ShareActivity extends AppCompatActivity {
     }
 
     // ------------------------------------------------------------------
-    // 逐帧动画：真值只信 100ms 采样拍，屏幕上的值全部由每帧的死推算给出
+    // 进度：真值只信 100ms 采样拍，补间整块交给面板（面板内部 200ms tween）
     // ------------------------------------------------------------------
 
     /**
-     * 每帧回调（vsync，约 16.7ms 一次），三件事按顺序做：
-     * <ol>
-     *   <li>每 {@link #TICK_MS} 采一次真值和速率目标（{@link #sampleTruth}，只做算术）；</li>
-     *   <li>把显示值和显示速率往前推一步（{@link #advanceDisplayed}，纯算术）；</li>
-     *   <li>写控件（{@link #applyToViews}）——值没变得看得出来就不写，省掉 measure/layout。</li>
-     * </ol>
+     * 每帧回调（vsync）。插值已经整块删掉了 —— 面板（{@code ReceiveProgressPanel}）内部
+     * 自己做 200ms 的 tween，这里只做一件事：每 {@link #TICK_MS} 采一次真值，再推给面板。
      *
-     * <p>为什么不在这里再 {@code handler.post(...)}：这个方法本来就在主线程上跑，
-     * post 只是把这一帧的更新拖到下一个消息里执行，等于又加了一层 16~33ms 的抖动
-     * （上一版每拍都 post 一次，控件更新的时刻和节拍对不上，看着更抖）。
+     * <p>为什么还留着逐帧节拍、不改成 handler.postDelayed：vsync 回调天然和屏幕对齐，
+     * 采样时刻稳定；它同时是「这一屏还活着」的心跳，收尾时停掉即可。
      */
     private void onFrame(long frameTimeNanos) {
         if (finished || !transferring) {
@@ -702,20 +636,11 @@ public class ShareActivity extends AppCompatActivity {
         // vsync 时刻和 elapsedRealtime 是同一个时间基准（都来自 nanoTime），
         // 折成毫秒以后，采样节拍和速率计算共用一条时间线，不会互相打架
         long now = frameTimeNanos / 1_000_000L;
-        long dtMs = lastFrameNanos == 0L ? 16L : (frameTimeNanos - lastFrameNanos) / 1_000_000L;
-        lastFrameNanos = frameTimeNanos;
-        // 掉帧、切后台回来时 dt 会很大：夹住，免得一帧把显示值推出去老远
-        if (dtMs < 1L) {
-            dtMs = 1L;
-        } else if (dtMs > MAX_FRAME_MS) {
-            dtMs = MAX_FRAME_MS;
-        }
         if (lastSampleAt == 0L || now - lastSampleAt >= TICK_MS) {
             lastSampleAt = now;
             sampleTruth(now);
+            applyToPanel();
         }
-        advanceDisplayed(dtMs);
-        applyToViews();
     }
 
     /**
@@ -724,7 +649,7 @@ public class ShareActivity extends AppCompatActivity {
      *   <li>数据段：{@code sendProgress.snapshot().doneBytes}（+ 已完成组的字节）；</li>
      *   <li>校验段（{@code verifyTotal > 0}）：{@code verifyDoneBytes()}。</li>
      * </ul>
-     * 这里只取数、只做算术，不碰任何控件。
+     * 这里只取数、只做算术，不碰界面。
      */
     private void sampleTruth(long now) {
         long verifyTotal = HFXService.verifyTotalBytes();
@@ -734,9 +659,10 @@ public class ShareActivity extends AppCompatActivity {
         long total;
         if (verify) {
             // 校验阶段：数据已经发完，两端在算整文件 SHA-256。这条进度是「读完 4MB 加一次」，
-            // 同样是跳着长的，所以一样要走死推算
+            // 一样是跳着长的，跳变由面板补间成连续的
             truth = verifyDone;
             total = verifyTotal;
+            lastSnapshot = null;
         } else {
             HFXServer srv = server;
             BlockProgress.Snapshot snapshot = null;
@@ -762,140 +688,141 @@ public class ShareActivity extends AppCompatActivity {
                     ledgerPath = path == null ? "" : path;
                 }
             }
+            // 分段条顺手用这一拍的快照，不用再取第二次
+            lastSnapshot = snapshot;
             truth = completedBytes + currentGroupSent;
             total = totalBytes;
         }
-        if (verify != verifyPhase || truth < truthBytes) {
-            // 换阶段（数据 → 校验）或者账本被重置（真值变小）：显示基线直接挪到新真值上。
-            // 这是整个动画里唯一允许往回退的时刻，因为它不是「进度倒退」，而是「上一帧那个数是错的」：
-            // 上一组结束时 completedBytes 加上还没清空的 doneBytes 会重复算一次，显示值跟着被推高，
-            // 不退回来就会一直挂在一个偏大的数上（就是用户报的「600.00MB/600.00MB · 0B/s」）。
-            // 退一次，比一直显示错的强。
-            resetDisplayBaseline(truth);
-        }
+        boolean phaseChanged = verify != verifyPhase;
+        boolean rewound = truth < truthBytes;
         verifyPhase = verify;
         truthBytes = truth;
         truthTotal = total;
-        // 速率：真值的增量 → 600ms 滑动窗口平均 → 轻度平滑，得到这一拍的目标速率
+        if (phaseChanged || rewound) {
+            // 换阶段（数据 → 校验）或者账本被重置（真值变小）：基线直接挪到新真值上。
+            // 这是整条进度上唯一允许往回退的时刻，因为它不是「进度倒退」，而是「上一拍那个数是错的」：
+            // 上一组结束时 completedBytes 加上还没清空的 doneBytes 会重复算一次，
+            // 不退回来就会一直挂在一个偏大的数上（就是用户报的「600.00MB/600.00MB · 0B/s」）。
+            resetBaseline(truth);
+        } else if (truth > shownBytes) {
+            // 只增不减：块是 1MiB 一颗地记账的，显示值永远不超过真值
+            shownBytes = truth;
+        }
+        // 合计速率：真值的增量 → 600ms 滑动窗口平均 → 轻度平滑（只用来记峰值，屏幕上的速率面板自己算）
         updateSpeed(truth, now);
-        speedTarget = smoothedSpeed;
     }
 
-    /** 换阶段/换账本时的显示基线重置：显示值挪到真值，速率重新量 */
-    private void resetDisplayBaseline(long truth) {
-        shownBytesF = truth;
+    /** 换阶段/换账本时的基线重置：显示值挪到真值，速率重新量 */
+    private void resetBaseline(long truth) {
         shownBytes = truth;
         speedSamples.clear();
         speedStateStarted = false;
         smoothedSpeed = 0L;
-        speedTarget = 0.0;
-        speedShown = 0.0;
         lastSampleBytes = truth;
         lastGrowAt = 0L;
         lastGrowGapMs = 0L;
-        // 强制下一帧重画一次
-        lastBarValue = Integer.MIN_VALUE;
-    }
-
-    /** 把这一帧的值写进控件：进度条只在整数值变了才写，文字只在真的不一样时才 setText */
-    private void applyToViews() {
-        long total = truthTotal;
-        if (total <= 0L) {
-            // 只发了文件夹（没有可统计的字节数）：进度条保持不确定态，只更新文字，
-            // 否则一条永远不动的 0% 杆子比转圈还像卡死
-            if (!progressBar.isIndeterminate()) {
-                progressBar.setIndeterminate(true);
-                lastBarValue = Integer.MIN_VALUE;
-            }
-        } else {
-            if (progressBar.isIndeterminate()) {
-                // setIndeterminate 会重设 drawable 和动画，只在真的要变的时候调
-                progressBar.setIndeterminate(false);
-                lastBarValue = Integer.MIN_VALUE;
-            }
-            int bar = progressOf(shownBytes);
-            if (bar != lastBarValue) {
-                lastBarValue = bar;
-                // 这里不用 setProgress(v, true)：自带的补间会把传入值当终点、再叠一条插值曲线，
-                // 而我们每帧给的本来就是插值好的值，再套一层是双重平滑，还不好保证不越界
-                progressBar.setProgress(bar);
-            }
-        }
-
-        // 速率文字：先拼进复用缓冲，只有内容真的变了才 toString + setText。
-        // statusView 和 speedView 共用同一个字符串实例，不重复格式化。
-        speedBuffer.setLength(0);
-        appendSpeed(speedBuffer, speedShown);
-        boolean speedChanged = differs(lastSpeedText, speedBuffer);
-        if (speedChanged) {
-            lastSpeedText = speedBuffer.toString();
-        }
-
-        textBuffer.setLength(0);
-        if (verifyPhase) {
-            appendVerifyText(textBuffer, total);
-        } else {
-            // 文案排版和上一版逐字一致：前缀 + 文件名 + 「已发/总量」+ 速率，中间两个空格
-            textBuffer.append(sendingPrefix);
-            boolean hasField = false;
-            if (!TextUtils.isEmpty(currentFileName)) {
-                textBuffer.append(currentFileName);
-                hasField = true;
-            }
-            if (totalBytes > 0L) {
-                if (hasField) {
-                    textBuffer.append("  ");
-                }
-                appendSize(textBuffer, Math.min(shownBytes, totalBytes));
-                textBuffer.append('/');
-                appendSize(textBuffer, totalBytes);
-                hasField = true;
-            }
-            if (lastSpeedText != null && lastSpeedText.length() > 0) {
-                if (hasField) {
-                    textBuffer.append("  ");
-                }
-                textBuffer.append(lastSpeedText);
-            }
-        }
-        if (differs(lastStatusText, textBuffer)) {
-            lastStatusText = textBuffer.toString();
-            statusView.setText(lastStatusText);
-        }
-        if (speedView != null) {
-            if (verifyPhase) {
-                if (speedView.getVisibility() != View.GONE) {
-                    speedView.setVisibility(View.GONE);
-                }
-            } else {
-                boolean visible = speedView.getVisibility() == View.VISIBLE;
-                if (!visible) {
-                    speedView.setVisibility(View.VISIBLE);
-                }
-                // 刚显示出来的那一帧也要写上，否则会留着上一阶段的旧值
-                if (speedChanged || !visible) {
-                    speedView.setText(lastSpeedText);
-                }
-            }
-        }
     }
 
     /**
-     * 校验阶段的文字：百分比和字节数都用插值后的显示值，和进度条一起走。
+     * 把这一拍的真值组装成面板要的状态，推给 {@link ShareProgress}。
      *
-     * <p>「校验完成，等待电脑端确认…」这句话只看真值（本端真的算完了才说），
-     * 拿显示值判断会提前一拍说完成。
+     * <p>面板和双窗口弹窗、应用外悬浮窗是同一个组件（{@code ReceiveProgressPanel}），
+     * 里面自己做 200ms 的补间，所以这里只喂真值，不做任何平滑：
+     * <ul>
+     *   <li>{@code xferDone} / {@code xferBytes}：按块统计的已发字节（只增不减）；</li>
+     *   <li>{@code xferTotal}：&lt;= 0 时面板自己走不确定态（只发了文件夹的情况）；</li>
+     *   <li>{@code xferSegments}：分段条 = 块空间里「相邻块归属变化」的区间，只有单文件才有意义；</li>
+     *   <li>{@code xferChannels}：各通道明细，速率按相邻两拍的增量做低通；</li>
+     *   <li>{@code xferNote}：校验阶段报百分比，数据发完等电脑端时给一句「等待电脑校验…」。</li>
+     * </ul>
      */
-    private void appendVerifyText(StringBuilder out, long total) {
-        if (truthBytes >= total) {
-            out.append("校验完成，等待电脑端确认…");
-            return;
+    private void applyToPanel() {
+        List<ChannelStat> channels = buildChannels(false);
+        boolean allChannelsFinished = true;
+        for (ChannelStat channel : channels) {
+            if (!channel.getFinished()) {
+                allChannelsFinished = false;
+                break;
+            }
         }
-        long shown = Math.max(0L, Math.min(shownBytes, total));
-        out.append("校验中 ").append(shown * 100L / Math.max(1L, total)).append("%  ");
-        appendSize(out, shown);
-        out.append('/');
-        appendSize(out, total);
+        // 数据已经发完、还在等电脑端复算整文件 SHA-256：这段时间没有字节在流动，
+        // 必须给个说法，否则界面就是「79x/800 MB · 0 B/s」一动不动，看着像卡死（实测卡 2 分钟）
+        boolean waiting = !verifyPhase && truthTotal > 0L && truthBytes >= truthTotal && allChannelsFinished;
+        String note;
+        if (verifyPhase) {
+            note = "校验中 " + (truthBytes * 100L / Math.max(1L, truthTotal)) + "%";
+        } else if (waiting) {
+            note = "等待电脑校验…";
+        } else {
+            note = "";
+        }
+        // 多文件/文件夹没有跨文件的块空间，分段画出来会和整条进度对不上，退回整条连续进度
+        List<SegInfo> segments;
+        BlockProgress.Snapshot snapshot = lastSnapshot;
+        if (!verifyPhase && sentFileCount <= 1 && truthTotal > 0L && snapshot != null) {
+            segments = new ArrayList<>(snapshot.segments.size());
+            for (BlockProgress.Segment segment : snapshot.segments) {
+                segments.add(new SegInfo(
+                        segment.owner == null ? "" : segment.owner,
+                        segment.start,
+                        segment.end,
+                        segment.filled));
+            }
+        } else {
+            segments = Collections.emptyList();
+        }
+        ShareProgress.update(
+                true,
+                currentFileName,
+                shownBytes,
+                truthTotal,
+                shownBytes,
+                segments,
+                channels,
+                note,
+                server != null ? server.getDisplayName() : "");
+    }
+
+    /**
+     * 各通道明细：名字 / 已发字节 / 实时速率 / 是否已收尾。
+     *
+     * <p>字节取 {@code trafficSnapshot()} 的累计发出量（真值），速率按相邻两拍的增量做 1 秒低通，
+     * 和双窗口传输页同一套口径。{@code idle=true} 时速率一律给 0：暂停/收尾/等电脑校验这些时间里
+     * 没有字节在流动，留着旧数字会让「已完成」这一列永远显示不出来。
+     */
+    private List<ChannelStat> buildChannels(boolean idle) {
+        HFXServer srv = server;
+        if (srv == null) {
+            return Collections.emptyList();
+        }
+        List<HFXService.ChannelTrafficSnapshot> snapshot;
+        try {
+            snapshot = srv.trafficSnapshot();
+        } catch (Throwable e) {
+            // 取消后重建会把 connections 整体换掉，读到一半抛异常就当这一拍没取到
+            return Collections.emptyList();
+        }
+        long now = SystemClock.elapsedRealtime();
+        long dt = channelSampleAt == 0L ? TICK_MS : Math.max(1L, Math.min(1000L, now - channelSampleAt));
+        channelSampleAt = now;
+        List<ChannelStat> out = new ArrayList<>(snapshot.size());
+        for (HFXService.ChannelTrafficSnapshot channel : snapshot) {
+            String name = channel.name == null ? "" : channel.name;
+            long bytes = channel.uploaded;
+            Long before = channelLastBytes.get(name);
+            channelLastBytes.put(name, bytes);
+            long instant = before != null && bytes >= before ? (bytes - before) * 1000L / dt : 0L;
+            Long lastBoxed = channelLastSpeed.get(name);
+            long last = lastBoxed == null ? 0L : lastBoxed;
+            boolean finished = doneChannels.contains(name);
+            long speed = idle || finished ? 0L : last + (instant - last) * dt / 1000L;
+            if (speed < 0L) {
+                speed = 0L;
+            }
+            channelLastSpeed.put(name, speed);
+            out.add(new ChannelStat(name, bytes, speed, finished));
+        }
+        return out;
     }
 
     /** 新的一次传输：速率的采样窗口、显示用的字节全部归零（否则会接着上一次的数往前跑） */
@@ -905,25 +832,23 @@ public class ShareActivity extends AppCompatActivity {
         lastGrowAt = 0L;
         lastGrowGapMs = 0L;
         smoothedSpeed = 0L;
-        speedTarget = 0.0;
-        speedShown = 0.0;
-        shownBytesF = 0.0;
         shownBytes = 0L;
         truthBytes = 0L;
         truthTotal = 0L;
         verifyPhase = false;
         ledgerPath = "";
         accountedLedgerPath = null;
-        lastFrameNanos = 0L;
+        lastSnapshot = null;
         lastSampleAt = 0L;
-        lastBarValue = Integer.MIN_VALUE;
-        lastStatusText = null;
-        lastSpeedText = null;
         speedStateStarted = false;
+        doneChannels.clear();
+        channelLastBytes.clear();
+        channelLastSpeed.clear();
+        channelSampleAt = 0L;
     }
 
     /**
-     * 用按块真值的增量算速率：600ms 滑动窗口平均 + 和上一帧 0.75/0.25 混合。
+     * 用按块真值的增量算速率：600ms 滑动窗口平均 + 和上一拍 0.75/0.25 混合。
      *
      * <p>为什么不用 {@code onSpeedInfo}：那是「每秒一次的流量回调」，一秒里一个字节都没有的
      * 收尾阶段（只剩一条蓝牙，0.13MB/s）根本不会触发，界面就常驻在 0B/s。
@@ -931,7 +856,6 @@ public class ShareActivity extends AppCompatActivity {
      *
      * @param sent 这一拍按块统计出来的已发字节（真值）
      * @param now  这一拍的时刻（ms，和 vsync 同一条时间线）
-     * @return 结果写在 {@link #smoothedSpeed}：这一拍的「目标速率」，由调用方逐帧补间到屏幕上
      */
     private void updateSpeed(long sent, long now) {
         if (!speedStateStarted) {
@@ -1005,213 +929,49 @@ public class ShareActivity extends AppCompatActivity {
         if (instant > SPEED_MAX_BYTES_PER_SEC) {
             return;
         }
-        // 窗口平均值再和上一帧 0.75/0.25 混合：只削掉残余抖动，不拖慢响应
+        // 窗口平均值再和上一拍 0.75/0.25 混合：只削掉残余抖动，不拖慢响应
         smoothedSpeed = smoothedSpeed <= 0 ? instant : (smoothedSpeed * 3 + instant) / 4;
         // 慢通道下 onSpeedInfo 拿不到值，峰值也就记不上，这里补一份
         peakSpeedBytes = Math.max(peakSpeedBytes, smoothedSpeed);
     }
 
     /**
-     * 每帧把显示值往前推一小步（dead reckoning），并让显示速率逐帧补间到目标速率。
+     * 面板上的「一句话说明」：正在准备 / 正在等待电脑连接 / 已取消 / 已完成 / 失败。
      *
-     * <p>为什么速率也要补间：目标速率是 100ms 才更新一次的量，直接拿去显示就是
-     * 「0 → 21.24MB/s」这种跳变；这里用指数逼近（时间常数 {@link #SPEED_TAU_MS}），
-     * 每帧只挪 10%~15%，几帧之后贴住目标，肉眼看到的是数字在爬。
-     * 闲置时目标速率会被 {@link #updateSpeed} 归零，显示速率同样是平滑落下去，
-     * 不会突然变成 0B/s。
-     *
-     * <p>为什么字节数要按速率推、而不是直接画真值：真值是按整块记账的（1MiB 一颗），
-     * 慢链路上 0.1MB/s 一颗要十秒 —— 直接画真值就是「静止十秒 + 突然跳一格」。
-     *
-     * <p><b>为什么这样不骗人</b>（三条约束，缺一条就成了骗）：
-     * <ul>
-     *   <li>上限永远是「真值 + 前瞻余量」，前瞻最多一块、最多 0.25 秒的速率
-     *       （见 {@link #limitBytes}）—— 补的是块记账的量化误差，不越过真发出去的数据；</li>
-     *   <li>速率归零就停住：目标速率被归零后，显示值不再增加，最多停在
-     *       「最后一块的位置 + 当时那点余量」上等真值追上来，绝不自己往 100% 爬；</li>
-     *   <li>只增不减：除了换阶段/账本被重置（那时是之前显示错了），进度条绝不往回退。</li>
-     * </ul>
+     * <p>传输中不用它：那时候面板显示的是校验进度或「等待电脑校验…」（见 {@link #applyToPanel}）。
      */
-    private void advanceDisplayed(long dtMs) {
-        // 1) 显示速率逐帧逼近目标速率（指数逼近，和帧率无关）
-        double alpha = 1.0 - Math.exp(-dtMs / SPEED_TAU_MS);
-        speedShown += (speedTarget - speedShown) * alpha;
-        if (Math.abs(speedTarget - speedShown) < 1.0) {
-            // 差不到 1B/s 就直接贴合，免得永远在逼近路上（数字末两位一直抖）
-            speedShown = speedTarget;
-        }
-        // 2) 死推算：这一帧按显示速率前进 speed * dt
-        if (speedShown > 0.0) {
-            shownBytesF += speedShown * dtMs / 1000.0;
-        }
-        long shown = (long) shownBytesF;
-        // 3) 上限：真值 + 前瞻余量
-        long limit = limitBytes();
-        if (shown > limit) {
-            // 夹到上限；但如果上一帧已经画在上限之外（速率刚掉下来），就停在原处等真值追上来，
-            // 绝不往回走 —— 进度条往回退比停住更像出了错
-            shown = Math.max(shownBytes, limit);
-            shownBytesF = shown;
-        }
-        // 4) 落后太多（中途停顿过、速率被低估）：先拉近，别让界面长期落后于真值
-        long lag = truthBytes - shown;
-        if (lag > MAX_DISPLAY_LAG_BYTES) {
-            shown = truthBytes - MAX_DISPLAY_LAG_BYTES;
-            shownBytesF = shown;
-        }
-        // 5) 单调：显示值只增不减
-        if (shown < shownBytes) {
-            shown = shownBytes;
-            shownBytesF = shown;
-        }
-        shownBytes = shown;
-    }
-
-    /**
-     * 显示值允许到达的上限 = 真值 + 前瞻余量。
-     *
-     * <p>前瞻余量为什么不算骗人：真值是「按整块记账」的 —— 一块 1MiB 只有整块写完才被记进
-     * {@code doneBytes}，而这一块里最多已经有 1MiB-1 个字节真的发出去了，只是还没被记账。
-     * 所以允许显示值外推「至多 0.25 秒的速率、且不超过一整块」，补的是记账本身的量化误差，
-     * 而不是凭空往前画：速率一归零，余量立刻跟着归零。
-     *
-     * <p>总量已知时还有一道硬闸：真值没到总量，上限一律压在「总量 - 1」。
-     * 这样屏幕上不会再出现「600.00MB/600.00MB · 0B/s」这种自相矛盾的画面 ——
-     * 数字写满就必须是传输真的结束了。
-     */
-    private long limitBytes() {
-        long lookahead = (long) (speedShown * LOOKAHEAD_MS / 1000.0);
-        if (lookahead < 0L) {
-            lookahead = 0L;
-        } else if (lookahead > LOOKAHEAD_MAX_BYTES) {
-            lookahead = LOOKAHEAD_MAX_BYTES;
-        }
-        long limit = truthBytes + lookahead;
-        long total = truthTotal;
-        if (total > 0L) {
-            long cap = truthBytes >= total ? total : total - 1L;
-            if (limit > cap) {
-                limit = cap;
-            }
-        }
-        return limit;
-    }
-
-    /** 显示字节 → 进度条的值（0~{@link #PROGRESS_MAX}）；真值没到总量时绝不给满 */
-    private int progressOf(long shown) {
-        long total = truthTotal;
-        if (total <= 0L) {
-            return 0;
-        }
-        long value = Math.max(0L, Math.min(shown, total)) * PROGRESS_MAX / total;
-        if (truthBytes < total && value >= PROGRESS_MAX) {
-            value = PROGRESS_MAX - 1L;
-        }
-        return (int) Math.min(PROGRESS_MAX, value);
-    }
-
-    // ------------------------------------------------------------------
-    // 逐帧要用的字符串：全部手写、零对象、和上一次一模一样就不 setText
-    // ------------------------------------------------------------------
-
-    /**
-     * 手写「12.34MB」（四舍五入到 0.01），口径和 {@code Utils.formatFileSize} 一致。
-     *
-     * <p>为什么不用 {@code Utils.formatFileSize}：它里面是 {@code String.format}，
-     * 每调一次都要新建 Formatter、参数数组，还会按 locale 决定小数点 ——
-     * 逐帧调用就是每秒五十几次纯浪费，而且换 locale 时字符串宽度会跳。
-     * 这里全是整数运算，一个对象都不分配。
-     */
-    private static void appendSize(StringBuilder out, long bytes) {
-        if (bytes < 0L) {
-            bytes = 0L;
-        }
-        if (bytes < 1024L) {
-            out.append(bytes).append('B');
-        } else if (bytes < 1024L * 1024L) {
-            appendHundredths(out, hundredthsOf(bytes, 1024L));
-            out.append("KB");
-        } else if (bytes < 1024L * 1024L * 1024L) {
-            appendHundredths(out, hundredthsOf(bytes, 1024L * 1024L));
-            out.append("MB");
-        } else {
-            appendHundredths(out, hundredthsOf(bytes, 1024L * 1024L * 1024L));
-            out.append("GB");
-        }
-    }
-
-    /** 手写速率：「12.34MB/s」，口径和 {@code Utils.formatSpeed} 一致（B/KB/MB，两位小数） */
-    private static void appendSpeed(StringBuilder out, double bytesPerSecond) {
-        // 写成 bps > 0 而不是 bps <= 0：顺便把 NaN 也挡在外面
-        if (!(bytesPerSecond > 0.0)) {
-            out.append("0B/s");
-            return;
-        }
-        long whole = (long) (bytesPerSecond + 0.5);
-        if (whole < 1024L) {
-            out.append(whole).append("B/s");
-        } else if (whole < 1024L * 1024L) {
-            appendHundredths(out, hundredthsOf(whole, 1024L));
-            out.append("KB/s");
-        } else {
-            appendHundredths(out, hundredthsOf(whole, 1024L * 1024L));
-            out.append("MB/s");
-        }
-    }
-
-    /** {@code bytes / unit} 保留两位小数的整数版（乘 100 后四舍五入） */
-    private static long hundredthsOf(long bytes, long unit) {
-        return (bytes * 100L + unit / 2L) / unit;
-    }
-
-    /** 把「百分之一为单位」的整数写成 {@code 12.34} 这种形式 */
-    private static void appendHundredths(StringBuilder out, long hundredths) {
-        out.append(hundredths / 100L).append('.');
-        long fraction = hundredths % 100L;
-        if (fraction < 10L) {
-            out.append('0');
-        }
-        out.append(fraction);
-    }
-
-    /**
-     * 缓冲里的内容和上一次写进控件的字符串是否不同。
-     *
-     * <p>为什么要比：TextView.setText 会触发 measure/layout/invalidate，
-     * 值没变（比如速率停在同一档、暂停中数字不动）还每帧 setText 一次，
-     * 就是每秒几十次白白的布局。这里逐字符比一遍，一个对象都不分配。
-     */
-    private static boolean differs(String previous, StringBuilder buffer) {
-        int length = buffer.length();
-        if (previous == null || previous.length() != length) {
-            return true;
-        }
-        for (int i = 0; i < length; i++) {
-            if (previous.charAt(i) != buffer.charAt(i)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-
-    private void setIndeterminate(boolean indeterminate) {
-        handler.post(() -> progressBar.setIndeterminate(indeterminate));
-    }
-
     private void showStatus(String text) {
-        handler.post(() -> statusView.setText(text));
+        handler.post(() -> ShareProgress.update(
+                false,
+                currentFileName,
+                shownBytes,
+                truthTotal,
+                shownBytes,
+                Collections.emptyList(),
+                buildChannels(true),
+                text,
+                server != null ? server.getDisplayName() : ""));
     }
 
-    private void postStatus(String text) {
-        handler.post(() -> statusView.setText(text));
-    }
-
-    private void postHint(String text) {
-        handler.post(() -> {
-            hintView.setText(text);
-            hintView.setVisibility(TextUtils.isEmpty(text) ? View.GONE : View.VISIBLE);
-        });
+    /**
+     * 收尾（完成 / 失败 / 取消）时把面板最后刷一次：速率一律清零，说明文案换成结果。
+     *
+     * @param clearProgress true 时把进度也清零（失败、取消）
+     */
+    private void flushPanel(String note, boolean clearProgress) {
+        if (clearProgress) {
+            shownBytes = 0L;
+        }
+        ShareProgress.update(
+                false,
+                currentFileName,
+                shownBytes,
+                truthTotal,
+                shownBytes,
+                Collections.emptyList(),
+                buildChannels(true),
+                note,
+                server != null ? server.getDisplayName() : "");
     }
 
     // ------------------------------------------------------------------
@@ -1307,7 +1067,7 @@ public class ShareActivity extends AppCompatActivity {
                     copied += read;
                     if (copied - lastUpdate > 8L * 1024 * 1024) {
                         lastUpdate = copied;
-                        postStatus(getString(R.string.share_copying_file, Utils.formatFileSize(copied)));
+                        showStatus(getString(R.string.share_copying_file, Utils.formatFileSize(copied)));
                     }
                 }
             }
@@ -1365,6 +1125,8 @@ public class ShareActivity extends AppCompatActivity {
         cancelled = true;
         // 界面没了就别再占着 vsync：Activity 销毁后控件引用也不能再碰
         frameClock.stop();
+        // 面板的 ComposeView 跟着 Activity 一起没了：owner 走到 DESTROYED，状态清干净
+        ShareProgress.release();
         super.onDestroy();
     }
 

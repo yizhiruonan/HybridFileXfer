@@ -4,9 +4,7 @@
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:orientation="vertical"
-    android:paddingStart="24dp"
     android:paddingTop="22dp"
-    android:paddingEnd="24dp"
     android:paddingBottom="20dp">
 
     <androidx.core.widget.NestedScrollView
@@ -47,46 +45,20 @@
                 android:textSize="20sp"
                 android:textStyle="bold" />
 
-            <TextView
-                android:id="@+id/share_status"
+            <!--
+                进度面板的占位容器：ShareActivity 在 onCreate 里把
+                ShareProgress.host(this) 造出来的 ComposeView 加进来。
+                面板就是双窗口弹窗 / 应用外悬浮窗用的那个 ReceiveProgressPanel
+                （标题、分段进度条、已发/总量、速率、各通道明细都在里面），
+                以后只有这一套进度界面。
+                宽度铺满：面板内部自己是一张居中的 340dp 卡片，外面再套 Activity 的左右 padding
+                会被挤窄（窄屏上分段条和各通道那几列就挤不下了），所以左右留白交给按钮自己加。
+            -->
+            <FrameLayout
+                android:id="@+id/share_panel"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_marginTop="8dp"
-                android:gravity="center"
-                android:minLines="1"
-                android:text="@string/share_preparing"
-                android:textColor="@color/text_secondary"
-                android:textSize="14sp" />
-
-            <TextView
-                android:id="@+id/share_speed"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="2dp"
-                android:gravity="center"
-                android:textColor="@color/accent"
-                android:textSize="13sp"
-                android:visibility="gone" />
-
-            <TextView
-                android:id="@+id/share_hint"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="6dp"
-                android:gravity="center"
-                android:textColor="@color/text_secondary"
-                android:textSize="12sp"
-                android:visibility="gone" />
-
-            <ProgressBar
-                android:id="@+id/share_progress"
-                style="?android:attr/progressBarStyleHorizontal"
-                android:layout_width="match_parent"
-                android:layout_height="6dp"
-                android:layout_marginTop="16dp"
-                android:indeterminate="true"
-                android:max="100"
-                android:progressTint="@color/accent" />
+                android:layout_marginTop="8dp" />
         </LinearLayout>
     </androidx.core.widget.NestedScrollView>
 
@@ -94,7 +66,9 @@
         android:id="@+id/share_action"
         android:layout_width="match_parent"
         android:layout_height="48dp"
+        android:layout_marginStart="24dp"
         android:layout_marginTop="16dp"
+        android:layout_marginEnd="24dp"
         android:insetTop="0dp"
         android:insetBottom="0dp"
         android:minHeight="48dp"
