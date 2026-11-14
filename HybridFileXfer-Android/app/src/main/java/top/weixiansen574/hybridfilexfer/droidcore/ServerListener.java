@@ -33,10 +33,14 @@ public class ServerListener implements AutoCloseable {
     private static final byte[] CLIENT_HEADER = HFXService.CLIENT_HEADER.getBytes(StandardCharsets.UTF_8);
     /**
      * 判断"这个连接有没有先说话"的观察窗口。控制通道的协议头是连上后立刻写出的
-     * （同一台机器上通常 1ms 内就到），400ms 留了足够的余量；代价是当前电脑的每条
-     * 传输通道要多等 400ms，一台电脑最多 8 条通道，仍在电脑端 15s 的握手超时之内。
+     * （同一台机器上实测 1ms 内就到），100ms 已经是二十倍余量。
+     *
+     * <p>这个窗口是**按通道串行付**的：14 条通道 × 400ms = 5.6 秒，全花在"等安静"上，
+     * 用户看到的就是"插上线要等好几秒才连上"。压到 100ms 后同样 14 条只要 1.4 秒，
+     * 而控制通道几乎不可能超过 100ms 还不说话（真要超了，也只是别的电脑刚接入那种极少数情况，
+     * 电脑端会自己重连）。
      */
-    private static final int CLASSIFY_WINDOW_MS = 400;
+    private static final int CLASSIFY_WINDOW_MS = 100;
     private static final int ACCEPT_POLL_MS = 20;
     /** 暂存的控制通道上限：超出说明有人在反复重连，直接关掉避免堆积 */
     private static final int MAX_STASHED = 8;
