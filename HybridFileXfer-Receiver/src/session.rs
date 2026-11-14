@@ -1473,7 +1473,8 @@ fn sha256_file(path: &Path) -> io::Result<FileDigest> {
     let mut file = std::fs::File::open(path)?;
     let size = file.metadata()?.len();
     let mut context = digest::Context::new(&digest::SHA256);
-    let mut buffer = vec![0u8; BLOCK_SIZE as usize];
+    // 4MiB 一块：1MiB 时 1.78GB 要 read 1800 次，收尾那 1 秒里有一截耗在系统调用上
+    let mut buffer = vec![0u8; (BLOCK_SIZE as usize).max(4 * 1024 * 1024)];
     loop {
         let read = file.read(&mut buffer)?;
         if read == 0 {
@@ -1488,14 +1489,48 @@ fn sha256_file(path: &Path) -> io::Result<FileDigest> {
 }
 
 /// 把一组本地文件算成指纹表（排序后便于两端直接比对）
+///
+/// 多文件时按文件并行：单个文件的 SHA-256 没法拆（后一段的初值依赖前一段），
+/// 但"文件夹里几十个文件"这种收尾能快好几倍。单文件时就是一次顺序读。
 fn digest_files(paths: &[PathBuf]) -> Vec<FileDigest> {
-    let mut digests = Vec::with_capacity(paths.len());
-    for path in paths {
-        match sha256_file(path) {
-            Ok(digest) => digests.push(digest),
-            Err(e) => log::warn(&format!("{}: {}", path.display(), e)),
-        }
+    if paths.len() <= 1 {
+        return paths
+            .iter()
+            .filter_map(|path| match sha256_file(path) {
+                Ok(digest) => Some(digest),
+                Err(e) => {
+                    log::warn(&format!("{}: {}", path.display(), e));
+                    None
+                }
+            })
+            .collect();
     }
+    let lanes = paths.len().min(4).max(1);
+    let mut buckets: Vec<Vec<&PathBuf>> = (0..lanes).map(|_| Vec::new()).collect();
+    for (i, path) in paths.iter().enumerate() {
+        buckets[i % lanes].push(path);
+    }
+    let mut digests: Vec<FileDigest> = std::thread::scope(|scope| {
+        let handles: Vec<_> = buckets
+            .into_iter()
+            .map(|bucket| {
+                scope.spawn(move || {
+                    let mut local = Vec::with_capacity(bucket.len());
+                    for path in bucket {
+                        match sha256_file(path) {
+                            Ok(digest) => local.push(digest),
+                            Err(e) => log::warn(&format!("{}: {}", path.display(), e)),
+                        }
+                    }
+                    local
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap_or_default())
+            .collect()
+    });
     digests.sort();
     digests
 }
