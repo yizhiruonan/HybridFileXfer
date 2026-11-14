@@ -84,6 +84,9 @@ public final class NetInterfaces {
         if (name.startsWith("eth")) {
             return "以太网";
         }
+        if (name.startsWith("rndis") || name.startsWith("usb")) {
+            return "USB 网络共享";
+        }
         return ifName;
     }
 
