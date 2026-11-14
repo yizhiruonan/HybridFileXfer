@@ -4,6 +4,7 @@ import android.content.Context
 import android.util.Log
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.platform.ComposeView
+import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.LifecycleRegistry
@@ -101,8 +102,8 @@ internal object ShareProgress {
                     // 和 TransferScreen.kt 里双窗口那段一比一：
                     // sending=true / showFooter 不传（默认 true，底部按钮由面板自己画）/
                     // bare=true（唯一的不同，见类注释：false 会把小窗口撑成满屏黑）。
-                    // scale=1.15：整张卡片（标题 / 进度条 / 各通道明细 / 按钮）在分享页放大一号，
-                    // 双窗口和其它地方不传 scale，保持原始 340dp。
+                    // widthDp=390dp：只把卡片放宽（双窗口是 340dp）—— 字号、行高、按钮、间距
+                    // 一个都不动，窄屏时面板自己按「屏宽 - 32dp」兜底。
                     val current = actions.value
                     ReceiveProgressPanel(
                         state = state.value,
@@ -112,7 +113,7 @@ internal object ShareProgress {
                         onResume = { current?.onResume?.run() },
                         onCancel = { current?.onCancel?.run() },
                         bare = true,
-                        scale = 1.15f,
+                        widthDp = 390.dp,
                     )
                 }
             }
