@@ -19,6 +19,14 @@ use crate::util;
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(1500);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(20);
+/// 多久没收到手机的心跳就当它已经走了。
+///
+/// 手机端每 3 秒发一次 PING（ServerService.PING_INTERVAL_MS），所以 12 秒＝连丢 4 次，
+/// 真断了不会误判。以前这里是 IDLE_TIMEOUT * 5 = 100 秒 —— 用户在手机上点「停止服务」
+/// 再点「启动服务」时，手机那边根本不发 FIN（服务停了、进程还在，套接字还开着），
+/// 电脑只能干等超时：界面上一直显示「已连接」，手机一直显示「等待电脑连接」，
+/// 用户看到的就是「要等一分钟才连上」。
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(12);
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(60);
 /// 连不上的通道地址缓存两分钟：重连/拔插时直接跳过，不用每条再等 2 秒超时
 const UNREACHABLE_TTL: Duration = Duration::from_secs(120);
@@ -352,7 +360,8 @@ impl Session {
                         id
                     }
                     Err(e) if is_timeout(&e) => {
-                        if last_activity.elapsed() > IDLE_TIMEOUT * 5 {
+                        // 手机每 3 秒一次心跳：连着 12 秒一个字都没收到就是断了
+                        if last_activity.elapsed() > HEARTBEAT_TIMEOUT {
                             return SessionEnd::Disconnected(describe_read_error(&e));
                         }
                         continue;
@@ -1210,6 +1219,8 @@ impl Session {
         proto::write_i16(&mut self.writer, controller::RESUME_REPLY)?;
         proto::write_i32(&mut self.writer, entries.len() as i32)?;
         let mut resumed = 0usize;
+        // 命中续传的文件：位图留着，稍后把「磁盘上已有的块」直接标成本次进度的已完成
+        let mut resumed_files: Vec<(String, u64, Vec<u8>)> = Vec::new();
         for (path, size, mtime) in &entries {
             match receiver.resume_bitmap(path, *size, *mtime) {
                 Some(bitmap) => {
@@ -1222,6 +1233,7 @@ impl Session {
                         crate::receiver::human_bytes(*size),
                         path
                     ));
+                    resumed_files.push((path.clone(), *size, bitmap.clone()));
                     proto::write_bool(&mut self.writer, true)?;
                     proto::write_i32(&mut self.writer, bitmap.len() as i32)?;
                     self.writer.write_all(&bitmap)?;
@@ -1239,6 +1251,21 @@ impl Session {
             resumed,
             entries.len()
         ));
+        // 305：口径统一 —— 续传时「磁盘上已有的块」= 已完成（手机端也是这么算的）。
+        // 以前只有本轮真收到的块才会计账，跳过的区间既没有归属也不算完成，
+        // 进度条就成了「最左边一小段 + 中间一大片空白 + 右边一串碎段」，
+        // 而「已接收」的数字却是含这些块的，两个数字对不上。
+        for (path, size, bits) in &resumed_files {
+            let blocks = crate::receiver::PROGRESS.mark_resumed(path, *size, bits);
+            receiver.progress.mark_resumed(path, *size, bits);
+            log::info(&format!(
+                "{} {} / {} ({})",
+                crate::i18n::tr("续传：本次按已完成计的块数", "resume: blocks counted as done"),
+                blocks,
+                crate::i18n::tr("共", "of"),
+                crate::receiver::human_bytes(*size)
+            ));
+        }
         Ok(())
     }
 
@@ -1254,14 +1281,19 @@ impl Session {
         // 必须排在续传查询之前 —— 查询会把"已经全在"的文件登记进本次会话（收尾要复算它的 SHA-256），
         // 排在后面就会把这些登记一起清掉，日志里出现「0 个文件」。
         receiver.reset_session_counters();
+        // 每次接收都要重置进度：不清的话上一条会话里传过的文件还留在 files 表里，
+        // 界面会显示「已接收 9.75 GB · 3 个文件」（其实是同一个文件传了三次）。
+        //
+        // 必须排在续传查询**之前**：查询会把「磁盘上已有的块」标成本次进度的已完成，
+        // 排在后面就把这些标记一起清掉了，进度条又变回「大片空白 + 一串碎段」。
+        crate::receiver::PROGRESS.reset();
+        receiver.progress.reset();
         // 305：手机发完 REQUEST_RECEIVE 会立刻来一帧 RESUME_QUERY（这次要传的文件清单），
-        // 这里读它、回每个文件"已经收到哪些块"的位图，发送端据此跳过已收到的块。
+        // 这里读它、回每个文件"已经收到哪些块"的位图，发送端据此跳过已收到的块；
+        // 同时把这些块直接标进进度（手机端也是把它们当完成的）。
         self.handle_resume_query(receiver)?;
         // 接收方向没有发送计划：清掉上一次的发送分段，界面改按"谁写了第几块"还原
         reset_send_segments();
-        // 每次接收都要重置进度：不清的话上一条会话里传过的文件还留在 files 表里，
-        // 界面会显示「已接收 9.75 GB · 3 个文件」（其实是同一个文件传了三次）。
-        crate::receiver::PROGRESS.reset();
         // 接收期间界面显示「暂停 / 已暂停」，暂停时通知手机端停发
         let _receiving = crate::control::ReceivingGuard::begin();
         let started = Instant::now();

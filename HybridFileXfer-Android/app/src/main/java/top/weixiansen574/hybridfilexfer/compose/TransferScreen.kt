@@ -256,19 +256,13 @@ internal fun TransferScreen(
 
         override fun onChannelComplete(iName: String?, traffic: Long, time: Long) {
             val key = iName ?: ""
-            main.post {
-                xferPopupDoneNames.add(key)
-                if (!xferPopupWaiting && xferPopupSending) {
-                    val total = xferPopupChannels.size
-                    if (total > 0 && xferPopupDoneNames.size >= total) {
-                        // 所有通道的 EOF 都发出去了 = 数据全部写完。之后到电脑回结论帧之前
-                        // 只有电脑在算 SHA-256，界面切到"等待电脑校验…"并把进度条补满，
-                        // 否则就是"791.0 MB / 800.0 MB · 0 KB/s"一动不动（实测被当成卡死）。
-                        xferPopupWaiting = true
-                        if (xferPopupTotal > 0) xferPopupDone = xferPopupTotal
-                    }
-                }
-            }
+            // 只记名字（"各通道进度"那一行要显示「已完成」）。
+            // 别在这里切到校验阶段：**所有通道 EOF ≠ 数据发完**。
+            // 慢通道会被判"没活"提前收工，它那段块这时可能正被别的通道抢着发；
+            // 更早的写法还比过「已收工数 >= 通道数」，而通道数会因为收工的通道被摘掉而变小，
+            // 于是传到一半就跳进校验（用户报的「还没发完就切校验」）。
+            // 数据阶段结束一律看按块真值（下面的 done >= total），见定时循环里的注释。
+            main.post { xferPopupDoneNames.add(key) }
         }
 
         override fun onChannelError(iName: String?, errorType: Int, message: String?) {
@@ -685,6 +679,11 @@ internal fun TransferScreen(
                 singleFile -> maxOf(blockProgress!!.doneBytes, xferPopupResumeBase)
                     .let { if (xferPopupTotal > 0) it.coerceAtMost(xferPopupTotal) else it }
                 else -> xferPopupResumeBase + sum
+            }
+            // 数据发完的判定只有一条：按块真值追平总字节（done >= xferPopupTotal）。
+            // 这条对发送/接收两个方向都一样，不会像「通道全部收工」那样提前触发。
+            if (!xferPopupWaiting && xferPopupTotal > 0 && done >= xferPopupTotal) {
+                xferPopupWaiting = true
             }
             // 校验阶段：数据已经发完，两端在复算整文件 SHA-256。
             // 这时候把进度条清零，改用校验的字节数 —— 传输进度和校验进度共用同一条进度条，

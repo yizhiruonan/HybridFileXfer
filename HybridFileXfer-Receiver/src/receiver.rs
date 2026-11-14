@@ -74,6 +74,36 @@ impl BlockMap {
         }
     }
 
+    /// 305：按「每块 1 bit」的字节位图整片置位（续传日志就是这种格式，最低位是这一字节的第一个块）。
+    /// 返回这次新标上的块数（本来就已经是完成的块不重复计数）。
+    fn mark_bits(&mut self, bits: &[u8], total_size: u64, block_size: u64) -> usize {
+        let total = ((total_size + block_size - 1) / block_size.max(1)).max(1) as usize;
+        if total != self.total_blocks {
+            self.total_blocks = total;
+            self.bits = vec![0u64; (total + 63) / 64];
+        }
+        let mut marked = 0usize;
+        for (byte_index, byte) in bits.iter().enumerate() {
+            if *byte == 0 {
+                continue;
+            }
+            for bit in 0..8u32 {
+                if (byte & (1u8 << bit)) == 0 {
+                    continue;
+                }
+                let index = byte_index * 8 + bit as usize;
+                if index >= total {
+                    break;
+                }
+                if !self.is_done(index) {
+                    marked += 1;
+                }
+                self.bits[index / 64] |= 1u64 << (index % 64);
+            }
+        }
+        marked
+    }
+
     /// 已置位的块数
     pub fn count(&self) -> usize {
         self.bits.iter().map(|w| w.count_ones() as usize).sum()
@@ -99,6 +129,12 @@ pub struct XferSeg {
     pub filled: f32,
 }
 
+/// 续传时「磁盘上本来就有」的块用这个通道号记账。
+///
+/// 它和真正的通道号（0/1/2…）分开：这些块是一整片区间，画进度条时自然连成一段，
+/// 不会被本轮新收到的块挤成碎条。u8::MAX 已经表示「归属未知」，所以取它前一个。
+pub const OWNER_RESUMED: u8 = u8::MAX - 1;
+
 /// 一个文件（一次发送 / 接收）的进度：块位图 + 每块是哪条通道做的。
 ///
 /// 多文件并发时每个文件一份，互不干扰；段数由"相邻块的通道归属"还原。
@@ -119,6 +155,25 @@ impl FileProgress {
             self.owners.resize(i + 1, u8::MAX);
         }
         self.owners[i] = channel;
+    }
+
+    /// 305：续传时把「磁盘上已经有的块」一次性标成完成，归属记作 {@link OWNER_RESUMED}。
+    ///
+    /// 手机端续传时把这些块直接当完成（不再重发），电脑端以前只记「本轮真收到的块」，
+    /// 于是这些区间在进度条上一直是空的：数字说 480MB 已收，条子上却只有后面新传的那点碎段。
+    fn mark_resumed(&mut self, total: u64, bits: &[u8]) -> usize {
+        self.total = total;
+        let marked = self.blocks.mark_bits(bits, total, BLOCK_SIZE);
+        let blocks = self.blocks.blocks();
+        if self.owners.len() < blocks {
+            self.owners.resize(blocks, u8::MAX);
+        }
+        for i in 0..blocks {
+            if self.blocks.is_done(i) && self.owners.get(i).copied().unwrap_or(u8::MAX) == u8::MAX {
+                self.owners[i] = OWNER_RESUMED;
+            }
+        }
+        marked
     }
 
     fn done_bytes(&self) -> u64 {
@@ -144,8 +199,11 @@ impl FileProgress {
             let owner = self.owners.get(i).copied().unwrap_or(u8::MAX);
             match previous {
                 None => {
+                    // 第一段的起点是「第一个已完成的块」，不是 0：
+                    // 续传时前面的块可能还没到，写死 0 会让这一段从最左边开始填，
+                    // 和它真实所在的位置错位（看着就是「左边一小段蓝 + 中间大片空白」）。
                     previous = Some(owner);
-                    segment_start = 0;
+                    segment_start = i;
                 }
                 Some(prev) if prev != owner => {
                     bounds.push((segment_start, prev));
@@ -220,8 +278,10 @@ pub struct ProgressState {
     file_done: AtomicU64,
     /// 当前文件总字节
     file_total: AtomicU64,
-    /// 本次会话累计字节
+    /// 本次会话真收到的字节（不含续传时「磁盘上本来就有」的部分，速率按它算）
     session_bytes: AtomicU64,
+    /// 续传基线：这次续传开始时，磁盘上已经完成的字节（算进「已接收」显示，但不进速率）
+    resumed_bytes: AtomicU64,
     /// 本次会话已开始的文件数（= 表里条目数，不是切换次数）
     files_started: AtomicU64,
     /// 每个文件一份进度，按目标路径分开
@@ -239,6 +299,7 @@ impl ProgressState {
         self.file_done.store(0, Ordering::Relaxed);
         self.file_total.store(0, Ordering::Relaxed);
         self.session_bytes.store(0, Ordering::Relaxed);
+        self.resumed_bytes.store(0, Ordering::Relaxed);
         self.files_started.store(0, Ordering::Relaxed);
         if let Ok(mut files) = self.files.lock() {
             files.clear();
@@ -253,6 +314,47 @@ impl ProgressState {
     /// 接收方向（手机 -> 电脑）：一块已写盘
     pub fn mark_received(&self, channel: u8, dest: &str, index: u32, total: u64, written: u64) {
         self.mark_block(channel, dest, index, total, written);
+    }
+
+    /// 305：续传开始前，把「磁盘上已经有的块」直接标成完成（手机端也是这么算的）。
+    ///
+    /// 这样进度条从「已经传过的位置」接着往上填，而不是把这一片当成没传；
+    /// 「已接收 x / y」和条子读的是同一份块位图，数字和填充自然对得上。
+    /// 返回这次新标上的块数（日志用）。
+    pub fn mark_resumed(&self, path: &str, total: u64, bits: &[u8]) -> usize {
+        if bits.is_empty() || total == 0 {
+            return 0;
+        }
+        let (is_new, added, done, total_now) = match self.files.lock() {
+            Ok(mut files) => {
+                let is_new = !files.contains_key(path);
+                let entry = files.entry(path.to_string()).or_default();
+                let before = entry.done_bytes();
+                entry.mark_resumed(total, bits);
+                let done = entry.done_bytes();
+                let total_now = entry.total.max(total);
+                (is_new, done.saturating_sub(before), done.min(total_now), total_now)
+            }
+            Err(_) => return 0,
+        };
+        if is_new {
+            self.files_started.fetch_add(1, Ordering::Relaxed);
+        }
+        // 只把「因为续传而多出来的字节」记进基线：后面真收到的块走 mark_block 的 session_bytes
+        self.resumed_bytes.fetch_add(added, Ordering::Relaxed);
+        self.file_total.store(total_now, Ordering::Relaxed);
+        self.file_done.store(done, Ordering::Relaxed);
+        if let Ok(mut name) = self.current.write() {
+            if name.as_str() != path {
+                *name = path.to_string();
+            }
+        }
+        added as usize
+    }
+
+    /// 本次会话真收到的字节数（续传基线不算）：界面用它算速率，避免续传一开始跳出一个假峰值
+    pub fn received_bytes(&self) -> u64 {
+        self.session_bytes.load(Ordering::Relaxed)
     }
 
     fn mark_block(&self, channel: u8, path: &str, index: u32, total: u64, bytes: u64) {
@@ -297,13 +399,21 @@ impl ProgressState {
         }
     }
 
+    /// (文件名, 当前文件已完成字节, 当前文件总字节, 本次会话字节（含续传基线）, 文件数)
+    ///
+    /// 第三个数字（已接收）和进度条同源：当前文件的字节数取自块位图，
+    /// 会话字节 = 本轮真收到 + 续传基线，续传时一开始就是「480.0 MB」而不是 0。
     pub fn snapshot(&self) -> (String, u64, u64, u64, u64) {
         let name = self.current.read().map(|g| g.clone()).unwrap_or_default();
+        let session = self
+            .session_bytes
+            .load(Ordering::Relaxed)
+            .saturating_add(self.resumed_bytes.load(Ordering::Relaxed));
         (
             name,
             self.file_done.load(Ordering::Relaxed),
             self.file_total.load(Ordering::Relaxed),
-            self.session_bytes.load(Ordering::Relaxed),
+            session,
             self.files_started.load(Ordering::Relaxed),
         )
     }

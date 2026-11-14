@@ -56,7 +56,16 @@ impl State {
             handle.stop.store(true, Ordering::Relaxed);
             log::info(i18n::tr("正在停止接收…", "stopping…"));
         }
+        // 停就是停：设备表、排队中的状态一起清掉。
+        // 以前只把 engine 摘掉，设备表里还留着「已连接」那条，而界面上的「是否在接收」
+        // 又是按设备数算的 —— 点一次停止，界面自己又跳回「已连接/停止接收」，
+        // 用户得再点一次才真的停（线程这时才收完尾）。
+        self.devices.clear();
+        self.device_order.clear();
+        self.asked_target = false;
         self.state = EngineState::Stopped;
+        self.expanded_dirty = true;
+        while self.state_rx.try_recv().is_ok() {}
     }
 
     fn start_engine(&mut self, port: u16, mode: ConnectMode, dir: PathBuf) {
@@ -258,6 +267,7 @@ fn main() -> Result<(), slint::PlatformError> {
             ui.set_message("".into());
             hfx_receiver::receiver::PROGRESS.reset();
             hfx_receiver::session::reset_send_segments();
+            log::info("按钮：开始接收");
             s.start_engine(port, mode, dir);
             ui.set_running(true);
         });
@@ -267,6 +277,7 @@ fn main() -> Result<(), slint::PlatformError> {
         let ui_weak = ui.as_weak();
         ui.on_stop_clicked(move || {
             let mut s = st.lock().unwrap();
+            log::info("按钮：停止接收");
             s.stop_engine();
             if let Some(ui) = ui_weak.upgrade() {
                 ui.set_running(false);
@@ -380,10 +391,14 @@ fn main() -> Result<(), slint::PlatformError> {
             let Some(ui) = ui_weak.upgrade() else { return };
             let mut s = st.lock().unwrap();
 
+            // 「在不在接收」只看引擎：设备数不行 —— 停止过程中设备表里那条还在，
+            // 界面就会自己跳回「已连接」，得按两次停止（用户报的那个 bug）
+            let engine_running = s.engine.is_some();
             let mut changed = false;
             while let Ok((device, next)) = s.state_rx.try_recv() {
                 changed = true;
-                if matches!(next, EngineState::Stopped) {
+                // 已经点了停止：引擎线程收尾时还会推几条消息过来，别再让界面跳回「已连接」
+                if !engine_running || matches!(next, EngineState::Stopped) {
                     s.devices.remove(&device);
                 } else {
                     s.devices.insert(device, next);
@@ -419,13 +434,23 @@ fn main() -> Result<(), slint::PlatformError> {
                     .filter(|st| matches!(st, EngineState::Connected(_)))
                     .count();
                 let waiting_devices = count.saturating_sub(connected_devices);
-                let (kind, title, sub) = if !connected.is_empty() {
+                let (kind, title, sub) = if !engine_running {
+                    // 没在接收就是没在接收，别让残留的设备状态把界面顶回「已连接」
+                    (
+                        0,
+                        i18n::tr("未开始接收", "not receiving").to_string(),
+                        i18n::tr("点「开始接收」等待手机连接", "click Start to wait for a phone")
+                            .to_string(),
+                    )
+                } else if !connected.is_empty() {
                     (
                         2,
                         if connected_devices > 1 {
                             format!("已连接 {connected_devices} 台设备")
                         } else {
-                            "已连接电脑".to_string()
+                            // 这一侧是电脑，连上来的是手机/平板：「已连接电脑」读着像在说自己，
+                            // 统一叫「设备」（和「已连接 N 台设备」保持一套词）
+                            "已连接设备".to_string()
                         },
                         // 收起时只给概况，完整通道列表在展开后显示
                         if waiting_devices > 0 {
@@ -458,7 +483,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 ui.set_status_title(title.into());
                 ui.set_status_sub(sub.into());
                 ui.set_status_sub_full(full_channels.clone().into());
-                ui.set_running(count > 0);
+                ui.set_running(engine_running);
 
                 let mut serials: Vec<String> = s.devices.keys().cloned().collect();
                 serials.sort();
@@ -541,14 +566,17 @@ fn main() -> Result<(), slint::PlatformError> {
             let (path, done, total, session_bytes, files) =
                 hfx_receiver::receiver::PROGRESS.snapshot();
 
+            // 速率只按「这次真收到的字节」算：续传基线（磁盘上本来就有的一块）不算进去，
+            // 否则续传一开始会跳出一个几 GB/s 的假峰值。
+            let received = hfx_receiver::receiver::PROGRESS.received_bytes();
             let now = std::time::Instant::now();
             let elapsed = now.duration_since(last_tick).as_secs_f64();
             if elapsed >= 0.4 {
-                let delta = session_bytes.saturating_sub(last_bytes);
+                let delta = received.saturating_sub(last_bytes);
                 let instant = delta as f64 / elapsed;
                 // 轻微平滑，避免数字乱跳
                 speed = if speed <= 0.0 { instant } else { speed * 0.6 + instant * 0.4 };
-                last_bytes = session_bytes;
+                last_bytes = received;
                 last_tick = now;
             }
 
