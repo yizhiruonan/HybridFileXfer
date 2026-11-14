@@ -78,9 +78,12 @@ impl Session {
         expected_interfaces: usize,
     ) -> io::Result<Session> {
         let control_port = if address.is_loopback() { local_port } else { port };
-        let control = TcpStream::connect_timeout(
-            &SocketAddr::new(address, control_port),
+        // 控制通道也一样走"绑定物理网卡"的连接：梯子/虚拟网卡抢走默认路由时
+        // 连手机的第一步就会失败或绕远路
+        let control = crate::netif::connect(
+            SocketAddr::new(address, control_port),
             CONNECT_TIMEOUT,
+            None,
         )?;
         control.set_nodelay(true)?;
         control.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
@@ -172,7 +175,7 @@ impl Session {
                     .map(|b| b.to_string())
                     .unwrap_or_else(|| "system default".to_string())
             ));
-            match TcpStream::connect_timeout(&target, CONNECT_TIMEOUT) {
+            match crate::netif::connect(target, CONNECT_TIMEOUT, interface.bind) {
                 Ok(stream) => {
                     stream.set_nodelay(true)?;
                     stream.set_read_timeout(Some(TRANSFER_TIMEOUT))?;
@@ -368,7 +371,7 @@ impl Session {
                 self.port
             };
             let target = SocketAddr::new(interface.address, port);
-            let stream = match TcpStream::connect_timeout(&target, CONNECT_TIMEOUT) {
+            let stream = match crate::netif::connect(target, CONNECT_TIMEOUT, interface.bind) {
                 Ok(stream) => stream,
                 Err(e) => {
                     log::warn(&format!(

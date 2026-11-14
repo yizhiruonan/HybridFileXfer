@@ -37,6 +37,13 @@ windows-sys = { version = "0.59", features = [
     "Win32_Graphics_Gdi",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
+    # 传输通道直连物理网卡（不被梯子/虚拟网卡抢走路由）要用：
+    #   GetAdaptersAddresses 枚举本机网卡地址、WSASocketW/bind/connect 做"指定源地址"的连接
+    "Win32_NetworkManagement",
+    "Win32_NetworkManagement_IpHelper",
+    # IP_ADAPTER_ADDRESSES_LH 的字段用到 Ndis 里的类型（OperStatus/IfType）
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
 ] }
 
 [build-dependencies]

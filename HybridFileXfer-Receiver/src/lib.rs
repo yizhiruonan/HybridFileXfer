@@ -10,6 +10,7 @@ pub mod engine;
 pub mod i18n;
 pub mod journal;
 pub mod log;
+pub mod netif;
 pub mod proto;
 pub mod receiver;
 pub mod session;
