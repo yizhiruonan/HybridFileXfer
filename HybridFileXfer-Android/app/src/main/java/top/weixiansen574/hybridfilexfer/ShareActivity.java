@@ -106,13 +106,31 @@ public class ShareActivity extends AppCompatActivity {
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
-        requestWindowFeature(android.view.Window.FEATURE_NO_TITLE);
         super.onCreate(savedInstanceState);
+        // 3.0.0：这个窗口**没有标题栏**，卡片上方不许出现任何一行标题文字。
+        //
+        // 以前这里调的是 Activity.requestWindowFeature()，对 AppCompatActivity 来说
+        // 只是个 framework 调用：它关掉的是 PhoneWindow 自己的 DecorView 标题，
+        // AppCompat 那套 SubDecor 完全不知道。而本页面用的是 Dialogue 系主题
+        // （windowIsFloating=true），AppCompat 认为"没标 windowNoTitle"时就会把
+        // abc_dialog_title_material 里的那颗 TextView（id/title，文字 = activity 的
+        // android:label「发送到电脑」）插在 SubDecor 最上面。这就是多任务重构之后
+        // 卡片上方多出来的那条孤立文字（真机 dumpsys 里能看到：
+        // MaterialTextView #id/title 0,0-1595,124，正好压在卡片上面 124px）。
+        //
+        // 正确的入口是 supportRequestWindowFeature()（走 AppCompatDelegate），
+        // 而且必须在 super.onCreate() 之后、setContentView()（安装 SubDecor）之前调用。
+        supportRequestWindowFeature(android.view.Window.FEATURE_NO_TITLE);
         CrashGuard.install();
+        // 主题里已经关掉了 ActionBar（themes.xml 的 windowNoTitle/windowActionBar），
+        // 这里再兜一次：某些 AppCompat 版本会先建出 ActionBar 再让你 hide()。
         if (getSupportActionBar() != null) {
             getSupportActionBar().hide();
         }
         setContentView(R.layout.activity_share);
+        // 最后兜一道：万一还是被插了标题（老版本 AppCompat / 系统 Dialog 主题），
+        // 直接把那颗 TextView 从窗口里摘掉，别让它把卡片往下挤 124px。
+        dropStrayWindowTitle();
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
             setFinishOnTouchOutside(false);
         }
@@ -162,6 +180,40 @@ public class ShareActivity extends AppCompatActivity {
             return;
         }
         attachTask(target);
+    }
+
+    /**
+     * 把窗口自带的标题那一行摘掉（卡片上方那条「发送到电脑」）。
+     *
+     * <p>正常情况下 themes.xml 里的 windowNoTitle + supportRequestWindowFeature 已经
+     * 让它根本不会被创建；这里只是兜底：AppCompat 的行为按版本有过变化
+     * （悬浮窗口 + 没读到 windowNoTitle 时会 inflate abc_dialog_title_material，
+     * 里面那颗 TextView 的 id 就是 {@code app:id/title}）。留着它会把面板往下挤
+     * 124px，屏幕上就是一条孤零零的「发送到电脑」。
+     *
+     * <p>只摘"窗口标题"那一个：父节点不能是卡片那一层，绝不碰面板内部的任何 view。
+     */
+    private void dropStrayWindowTitle() {
+        try {
+            // 窗口标题的文字来自 activity 的 android:label；先清空，就算摘不掉也不会显形
+            setTitle("");
+            int id = getResources().getIdentifier("title", "id", getPackageName());
+            if (id == 0) {
+                return;
+            }
+            android.view.View title = getWindow().getDecorView().findViewById(id);
+            if (title == null) {
+                return;
+            }
+            android.view.ViewParent parent = title.getParent();
+            android.view.View card = findViewById(R.id.share_panel);
+            if (parent instanceof ViewGroup && parent != card) {
+                ((ViewGroup) parent).removeView(title);
+                Log.i(TAG, "移除了窗口自带的标题 view（卡片上方不应有标题）");
+            }
+        } catch (Throwable e) {
+            Log.w(TAG, "移除窗口标题失败（不影响使用）", e);
+        }
     }
 
     /** 第一次进来（一次新的分享）：新建任务并开跑 */

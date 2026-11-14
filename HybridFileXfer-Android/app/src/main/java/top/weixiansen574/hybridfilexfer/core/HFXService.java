@@ -220,6 +220,76 @@ public abstract class HFXService {
         }
     }
 
+    /**
+     * **电脑端抢的取消**（不是手机界面点的）：置标志 + 放开暂停闸门 + 关掉所有传输通道。
+     *
+     * <p>为什么必须关 socket，光置标志不够：本端是发送方时，发块线程正一门心思往
+     * 传输通道里写，写满 TCP 缓冲就阻塞在 {@code writeFully} 里 —— 它自己不会回头
+     * 看任何标志。电脑端点了「取消 → 保留进度」之后不再读数据，我们这边就一直
+     * 「还在继续发」（用户报的第 1 个问题）。只有把 socket 关掉，那次 write 才会
+     * 以 AsynchronousCloseException 立刻返回。
+     *
+     * <p>顺便打上 {@link TransferConnection#markCancelled()}：SendFileCall /
+     * ReceiveFileCall 的 catch 据此把这次异常当"取消"而不是"通道错误"，
+     * 不会再弹一条红色通道错误（用户报的第 2 个问题里那个报错）。
+     *
+     * <p>还要放开暂停闸门：电脑端点「取消」时是先把手机暂停住的（它弹确认框那几秒
+     * 不让继续灌数据），暂停中的线程停在 {@code TransferPause.awaitResume()} 里，
+     * 不放开就永远不会退出；而下一轮传输会换一个新的闸门对象，这批老线程就永远挂着，
+     * 一直占着共享的 native 缓冲区池（下一次传输实测会报 newPosition > limit）。
+     *
+     * <p>幂等：重复调用只会再关一遍已经关掉的 socket，不会写任何控制帧。
+     * 调用时**不能**持有 controlLock（{@link #readResultFrameOrNull} 在
+     * receiveFiles 的收尾里是持锁调的），这里只碰通道和闸门。
+     */
+    protected void cancelByPeer(String reason) {
+        if (!transferCancelled) {
+            top.weixiansen574.hybridfilexfer.core.HFXLog.d("cancelByPeer: " + reason);
+        }
+        transferCancelled = true;
+        needsRebuild = true;
+        try {
+            TransferPause gate = pauseGate;
+            if (gate != null) {
+                gate.resume();
+            }
+        } catch (Throwable ignored) {
+        }
+        shutdownTransferChannels(reason);
+    }
+
+    /**
+     * 关掉当前所有传输通道（先打"取消"标，收尾时不弹通道错误）。
+     *
+     * <p>幂等，任何线程都能调；返回关掉了几条。重建时
+     * {@code HFXServer.beginRebuild()} 会把这些已经关掉的通道从表里摘掉，
+     * 不会出现"旧通道还在表里 + 新通道又加进来"的双份通道
+     * （以前电脑端取消时没人关通道，重建后 6 条变 12 条，下一次传输一半线程
+     * 一开始就写失败 —— 用户报的"再取消一次手机端报错"）。
+     */
+    protected int shutdownTransferChannels(String reason) {
+        List<TransferConnection> list = connections;
+        if (list == null || list.isEmpty()) {
+            return 0;
+        }
+        int closed = 0;
+        for (TransferConnection connection : list) {
+            if (connection == null) {
+                continue;
+            }
+            try {
+                // 先打标再关：收尾时按"取消"处理，不当通道错误
+                connection.markCancelled();
+                connection.close();
+                closed++;
+            } catch (Throwable ignored) {
+            }
+        }
+        top.weixiansen574.hybridfilexfer.core.HFXLog.d(
+                "shutdownTransferChannels(" + reason + "): closed " + closed);
+        return closed;
+    }
+
     /** 取一个提前读到的重建通道名；没有返回 null */
     public String pollRebuildName() {
         return pendingRebuildNames.poll();
@@ -309,10 +379,16 @@ public abstract class HFXService {
         // 多写一帧会让电脑端把 REBUILD_ACK 读成别的帧，帧流一错位整条会话就报废。
         if (pcResult == null || pcResult.cancelled) {
             top.weixiansen574.hybridfilexfer.core.HFXLog.d("sendFiles: cancelled, skip result frame");
+            // 3.0.0：取消时先把传输通道关掉再等线程 —— 发块线程此刻多半阻塞在
+            // writeFully 里（电脑端不读了，缓冲写满），只有 socket 被关掉那次写才会
+            // 立刻抛出来，awaitTransferThreads 也才有机会在几百毫秒内退完
+            // （以前靠电脑端重建时才 shutdown，等于要等它走完 join+收尾，
+            //   手机这边整整几秒还"在发"）。这行对已经关过的通道是幂等的。
             // 304：取消后不能立刻返回 —— 读文件线程（FileRead）和发块线程可能还在用
             // 这条连接共享的 native 缓冲区池。等它们退完，会话线程才会进重建；
             // 否则"取消完立刻再传"时两批线程抢同一个 ByteBuffer，实测下一次传输
             // 直接 IllegalArgumentException: newPosition > limit（缓冲区被二次回收/复用）。
+            shutdownTransferChannels("sendFiles: cancelled before join");
             awaitTransferThreads(readThread, readFileTask, transferTasks, 5000);
             callback.onIncomplete();
             return false;
@@ -1204,8 +1280,10 @@ public abstract class HFXService {
             // 这次传输就地作废：置取消标志（界面显示"已取消传输"），并且等它重建通道。
             if (opcode == ControllerIdentifiers.CANCEL) {
                 top.weixiansen574.hybridfilexfer.core.HFXLog.d("readResultFrame: peer CANCEL");
-                transferCancelled = true;
-                needsRebuild = true;
+                // 3.0.0：除了置标志，还要**立刻关掉传输通道 + 放开暂停闸门** ——
+                // 发块线程正阻塞在 write 里（电脑端不读了），只置标志它停不下来，
+                // 用户看到的就是"电脑端已经取消了、手机还在继续发"。
+                cancelByPeer("readResultFrame: peer CANCEL");
                 return PeerResult.cancelled();
             }
             // 304：电脑已经开始重建了（理论上 CANCEL 在它前面，这里只是兜底）
@@ -1213,7 +1291,7 @@ public abstract class HFXService {
                 String name = ctChannel.readUTF();
                 top.weixiansen574.hybridfilexfer.core.HFXLog.d("readResultFrame: REBUILD_REQ " + name);
                 stashRebuildName(name);
-                needsRebuild = true;
+                cancelByPeer("readResultFrame: REBUILD_REQ");
                 return PeerResult.cancelled();
             }
             if (opcode == ControllerIdentifiers.RESULT) {
@@ -1276,14 +1354,12 @@ public abstract class HFXService {
                 synchronized (controlLock) {
                     switch (opcode) {
                         case ControllerIdentifiers.CANCEL:
-                            transferCancelled = true;
-                            needsRebuild = true;
+                            cancelByPeer("probePeerCancel: CANCEL");
                             return true;
                         case ControllerIdentifiers.REBUILD_REQ:
                             // 电脑已经开始重建传输通道：这次传输同样作废
                             stashRebuildName(channel.readUTF());
-                            transferCancelled = true;
-                            needsRebuild = true;
+                            cancelByPeer("probePeerCancel: REBUILD_REQ");
                             return true;
                         case ControllerIdentifiers.PAUSE_REPLY:
                             applyPcPause(channel.readBoolean());

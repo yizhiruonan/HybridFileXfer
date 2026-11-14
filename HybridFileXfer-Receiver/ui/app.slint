@@ -141,6 +141,10 @@ export component AppWindow inherits Window {
     in-out property <bool> recv-active: false;
     // 取消接收的确认框：保留进度 / 不保留（删掉未完成文件）/ 继续接收
     in-out property <bool> cancel-ask: false;
+    // 这次接收的「取消」已经受理过（收尾 / 重建还在进行）：把按钮收起来，
+    // 同一轮接收只允许取消一次 —— 第二次点击如果照样往控制通道插帧，
+    // 会和手机端正在做的重建握手抢帧序（手机端报 unexpected control frame）。
+    in-out property <bool> recv-cancelling: false;
     in-out property <bool> send-paused: false;
     in-out property <string> file-name: "";
     in-out property <float> file-progress: 0.0;
@@ -175,8 +179,9 @@ export component AppWindow inherits Window {
     callback device-chosen(int);
     callback toggle-pause-send();
     callback cancel-send();
-    // 接收方向的取消：点「取消」先暂停并弹确认框，再按用户的选择收尾
-    callback cancel-recv();
+    // 接收方向的取消：点「取消」先暂停并弹确认框，再按用户的选择收尾。
+    // 返回 false = 这次点击被忽略（没有在接收 / 已经在取消中），别弹确认框。
+    callback cancel-recv() -> bool;
     callback cancel-keep();
     callback cancel-discard();
     callback cancel-dismiss();
@@ -453,9 +458,16 @@ export component AppWindow inherits Window {
                     // 接收方向原来只有「暂停 / 继续」，用户没法真的取消这次传输。
                     // 点「取消」先暂停（手机端跟着停发），再问一句已收到的部分怎么处理，
                     // 语义和手机端的取消确认框一致（保留进度 / 不保留）。
-                    if root.recv-active : SecondaryButton {
+                    // 已经在取消中（收尾 / 重建）就把按钮收起来：取消是幂等的，
+                    // 第二轮点击既没有意义，又可能和重建握手抢帧序。
+                    if root.recv-active && !root.recv-cancelling : SecondaryButton {
                         label: "取消";
-                        clicked => { root.cancel-ask = true; root.cancel-recv(); }
+                        // cancel-recv 返回 false（被忽略）时不要弹确认框
+                        clicked => {
+                            if (root.cancel-recv()) {
+                                root.cancel-ask = true;
+                            }
+                        }
                     }
                 }
             }

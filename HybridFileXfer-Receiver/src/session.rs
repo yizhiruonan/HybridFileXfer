@@ -423,11 +423,23 @@ impl Session {
             "开始重建传输通道（已通知手机端取消）",
             "rebuilding the transfer channels",
         ));
-        let _ = proto::write_i16(&mut self.writer, controller::CANCEL);
-        let _ = self.writer.flush();
-        // 叫醒还卡在读写里的传输线程（它们退出前不能被回收，下面的 join 已经做过了）
+        // 顺序：先关掉旧的传输通道，再告诉手机"这是取消"。
+        //
+        // 手机端是发送方，它在写满缓冲时会阻塞在 write 里、看不到控制通道；
+        // 关通道（shutdown 会回 RST）是让它立刻停下的唯一手段。先关再发帧，
+        // 手机端就不用「先读到 CANCEL 还得等写失败」。
+        // （read_transfer_channel / handle_receive 的等待循环里已经关过一遍，
+        //   这里再关一次是幂等的，覆盖"线程已经正常 EOF 退出"的情形。）
         for (_, stream) in self.transfers.iter() {
             let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+        // 整个取消过程只写**一帧** CANCEL：它是「重建握手」的开场白，不是可重复的
+        // 指令。第二次点「取消 → 保留」会被 control::cancel_receive 的幂等闸门挡掉；
+        // 等待循环里通常已经抢先把这一帧写出去了（claim_cancel_frame），这里只是兜底
+        // （比如线程已经全部正常退出、等待循环没机会发现取消）。
+        if crate::control::claim_cancel_frame() {
+            let _ = proto::write_i16(&mut self.writer, controller::CANCEL);
+            let _ = self.writer.flush();
         }
         let names: Vec<String> = self.transfers.iter().map(|(name, _)| name.clone()).collect();
         if names.is_empty() {
@@ -1343,6 +1355,8 @@ impl Session {
         let channel_count = handles.len();
         let mut finished = vec![false; handles.len()];
         let mut remaining = handles.len();
+        // 取消时"关掉所有传输通道"只做一次（关 socket 是幂等的，但没必要每 10ms 打一遍）
+        let mut abort_shutdown = false;
         while remaining > 0 {
             if let Err(e) = self.poll_control_during_transfer() {
                 log::warn(&format!(
@@ -1353,6 +1367,32 @@ impl Session {
                 // 对端没打招呼就走了：别让传输线程干等 120s 超时
                 self.shutdown_transfers();
                 break;
+            }
+            // 3.0.0：本地点了「取消」（control::cancel_receive）就立刻把传输通道全关掉。
+            // 手机端是发送方，它写满缓冲就阻塞在 write 里，看不到控制通道；
+            // 把 socket 关掉它的写才会失败、才会自己停下。放在这里而不是只放在
+            // rebuild_transfers：那一步要等所有线程 join + finish_with 写完续传日志，
+            // 中间那几百毫秒到几秒手机一直在发（用户报的"取消后手机还在继续发"）。
+            if !abort_shutdown && crate::control::cancelled() {
+                abort_shutdown = true;
+                log::warn(crate::i18n::tr(
+                    "取消接收：先关传输通道，再通知手机端（它才能立刻停下）",
+                    "cancel: closing the transfer channels first, then telling the phone",
+                ));
+                // 顺序很重要：先关通道，手机端那次阻塞的 write 才会立刻失败；
+                // 它这一下自己就会停，不用等我们后面那帧 CANCEL 走到重建阶段。
+                self.shutdown_transfers();
+                // 立刻把 CANCEL 写出去（别等 join + finish_with + rebuild_transfers）。
+                // 手机端的控制读取线程和发块线程是两个线程，它随时能读到这一帧。
+                // claim_cancel_frame() 保证重建阶段不会再写第二帧。
+                if crate::control::claim_cancel_frame() {
+                    let _ = proto::write_i16(&mut self.writer, controller::CANCEL);
+                    let _ = self.writer.flush();
+                    log::warn(crate::i18n::tr(
+                        "已通知手机端取消（CANCEL 帧已发出）",
+                        "the phone has been told about the cancel (CANCEL sent)",
+                    ));
+                }
             }
             for (i, (_, handle)) in handles.iter().enumerate() {
                 if !finished[i] && handle.is_finished() {
@@ -1778,6 +1818,15 @@ fn read_transfer_channel(
         }
         let _ = stream.set_read_timeout(Some(Duration::from_secs(120)));
         if crate::control::cancelled() {
+            // 3.0.0：取消的时候**必须**先把这条通道关掉，别只是自己退出。
+            //
+            // 取消的是「手机 → 电脑」这个方向，手机那边正一门心思往这条通道里写；
+            // 写满 TCP 缓冲之后它就阻塞在 write 里，自己不会回头去看控制通道，
+            // 也就看不到我们随后写的 CANCEL 帧。只有让它的 write 立刻失败
+            // （shutdown 之后对端的写会拿到 RST / EPIPE），它才会走取消分支。
+            // 以前这里只置了个本地标志就返回：要等 join、等 finish_with 写完续传日志、
+            // 等 rebuild_transfers 里才 shutdown —— 实测那几秒手机还在继续发数据。
+            let _ = stream.shutdown(std::net::Shutdown::Both);
             return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled by user"));
         }
         let header = match proto::read_i16(&mut stream) {

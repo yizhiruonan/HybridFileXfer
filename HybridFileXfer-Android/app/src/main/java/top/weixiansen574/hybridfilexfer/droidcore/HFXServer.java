@@ -682,7 +682,12 @@ public class HFXServer extends HFXService {
                     continue;
                 }
                 count++;
-                if (connection.channel != null && connection.channel.isOpen()) {
+                // 只留下"确实还能用"的通道：电脑端取消时我们会在 cancelByPeer 里把
+                // 通道 markCancelled + close，这里必须把它们摘掉 —— 以前电脑端取消
+                // 没人关通道，重建后这批旧 socket 也留在表里，6 条变 12 条，
+                // 下一次发送一半线程一上来就写失败（用户报的"再取消一次手机端报错"）。
+                if (connection.channel != null && connection.channel.isOpen()
+                        && !connection.isCancelled()) {
                     live.add(connection);
                 }
             }
@@ -1092,15 +1097,17 @@ public class HFXServer extends HFXService {
             case ControllerIdentifiers.CANCEL:
                 // 电脑端点的是「中断发送」：这次传输作废，等它重建通道
                 top.weixiansen574.hybridfilexfer.core.HFXLog.d("exchangePause: peer CANCEL");
-                transferCancelled = true;
-                needsRebuild = true;
+                // 3.0.0：和 readResultFrameOrNull 一样，除了置标志还要关传输通道
+                // （关 socket 才能让阻塞在 write 里的发块线程立刻退出）。
+                // controlLock 在这条路径上是**已经持有**的，cancelByPeer 不碰它。
+                cancelByPeer("exchangePause: peer CANCEL");
                 return true;
             case ControllerIdentifiers.REBUILD_REQ: {
                 // 电脑已经开始重建了：通道名先收好，交给 rebuildTransfers 用
                 String name = ctChannel.readUTF();
                 top.weixiansen574.hybridfilexfer.core.HFXLog.d("exchangePause: REBUILD_REQ " + name);
                 stashRebuildName(name);
-                needsRebuild = true;
+                cancelByPeer("exchangePause: REBUILD_REQ");
                 return true;
             }
             default:

@@ -17,8 +17,22 @@
     <style name="Theme.HybridFileXfer2" parent="Base.Theme.HybridFileXfer2" />
 
     <!-- 分享"发送到电脑"时使用的小窗口主题 -->
+    <!--
+        3.0.0：**必须同时写两个 windowNoTitle**。
+        - android:windowNoTitle 是 framework 的：它只让 PhoneWindow 不画 DecorView 标题；
+        - windowNoTitle（不带 android: 前缀）是 AppCompat 自己的 attr。
+        AppCompatActivity 的 SubDecor 是 AppCompat 在 setContentView 时安装的，它读的是
+        **后者**。只写 android: 那个的话，AppCompat 认为"有标题"，而 Dialog 系主题的
+        windowIsFloating=true，于是它把 abc_dialog_title_material 里那颗 TextView
+        （id/title，内容 = activity 的 android:label）插到卡片上面 —— 就是用户看到的
+        那条孤立「发送到电脑」文字（多任务重构换了 launchMode 之后暴露出来的）。
+        windowActionBar=false 同理：Dialog 主题的祖先里 windowActionBar 是 true，
+        AppCompat 会照着建一个只有标题的 ActionBar。
+    -->
     <style name="Theme.HybridFileXfer2.Dialog" parent="Theme.MaterialComponents.DayNight.Dialog">
         <item name="android:windowNoTitle">true</item>
+        <item name="windowNoTitle">true</item>
+        <item name="windowActionBar">false</item>
         <item name="android:windowCloseOnTouchOutside">false</item>
         <item name="colorControlActivated">@color/accent</item>
         <item name="android:windowBackground">@drawable/bg_rounded_dialog</item>

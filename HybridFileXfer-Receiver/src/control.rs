@@ -23,6 +23,25 @@ pub static PHONE_PAUSED: AtomicBool = AtomicBool::new(false);
 /// 由收尾的 finish_with 一次性消费。每次接收开始（ReceivingGuard::begin）都会清掉，
 /// 不会把上一次的选择带到下一次。
 pub static DISCARD_PARTIAL: AtomicBool = AtomicBool::new(false);
+/// 「取消接收」这次请求是否**已经受理过**（幂等闸门）。
+///
+/// 用户可能连点两下「取消 → 保留」：第一下置好取消标志后，接收线程还要退出、
+/// 收尾写日志、重建传输通道，这中间 RECEIVING 仍然是 true，界面上那颗「取消」
+/// 还看得见。第二下如果照旧置位，就会在「已取消、控制通道正在重建」的状态下
+/// 再插一次选择，和手机端正在做的重建握手抢帧序 —— 手机端报
+/// `unexpected control frame while waiting for RESULT`，电脑端这边却显示"可续传"。
+///
+/// 所以第二次点击一律忽略：状态机是 Idle → Requested（一次性），
+/// 由 ReceivingGuard（每次接收开始）和 reset() 复位。
+static CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// 这一轮取消的 {@code CANCEL} 帧是否已经写进控制通道（保证只写一帧）。
+///
+/// 取消要通知手机端，而通知的时机有两处：等待循环里一发现取消（越早越好）、
+/// 以及收尾后的 {@code rebuild_transfers}（兜底）。两处都写就成了两帧 CANCEL，
+/// 而手机端此时正在做重建握手 —— 多出来的一帧会被它当成"未知指令"或者被
+/// 下一个读循环吃走，帧序一乱整条会话就废。用 swap 抢一个名额：谁先谁写。
+static CANCEL_FRAME_SENT: AtomicBool = AtomicBool::new(false);
 
 pub fn pause(on: bool) {
     PAUSE_SEND.store(on, Ordering::Relaxed);
@@ -61,9 +80,34 @@ impl CancelChoice {
 /// 顺序不能反：选择是收尾（handle_receive 里的 finish_with）才读的，
 /// 先写选择再置取消，收尾时一定读得到；反过来会有一瞬间「已经是取消了、
 /// 选择还是上一轮的」。
-pub fn cancel_receive(choice: CancelChoice) {
+///
+/// **幂等**：没有正在进行的接收、或者这次取消已经受理过（收尾 / 重建还没做完
+/// 时用户又点了一下），直接返回 false —— 不置任何标志、不写任何帧。
+/// 调用方（GUI）据此复用上一次的结果，而不是当成一次新的取消。
+pub fn cancel_receive(choice: CancelChoice) -> bool {
+    if !receiving() {
+        return false;
+    }
+    if CANCEL_REQUESTED.swap(true, Ordering::Relaxed) {
+        return false;
+    }
     set_discard_partial(!choice.keep_incomplete());
     cancel();
+    true
+}
+
+/// 这次「取消接收」是否已经受理过（正在收尾 / 重建中）。
+///
+/// 界面用它把「取消」按钮灰掉 / 收起确认框：同一轮接收只允许一次取消。
+pub fn cancel_requested() -> bool {
+    CANCEL_REQUESTED.load(Ordering::Relaxed)
+}
+
+/// 抢"写 CANCEL 帧"的名额：返回 true 表示由调用方写，false 表示这一轮已经写过了。
+///
+/// 用它保证一轮取消在控制通道上**只有一帧** CANCEL（见 {@link CANCEL_FRAME_SENT}）。
+pub fn claim_cancel_frame() -> bool {
+    !CANCEL_FRAME_SENT.swap(true, Ordering::SeqCst)
 }
 
 pub fn cancelled() -> bool {
@@ -75,6 +119,9 @@ pub fn reset() {
     CANCEL_SEND.store(false, Ordering::Relaxed);
     PHONE_PAUSED.store(false, Ordering::Relaxed);
     DISCARD_PARTIAL.store(false, Ordering::Relaxed);
+    // 下一轮接收可以再取消一次（幂等闸门复位），并且可以再写一帧 CANCEL
+    CANCEL_REQUESTED.store(false, Ordering::Relaxed);
+    CANCEL_FRAME_SENT.store(false, Ordering::Relaxed);
 }
 
 /// 手机端要求「不保留进度」（收尾时删掉半截文件和续传日志）

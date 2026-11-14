@@ -347,21 +347,47 @@ fn main() -> Result<(), slint::PlatformError> {
     // ---- 接收方向的「取消」（不只是暂停 / 继续）----
     // 点「取消」先暂停：手机端在暂停同步里看到电脑暂停就会停发，
     // 别让它在用户看确认框的这几秒里继续往盘里灌数据。
-    ui.on_cancel_recv(move || {
+    // 返回 bool：false = 这次点击被忽略（没在接收 / 已经在取消中），
+    // Slint 那边据此不弹确认框 —— 同一轮接收只允许取消一次。
+    ui.on_cancel_recv(move || -> bool {
         if !hfx_receiver::control::receiving() {
-            return;
+            log::warn(i18n::tr(
+                "按钮：取消接收被忽略（当前没有接收在进行）",
+                "cancel receiving ignored: nothing is being received",
+            ));
+            return false;
+        }
+        if hfx_receiver::control::cancel_requested() {
+            // 第一次取消已经在收尾 / 重建里了：这次点击直接复用上一次的结果，
+            // 绝不再往控制通道插第二帧（那会和手机端的重建握手抢帧序）。
+            log::warn(i18n::tr(
+                "按钮：取消接收被忽略（这次取消已经受理过）",
+                "cancel receiving ignored: this cancel was already accepted",
+            ));
+            return false;
         }
         hfx_receiver::control::pause(true);
         log::warn(i18n::tr(
             "按钮：取消接收（已暂停，等用户选择是否保留进度）",
             "button: cancel receiving (paused, waiting for the user's choice)",
         ));
+        true
     });
     {
         let st = Arc::clone(&state);
         ui.on_cancel_keep(move || {
             // 保留：和手机端「保留进度」同一个语义 —— 收尾时留着半截文件和 .hfxpart
-            hfx_receiver::control::cancel_receive(hfx_receiver::control::CancelChoice::Keep);
+            if !hfx_receiver::control::cancel_receive(
+                hfx_receiver::control::CancelChoice::Keep,
+            ) {
+                // 幂等：这次取消已经受理过（收尾 / 重建还没做完）时不再做任何事，
+                // 上一次的结果原样复用，界面不重复提示、控制通道不插第二帧。
+                log::warn(i18n::tr(
+                    "按钮：取消接收 · 保留进度被忽略（这次取消已经受理过）",
+                    "cancel · keep ignored: this cancel was already accepted",
+                ));
+                return;
+            }
             log::warn(i18n::tr(
                 "按钮：取消接收 · 保留进度（半截文件和 .hfxpart 留着，可续传）",
                 "button: cancel receiving · keep the partial file (resumable)",
@@ -381,7 +407,15 @@ fn main() -> Result<(), slint::PlatformError> {
         let st = Arc::clone(&state);
         ui.on_cancel_discard(move || {
             // 不保留：收尾（Receiver::finish_with(false)）会把没传完的文件和续传记录删掉
-            hfx_receiver::control::cancel_receive(hfx_receiver::control::CancelChoice::Discard);
+            if !hfx_receiver::control::cancel_receive(
+                hfx_receiver::control::CancelChoice::Discard,
+            ) {
+                log::warn(i18n::tr(
+                    "按钮：取消接收 · 不保留被忽略（这次取消已经受理过）",
+                    "cancel · discard ignored: this cancel was already accepted",
+                ));
+                return;
+            }
             log::warn(i18n::tr(
                 "按钮：取消接收 · 不保留（收尾删掉没传完的文件和续传记录）",
                 "button: cancel receiving · discard the incomplete files",
@@ -664,6 +698,11 @@ fn main() -> Result<(), slint::PlatformError> {
             // 发送中 / 接收中都显示「暂停 / 继续」，发送时额外给「中断发送」
             ui.set_send_active(hfx_receiver::control::sending());
             ui.set_recv_active(hfx_receiver::control::receiving());
+            // 这一轮接收的「取消」是否已经受理（收尾 / 重建中）：是就把取消按钮收起来，
+            // 取消是幂等的 —— 同一轮接收只允许取消一次。
+            ui.set_recv_cancelling(
+                hfx_receiver::control::receiving() && hfx_receiver::control::cancel_requested(),
+            );
             ui.set_send_paused(hfx_receiver::control::paused());
 
             // ---- 取消接收：确认框与结果提示 ----
@@ -680,9 +719,15 @@ fn main() -> Result<(), slint::PlatformError> {
             }
             // 传输自己结束了 / 引擎被停了：确认框没意义了，顺手把「为了弹框」加的暂停放掉，
             // 否则下一次接收会从「已暂停」开始
-            if ui.get_cancel_ask() && !receiving_now {
+            // 已经在取消中（或者接收已经结束）就把确认框收掉：用户第二次点「取消」
+            // 时不该再看到它，更不该让那里再选一次「保留 / 不保留」。
+            if ui.get_cancel_ask()
+                && (!receiving_now || hfx_receiver::control::cancel_requested())
+            {
                 ui.set_cancel_ask(false);
-                hfx_receiver::control::pause(false);
+                if !hfx_receiver::control::cancel_requested() {
+                    hfx_receiver::control::pause(false);
+                }
             }
             // 新的一次传输开始了：上一次的取消提示让位（进度卡回来了，提示就不该再挂着）
             if !ui.get_notice_text().is_empty() && active {
