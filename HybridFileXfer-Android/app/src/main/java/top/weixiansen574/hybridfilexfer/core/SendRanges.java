@@ -37,8 +37,10 @@ public final class SendRanges {
     private final String[] names;
     private final long[] starts;
     private final long[] ends;
-    /** 已经投递出去的块数（小于它的块不会再改归属） */
-    private long frontier;
+    /** 已经投递进某条通道队列的块：抢段是随时发生的，投递顺序不再是一个前缀，所以按块记 */
+    private final java.util.BitSet produced = new java.util.BitSet();
+    /** 已投递块数（allProduced 要用 O(1) 判断，别每次扫位图） */
+    private long producedCount;
     private boolean finished;
 
     public SendRanges(int channels, long totalBlocks, String[] names) {
@@ -59,24 +61,39 @@ public final class SendRanges {
             ends[i] = at + len;
             at += len;
         }
-        this.frontier = 0;
     }
 
-    /** 第 block 块该由哪条通道发 */
-    public synchronized int ownerOf(long block) {
-        for (int i = 0; i < channels; i++) {
-            if (block >= starts[i] && block < ends[i]) {
-                return i;
-            }
+    /**
+     * 按需生产：取走这条通道当前段里最小的**还没投递**的块号，并标记为已投递。
+     * 读取线程用它决定下一块该读哪——谁缺谁拿，抢到新段的通道立刻能拿到那块。
+     *
+     * @return 块号（在本次传输的 missing 空间里），本段已经产完则返回 -1
+     */
+    public synchronized long takeNext(int channel) {
+        if (channel < 0 || channel >= channels) {
+            return -1;
         }
-        return (int) (block % channels);
+        int at = produced.nextClearBit((int) Math.max(0, starts[channel]));
+        if (at < 0 || at >= ends[channel] || at >= totalBlocks) {
+            return -1;
+        }
+        produced.set(at);
+        producedCount++;
+        return at;
     }
 
-    /** 第 block 块已经投递出去了（之后不会再改归属） */
-    public synchronized void markProduced(long block) {
-        if (block + 1 > frontier) {
-            frontier = block + 1;
+    /** 整份文件都投递出去了吗 */
+    public synchronized boolean allProduced() {
+        return producedCount >= totalBlocks;
+    }
+
+    /** [from, to) 里还有没投递出去的块吗（给「自己这段还没产完」判断用） */
+    private boolean hasUnproduced(long from, long to) {
+        if (to <= from) {
+            return false;
         }
+        int at = produced.nextClearBit((int) Math.max(0, from));
+        return at >= 0 && at < to;
     }
 
     /**
@@ -88,8 +105,7 @@ public final class SendRanges {
         if (channel < 0 || channel >= channels) {
             return false;
         }
-        long from = Math.max(starts[channel], frontier);
-        if (ends[channel] > from) {
+        if (hasUnproduced(starts[channel], ends[channel])) {
             // 自己那段还有块没产出来，等它
             return true;
         }
@@ -97,28 +113,40 @@ public final class SendRanges {
             return false;
         }
         int best = -1;
+        long bestFrom = 0;
         long bestLen = 1;
         for (int i = 0; i < channels; i++) {
             if (i == channel) {
                 continue;
             }
-            long donorFrom = Math.max(starts[i], frontier);
-            long len = ends[i] - donorFrom;
+            // 只抢别人「还没投递出去」的那条尾巴。已投递的块在每段里是一段前缀，
+            // 所以尾巴从「第一个没投递的块」一直到最后：nextClearBit(starts[i])。
+            // 注意别从 ends 往回走 —— 每段最后一个块本来就还没投递，那样走一位就停了，
+            // 算出来的长度恒为 0，抢段就永远不生效（之前那个 bug 就是这么来的）。
+            if (ends[i] <= starts[i]) {
+                continue;
+            }
+            int firstClear = produced.nextClearBit((int) starts[i]);
+            long from = firstClear < 0 ? ends[i] : Math.max(starts[i], firstClear);
+            if (from >= ends[i]) {
+                continue;
+            }
+            long len = ends[i] - from;
             if (len > bestLen) {
                 best = i;
+                bestFrom = from;
                 bestLen = len;
             }
         }
         if (best < 0) {
             return false;
         }
-        long donorFrom = Math.max(starts[best], frontier);
-        long donorEnd = ends[best];
-        long mid = donorFrom + (donorEnd - donorFrom) / 2;
-        if (mid <= donorFrom) {
+        long mid = bestFrom + bestLen / 2;
+        if (mid <= bestFrom) {
             return false;
         }
         // 把捐献者剩下的后半段 [mid, donorEnd) 划给申请者
+        long donorEnd = ends[best];
         ends[best] = mid;
         starts[channel] = mid;
         ends[channel] = donorEnd;

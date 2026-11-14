@@ -190,15 +190,23 @@ public abstract class ReadFileCall implements Callable<Void> {
         }
         java.util.BitSet have = resumeBits == null ? null : resumeBits.get(transferPath);
         int blockCount = (int) ((length + FileBlock.BLOCK_SIZE - 1) / FileBlock.BLOCK_SIZE);
-        // 305：把"要跳过的块"摘掉，剩下的块才参与分段计划
+        // 305：接收端已经有了的块先在进度上记完成，剩下的块做成 ordinal -> 文件内块序号 的映射
+        // （原来是在顺序读的循环里边读边跳过，现在生产顺序是 wave，所以先一次性标好）
+        int[] blockOf = (have == null || have.isEmpty()) ? null : new int[blockCount];
         int missing = 0;
-        if (have == null || have.isEmpty()) {
-            missing = blockCount;
-        } else {
-            for (int b = 0; b < blockCount; b++) {
-                if (!have.get(b)) {
-                    missing++;
+        BlockProgress skipTracker = progress;
+        for (int b = 0; b < blockCount; b++) {
+            if (have != null && have.get(b)) {
+                if (skipTracker != null) {
+                    // 305：续传跳过的块在进度条上直接算完成（owner 用空串 = 早就传输过了），
+                    // 否则续传时进度条永远到不了 100%（跳过的那几百 MB 不会再出现在进度里）
+                    skipTracker.onBlock("", transferPath, b, length);
                 }
+            } else {
+                if (blockOf != null) {
+                    blockOf[missing] = b;
+                }
+                missing++;
             }
         }
         if (missing <= 0) {
@@ -209,52 +217,62 @@ public abstract class ReadFileCall implements Callable<Void> {
         }
         SendRanges plan = new SendRanges(operateThreadCount, missing, channelNames);
         ranges = plan;
-        long remaining = length;
-        int i = 0;
-        int ordinal = 0;
-        while (remaining > 0) {
+        // 按需生产：哪条通道手上的块少于 prefetch 块，就把**它当前那一段**里的下一块读出来给它。
+        //
+        // 历史教训，两条路都走错过：
+        // 1) 按通道从头到尾顺序读（块 0..n/6 全给通道 0，再给通道 1 …）：第 6 条通道要等读到
+        //    文件的 5/6 处才拿到第一块 —— 实测发送时 adb 那两条立刻跑满，4 条 wlan 干等十几秒。
+        // 2) 改成按轮次（wave）各产一块：起跑是一起了，但**抢段失效** —— 谁先干完自己那一段都
+        //    没意义，因为剩下的块按固定轮次在产，抢到手也得等读取线程轮到。
+        // 现在按通道按需：谁缺谁拿。抢到新段的通道下一轮就能把它那段的块读出来，
+        // 于是"先干完的通道去切别人没传完的块"这个 IDM 行为才是真的生效。
+        final int prefetch = 8;
+        while (!plan.allProduced()) {
             if (shutdown) {
                 closeFile();
                 return;
             }
-            TransferPause gate = pause();
-            if (gate != null) {
-                gate.awaitResume();
-            }
-            int blkSize = (int) Math.min(remaining, FileBlock.BLOCK_SIZE);
-            if (have != null && have.get(i)) {
-                // 这块接收端已经有了：跳过读取和发送，但文件读位置要往后挪
-                BlockProgress tracker = progress;
-                if (tracker != null) {
-                    // 305：续传跳过的块在进度条上直接算完成（owner 用空串 = "早就传输过了"），
-                    // 否则续传时进度条永远到不了 100%（跳过的那几百 MB 不会再出现在进度里）
-                    tracker.onBlock("", transferPath, i, length);
+            boolean produced = false;
+            for (int ch = 0; ch < operateThreadCount; ch++) {
+                // 一次把这条通道补到 prefetch 块：刚抢到新段的通道下一轮就能连读几块，
+                // 不会一块一块地跟别人排轮次（否则抢段等于没用）
+                while (queues[ch].size() < prefetch) {
+                    long ordinal = plan.takeNext(ch);
+                    if (ordinal < 0) {
+                        break;
+                    }
+                    TransferPause gate = pause();
+                    if (gate != null) {
+                        gate.awaitResume();
+                    }
+                    int blockIndex = blockOf == null ? (int) ordinal : blockOf[(int) ordinal];
+                    long pos = (long) blockIndex * FileBlock.BLOCK_SIZE;
+                    int blkSize = (int) Math.min(length - pos, FileBlock.BLOCK_SIZE);
+                    ByteBuffer buffer = buffers.take();
+                    if (shutdown) {
+                        // 等到缓冲区的这一瞬间整个传输已经取消了：立刻还回去，别再往里读
+                        buffers.add(buffer);
+                        closeFile();
+                        return;
+                    }
+                    buffer.clear();
+                    buffer.limit(blkSize);
+                    while (buffer.hasRemaining()) {
+                        // 定位读：各通道的读位置互相独立，按需生产才不会互相干扰
+                        int read = channel.read(buffer, pos + buffer.position());
+                        if (read < 0) {
+                            throw new java.io.EOFException("读文件提前结束：" + file.getPath());
+                        }
+                    }
+                    queues[ch].add(new FileBlock(true, fileIndex, transferPath,
+                            lastModified, length, blockIndex, buffer));
+                    produced = true;
                 }
-                channel.position(channel.position() + blkSize);
-                remaining -= blkSize;
-                i++;
-                continue;
             }
-            ByteBuffer buffer = buffers.take();
-            if (shutdown) {
-                // 等到缓冲区的这一瞬间整个传输已经取消了：立刻还回去，别再往里读
-                buffers.add(buffer);
-                closeFile();
-                return;
+            if (!produced) {
+                // 每条通道都有块在手（或者都在等抢段），别空转烧 CPU
+                Thread.sleep(1);
             }
-            buffer.clear();
-            buffer.limit(blkSize);
-            while (buffer.hasRemaining()) {
-                channel.read(buffer);
-            }
-            FileBlock block = new FileBlock(true, fileIndex, transferPath,
-                    lastModified, length, i, buffer);
-            int owner = plan.ownerOf(ordinal);
-            plan.markProduced(ordinal);
-            queues[owner].add(block);
-            remaining -= blkSize;
-            i++;
-            ordinal++;
         }
         plan.finish();
         closeFile();
