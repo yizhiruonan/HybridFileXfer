@@ -24,8 +24,11 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.PhonelinkRing
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -107,6 +110,15 @@ internal fun SurfaceCard(
 internal fun StatusCard(state: UiState, plannedChannels: Int, onClick: () -> Unit) {
     val colorScheme = MiuixTheme.colorScheme
     val connected = state.connected
+    // 手机上有些网卡电脑根本连不到（Wi-Fi Direct 的 wlan2、热点网段、蓝牙共享网络），
+    // 通道数会永远停在 8/14 让人以为卡住了。连接建立 15 秒还没补齐，就当剩下的不通。
+    var settled by remember(connected) { mutableStateOf(false) }
+    if (connected) {
+        LaunchedEffect(connected) {
+            kotlinx.coroutines.delay(15_000)
+            settled = true
+        }
+    }
     val computers = state.connections.size
     val background = if (connected) colorScheme.primary.copy(alpha = 0.12f) else colorScheme.surfaceContainer
     val iconColor = if (connected) colorScheme.primary else colorScheme.onSurfaceVariantSummary
@@ -118,8 +130,11 @@ internal fun StatusCard(state: UiState, plannedChannels: Int, onClick: () -> Uni
     }
     val subtitle = when {
         // 握手过程中通道是一条条接入的，主页也实时显示进度
-        connected && plannedChannels > 0 && state.channelCount < plannedChannels ->
+        connected && plannedChannels > 0 && state.channelCount < plannedChannels && !settled ->
             "正在接入通道 " + state.channelCount + "/" + plannedChannels + " · 点此查看连接"
+        // 15 秒还补不齐：剩下的确实不通，把实际条数和不通条数摆出来
+        connected && plannedChannels > state.channelCount ->
+            state.channelCount.toString() + " 条通道（" + (plannedChannels - state.channelCount) + " 条不通）· 点此查看连接"
         connected -> state.channelCount.toString() + " 条通道 · 点此查看连接"
         state.state == ServerService.STATE_WAITING -> "插上数据线，或在电脑上运行接收器"
         state.state == ServerService.STATE_STARTING -> "正在启动 IO 服务"

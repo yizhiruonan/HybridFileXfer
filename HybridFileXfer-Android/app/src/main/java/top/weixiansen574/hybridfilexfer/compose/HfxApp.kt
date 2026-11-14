@@ -49,6 +49,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.font.FontWeight
@@ -841,6 +842,25 @@ private fun HomePage(
             }
         }
     }
+    // 「把通道开满」引导：进主页 1.2 秒后弹一次，点过「不再提示」或链路都开好了就不弹。
+    // 延时是为了别和首帧的网卡枚举抢资源，也让用户先看到主页本身。
+    val ctx = LocalContext.current
+    var boostVisible by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) {
+        delay(1200)
+        val config = Config.getInstance(ctx)
+        if (!config.isBoostPromptDismissed() && boostHasRoom(ctx)) {
+            boostVisible = true
+        }
+    }
+    BoostDialog(
+        visible = boostVisible,
+        onDismiss = { boostVisible = false },
+        onDismissForever = {
+            Config.getInstance(ctx).setBoostPromptDismissed(true)
+            boostVisible = false
+        },
+    )
 }
 
 /**

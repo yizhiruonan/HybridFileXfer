@@ -224,4 +224,13 @@ public class Config {
     public void setInterfaceBindAddresses(String value) {
         preferences.edit().putString("interface_bind_addresses", value).apply();
     }
+
+    /** 「把通道开满」引导已经点过「不再提示」 */
+    public boolean isBoostPromptDismissed() {
+        return preferences.getBoolean("boost_prompt_dismissed", false);
+    }
+
+    public void setBoostPromptDismissed(boolean dismissed) {
+        preferences.edit().putBoolean("boost_prompt_dismissed", dismissed).apply();
+    }
 }
