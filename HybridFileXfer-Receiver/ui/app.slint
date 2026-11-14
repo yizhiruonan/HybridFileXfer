@@ -130,13 +130,17 @@ export component AppWindow inherits Window {
     // 右键「发送到」里显示「发送到手机」
     in-out property <bool> sendto: false;
     in-out property <string> message: "";
+    // 状态卡下面的一行结果提示（取消接收后那句「已保留进度」/「已删除未完成文件」）
+    in-out property <string> notice-text: "";
 
     // ---- 传输进度 ----
     in-out property <bool> xfer-visible: false;
     // 手机正在从电脑取文件（显示暂停/中断按钮）
     in-out property <bool> send-active: false;
-    // 正在接收手机推过来的文件（显示暂停按钮）
+    // 正在接收手机推过来的文件（显示暂停 / 取消按钮）
     in-out property <bool> recv-active: false;
+    // 取消接收的确认框：保留进度 / 不保留（删掉未完成文件）/ 继续接收
+    in-out property <bool> cancel-ask: false;
     in-out property <bool> send-paused: false;
     in-out property <string> file-name: "";
     in-out property <float> file-progress: 0.0;
@@ -171,6 +175,11 @@ export component AppWindow inherits Window {
     callback device-chosen(int);
     callback toggle-pause-send();
     callback cancel-send();
+    // 接收方向的取消：点「取消」先暂停并弹确认框，再按用户的选择收尾
+    callback cancel-recv();
+    callback cancel-keep();
+    callback cancel-discard();
+    callback cancel-dismiss();
     callback open-dir();
 
     private property <color> status-color: root.status-kind == 2 ? #0F7B0F : root.status-kind == 3 ? #9D5D00 : #8A8A8A;
@@ -248,6 +257,20 @@ export component AppWindow inherits Window {
                     font-size: 11px;
                     color: #8A8A8A;
                     vertical-alignment: center;
+                }
+            }
+
+            // 取消接收之后的一句结果提示（保留进度 / 已删除未完成文件），
+            // 下一次传输开始、或重新点「开始接收」时自动消失
+            if root.notice-text != "" : VerticalLayout {
+                padding-left: 14px;
+                padding-right: 14px;
+                padding-bottom: 10px;
+                Text {
+                    text: root.notice-text;
+                    font-size: 11.5px;
+                    color: #0F7B0F;
+                    wrap: word-wrap;
                 }
             }
 
@@ -427,6 +450,13 @@ export component AppWindow inherits Window {
                         label: "中断发送";
                         clicked => { root.cancel-send(); }
                     }
+                    // 接收方向原来只有「暂停 / 继续」，用户没法真的取消这次传输。
+                    // 点「取消」先暂停（手机端跟着停发），再问一句已收到的部分怎么处理，
+                    // 语义和手机端的取消确认框一致（保留进度 / 不保留）。
+                    if root.recv-active : SecondaryButton {
+                        label: "取消";
+                        clicked => { root.cancel-ask = true; root.cancel-recv(); }
+                    }
                 }
             }
         }
@@ -582,5 +612,77 @@ export component AppWindow inherits Window {
 
         Rectangle { vertical-stretch: 1; }
     }
+    }
+
+    // ---------------- 取消接收：确认框 ----------------
+    // 盖住整窗的半透明遮罩 + 居中的卡片。三个选择：
+    //   「继续接收」= 只是关掉这个框（顺手把"为了不白传"而加的暂停放掉）；
+    //   「不保留，删掉」= 删掉没传完的文件和 .hfxpart 续传记录，下次从头传；
+    //   「保留进度」= 留着半截文件和续传记录，下次同一个文件接着传。
+    if root.cancel-ask : Rectangle {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+        background: #00000059;
+
+        // 吃掉遮罩上的点击，别透到下面的按钮（免得误触「停止接收」）
+        TouchArea { }
+
+        VerticalLayout {
+            alignment: center;
+            HorizontalLayout {
+                alignment: center;
+                Card {
+                    width: 424px;
+                    height: 188px;
+
+                    VerticalLayout {
+                        padding: 16px;
+                        spacing: 8px;
+
+                        Text {
+                            text: "取消接收？";
+                            font-size: 15px;
+                            font-weight: 600;
+                            color: #1A1A1A;
+                        }
+                        Text {
+                            text: "已经收到的部分怎么处理？（手机端也会停止这次发送）";
+                            font-size: 11.5px;
+                            color: #616161;
+                            wrap: word-wrap;
+                        }
+                        Text {
+                            text: "保留进度：留半截文件和续传记录，下次接着传；不保留：删掉。";
+                            font-size: 11.5px;
+                            color: #8A8A8A;
+                            wrap: word-wrap;
+                        }
+                        Rectangle { vertical-stretch: 1; }
+                        HorizontalLayout {
+                            height: 32px;
+                            spacing: 8px;
+                            Rectangle { horizontal-stretch: 1; }
+                            SecondaryButton {
+                                width: 92px;
+                                label: "继续接收";
+                                clicked => { root.cancel-ask = false; root.cancel-dismiss(); }
+                            }
+                            SecondaryButton {
+                                width: 128px;
+                                label: "不保留，删掉";
+                                clicked => { root.cancel-ask = false; root.cancel-discard(); }
+                            }
+                            PrimaryButton {
+                                width: 104px;
+                                label: "保留进度";
+                                clicked => { root.cancel-ask = false; root.cancel-keep(); }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }

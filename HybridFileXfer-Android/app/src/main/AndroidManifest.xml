@@ -74,14 +74,28 @@
             android:exported="false"
             android:theme="@style/Theme.HybridFileXfer2.NoActionBar" />
 
-        <!-- 分享面板 / 打开方式里的"发送到电脑" -->
+        <!--
+            分享面板 / 打开方式里的"发送到电脑"。
+
+            launchMode 从 singleTop 改成 standard（= 可多实例）：一个发送任务一个面板实例。
+            以前是 singleTop 的单实例，第二次分享走 onNewIntent，会把上一轮取消掉重开 ——
+            「暂停任务1再发任务2」就等于任务1被顶掉，两个任务的面板状态互相覆盖，
+            屏幕上只剩一个空壳（用户报的那个幽灵弹窗）。现在：
+              · 每次分享 = 新建一个 SendTask + 新建一个面板实例，几个任务可以并存；
+              · 通知栏点回来时带 taskId 打开「对应那个任务」的面板，
+                面板已经被划掉了就重建一个实例绑到同一个 taskId（进度接着显示）。
+            没选 documentLaunchMode / FLAG_ACTIVITY_NEW_DOCUMENT：那会给每个任务建一条
+            独立的 Recents 记录，而通知栏点回来时无法再利用分享来源 App 那个任务栈，
+            面板会从「分享来源应用上面弹出来」变成「跳到本应用的一个新任务里」，观感变差；
+            standard 多实例 + 面板按 taskId 去重（同一任务只会有一个窗口）已经够用。
+        -->
         <activity
             android:name=".ShareActivity"
             android:excludeFromRecents="true"
             android:exported="true"
             android:icon="@drawable/logo"
             android:label="@string/send_to_computer"
-            android:launchMode="singleTop"
+            android:launchMode="standard"
             android:theme="@style/Theme.HybridFileXfer2.Dialog" >
             <intent-filter>
                 <action android:name="android.intent.action.SEND" />

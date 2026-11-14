@@ -522,8 +522,9 @@ fn run_session(session: &mut Session, options: &EngineOptions, stop: &Arc<Atomic
     // 界面进度也复位，否则卡片上会一直挂着一个停住不动的假进度。
     //
     // 这里要传 true（保留）：掉线/被杀不是用户主动取消，半截文件留着，
-    // 下次同一个文件还能续传。真正"删掉"只有一条路 —— 手机端取消时选了「不保留进度」
-    // （CANCEL_DISCARD），那个选择由 handle_receive 自己带着走。
+    // 下次同一个文件还能续传。真正"删掉"只有两条路，都走 handle_receive 里的
+    // finish_with(keep_incomplete = false)：手机端取消时选了「不保留进度」
+    // （CANCEL_DISCARD），或电脑端在「当前文件」卡片上点「取消」再选「不保留」。
     if let Ok((kept, _lost)) = receiver.finish_with(true) {
         if kept > 0 {
             log::warn(&format!(

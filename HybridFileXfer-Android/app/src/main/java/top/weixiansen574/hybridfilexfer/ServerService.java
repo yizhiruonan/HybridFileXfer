@@ -69,6 +69,13 @@ public class ServerService extends Service implements ServiceConnection {
     public static final int STATE_CONNECTED = 3;
 
     private static final int NOTIFICATION_ID = 5740;
+    /**
+     * 通知 contentIntent 的 requestCode 起点（+ taskId）。
+     *
+     * <p>每个发送任务一条自己的点击目标：几个任务的 PendingIntent 不能共用 requestCode，
+     * 否则「点任务2的通知」会被 FLAG_UPDATE_CURRENT 换成任务1的面板。
+     */
+    private static final int NOTIFICATION_TASK_REQUEST_BASE = 6400;
     private static final String CHANNEL_ID = "server";
     private static final long PING_INTERVAL_MS = 3000;
     /** 「进度帧」的最小间隔：前台服务通知是同一个 id 反复 notify，20Hz 地刷会掉帧、发烫，500ms 一帧够了 */
@@ -265,6 +272,32 @@ public class ServerService extends Service implements ServiceConnection {
 
     public static List<String> getInterfaceNames() {
         return interfaceNames;
+    }
+
+    // ------------------------------------------------------------------
+    // 分享发送任务（SendTasks）：暂停 / 继续 / 取消一律按 taskId 作用
+    // ------------------------------------------------------------------
+
+    public static void pauseTask(int taskId) {
+        SendTasks.pauseTask(taskId);
+    }
+
+    public static void resumeTask(int taskId) {
+        SendTasks.resumeTask(taskId);
+    }
+
+    /**
+     * 取消一个分享发送任务。
+     *
+     * @param discardPartial true = 连电脑上那份不完整文件一起删掉（下次从头传）；
+     *                       false = 保留，下次同一个文件断点续传
+     */
+    public static void cancelTask(int taskId, boolean discardPartial) {
+        SendTasks.cancelTask(taskId, discardPartial);
+    }
+
+    public static boolean isTaskTransferring(int taskId) {
+        return SendTasks.isTaskTransferring(taskId);
     }
 
     /** 有会话正在传文件吗（收尾也算）：这时候不要改通道列表，会把传输打断 */
@@ -1522,11 +1555,23 @@ public class ServerService extends Service implements ServiceConnection {
     }
 
     private Notification buildNotification() {
-        Intent openIntent = new Intent(this, top.weixiansen574.hybridfilexfer.compose.MiuixMainActivity.class);
-        openIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
-        // 点通知 → 回到应用并重新弹出接收进度窗口
-        openIntent.putExtra("hfx_show_transfer", true);
-        PendingIntent contentIntent = PendingIntent.getActivity(this, 0, openIntent,
+        // 通知上现在挂着哪一条传输：有分享发送任务就是那个任务（多任务时是聚合视图）
+        TransferView view = currentTransferView();
+        Intent openIntent;
+        int requestCode = 0;
+        if (view != null && view.taskId > 0) {
+            // 点通知 → 回到「这个任务」的进度面板。
+            // 面板还在就是它自己（同 taskId 只会有一个窗口），被划掉了就重建一个绑到同一个 taskId，
+            // 进度接着显示。requestCode 按 taskId 区分，几个任务的 PendingIntent 不会互相顶掉。
+            openIntent = SendTasks.panelIntent(this, view.taskId);
+            requestCode = NOTIFICATION_TASK_REQUEST_BASE + view.taskId;
+        } else {
+            openIntent = new Intent(this, top.weixiansen574.hybridfilexfer.compose.MiuixMainActivity.class);
+            openIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+            // 点通知 → 回到应用并重新弹出接收进度窗口
+            openIntent.putExtra("hfx_show_transfer", true);
+        }
+        PendingIntent contentIntent = PendingIntent.getActivity(this, requestCode, openIntent,
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
 
         Intent stopIntent = new Intent(this, ServerService.class);
@@ -1570,7 +1615,7 @@ public class ServerService extends Service implements ServiceConnection {
                 .setPriority(NotificationCompat.PRIORITY_LOW)
                 .addAction(0, getString(R.string.notification_stop), stopPendingIntent);
         // 传输中：通知栏直接显示进度（发送/接收挑当前有活动的那一路，全局可见、不依赖悬浮窗权限）
-        applyTransferProgress(builder, currentTransferView());
+        applyTransferProgress(builder, view);
         return builder.build();
     }
 
@@ -1594,18 +1639,40 @@ public class ServerService extends Service implements ServiceConnection {
      * 挑"当下有活动的那一路"，两者都空就是没有传输。
      */
     private static final class TransferView {
+        /** 分享发送任务的 taskId；-1 = 不是任务（电脑推送 / 双窗口「← 复制」那两路） */
+        final int taskId;
         final boolean sending;
         final String name;
         final long done;
         final long total;
         final long speed;
+        /** 参与聚合的任务数（1 = 单个任务或者不是任务） */
+        final int taskCount;
+        /** 多任务时的展开明细（每行一个任务：文件名 · 百分比 · 各自的速率） */
+        final String multiDetail;
+        /** 这个任务现在是暂停着（用户按的暂停 / 为了给别的任务让路而停住） */
+        final boolean paused;
 
         TransferView(boolean sending, String name, long done, long total, long speed) {
+            this(-1, sending, name, done, total, speed, 1, "", false);
+        }
+
+        TransferView(int taskId, boolean sending, String name, long done, long total, long speed,
+                     int taskCount, String multiDetail) {
+            this(taskId, sending, name, done, total, speed, taskCount, multiDetail, false);
+        }
+
+        TransferView(int taskId, boolean sending, String name, long done, long total, long speed,
+                     int taskCount, String multiDetail, boolean paused) {
+            this.taskId = taskId;
             this.sending = sending;
             this.name = name == null ? "" : name;
             this.done = done;
             this.total = total;
             this.speed = speed;
+            this.taskCount = Math.max(1, taskCount);
+            this.multiDetail = multiDetail == null ? "" : multiDetail;
+            this.paused = paused;
         }
 
         int percent() {
@@ -1614,6 +1681,49 @@ public class ServerService extends Service implements ServiceConnection {
             }
             return (int) Math.max(0, Math.min(100, done * 100 / total));
         }
+    }
+
+    /** 每个发送任务自己的速率采样（多任务并发时各算各的，不能共用一个） */
+    private final java.util.Map<Integer, TaskSpeed> taskSpeeds = new java.util.HashMap<>();
+
+    private static final class TaskSpeed {
+        long bytes;
+        long at;
+        long speed;
+    }
+
+    /**
+     * 采一次某个发送任务的速率。
+     *
+     * <p>和 {@link #sampleTransferSpeed} 同一套算法（两次采样的增量 ÷ 时间，再做一阶平滑），
+     * 只是<b>按 taskId 各存一份</b> —— 两个任务同时在传时，通知栏上的合计和展开里的
+     * 每一条都必须是各自的速度，不能互相串。
+     */
+    private long sampleTaskSpeed(int taskId, long done, long now) {
+        TaskSpeed sample = taskSpeeds.get(taskId);
+        if (sample == null) {
+            sample = new TaskSpeed();
+            sample.bytes = done;
+            sample.at = now;
+            taskSpeeds.put(taskId, sample);
+            return 0;
+        }
+        // 换文件 / 让出通道后重新接着传：账本会重来，done 变小就重新起算
+        if (done < sample.bytes) {
+            sample.bytes = done;
+            sample.at = now;
+            sample.speed = 0;
+            return 0;
+        }
+        long elapsed = now - sample.at;
+        if (elapsed < PROGRESS_NOTIFY_INTERVAL_MS / 2) {
+            return sample.speed;
+        }
+        long instant = (done - sample.bytes) * 1000L / Math.max(1L, elapsed);
+        sample.speed = sample.speed <= 0 ? instant : (sample.speed * 2 + instant) / 3;
+        sample.bytes = done;
+        sample.at = now;
+        return sample.speed;
     }
 
     /**
@@ -1629,6 +1739,12 @@ public class ServerService extends Service implements ServiceConnection {
      * 所以"有数的那一路"就是正在传的那一路，不会把上一次传输的数字贴上来。
      */
     private TransferView currentTransferView() {
+        // 0) 分享发送任务（多任务会话表 SendTasks）：有任务在传就以任务为准 ——
+        //    这条通知的 contentIntent 要落到「这个任务」的面板（用户报的「点通知回不到任务1」）。
+        java.util.List<SendTask> tasks = SendTasks.transferringTasks();
+        if (!tasks.isEmpty()) {
+            return sendTaskView(tasks);
+        }
         Live live = currentTransfer();
         if (live != null && live.total > 0) {
             long done = live.done;
@@ -1666,6 +1782,53 @@ public class ServerService extends Service implements ServiceConnection {
             }
         }
         return null;
+    }
+
+    /**
+     * 把「正在传的几个分享任务」折成一条通知要的视图。
+     *
+     * <p>一个任务：就是它自己的进度 + 它自己的速率，点通知回到它。
+     * 多个任务（打在不同电脑上时是真并发）：标题给「N 个任务 · 合计」，展开明细里一行一个任务，
+     * 各算各的速率 —— 面板那边更不用争，每个任务有自己的窗口和 100ms 采样。
+     */
+    private TransferView sendTaskView(java.util.List<SendTask> tasks) {
+        long now = SystemClock.elapsedRealtime();
+        if (tasks.size() == 1) {
+            SendTask task = tasks.get(0);
+            long done = task.getDoneBytes();
+            long total = task.getTotalBytes();
+            boolean paused = task.isPausedByUser() || task.isSuspended();
+            return new TransferView(task.getTaskId(), true, shortName(task.getCurrentFileName()),
+                    done, total, paused ? 0L : sampleTaskSpeed(task.getTaskId(), done, now), 1, "",
+                    paused);
+        }
+        long doneSum = 0L;
+        long totalSum = 0L;
+        long speedSum = 0L;
+        StringBuilder detail = new StringBuilder();
+        for (SendTask task : tasks) {
+            long done = task.getDoneBytes();
+            long total = task.getTotalBytes();
+            long speed = sampleTaskSpeed(task.getTaskId(), done, now);
+            doneSum += done;
+            totalSum += total;
+            speedSum += speed;
+            if (detail.length() > 0) {
+                detail.append('\n');
+            }
+            int pct = total <= 0 ? 0 : (int) Math.max(0, Math.min(100, done * 100 / total));
+            detail.append("任务").append(task.getTaskId())
+                    .append(" · ").append(shortName(task.getCurrentFileName()))
+                    .append(" · ").append(pct).append('%');
+            if (task.isPausedByUser() || task.isSuspended()) {
+                detail.append(" · 已暂停");
+            } else if (speed > 0) {
+                detail.append(" · ").append(GlobalProgress.formatSpeed(speed));
+            }
+        }
+        // 点通知落到最近创建的那个任务的面板（transferringTasks 已经按 taskId 倒序）
+        return new TransferView(tasks.get(0).getTaskId(), true, "", doneSum, totalSum, speedSum,
+                tasks.size(), detail.toString());
     }
 
     /**
@@ -1718,11 +1881,13 @@ public class ServerService extends Service implements ServiceConnection {
             sampleAt = 0;
             sampleBytes = 0;
             sampleSpeed = 0;
+            taskSpeeds.clear();
             updateNotification();
             return;
         }
         progressNotifyAt = now;
-        if (view.speed <= 0) {
+        // 任务那一路的速率是 sendTaskView 里按 taskId 各自采的，这里只兜「不是任务」的老路径
+        if (view.speed <= 0 && view.taskId <= 0) {
             sampleTransferSpeed(view.done, now);
         }
         updateNotification();
@@ -1740,8 +1905,23 @@ public class ServerService extends Service implements ServiceConnection {
             return;
         }
         int pct = view.percent();
-        String title = view.sending ? "正在发送文件" : getString(R.string.notification_receiving);
-        title = pct >= 100 ? title + " · 收尾中" : title + " · " + pct + "%";
+        String title;
+        if (view.taskCount > 1) {
+            // 多任务并发：一条通知给合计（前台服务只能有一条常驻通知，拆成多条会和
+            // 「等电脑连接」那条同时挂着，用户更分不清）。展开明细里每个任务一行、
+            // 各算各的速率；点它落到最近那个任务的面板，其它任务的面板各自的窗口都在跑。
+            title = view.taskCount + " 个任务 · " + pct + "%"
+                    + (pct < 100 && view.speed > 0 ? " · " + GlobalProgress.formatSpeed(view.speed) : "");
+        } else {
+            String base = view.sending ? "正在发送文件" : getString(R.string.notification_receiving);
+            if (pct >= 100) {
+                title = base + " · 收尾中";
+            } else if (view.paused) {
+                title = "已暂停 · " + pct + "%";
+            } else {
+                title = base + " · " + pct + "%";
+            }
+        }
         StringBuilder detail = new StringBuilder();
         if (!view.name.isEmpty()) {
             detail.append(view.name).append(" · ");
@@ -1752,9 +1932,11 @@ public class ServerService extends Service implements ServiceConnection {
         if (pct < 100 && view.speed > 0) {
             detail.append(" · ").append(GlobalProgress.formatSpeed(view.speed));
         }
+        // 多任务时正文保持合计，展开（BigText）里给每个任务各自一行
+        String bigText = view.multiDetail.isEmpty() ? detail.toString() : view.multiDetail;
         builder.setContentTitle(title)
                 .setContentText(detail.toString())
-                .setStyle(new NotificationCompat.BigTextStyle().bigText(detail.toString()))
+                .setStyle(new NotificationCompat.BigTextStyle().bigText(bigText))
                 .setProgress(100, pct, false);
         progressShown = true;
     }

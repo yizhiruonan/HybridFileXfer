@@ -622,7 +622,8 @@ impl Receiver {
     ///
     /// @param keep_incomplete 没传完的文件要不要留（用户取消时就问过这一句）：
     ///   - true（默认）＝ 留文件和续传日志，下次续传；
-    ///   - false ＝ 手机端点的是「不保留进度」：半截文件和 `.hfxpart` 一起删掉，
+    ///   - false ＝ 用户取消时选的是「不保留进度」（手机端发 CANCEL_DISCARD，或电脑端
+    ///     「当前文件」卡片上点「取消」→「不保留，删掉」）：半截文件和 `.hfxpart` 一起删掉，
     ///     下次同一个文件从头传（1.7GB 的文件预分配了整份大小，留着就是白占盘）。
     /// 返回（保留的未完成文件数, 这些文件已经收到的字节数）。
     pub fn finish_with(&self, keep_incomplete: bool) -> io::Result<(usize, u64)> {
@@ -685,8 +686,8 @@ impl Receiver {
                 Ok(()) => crate::log::warn(&format!(
                     "{} {}",
                     crate::i18n::tr(
-                        "已删除未接收完的文件（手机端选择不保留）",
-                        "removed the incomplete file (the phone chose not to keep it)"
+                        "已删除未接收完的文件（选择不保留进度）",
+                        "removed the incomplete file (discard chosen)"
                     ),
                     path.display()
                 )),
@@ -822,6 +823,33 @@ mod tests {
             crate::journal::ReceiveJournal::sidecar_path(&partial).exists(),
             "保留时要写出续传日志"
         );
+    }
+
+    /// 一次取消里同时有「收全了」和「传了一半」的文件：
+    /// 选「不保留」时只删没传完的那个，收全的文件一个字节都不能动
+    /// （电脑端「取消」→「不保留」走的就是这条路径）。
+    #[test]
+    fn discarding_keeps_already_complete_files() {
+        let dir = temp_dir("incomplete-mixed");
+        let receiver = Receiver::new(util::normalize_dir(&dir));
+        let done = dir.join("done.bin");
+        let partial = dir.join("partial.bin");
+        let done_str = done.to_string_lossy().to_string();
+        let partial_str = partial.to_string_lossy().to_string();
+        // 一个文件收全（1 块 = 1MB，长度刚好对上）
+        receiver
+            .write_block(0, &done_str, 1_048_576, 0, 1_700_000_000_000, &[9u8; 1_048_576])
+            .unwrap();
+        // 另一个只写了第一块
+        receiver
+            .write_block(0, &partial_str, 2_097_152, 0, 1_700_000_000_000, &[1u8; 1024])
+            .unwrap();
+        let (kept, lost) = receiver.finish_with(false).unwrap();
+        assert_eq!((kept, lost), (0, 0));
+        assert!(done.exists(), "已经收全的文件不能因为取消被删掉");
+        assert!(!crate::journal::ReceiveJournal::sidecar_path(&done).exists());
+        assert!(!partial.exists(), "没传完的文件要删掉");
+        assert!(!crate::journal::ReceiveJournal::sidecar_path(&partial).exists());
     }
 
     #[test]

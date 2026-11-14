@@ -37,6 +37,35 @@ pub fn cancel() {
     CANCEL_SEND.store(true, Ordering::Relaxed);
 }
 
+/// 电脑端「当前文件」卡片上点「取消」时，用户在确认框里选的这一项。
+///
+/// 和手机端那套（CANCEL_DISCARD + Receiver::finish_with(keep_incomplete)）是同一份语义，
+/// 只是选择权在电脑这边：选项直接写进 DISCARD_PARTIAL，收尾的 finish_with 照旧去读。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CancelChoice {
+    /// 保留进度：半截文件 + .hfxpart 续传记录都留着，下次同一个文件接着传
+    Keep,
+    /// 不保留进度：删掉没传完的文件和续传记录，下次同一个文件从头传
+    Discard,
+}
+
+impl CancelChoice {
+    /// 传给 Receiver::finish_with 的 keep_incomplete 参数
+    pub fn keep_incomplete(self) -> bool {
+        matches!(self, CancelChoice::Keep)
+    }
+}
+
+/// 电脑端点了「取消」并在确认框里做了选择：先记下选择，再置取消标志。
+///
+/// 顺序不能反：选择是收尾（handle_receive 里的 finish_with）才读的，
+/// 先写选择再置取消，收尾时一定读得到；反过来会有一瞬间「已经是取消了、
+/// 选择还是上一轮的」。
+pub fn cancel_receive(choice: CancelChoice) {
+    set_discard_partial(!choice.keep_incomplete());
+    cancel();
+}
+
 pub fn cancelled() -> bool {
     CANCEL_SEND.load(Ordering::Relaxed)
 }
@@ -107,5 +136,17 @@ impl Drop for SendingGuard {
     fn drop(&mut self) {
         SENDING.store(false, Ordering::Relaxed);
         reset();
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::CancelChoice;
+
+    /// 取消确认框的两个选项 -> Receiver::finish_with 的参数。
+    /// 纯函数，不碰全局原子量（同一进程里别的用例也在跑，别去污染它们）
+    #[test]
+    fn cancel_choice_maps_to_keep_incomplete() {
+        assert!(CancelChoice::Keep.keep_incomplete(), "保留进度要传 true");
+        assert!(!CancelChoice::Discard.keep_incomplete(), "不保留要传 false");
     }
 }

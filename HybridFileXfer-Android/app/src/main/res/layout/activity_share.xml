@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
     分享发送页：整个界面就是一张进度面板，别的一律没有。
-    面板由 ShareActivity 在 onCreate 里塞进 ShareProgress.host(this) 造的 ComposeView，
+    面板由 ShareActivity 在 onCreate 里塞进 new SharePanel(this).view(this) 造的 ComposeView（每个面板一份状态），
     渲染的就是双窗口弹窗 / 应用外悬浮窗用的那个 ReceiveProgressPanel —— 标题「正在发送文件」、
     电脑名 · 文件名、分段进度条、已发/总量、速率、各通道明细，以及底部的
     「暂停发送 / 继续 / 取消发送 / 关闭」按钮，全都在面板里面。

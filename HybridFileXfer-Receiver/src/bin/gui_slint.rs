@@ -44,6 +44,9 @@ struct State {
     expanded: std::collections::HashSet<String>,
     expanded_dirty: bool,
     asked_target: bool,
+    /// 取消接收后要贴到状态卡下面的那句话，等这次接收真正收完尾（RECEIVING 落下去）
+    /// 再显示出来 —— 「已删除」不能比实际删文件早一句话。
+    cancel_note: Option<String>,
 }
 
 impl State {
@@ -196,6 +199,7 @@ fn main() -> Result<(), slint::PlatformError> {
         expanded: std::collections::HashSet::new(),
         expanded_dirty: false,
         asked_target: false,
+        cancel_note: None,
         state_rx,
         state_tx,
     }));
@@ -265,6 +269,10 @@ fn main() -> Result<(), slint::PlatformError> {
                 return;
             }
             ui.set_message("".into());
+            // 上一次取消留下的提示 / 没关掉的确认框，别带进这一次
+            ui.set_notice_text("".into());
+            ui.set_cancel_ask(false);
+            hfx_receiver::control::pause(false);
             hfx_receiver::receiver::PROGRESS.reset();
             hfx_receiver::session::reset_send_segments();
             log::info("按钮：开始接收");
@@ -279,8 +287,13 @@ fn main() -> Result<(), slint::PlatformError> {
             let mut s = st.lock().unwrap();
             log::info("按钮：停止接收");
             s.stop_engine();
+            s.cancel_note = None;
+            // 停就是停：弹了一半的取消确认框、为了弹框加的暂停，一起收掉
+            hfx_receiver::control::pause(false);
             if let Some(ui) = ui_weak.upgrade() {
                 ui.set_running(false);
+                ui.set_cancel_ask(false);
+                ui.set_notice_text("".into());
             }
         });
     }
@@ -331,6 +344,67 @@ fn main() -> Result<(), slint::PlatformError> {
             hfx_receiver::control::cancel();
         });
     }
+    // ---- 接收方向的「取消」（不只是暂停 / 继续）----
+    // 点「取消」先暂停：手机端在暂停同步里看到电脑暂停就会停发，
+    // 别让它在用户看确认框的这几秒里继续往盘里灌数据。
+    ui.on_cancel_recv(move || {
+        if !hfx_receiver::control::receiving() {
+            return;
+        }
+        hfx_receiver::control::pause(true);
+        log::warn(i18n::tr(
+            "按钮：取消接收（已暂停，等用户选择是否保留进度）",
+            "button: cancel receiving (paused, waiting for the user's choice)",
+        ));
+    });
+    {
+        let st = Arc::clone(&state);
+        ui.on_cancel_keep(move || {
+            // 保留：和手机端「保留进度」同一个语义 —— 收尾时留着半截文件和 .hfxpart
+            hfx_receiver::control::cancel_receive(hfx_receiver::control::CancelChoice::Keep);
+            log::warn(i18n::tr(
+                "按钮：取消接收 · 保留进度（半截文件和 .hfxpart 留着，可续传）",
+                "button: cancel receiving · keep the partial file (resumable)",
+            ));
+            if let Ok(mut s) = st.lock() {
+                s.cancel_note = Some(
+                    i18n::tr(
+                        "已取消：保留已收到的部分，下次同一个文件可续传",
+                        "cancelled: what already arrived is kept and can be resumed",
+                    )
+                    .to_string(),
+                );
+            }
+        });
+    }
+    {
+        let st = Arc::clone(&state);
+        ui.on_cancel_discard(move || {
+            // 不保留：收尾（Receiver::finish_with(false)）会把没传完的文件和续传记录删掉
+            hfx_receiver::control::cancel_receive(hfx_receiver::control::CancelChoice::Discard);
+            log::warn(i18n::tr(
+                "按钮：取消接收 · 不保留（收尾删掉没传完的文件和续传记录）",
+                "button: cancel receiving · discard the incomplete files",
+            ));
+            if let Ok(mut s) = st.lock() {
+                s.cancel_note = Some(
+                    i18n::tr(
+                        "已取消：已删除未传完的文件和续传记录",
+                        "cancelled: the incomplete files and their resume journals were removed",
+                    )
+                    .to_string(),
+                );
+            }
+        });
+    }
+    ui.on_cancel_dismiss(move || {
+        // 确认框里选了「继续接收」：把刚才加的暂停放掉，传输照常
+        hfx_receiver::control::pause(false);
+        log::info(i18n::tr(
+            "取消接收确认框：选了「继续接收」",
+            "cancel dialog: keep receiving",
+        ));
+    });
     {
         let st = Arc::clone(&state);
         ui.on_tray_toggled(move |enabled| {
@@ -591,6 +665,30 @@ fn main() -> Result<(), slint::PlatformError> {
             ui.set_send_active(hfx_receiver::control::sending());
             ui.set_recv_active(hfx_receiver::control::receiving());
             ui.set_send_paused(hfx_receiver::control::paused());
+
+            // ---- 取消接收：确认框与结果提示 ----
+            // 什么时候算「收完尾」：进度卡没了（handle_receive 在 finish_with 之后才 reset 进度），
+            // 或者 RECEIVING 已经落下去。两个条件谁先满足都行 —— 「已删除」不能比实际删文件
+            // 早一句话，而取消之后的重建握手（最长几十秒）不该把这句话一起拖着。
+            let receiving_now = hfx_receiver::control::receiving();
+            let idle_now = !receiving_now || !active;
+            if let Some(note) = s.cancel_note.clone() {
+                if idle_now {
+                    s.cancel_note = None;
+                    ui.set_notice_text(note.into());
+                }
+            }
+            // 传输自己结束了 / 引擎被停了：确认框没意义了，顺手把「为了弹框」加的暂停放掉，
+            // 否则下一次接收会从「已暂停」开始
+            if ui.get_cancel_ask() && !receiving_now {
+                ui.set_cancel_ask(false);
+                hfx_receiver::control::pause(false);
+            }
+            // 新的一次传输开始了：上一次的取消提示让位（进度卡回来了，提示就不该再挂着）
+            if !ui.get_notice_text().is_empty() && active {
+                ui.set_notice_text("".into());
+            }
+
             if active {
                 let short = path
                     .rsplit(['/', '\\'])
@@ -650,6 +748,8 @@ fn main() -> Result<(), slint::PlatformError> {
             };
             let want_h = 400.0
                 + if ui.get_ask_target() { 60.0 } else { 0.0 }
+                // 状态卡下面那行「已取消…」的提示
+                + if ui.get_notice_text().is_empty() { 0.0 } else { 20.0 }
                 + devices_h
                 + if xfer_now { 190.0 } else { 0.0 }
                 + if xfer_now && ui.get_send_active() { 50.0 } else { 0.0 }

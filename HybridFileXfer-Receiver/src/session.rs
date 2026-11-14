@@ -1417,7 +1417,7 @@ impl Session {
         let files = receiver.file_count();
         let elapsed = started.elapsed().as_secs_f64().max(0.001);
         // 这次到底收全了没有。没传完要不要留在电脑上由下面的 keep_incomplete 决定：
-        // 默认留着（续传），手机端点了「不保留进度」才删。
+        // 默认留着（续传），任意一端在取消时选了「不保留进度」才删。
         let complete = hard_error.is_none() && aborts.is_empty();
         // 303：先把落盘文件列表记下来，finish_with() 会把条目清空
         let received = receiver.received_files();
@@ -1431,14 +1431,23 @@ impl Session {
             crate::receiver::human_bytes(bytes),
             ""
         ));
-        // 取消确认框：手机端取消时选了「不保留进度」，收尾就把这次写到一半的文件和
-        // `.hfxpart` 续传记录一起删掉（下次同一个文件从头传）。必须在 `_receiving`
-        // 这个 guard 结束之前读 —— 它 drop 时会把 DISCARD_PARTIAL 一起 reset 掉。
+        // 取消确认框：不管选择是手机端给的（CANCEL_DISCARD）还是电脑端给的
+        // （「当前文件」卡片上的「取消」→ 保留 / 不保留，见 control::cancel_receive），
+        // 都汇总到 DISCARD_PARTIAL 这一个开关上：选了「不保留进度」，收尾就把这次
+        // 写到一半的文件和 `.hfxpart` 续传记录一起删掉（下次同一个文件从头传）。
+        // 必须在 `_receiving` 这个 guard 结束之前读 —— 它 drop 时会把 DISCARD_PARTIAL
+        // 一起 reset 掉。
         let keep_incomplete = !crate::control::discard_partial();
+        let cancelling = crate::control::cancelled() || peer_went_away;
         if !keep_incomplete {
             log::warn(crate::i18n::tr(
-                "手机端选择不保留：这次没传完的文件会被删掉",
-                "the phone asked to discard: incomplete files will be removed",
+                "选择不保留进度：这次没传完的文件会被删掉",
+                "discard chosen: incomplete files will be removed",
+            ));
+        } else if cancelling {
+            log::warn(crate::i18n::tr(
+                "取消接收：保留已收到的部分（可续传）",
+                "cancel: keeping what already arrived (resumable)",
             ));
         }
         match receiver.finish_with(keep_incomplete) {
@@ -1453,6 +1462,20 @@ impl Session {
             )),
             Ok(_) => {}
             Err(e) => log::warn(&format!("finish(): {}", e)),
+        }
+
+        // 电脑端在「当前文件」上点了「取消」，而此时数据其实已经收齐（传输线程全部正常退出，
+        // 现在正卡在算校验/等结论这两步里）：文件是完整的，不动它 —— 删除只针对没传完的文件；
+        // 但这次传输按取消收尾 —— 不写结论帧、不比对指纹、把传输通道重建回来，
+        // 手机端收到那帧 CANCEL 也会停在那里显示"已中断"，不会干等到超时。
+        if hard_error.is_none() && aborts.is_empty() && crate::control::cancelled() {
+            log::warn(crate::i18n::tr(
+                "接收已取消（数据已收齐，文件保留）",
+                "receiving cancelled after all data arrived; the files stay",
+            ));
+            crate::receiver::PROGRESS.reset();
+            reset_send_segments();
+            return self.finish_cancelled();
         }
 
         // 303：整文件 SHA-256 复算（本端是接收方，算自己落盘的文件）。

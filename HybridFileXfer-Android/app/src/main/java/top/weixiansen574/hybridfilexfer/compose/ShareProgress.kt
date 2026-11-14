@@ -25,8 +25,8 @@ import top.yukonga.miuix.kmp.theme.ThemeController
 /**
  * 面板上那几颗按钮（暂停发送 / 继续 / 取消发送）点下去要做什么。
  *
- * 由 [ShareProgress.setActions] 一次性装进来；[onPause] / [onResume] 传 null 时
- * 面板就不画暂停那一颗（和双窗口弹窗传 null 时的表现完全一样）。
+ * 由 [SharePanel.setActions] 一次性装进来；[ShareActions.onPause] / [ShareActions.onResume]
+ * 传 null 时面板就不画暂停那一颗（和双窗口弹窗传 null 时的表现完全一样）。
  */
 class ShareActions(
     val onDismiss: Runnable,
@@ -37,97 +37,70 @@ class ShareActions(
 
 /**
  * 「分享发送」页的进度面板：把双窗口弹窗 / 应用外悬浮窗用的那个 [ReceiveProgressPanel]
- * <b>原样</b>塞进 ShareActivity 这条 Java 流程里，参数和 TransferScreen.kt 里
- * `if (xferPopup) { ReceiveProgressPanel(...) }` 那段一一对应：
+ * 原样塞进 ShareActivity 这条 Java 流程里。
+ *
+ * 一个面板实例对应一个 Activity、一个发送任务（top.weixiansen574.hybridfilexfer.SendTask 的 taskId）。
+ * 以前这里是个 object（全进程一份）：一个 Activity 承载所有分享任务，所以「暂停任务1再发任务2」
+ * 时两个任务的面板状态互相覆盖，release() 还会把另一轮的状态一起清掉 —— 屏幕上那个空壳就是这么来的。
+ * 现在每开一个面板就是 new 一个 [SharePanel]，Compose 状态、按钮落点、取消确认框全部各自一份。
  *
  * | 参数 | 双窗口 | 这里 |
  * | --- | --- | --- |
  * | state | UiState(...) | 同一个 UiState，字段含义一致（见下面的 update） |
- * | onDismiss | { xferPopup = false } | ShareActivity 的 dismissPanel（准备阶段关窗口 / 传输中收起，传输继续） |
+ * | onDismiss | { xferPopup = false } | ShareActivity 的 dismissPanel（准备阶段关窗口 / 传输中收起） |
  * | sending | xferPopupSending | true（这个页面永远是「发」） |
- * | onPause | server.pauseTransfer() | server.pauseTransfer() |
- * | onResume | server.resumeTransfer() | server.resumeTransfer() |
- * | onCancel | server.abortTransfer() + Toast | ShareActivity 原来的取消逻辑 |
- * | bare | 不传（= false） | <b>true</b>（原因见下） |
+ * | onPause / onResume | server.pauseTransfer / resumeTransfer | 任务自己的 pause() / resume() |
+ * | onCancel | server.abortTransfer() + Toast | 任务自己的取消（先弹「保留/不保留」确认框） |
+ * | bare | 不传（= false） | true（原因见下） |
  * | showFooter | 不传（= true） | 不传（= true） |
- * | closeWhenIdle | 不传（= false） | <b>true</b>：准备 / 等连接 / 复制 阶段底部补一颗「关闭」 |
+ * | closeWhenIdle | 不传（= false） | true：准备 / 等连接 / 复制 阶段底部补一颗「关闭」 |
  *
- * 为什么 bare 必须是 true：`ReceiveProgressPanel` 的 bare=false 分支根本不画遮罩框，
- * 它是一整个 `Box(Modifier.fillMaxSize().background(黑 35%))` —— 双窗口那边它铺在
- * 整页的 Composable 里所以正好是全屏压暗；而在 ShareActivity 这种 WRAP_CONTENT 的窗口里，
- * fillMaxSize 会把这个小窗口直接撑成满屏 + 一层 35% 黑，也就是「一整块黑」。
- * 所以这里走 bare=true：只画那张卡片（卡片和双窗口那边是同一个 composable，像素级一样），
- * 窗口自己按卡片大小包住它，不铺任何遮罩。
- *
- * 用法（ShareActivity）：
- * 1. onCreate 里 `((ViewGroup) findViewById(R.id.share_panel)).addView(ShareProgress.host(this))`；
- * 2. 同一处调 [setActions] 把按钮接到自己的取消 / 暂停逻辑上；
- * 3. 每 100ms 采样到真值后调 [update]，只喂真值，补间由面板自己做；
- * 4. onDestroy 里调 [release]（owner 变 DESTROYED，顺手把状态清掉）。
+ * 为什么 bare 必须是 true：ReceiveProgressPanel 的 bare=false 分支根本不画遮罩框，
+ * 它是一整个 Box(fillMaxSize + 黑 35%) —— 双窗口那边它铺在整页的 Composable 里所以正好是全屏压暗；
+ * 而在 ShareActivity 这种 WRAP_CONTENT 的窗口里，fillMaxSize 会把这个小窗口直接撑成满屏 + 一层 35% 黑，
+ * 也就是「一整块黑」。所以这里走 bare=true：只画那张卡片，窗口自己按卡片大小包住它。
  *
  * 这个 ComposeView 挂在 Activity 的普通 ViewGroup 里，但 Compose 需要三个 owner
  * （Lifecycle / ViewModelStore / SavedStateRegistry）。Activity 的 DecorView 上虽然有一套，
- * 这里按 [GlobalTransferOverlay] 的做法自己挂一套，行为和应用外悬浮窗完全一致
+ * 这里按 GlobalTransferOverlay 的做法自己挂一套，行为和应用外悬浮窗完全一致
  * （少挂一个就会在 attach 时抛 IllegalStateException 把进程带崩）。
  */
-internal object ShareProgress {
-    private const val TAG = "HFXSharePanel"
-
-    /**
-     * 主线程 Handler：[mutableStateOf] 的写只能在主线程（Compose 的快照系统不是线程安全的，
-     * 后台线程直接写会有「写进去了但这一帧不重组」甚至 Snapshot 冲突的风险）。
-     * 所以所有入口都过 [runOnMain] —— 现在调用方本来都在主线程，这里兜的是以后有人从
-     * 后台线程调的情形（例如传输线程直接把真值推过来）。
-     */
+internal class SharePanel(context: Context) {
     private val main = Handler(Looper.getMainLooper())
 
-    /** 面板现在看到的状态：Compose 侧读它的 value，[update] 写它的 value */
+    /** 面板现在看到的状态：Compose 侧读它的 value，update 写它的 value */
     private val state = mutableStateOf(UiState())
 
-    /** 面板按钮的落点，[setActions] 之前是 null（点了也不会有反应，不会崩） */
+    /** 面板按钮的落点，setActions 之前是 null（点了也不会有反应，不会崩） */
     private val actions = mutableStateOf<ShareActions?>(null)
 
     /**
      * 「取消发送」的确认框现在是不是开着（已传的部分要不要保留）。
-     *
-     * 面板上的「取消发送」不再是"一按就断"：先弹 [CancelTransferDialog]，
-     * 用户选了才真正取消。框开着的时候传输还在跑（用户可以选「继续传输」回去）。
+     * 框开着的时候传输还在跑（用户可以选「继续传输」回去）。
      */
     private val cancelConfirm = mutableStateOf(false)
 
-    /** 确认框的两个落点，[setCancelHandlers] 之前是 null（点了只会把框关掉） */
+    /** 确认框的两个落点 */
     private var cancelKeep: Runnable? = null
     private var cancelDiscard: Runnable? = null
 
-    private var owner: Owner? = null
+    private val owner = Owner().also { it.start() }
 
-    /**
-     * 造一个渲染进度面板的 ComposeView，由调用方 addView 到布局里的占位容器。
-     *
-     * 传进来的 context 一般是 Activity（自带主题）；服务里的 Context 才需要
-     * ContextThemeWrapper 包一层，那是 [GlobalTransferOverlay] 的情况。
-     */
-    @JvmStatic
-    fun host(context: Context): ComposeView {
-        val lifecycleOwner = Owner()
-        // 必须在 ComposeView attach 之前就进到 CREATED/RESUMED：
-        // Compose 一 attach 就会去 consumeRestoredStateForKey，owner 还没起来会直接抛
-        lifecycleOwner.start()
+    /** 造一个渲染进度面板的 ComposeView，由调用方 addView 到布局里的占位容器 */
+    fun view(context: Context): ComposeView {
         val controller = ThemeController(
             colorSchemeMode = colorSchemeModeOf(Config.getInstance(context).themeMode),
         )
-        val compose = ComposeView(context).apply {
-            setViewTreeLifecycleOwner(lifecycleOwner)
-            setViewTreeViewModelStoreOwner(lifecycleOwner)
-            setViewTreeSavedStateRegistryOwner(lifecycleOwner)
+        return ComposeView(context).apply {
+            setViewTreeLifecycleOwner(owner)
+            setViewTreeViewModelStoreOwner(owner)
+            setViewTreeSavedStateRegistryOwner(owner)
             setContent {
                 MiuixTheme(controller = controller) {
-                    // 和 TransferScreen.kt 里双窗口那段一比一：
-                    // sending=true / showFooter 不传（默认 true，底部按钮由面板自己画）/
+                    // 和 TransferScreen.kt 里双窗口那段一比一：sending=true / 默认 showFooter /
                     // bare=true（false 会把小窗口撑成满屏黑，见类注释）/
-                    // closeWhenIdle=true（准备 / 等连接 / 复制 阶段底部补一颗「关闭」，见下面）。
-                    // widthDp=390dp：只把卡片放宽（双窗口是 340dp）—— 字号、行高、按钮、间距
-                    // 一个都不动，窄屏时面板自己按「屏宽 - 32dp」兜底。
+                    // closeWhenIdle=true（准备 / 等连接 / 复制 阶段补一颗「关闭」）。
+                    // widthDp=390dp：只把卡片放宽（双窗口是 340dp），窄屏时面板自己按「屏宽 - 32dp」兜底。
                     val current = actions.value
                     ReceiveProgressPanel(
                         state = state.value,
@@ -137,8 +110,6 @@ internal object ShareProgress {
                         onResume = { current?.onResume?.run() },
                         onCancel = { current?.onCancel?.run() },
                         bare = true,
-                        // 只有这一处开：传输还没起来（准备 / 等待电脑连接 / 正在复制）时 xferActive=false，
-                        // 面板底部原本一颗按钮都不画，用户只能按返回键退出。开着它，这几段补一颗「关闭」。
                         closeWhenIdle = true,
                         widthDp = 390.dp,
                     )
@@ -160,36 +131,29 @@ internal object ShareProgress {
                 }
             }
         }
-        owner = lifecycleOwner
-        return compose
     }
 
-    /** 把面板那几颗按钮接到 Activity 自己的逻辑上（在 [host] 之后随时可调） */
-    @JvmStatic
+    /** 把面板那几颗按钮接到任务上（在 view 之后随时可调） */
     fun setActions(next: ShareActions) {
         actions.value = next
     }
 
     /**
-     * 装「取消发送」确认框的两个落点（在 [host] 之后随时可调，传 null 就只关框）。
+     * 装「取消发送」确认框的两个落点。
      *
-     * @param keep 用户选了「保留进度」：走原来的取消逻辑，电脑上的半截文件留着下次续传
-     * @param discard 用户选了「不保留」：让电脑端把这次的不完整文件和续传记录删掉
+     * @param keep 用户选了「保留进度」：电脑上的半截文件留着下次续传
+     * @param discard 用户选了「不保留」：让电脑端把不完整文件和续传记录删掉
      */
-    @JvmStatic
     fun setCancelHandlers(keep: Runnable?, discard: Runnable?) {
         cancelKeep = keep
         cancelDiscard = discard
     }
 
     /** 弹「取消发送」确认框（面板上的「取消发送」按一下就走这里） */
-    @JvmStatic
     fun showCancelConfirm() {
         runOnMain { cancelConfirm.value = true }
     }
 
-    /** 收起确认框（开始新一次发送时要保证它是关着的） */
-    @JvmStatic
     fun hideCancelConfirm() {
         runOnMain { cancelConfirm.value = false }
     }
@@ -203,40 +167,14 @@ internal object ShareProgress {
     }
 
     /**
-     * 新一轮开始：把面板刷成干净的空态。
-     *
-     * <p>为什么需要它：二次分享（暂停中再分享、传完再分享）时 Activity 是同一条，
-     * 面板这个 object 也是同一个。只喂一次「未激活」的 [update] 也能盖掉大部分残留，
-     * 但「取消确认框还开着」「[UiState] 里这次没传的那些字段」这些得靠整块换掉才彻底。
-     * 调用之后应当再调一次 [update] 把新一轮的初始值（例如电脑名）喂进去。
-     *
-     * <p>注意：不清 [actions] / [cancelKeep] / [cancelDiscard] —— 那三个是 Activity 在
-     * onCreate 里装好的按钮落点，跨轮次有效，只有 onDestroy 的 [release] 才清。
-     */
-    @JvmStatic
-    fun reset() {
-        runOnMain {
-            cancelConfirm.value = false
-            state.value = UiState()
-        }
-    }
-
-    /** 把最新的 UiState 推进面板（任何线程调都安全；实际调用都在主线程） */
-    @JvmStatic
-    fun update(next: UiState) {
-        runOnMain { state.value = next }
-    }
-
-    /**
      * Java 侧专用入口。
      *
-     * [UiState] 有四十多个字段，从 Java 直接构造太容易错位，这里只暴露进度相关的那几个，
+     * UiState 有四十多个字段，从 Java 直接构造太容易错位，这里只暴露进度相关的那几个，
      * 剩下的（连接列表、配置项……）保持默认值 —— 面板只读这几个字段。
      *
      * @param active true = 传输中：面板底部画「暂停发送」（暂停后是「继续」+「取消发送」）
-     * @param paused 电脑端 / HFXServer 那边的暂停闸门现在是关着的（和双窗口读 isTransferPaused 一样）
+     * @param paused 这个任务现在是暂停着（用户按的暂停，或者为了给别的任务让路而停住）
      */
-    @JvmStatic
     fun update(
         active: Boolean,
         paused: Boolean,
@@ -269,11 +207,12 @@ internal object ShareProgress {
         ))
     }
 
-    /** Activity 销毁：owner 走到 DESTROYED，状态清干净（下次进来重新开始） */
-    @JvmStatic
+    fun update(next: UiState) {
+        runOnMain { state.value = next }
+    }
+
+    /** 面板销毁：owner 走到 DESTROYED，状态清干净（只影响这一个面板实例） */
     fun release() {
-        val current = owner
-        owner = null
         runOnMain {
             actions.value = null
             cancelConfirm.value = false
@@ -281,7 +220,7 @@ internal object ShareProgress {
         }
         cancelKeep = null
         cancelDiscard = null
-        current?.stop()
+        owner.stop()
     }
 
     private class Owner : LifecycleOwner, ViewModelStoreOwner, SavedStateRegistryOwner {
@@ -293,8 +232,7 @@ internal object ShareProgress {
         override val savedStateRegistry: SavedStateRegistry get() = savedState.savedStateRegistry
 
         init {
-            // performAttach 必须在 owner 还是 INITIALIZED 的时候叫（savedstate 的限制：
-            // "Restarter must be created only during owner's initialization stage"），
+            // performAttach 必须在 owner 还是 INITIALIZED 的时候叫（savedstate 的限制），
             // 之后再 performRestore，Compose 里的 rememberSaveable 才能正常读
             try {
                 savedState.performAttach()
@@ -305,9 +243,7 @@ internal object ShareProgress {
 
         fun start() {
             try {
-                // 顺序不能反：先 performRestore 再切到 CREATED，
-                // 否则切状态时 savedstate 的 Recreator 会去 consume，
-                // 那时 isRestored 还是 false，直接抛 IllegalStateException
+                // 顺序不能反：先 performRestore 再切到 CREATED
                 savedState.performRestore(null)
                 registry.currentState = Lifecycle.State.CREATED
                 registry.currentState = Lifecycle.State.RESUMED
@@ -323,5 +259,9 @@ internal object ShareProgress {
             } catch (_: Throwable) {
             }
         }
+    }
+
+    private companion object {
+        private const val TAG = "HFXSharePanel"
     }
 }
