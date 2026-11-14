@@ -25,6 +25,53 @@ public abstract class ReadFileCall implements Callable<Void> {
     private int fileIndex = -1;
     /** 303：本次发出去的文件（手机本地绝对路径），收尾复算 SHA-256 用 */
     private final List<String> sourcePaths = new java.util.ArrayList<>();
+    /**
+     * 303：收尾要复算整文件 SHA-256。那一步等于把文件再读一遍（1.78GB 实测约 2 秒，
+     * 用户反馈「校验时间有点长」），而这段时间电脑端同时也在算，谁慢谁拖后腿。
+     * 现在文件一登记就丢给后台线程先算，收尾只是 get() 一下 —— 这几秒藏进传输过程里了。
+     */
+    private final java.util.Map<String, java.util.concurrent.Future<HFXService.FileDigest>> digestTasks =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    /** 后台算指纹的线程池（懒建；2 条就够，再多人也是抢同一块闪存带宽） */
+    private java.util.concurrent.ExecutorService digestExecutor;
+
+    /** 收尾按路径取「提前算好的指纹」，取不到的再同步算（见 HFXService.digestOf 重载） */
+    public java.util.Map<String, java.util.concurrent.Future<HFXService.FileDigest>> digestTasks() {
+        return digestTasks;
+    }
+
+    /** 收尾取完指纹后关掉后台线程池（shutdown 不打断正在算的那个文件） */
+    public void shutdownDigest() {
+        java.util.concurrent.ExecutorService executor;
+        synchronized (this) {
+            executor = digestExecutor;
+            digestExecutor = null;
+        }
+        if (executor != null) {
+            executor.shutdown();
+        }
+    }
+
+    private void prefetchDigest(String path) {
+        if (digestTasks.containsKey(path)) {
+            return;
+        }
+        synchronized (this) {
+            if (digestExecutor == null) {
+                digestExecutor = java.util.concurrent.Executors.newFixedThreadPool(2, r -> {
+                    Thread t = new Thread(r, "hfx-digest");
+                    t.setDaemon(true);
+                    return t;
+                });
+            }
+        }
+        try {
+            digestTasks.put(path, digestExecutor.submit(() -> HFXService.digestOne(path)));
+        } catch (Throwable e) {
+            // 线程池已经关了（传输收尾）之类：收尾时同步算，行为退回老样子
+            top.weixiansen574.hybridfilexfer.core.HFXLog.d("prefetchDigest failed: " + path, e);
+        }
+    }
     /** 暂停闸门：暂停时不再往队列里读块 */
     private volatile TransferPause pause;
 
@@ -173,8 +220,9 @@ public abstract class ReadFileCall implements Callable<Void> {
                     file.lastModified(), 0, 0, null));
             return;
         }
-        // 303：记下这次真正发出去的文件（收尾复算 SHA-256 用）
+        // 303：记下这次真正发出去的文件（收尾复算 SHA-256 用），并让后台线程现在就开始算指纹
         sourcePaths.add(file.getPath());
+        prefetchDigest(file.getPath());
         FileChannel channel = openFile(file.getPath());
         long length = channel.size();
         long lastModified = file.lastModified();

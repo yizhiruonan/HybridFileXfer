@@ -314,9 +314,12 @@ public abstract class HFXService {
             readFileTask.get();
             // 303：把发出去的文件复算一遍 SHA-256，和电脑端落盘文件的指纹比对。
             // 手机上这一步等于把文件再读一遍（3.25GB 约几秒），换来的是"字节级一致"的确认。
+            // 指纹在传输一开始就由后台线程在算（ReadFileCall.prefetchDigest），这里通常只是取结果
             String verifyError = pcResult == null || pcResult.digests.isEmpty()
                     ? null
-                    : compareDigests(digestOf(readFileCall.sourcePaths()), pcResult.digests);
+                    : compareDigests(digestOf(readFileCall.sourcePaths(), readFileCall.digestTasks()),
+                    pcResult.digests);
+            readFileCall.shutdownDigest();
             if (verifyError != null) {
                 top.weixiansen574.hybridfilexfer.core.HFXLog.d("sendFiles: verify FAILED: " + verifyError);
             } else if (pcResult != null && !pcResult.digests.isEmpty()) {
@@ -603,29 +606,102 @@ public abstract class HFXService {
         return (int) crc.getValue();
     }
 
+    /** 单个文件的指纹；不是文件/读不出来返回 null（和"跳过这个文件"的老行为一致） */
+    protected static FileDigest digestOne(String path) {
+        try {
+            File file = new File(path);
+            if (!file.isFile()) {
+                return null;
+            }
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            // 4MB 一块：1MB 时 1.78GB 要读 1800 次，读的次数太多，收尾时间里有一截耗在这上面
+            byte[] buffer = new byte[4 * 1024 * 1024];
+            try (FileInputStream in = new FileInputStream(file)) {
+                int read;
+                while ((read = in.read(buffer)) > 0) {
+                    digest.update(buffer, 0, read);
+                }
+            }
+            return new FileDigest(file.length(), digest.digest());
+        } catch (Throwable e) {
+            top.weixiansen574.hybridfilexfer.core.HFXLog.d("digest failed: " + path, e);
+            return null;
+        }
+    }
+
     /** 把一组本地文件算成指纹表（排序后两端可直接比对）；读不出来的文件跳过 */
     protected static List<FileDigest> digestOf(List<String> paths) {
-        List<FileDigest> digests = new ArrayList<>();
+        return digestOf(paths, null);
+    }
+
+    /**
+     * 把一组本地文件算成指纹表。
+     *
+     * <p>两条加速（用户反馈「校验时间有点长了」）：
+     * <ul>
+     *   <li>precomputed：发送方向在传输一开始就把文件丢给后台线程算了（{@code ReadFileCall}），
+     *       这里只是 {@code get()} —— 那几秒藏进传输过程里，收尾几乎不用等；</li>
+     *   <li>多文件按文件并行：SHA-256 本身没法拆，但"文件夹里几十个文件"可以几路一起读，
+     *       以前是串行一个接一个。</li>
+     * </ul>
+     */
+    protected static List<FileDigest> digestOf(List<String> paths,
+                                               java.util.Map<String, java.util.concurrent.Future<FileDigest>> precomputed) {
         if (paths == null) {
-            return digests;
+            return new ArrayList<>();
         }
-        byte[] buffer = new byte[1024 * 1024];
+        List<FileDigest> digests = java.util.Collections.synchronizedList(new ArrayList<>());
+        List<String> todo = new ArrayList<>();
         for (String path : paths) {
+            java.util.concurrent.Future<FileDigest> future = precomputed == null ? null : precomputed.get(path);
+            if (future == null) {
+                todo.add(path);
+                continue;
+            }
             try {
-                File file = new File(path);
-                if (!file.isFile()) {
-                    continue;
+                FileDigest digest = future.get();
+                if (digest != null) {
+                    digests.add(digest);
                 }
-                MessageDigest digest = MessageDigest.getInstance("SHA-256");
-                try (FileInputStream in = new FileInputStream(file)) {
-                    int read;
-                    while ((read = in.read(buffer)) > 0) {
-                        digest.update(buffer, 0, read);
-                    }
-                }
-                digests.add(new FileDigest(file.length(), digest.digest()));
             } catch (Throwable e) {
-                top.weixiansen574.hybridfilexfer.core.HFXLog.d("digest failed: " + path, e);
+                // 后台线程算失败（文件被删/线程池被关）：退回同步算一遍，别静默少一个文件
+                top.weixiansen574.hybridfilexfer.core.HFXLog.d("digest prefetch failed: " + path, e);
+                FileDigest digest = digestOne(path);
+                if (digest != null) {
+                    digests.add(digest);
+                }
+            }
+        }
+        int threads = Math.min(4, todo.size());
+        if (threads <= 1) {
+            for (String path : todo) {
+                FileDigest digest = digestOne(path);
+                if (digest != null) {
+                    digests.add(digest);
+                }
+            }
+        } else {
+            java.util.concurrent.ExecutorService pool =
+                    java.util.concurrent.Executors.newFixedThreadPool(threads, r -> {
+                        Thread t = new Thread(r, "hfx-digest");
+                        t.setDaemon(true);
+                        return t;
+                    });
+            try {
+                for (String path : todo) {
+                    pool.execute(() -> {
+                        FileDigest digest = digestOne(path);
+                        if (digest != null) {
+                            digests.add(digest);
+                        }
+                    });
+                }
+                pool.shutdown();
+                pool.awaitTermination(30, java.util.concurrent.TimeUnit.MINUTES);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } finally {
+                pool.shutdownNow();
             }
         }
         Collections.sort(digests);
