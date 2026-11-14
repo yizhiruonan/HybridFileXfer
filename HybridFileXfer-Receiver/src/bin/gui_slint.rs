@@ -109,7 +109,10 @@ fn main() -> Result<(), slint::PlatformError> {
     let lang = config.lang.unwrap_or_else(detect_lang);
     i18n::set_lang(lang);
 
-    log::init(Some(exe_dir.join("receiver.log")), false);
+    // -v / --verbose：日志里多出调试行（比如每条通道"绑定本机哪个地址"），
+    // 排查"梯子/虚拟网卡抢路由"这类问题时用得上
+    let verbose = std::env::args().any(|a| a == "-v" || a == "--verbose");
+    log::init(Some(exe_dir.join("receiver.log")), verbose);
     log::set_console(false);
     log::info(&format!(
         "GUI build={} pid={} exe={}",
@@ -134,7 +137,7 @@ fn main() -> Result<(), slint::PlatformError> {
     let mut send_target: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
-        if arg == "--send" || arg == "--autostart" {
+        if arg == "--send" || arg == "--autostart" || arg == "-v" || arg == "--verbose" {
             continue;
         }
         // --to <串号>：只把文件推给指定设备（多设备时用）
