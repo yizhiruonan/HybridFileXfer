@@ -216,6 +216,21 @@ public class Config {
         preferences.edit().putString("disabled_interfaces", names).apply();
     }
 
+    /**
+     * 用户**显式勾上过**的蓝牙共享网络网卡（逗号分隔，一般是 bt-pan）。
+     *
+     * <p>蓝牙通道默认不勾：它只有 0.2~0.3 MB/s，多轨切分时是最慢那条，会拖住收尾。
+     * 但用户想用就得能开，所以单独记一份「勾过的蓝牙网卡」，和 enabled_interfaces 分开——
+     * 后者是老的默认全开语义写进去的，里面可能早就有 bt-pan，分不清是不是用户自己想勾。
+     */
+    public String getEnabledBluetoothNames() {
+        return preferences.getString("enabled_bluetooth", "");
+    }
+
+    public void setEnabledBluetoothNames(String names) {
+        preferences.edit().putString("enabled_bluetooth", names).apply();
+    }
+
     /** 各网卡指定的电脑IP，格式 "wlan0=192.168.1.100;wlan1=" */
     public String getInterfaceBindAddresses() {
         return preferences.getString("interface_bind_addresses", "");

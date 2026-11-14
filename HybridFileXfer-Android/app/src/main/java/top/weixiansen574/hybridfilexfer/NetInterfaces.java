@@ -44,10 +44,7 @@ public final class NetInterfaces {
                 // 高通/联发科/三星的蜂窝网卡名字分别是 rmnet*、ccmni*、pdp_ip*
                 boolean cellular = ifName.startsWith("rmnet") || ifName.startsWith("ccmni")
                         || ifName.startsWith("pdp_ip");
-                // 蓝牙共享网络（PAN）实测只有 0.2~0.3 MB/s：多轨切分时它永远是最慢的那一条，
-                // 收尾要等它、还会占掉一个通道名额，得不偿失，所以干脆不参与传输、也不列进计划。
-                boolean bluetooth = isBluetooth(ifName);
-                if (!address.isLoopbackAddress() && address instanceof Inet4Address && !cellular && !bluetooth) {
+                if (!address.isLoopbackAddress() && address instanceof Inet4Address && !cellular) {
                     NetInterfaceInfo item = new NetInterfaceInfo(networkInterface.getDisplayName(), address);
                     //VPN开的虚拟网卡，默认不勾选
                     if (item.name.startsWith("tun")) {
@@ -119,7 +116,17 @@ public final class NetInterfaces {
         String disabledNames = config.getDisabledInterfaceNames();
         boolean hasSaved = !TextUtils.isEmpty(disabledNames);
         List<String> disabled = hasSaved ? split(disabledNames, ',') : new ArrayList<String>();
+        // 「被显式勾上过」的蓝牙网卡：蓝牙共享网络默认不勾，只认这份单独的记录
+        String btNames = config.getEnabledBluetoothNames();
+        List<String> btEnabled = TextUtils.isEmpty(btNames)
+                ? new ArrayList<String>() : split(btNames, ',');
         for (NetInterfaceInfo item : list) {
+            if (isBluetooth(item.name)) {
+                // 蓝牙共享网络（PAN）只有 0.2~0.3 MB/s，多轨切分时是最慢那条，会拖住收尾，
+                // 所以默认不勾；想用它就在设置里勾上，勾过之后按勾选状态记住。
+                item.enabled = btEnabled.contains(item.name);
+                continue;
+            }
             item.enabled = !hasSaved || !disabled.contains(item.name);
             // 还没手动配置过时沿用老默认：VPN 的 tun 网卡不勾
             if (!hasSaved && item.name.startsWith("tun")) {
@@ -151,7 +158,15 @@ public final class NetInterfaces {
         StringBuilder enabled = new StringBuilder();
         StringBuilder disabled = new StringBuilder();
         StringBuilder binds = new StringBuilder();
+        StringBuilder bluetooth = new StringBuilder();
         for (NetInterfaceInfo item : list) {
+            if (isBluetooth(item.name) && item.enabled) {
+                // 蓝牙通道的勾选状态单独记一份（默认不勾），见 Config.getEnabledBluetoothNames()
+                if (bluetooth.length() > 0) {
+                    bluetooth.append(',');
+                }
+                bluetooth.append(item.name);
+            }
             if (item.enabled) {
                 if (enabled.length() > 0) {
                     enabled.append(',');
@@ -174,6 +189,7 @@ public final class NetInterfaces {
         Config config = Config.getInstance(context);
         config.setEnabledInterfaceNames(enabled.toString());
         config.setDisabledInterfaceNames(disabled.toString());
+        config.setEnabledBluetoothNames(bluetooth.toString());
         config.setInterfaceBindAddresses(binds.toString());
     }
 

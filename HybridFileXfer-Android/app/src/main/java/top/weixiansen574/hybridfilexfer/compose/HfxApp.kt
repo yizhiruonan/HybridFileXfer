@@ -411,7 +411,10 @@ fun HfxApp(
             ServerService.startAuto(activity)
         }
         interfaces = try {
-            NetInterfaces.enumerate(activity)
+            val list = NetInterfaces.enumerate(activity)
+            // 保存的勾选状态要应用上：不然「蓝牙共享网络默认不勾」这类规则在界面上看不出来
+            NetInterfaces.applySaved(activity, list)
+            list
         } catch (e: Exception) {
             emptyList()
         }
@@ -456,6 +459,10 @@ fun HfxApp(
                     if (old != null) {
                         item.enabled = old.enabled
                         item.bindAddress = old.bindAddress
+                    } else {
+                        // 新冒出来的网卡（比如刚连上的 bt-pan）按保存的规则定勾选状态，
+                        // 否则会按「默认全开」显示，蓝牙就自动勾上了
+                        NetInterfaces.applySaved(activity, listOf(item))
                     }
                 }
                 val changed = fresh.size != interfaces.size || fresh.indices.any { index ->
@@ -497,7 +504,15 @@ fun HfxApp(
         } catch (_: Exception) {
         }
         if (ServerService.isRunning()) {
-            ServerService.restartSession(activity)
+            // 网卡勾选变了得按新网卡列表重新规划通道：restartSession 只是重开当前这一轮会话，
+            // 新勾上的网卡（比如蓝牙共享网络）不会因此多出通道，用户会以为勾了没用。
+            try {
+                val config = Config.getInstance(activity)
+                ServerService.startServer(activity, config.mode, NetInterfaces.forAutoConnect(activity),
+                    config.getLocalBufferCount(), config.getRemoteBufferCount())
+            } catch (e: Exception) {
+                ServerService.restartSession(activity)
+            }
         }
     }
 
