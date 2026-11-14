@@ -14,7 +14,9 @@ use crate::proto::{self, controller, current_file_system, transfer, BLOCK_SIZE};
 use crate::receiver::Receiver;
 use crate::util;
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+/// 单条通道的连接超时。并行连之后总耗时就等于它，所以压到 1.5 秒：
+/// 同一个局域网里 1.5 秒还连不上的通道，多半本来就不通
+const CONNECT_TIMEOUT: Duration = Duration::from_millis(1500);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(60);
@@ -141,74 +143,147 @@ impl Session {
             ));
         }
 
-        // 已经连通的网段：不同网段的网卡（比如手机的 wlan1 走了另一个网段）直接跳过，
-        // 不用每条都等 CONNECT_TIMEOUT —— 否则 4 条连不上的通道会让"已连接"提示晚十几秒
-        let mut reachable_subnet: Option<[u8; 3]> = match address {
-            IpAddr::V4(v4) if !address.is_loopback() => {
-                let o = v4.octets();
-                Some([o[0], o[1], o[2]])
-            }
-            _ => None,
-        };
-
-        // One transfer channel per network interface, connected in the order the
-        // phone advertised them (the phone accepts them one by one).
-        let mut transfers: Vec<(String, TcpStream)> = Vec::with_capacity(interfaces.len());
-        // A writer/reader dedicated to the control channel: the "channel connected"
-        // flags are exchanged there, not on the transfer channels.
-        let mut cw = writer.try_clone()?;
-        for interface in &interfaces {
-            let interface_port = if interface.address.is_loopback() {
-                local_port
-            } else {
-                port
-            };
-            let target = SocketAddr::new(interface.address, interface_port);
-            // 每条通道都尝试连接（之前把"不同网段/最近超时"的通道直接跳过，
-            // 会导致通道数变少；宁可多等 2 秒也要把能连的都连上）
-            log::debug(&format!(
-                "connecting transfer channel {} -> {} (bind: {})",
-                interface.name,
-                target,
-                interface
-                    .bind
-                    .map(|b| b.to_string())
-                    .unwrap_or_else(|| "system default".to_string())
-            ));
-            match crate::netif::connect(target, CONNECT_TIMEOUT, interface.bind) {
-                Ok(stream) => {
-                    stream.set_nodelay(true)?;
-                    stream.set_read_timeout(Some(TRANSFER_TIMEOUT))?;
-                    stream.set_write_timeout(Some(TRANSFER_TIMEOUT))?;
-                    if !interface.address.is_loopback() {
-                        if let IpAddr::V4(v4) = interface.address {
-                            let o = v4.octets();
-                            reachable_subnet = Some([o[0], o[1], o[2]]);
+        // 通道连接必须快：插上线就该连上。以前是一条条串行连、每条最多等 CONNECT_TIMEOUT，
+        // 手机那边 4 条 wlan2（192.168.173.x，电脑压根没有这个网段的网卡）就能把「已连接」
+        // 拖到几十秒 —— 用户看到的就是「插上一分钟了还连不上」。
+        // 现在：本机没有同网段网卡的地址直接跳过（照规矩给手机回 false），其余并行连接、顺序握手。
+        struct ChannelAttempt {
+            name: String,
+            address: IpAddr,
+            bind: Option<IpAddr>,
+            target: SocketAddr,
+            /// 直接跳过、不再尝试的原因
+            skip: Option<&'static str>,
+        }
+        let local_v4 = crate::netif::local_ipv4();
+        let mut plan: Vec<ChannelAttempt> = Vec::with_capacity(interfaces.len());
+        {
+            let cache = unreachable_channels().lock().unwrap();
+            for interface in &interfaces {
+                let interface_port = if interface.address.is_loopback() {
+                    local_port
+                } else {
+                    port
+                };
+                let mut skip = None;
+                if let IpAddr::V4(v4) = interface.address {
+                    if !v4.is_loopback() {
+                        let o = v4.octets();
+                        // 只比前三段（/24）：手机和电脑在同一个局域网时前缀一定相同
+                        let same_subnet = local_v4
+                            .iter()
+                            .any(|local| !local.is_loopback() && local.octets()[..3] == o[..3]);
+                        if !same_subnet {
+                            skip = Some("本机没有同网段网卡");
                         }
                     }
-                    proto::write_bool(&mut cw, true)?;
-                    proto::write_utf(&mut cw, &interface.name)?;
-                    let accepted = proto::read_bool(&mut reader)?;
-                    if accepted {
-                        transfers.push((interface.name.clone(), stream));
-                    } else {
-                        log::warn(&format!(
-                            "the phone refused the transfer channel {} ({})",
-                            interface.name, interface.address
-                        ));
+                }
+                if skip.is_none() {
+                    if let Some(at) = cache.get(&interface.address) {
+                        if at.elapsed() < UNREACHABLE_TTL {
+                            skip = Some("上次连接超时");
+                        }
                     }
                 }
-                Err(e) => {
-                    // 这张网卡连不上（比如电脑和手机的WIFI不在同一网段），
-                    // 告诉手机跳过它，其它通道继续用 —— 自适应多通道。
-                    let _ = proto::write_bool(&mut cw, false);
-                    let _ = proto::write_utf(&mut cw, &interface.name);
-                    let _ = proto::read_bool(&mut reader);
-                    log::warn(&format!(
-                        "cannot reach transfer channel {} ({}) : {} — skipped",
-                        interface.name, interface.address, e
+                plan.push(ChannelAttempt {
+                    name: interface.name.clone(),
+                    address: interface.address,
+                    bind: interface.bind,
+                    target: SocketAddr::new(interface.address, interface_port),
+                    skip,
+                });
+            }
+        }
+
+        // One transfer channel per network interface. 先并行把 TCP 连上（各自带超时，
+        // 总耗时 = 最慢的那条，而不是所有失败通道累加），再按手机广播的顺序握手。
+        let mut results: Vec<Option<io::Result<TcpStream>>> = thread::scope(|scope| {
+            let mut slots: Vec<Option<io::Result<TcpStream>>> = Vec::with_capacity(plan.len());
+            let handles: Vec<_> = plan
+                .iter()
+                .map(|attempt| {
+                    if attempt.skip.is_some() {
+                        return None;
+                    }
+                    log::debug(&format!(
+                        "connecting transfer channel {} -> {} (bind: {})",
+                        attempt.name,
+                        attempt.target,
+                        attempt
+                            .bind
+                            .map(|b| b.to_string())
+                            .unwrap_or_else(|| "system default".to_string())
                     ));
+                    let target = attempt.target;
+                    let bind = attempt.bind;
+                    Some(scope.spawn(move || crate::netif::connect(target, CONNECT_TIMEOUT, bind)))
+                })
+                .collect();
+            for handle in handles {
+                slots.push(match handle {
+                    None => None,
+                    Some(handle) => Some(handle.join().unwrap_or_else(|_| {
+                        Err(io::Error::new(io::ErrorKind::Other, "connect thread panicked"))
+                    })),
+                });
+            }
+            slots
+        });
+
+        // A writer/reader dedicated to the control channel: the "channel connected"
+        // flags are exchanged there, not on the transfer channels.
+        let mut transfers: Vec<(String, TcpStream)> = Vec::with_capacity(interfaces.len());
+        let mut cw = writer.try_clone()?;
+        for (index, attempt) in plan.iter().enumerate() {
+            let outcome = results[index].take();
+            let refusal = match (&attempt.skip, &outcome) {
+                (Some(reason), _) => Some((*reason).to_string()),
+                (None, Some(Err(e))) => Some(e.to_string()),
+                (None, Some(Ok(_))) => None,
+                (None, None) => Some("连接未完成".to_string()),
+            };
+            let stream = match (refusal, outcome) {
+                (None, Some(Ok(stream))) => stream,
+                (reason, _) => {
+                    // 这张网卡连不上（比如电脑和手机的 WIFI 不在同一网段）：告诉手机跳过它，
+                    // 其它通道继续用 —— 自适应多通道。
+                    let _ = proto::write_bool(&mut cw, false);
+                    let _ = proto::write_utf(&mut cw, &attempt.name);
+                    let _ = proto::read_bool(&mut reader);
+                    let reason = reason.unwrap_or_else(|| "连接失败".to_string());
+                    if attempt.skip.is_some() {
+                        log::debug(&format!(
+                            "skip transfer channel {} ({}) : {}",
+                            attempt.name, attempt.address, reason
+                        ));
+                    } else {
+                        // 超时的记两分钟，重连时不再白等
+                        unreachable_channels()
+                            .lock()
+                            .unwrap()
+                            .insert(attempt.address, Instant::now());
+                        log::warn(&format!(
+                            "cannot reach transfer channel {} ({}) : {} — skipped",
+                            attempt.name, attempt.address, reason
+                        ));
+                    }
+                    continue;
                 }
+            };
+            unreachable_channels().lock().unwrap().remove(&attempt.address);
+            stream.set_nodelay(true)?;
+            stream.set_read_timeout(Some(TRANSFER_TIMEOUT))?;
+            stream.set_write_timeout(Some(TRANSFER_TIMEOUT))?;
+            proto::write_bool(&mut cw, true)?;
+            proto::write_utf(&mut cw, &attempt.name)?;
+            let accepted = proto::read_bool(&mut reader)?;
+            if accepted {
+                transfers.push((attempt.name.clone(), stream));
+            } else {
+                log::warn(&format!(
+                    "the phone refused the transfer channel {} ({})",
+                    attempt.name, attempt.address
+                ));
             }
         }
 

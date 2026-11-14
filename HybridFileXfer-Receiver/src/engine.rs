@@ -258,7 +258,10 @@ impl AdbCycle {
             self.last_start_ok = started;
             self.fresh_sent_for = Some(device.serial.clone());
             self.last_ensure = Instant::now();
-            if !sleep_unless_stopped(stop, Duration::from_millis(500)) {
+            // 手机端从「服务被拉起」到「开始监听」还有一两百毫秒，刚插上线时更长。
+            // 以前先睡 500ms，失败一次就退到局域网发现（那要等广播），用户看到的就是
+            // 「插上好几秒才连上」。下面连 3 秒内每 250ms 重试一次 adb 通道。
+            if !sleep_unless_stopped(stop, Duration::from_millis(200)) {
                 return Attempt::Retry;
             }
         } else {
@@ -277,24 +280,38 @@ impl AdbCycle {
             }
         }
 
-        match Session::connect_with_local_port(
+        // 插上就连接：3 秒内每 250ms 重试一次，别一次失败就退到局域网发现
+        let deadline = Instant::now() + Duration::from_millis(3000);
+        let mut last_error: Option<String> = None;
+        loop {
+            match Session::connect_with_local_port(
                 IpAddr::from([127, 0, 0, 1]),
                 options.port,
                 options.local_port,
                 &home_dir(options),
                 0,
             ) {
-            Ok(mut session) => {
-                session.device = device.serial.clone();
-                report_connected(&session, on_state);
-                run_session(&mut session, options, stop);
-                return Attempt::Ran;
-            }
-            Err(e) => {
-                log::debug(&format!("connect via adb: {}", e));
-                return Attempt::Retry;
+                Ok(mut session) => {
+                    session.device = device.serial.clone();
+                    report_connected(&session, on_state);
+                    run_session(&mut session, options, stop);
+                    return Attempt::Ran;
+                }
+                Err(e) => {
+                    last_error = Some(e.to_string());
+                    if Instant::now() >= deadline
+                        || !sleep_unless_stopped(stop, Duration::from_millis(250))
+                    {
+                        break;
+                    }
+                }
             }
         }
+        log::debug(&format!(
+            "connect via adb: {}",
+            last_error.unwrap_or_else(|| "timeout".to_string())
+        ));
+        Attempt::Retry
     }
 }
 
