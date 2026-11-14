@@ -99,6 +99,17 @@ public class ServerService extends Service implements ServiceConnection {
     private Thread loopThread;
     private volatile boolean active;
     private volatile boolean bound;
+    /**
+     * 「服务正在/已经停止」。
+     *
+     * <p>停止流程里 setState(STATE_STOPPED) 会顺手 updateNotification()；但 onDestroy 跑的时候
+     * 服务记录已经从 AMS 摘掉了，那时的 stopForeground(STOP_FOREGROUND_REMOVE) 是空操作
+     * （ActiveServices.setServiceForeground 找不到 ServiceRecord 直接返回），
+     * 于是这条 notify() 就把刚被系统撤掉的前台通知又贴回通知栏 —— 而且它 setOngoing(true)、
+     * 没有前台服务再管它，用户就永远清不掉（报的「点停止没生效、通知没消失」）。
+     * 停止流程一开始就立这面旗，之后任何 updateNotification() 一律不 post。
+     */
+    private volatile boolean stopping;
     /** 共享监听套接字的分类器；只有 accept 循环线程会用它 */
     private volatile ServerListener listener;
     private volatile boolean shizukuBound;
@@ -787,6 +798,11 @@ public class ServerService extends Service implements ServiceConnection {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        // 收到的是"启动"而不是"停止"：把停止标记复位（停止流程刚走完、实例还没销毁时
+        // 又被电脑/adb 拉起，这条实例必须能继续更新通知，不然它以后再也不刷新通知栏）
+        if (intent == null || !ACTION_STOP.equals(intent.getAction())) {
+            stopping = false;
+        }
         // 系统要求 startForegroundService() 之后 5 秒内必须 startForeground()；
         // onCreate 只在第一次调用，服务已经在跑时再被 start（电脑每次连都会用 adb 拉起）
         // 就必须再喊一次，否则进程会被系统以 "did not then call startForeground" 杀掉，
@@ -1380,10 +1396,16 @@ public class ServerService extends Service implements ServiceConnection {
     }
 
     private void stopEverything() {
+        // 「先立旗再 setState：setState 会调 updateNotification()，停止期间绝不能再 post，
+        //  否则 onDestroy 那一次会把系统刚撤掉的前台通知重新贴回来」
+        stopping = true;
         active = false;
         stopLoop(true);
         setState(STATE_STOPPED);
         stopForegroundCompat();
+        // 「onDestroy 里服务记录已经没了，stopForeground 是空操作，必须自己 cancel 一次，
+        //  否则前面任何一次 updateNotification() 留下的通知会一直挂在通知栏（ongoing，滑不掉）」
+        cancelNotification();
     }
 
     @Override
@@ -1567,6 +1589,10 @@ public class ServerService extends Service implements ServiceConnection {
     }
 
     private void updateNotification() {
+        // 「停止流程开始后一律不 post：onDestroy 阶段 post 出去的通知没人再撤」
+        if (stopping) {
+            return;
+        }
         try {
             NotificationManager manager = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
             if (manager != null) {
@@ -1574,6 +1600,18 @@ public class ServerService extends Service implements ServiceConnection {
             }
         } catch (Throwable e) {
             Log.w(TAG, "updateNotification failed", e);
+        }
+    }
+
+    /** 「撤掉这条前台/常驻通知（停止后用；stopForeground 在服务已销毁时是空操作）」 */
+    private void cancelNotification() {
+        try {
+            NotificationManager manager = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+            if (manager != null) {
+                manager.cancel(NOTIFICATION_ID);
+            }
+        } catch (Throwable e) {
+            Log.w(TAG, "cancelNotification failed", e);
         }
     }
 
