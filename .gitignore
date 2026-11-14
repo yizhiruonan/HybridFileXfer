@@ -46,3 +46,6 @@ tmp-test/
 .dsh-vision-toolkit/
 wgc_capture.obj
 
+target-verify/
+tools/wgc-capture/shots/
+tools/wgc-capture/wgc_capture.exe
