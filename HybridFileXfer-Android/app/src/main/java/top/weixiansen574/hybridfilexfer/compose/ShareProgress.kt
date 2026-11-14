@@ -1,6 +1,8 @@
 package top.weixiansen574.hybridfilexfer.compose
 
 import android.content.Context
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.platform.ComposeView
@@ -70,6 +72,14 @@ class ShareActions(
  */
 internal object ShareProgress {
     private const val TAG = "HFXSharePanel"
+
+    /**
+     * 主线程 Handler：[mutableStateOf] 的写只能在主线程（Compose 的快照系统不是线程安全的，
+     * 后台线程直接写会有「写进去了但这一帧不重组」甚至 Snapshot 冲突的风险）。
+     * 所以所有入口都过 [runOnMain] —— 现在调用方本来都在主线程，这里兜的是以后有人从
+     * 后台线程调的情形（例如传输线程直接把真值推过来）。
+     */
+    private val main = Handler(Looper.getMainLooper())
 
     /** 面板现在看到的状态：Compose 侧读它的 value，[update] 写它的 value */
     private val state = mutableStateOf(UiState())
@@ -175,19 +185,46 @@ internal object ShareProgress {
     /** 弹「取消发送」确认框（面板上的「取消发送」按一下就走这里） */
     @JvmStatic
     fun showCancelConfirm() {
-        cancelConfirm.value = true
+        runOnMain { cancelConfirm.value = true }
     }
 
     /** 收起确认框（开始新一次发送时要保证它是关着的） */
     @JvmStatic
     fun hideCancelConfirm() {
-        cancelConfirm.value = false
+        runOnMain { cancelConfirm.value = false }
     }
 
-    /** 把最新的 UiState 推进面板（快照写入，任何线程调都安全；实际调用都在主线程） */
+    private fun runOnMain(block: Runnable) {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            block.run()
+        } else {
+            main.post(block)
+        }
+    }
+
+    /**
+     * 新一轮开始：把面板刷成干净的空态。
+     *
+     * <p>为什么需要它：二次分享（暂停中再分享、传完再分享）时 Activity 是同一条，
+     * 面板这个 object 也是同一个。只喂一次「未激活」的 [update] 也能盖掉大部分残留，
+     * 但「取消确认框还开着」「[UiState] 里这次没传的那些字段」这些得靠整块换掉才彻底。
+     * 调用之后应当再调一次 [update] 把新一轮的初始值（例如电脑名）喂进去。
+     *
+     * <p>注意：不清 [actions] / [cancelKeep] / [cancelDiscard] —— 那三个是 Activity 在
+     * onCreate 里装好的按钮落点，跨轮次有效，只有 onDestroy 的 [release] 才清。
+     */
+    @JvmStatic
+    fun reset() {
+        runOnMain {
+            cancelConfirm.value = false
+            state.value = UiState()
+        }
+    }
+
+    /** 把最新的 UiState 推进面板（任何线程调都安全；实际调用都在主线程） */
     @JvmStatic
     fun update(next: UiState) {
-        state.value = next
+        runOnMain { state.value = next }
     }
 
     /**
@@ -212,7 +249,9 @@ internal object ShareProgress {
         note: String,
         label: String,
     ) {
-        state.value = UiState(
+        // 每次都是一份**完整**的 UiState（其余字段走默认值）：面板不可能从上一帧
+        // 继承到 xferNote / xferPaused / 通道明细之类的旧值。
+        update(UiState(
             xferActive = active,
             xferName = name,
             xferDone = done,
@@ -227,7 +266,7 @@ internal object ShareProgress {
             // 暂停/取消走 ShareActivity 传进来的回调，面板不用去碰 ServerService 的传输控制
             xferId = -1,
             xferPaused = paused,
-        )
+        ))
     }
 
     /** Activity 销毁：owner 走到 DESTROYED，状态清干净（下次进来重新开始） */
@@ -235,12 +274,14 @@ internal object ShareProgress {
     fun release() {
         val current = owner
         owner = null
-        actions.value = null
+        runOnMain {
+            actions.value = null
+            cancelConfirm.value = false
+            state.value = UiState()
+        }
         cancelKeep = null
         cancelDiscard = null
-        cancelConfirm.value = false
         current?.stop()
-        state.value = UiState()
     }
 
     private class Owner : LifecycleOwner, ViewModelStoreOwner, SavedStateRegistryOwner {
