@@ -251,7 +251,15 @@ mod win {
         };
         let local = match local {
             Some(ip) => ip,
-            None => return Ok(None),
+            None => {
+                // 留着这条日志：排查「某张网卡的通道没绑定源地址」时要看候选列表
+                crate::log::debug(&format!(
+                    "netif: 找不到与 {} 同网段的网卡地址，候选 {:?}",
+                    target,
+                    local_ipv4()
+                ));
+                return Ok(None);
+            }
         };
         let stream = connect_from(local, target, timeout)?;
         crate::log::debug(&format!(
