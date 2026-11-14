@@ -26,6 +26,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
@@ -39,10 +40,14 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.Density
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
@@ -348,9 +353,74 @@ private fun humanSize(bytes: Long): String {
     }
 }
 
-/** 电脑推送文件时的进度提示：分块进度条 + 每通道明细（IDM / 迅雷 那种） */
+/**
+ * 进度卡片的外层：只负责「整体放大」这一件事。
+ *
+ * [scale] = 1f（默认）：和以前一模一样，三个老调用方（双窗口弹窗、应用外悬浮窗、
+ * 应用内接收）都不会有任何变化。
+ *
+ * [scale] > 1f：给分享发送页用（1.15f）—— 把 [LocalDensity] 整体乘上 scale，
+ * 卡片里的字号 / 间距 / 进度条高度 / 按钮就一起变大；因为是按新密度重新排版，
+ * 字是重新栅格化的（不会像 graphicsLayer 那样糊），布局也是真的放大而不是拉伸图片。
+ *
+ * 放大后不能顶出屏幕：卡片宽度按「屏宽 - 32dp」反算（内层 1dp 实际 = 外层 scale dp，
+ * 所以可用宽度要先除以 scale），高度同理按「屏高 - 48dp」封顶；窄屏上先保证放得下。
+ */
 @Composable
 internal fun ReceiveProgressPanel(
+    state: UiState,
+    onDismiss: () -> Unit = {},
+    sending: Boolean = false,
+    bare: Boolean = false,
+    showFooter: Boolean = true,
+    onPause: (() -> Unit)? = null,
+    onResume: (() -> Unit)? = null,
+    onCancel: (() -> Unit)? = null,
+    /** 整体放大倍数（1f = 原始大小，340dp 卡片）；分享发送页传 1.15f */
+    scale: Float = 1f,
+) {
+    if (scale <= 1.001f) {
+        // 绝大多数调用走这条：一个 dp 都不变
+        PanelCardContent(
+            state = state,
+            onDismiss = onDismiss,
+            sending = sending,
+            bare = bare,
+            showFooter = showFooter,
+            onPause = onPause,
+            onResume = onResume,
+            onCancel = onCancel,
+            cardWidth = 340.dp,
+            cardMaxHeight = 560.dp,
+        )
+        return
+    }
+    val base = LocalDensity.current
+    val screen = LocalConfiguration.current
+    // 换算成「内层 dp」：内层 1dp 实际占 scale dp，所以可用宽度、可用高度都要先除以 scale
+    val usableWidth = (screen.screenWidthDp - 32).coerceAtLeast(200).toFloat() / scale
+    val usableHeight = (screen.screenHeightDp - 48).coerceAtLeast(240).toFloat() / scale
+    CompositionLocalProvider(
+        LocalDensity provides Density(base.density * scale, base.fontScale * scale),
+    ) {
+        PanelCardContent(
+            state = state,
+            onDismiss = onDismiss,
+            sending = sending,
+            bare = bare,
+            showFooter = showFooter,
+            onPause = onPause,
+            onResume = onResume,
+            onCancel = onCancel,
+            cardWidth = minOf(340f, usableWidth).dp,
+            cardMaxHeight = minOf(560f, usableHeight).dp,
+        )
+    }
+}
+
+/** 电脑推送文件时的进度提示：分块进度条 + 每通道明细（IDM / 迅雷 那种） */
+@Composable
+private fun PanelCardContent(
     state: UiState,
     onDismiss: () -> Unit = {},
     sending: Boolean = false,
@@ -365,6 +435,10 @@ internal fun ReceiveProgressPanel(
     onPause: (() -> Unit)? = null,
     onResume: (() -> Unit)? = null,
     onCancel: (() -> Unit)? = null,
+    /** 卡片宽度（内层 dp，默认 340dp；放大时由外层按屏幕宽度收窄） */
+    cardWidth: Dp = 340.dp,
+    /** 卡片最大高度（内层 dp，默认 560dp；超出就在卡片内部滚动） */
+    cardMaxHeight: Dp = 560.dp,
 ) {
     val colorScheme = MiuixTheme.colorScheme
     val haptic = LocalHapticFeedback.current
@@ -478,8 +552,8 @@ internal fun ReceiveProgressPanel(
     val card: @Composable () -> Unit = {
         Column(
             modifier = Modifier
-                .width(340.dp)
-                .heightIn(max = 560.dp)
+                .width(cardWidth)
+                .heightIn(max = cardMaxHeight)
                 .clip(RoundedCornerShape(24.dp))
                 .background(colorScheme.surfaceContainer)
                 .clickable { }

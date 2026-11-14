@@ -100,7 +100,9 @@ internal object ShareProgress {
                 MiuixTheme(controller = controller) {
                     // 和 TransferScreen.kt 里双窗口那段一比一：
                     // sending=true / showFooter 不传（默认 true，底部按钮由面板自己画）/
-                    // bare=true（唯一的不同，见类注释：false 会把小窗口撑成满屏黑）
+                    // bare=true（唯一的不同，见类注释：false 会把小窗口撑成满屏黑）。
+                    // scale=1.15：整张卡片（标题 / 进度条 / 各通道明细 / 按钮）在分享页放大一号，
+                    // 双窗口和其它地方不传 scale，保持原始 340dp。
                     val current = actions.value
                     ReceiveProgressPanel(
                         state = state.value,
@@ -110,6 +112,7 @@ internal object ShareProgress {
                         onResume = { current?.onResume?.run() },
                         onCancel = { current?.onCancel?.run() },
                         bare = true,
+                        scale = 1.15f,
                     )
                 }
             }

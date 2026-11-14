@@ -206,10 +206,13 @@ public class ShareActivity extends AppCompatActivity {
                 this::cancelTransfer,
                 this::pauseTransfer,
                 this::resumeTransfer));
-        // 窗口跟着卡片走：宽高都 WRAP_CONTENT，背景和四周压暗全部去掉 —— 屏幕上只剩那张卡片，
-        // 和双窗口弹窗里看到的是同一张（窗口自带的圆角背景 + 压暗会变成「一个白框套着卡片」）。
+        // 窗口跟着卡片走：宽高都 WRAP_CONTENT，背景透明 —— 窗口自带的圆角背景会变成
+        // 「一个白框套着卡片」，所以只留卡片本身。
         getWindow().setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
-        getWindow().setDimAmount(0f);
+        // 背景压暗交给 Window 自己的 dim：只压后面那层，卡片保持原大小。
+        // （双窗口那层 35% 遮罩是 Compose 里 fillMaxSize 的黑 Box，搬到这种 WRAP_CONTENT
+        // 小窗口里会把窗口直接撑成满屏，所以这里用 dim 而不是黑 Box。）
+        getWindow().setDimAmount(0.35f);
         getWindow().setLayout(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT);
