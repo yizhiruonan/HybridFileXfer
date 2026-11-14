@@ -78,6 +78,17 @@ public class ControllerIdentifiers {
      * </pre>
      */
     public static final short RESUME_STATE = 30;
+    /**
+     * 取消传输时用户选了「不保留进度」：让电脑端把这次写到一半的文件和
+     * {@code <文件名>.hfxpart} 续传记录一起删掉，下次同一个文件从头传。
+     *
+     * <p>和 {@link #CANCEL} 一样不带载荷，语义只多一条：电脑端收到它就当取消处理，
+     * 收尾时按"丢弃"收尾（{@code Receiver::finish_with(false)}，见 src/session.rs）。
+     * 没有为它升协议版本号 —— 旧版本电脑端会把它当成"不认识的控制指令"忽略掉，
+     * 取消本身仍然会因为传输通道被关掉而被发现，只是半截文件会被保留
+     * （退化成"保留进度"），不会出错；和当初 PING / CHECK_PENDING 一样是纯增量指令。
+     */
+    public static final short CANCEL_DISCARD = 31;
 
     //就让魔法打败魔法吧！
     /**

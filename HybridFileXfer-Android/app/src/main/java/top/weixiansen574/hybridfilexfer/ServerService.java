@@ -189,6 +189,18 @@ public class ServerService extends Service implements ServiceConnection {
      * 会话不断，取消后立刻能再传。
      */
     public static void cancelTransfer(int connectionId) {
+        cancelTransfer(connectionId, false);
+    }
+
+    /**
+     * 取消某台电脑上正在进行的传输，并告诉电脑端「已传的部分要不要保留」。
+     *
+     * @param discardPartial true = 用户在取消确认框里选了「不保留进度」：
+     *        多发一帧 {@code CANCEL_DISCARD}，电脑端收尾时把这次写到一半的文件和
+     *        {@code <文件名>.hfxpart} 续传记录一起删掉，下次同一个文件从头传；
+     *        false = 保留（默认），下次同一个文件从断点续传。
+     */
+    public static void cancelTransfer(int connectionId, boolean discardPartial) {
         HFXServer target = HFXServer.getById(connectionId);
         if (target == null) {
             return;
@@ -200,7 +212,7 @@ public class ServerService extends Service implements ServiceConnection {
             liveFor(connectionId).userCancelled = true;
             // 只关传输通道，让传输线程抛异常退出；控制通道和缓冲区都留给会话线程收尾，
             // 这里绝不能调 disconnect()（会 free 掉正在用的 native 内存）
-            target.abortTransfer();
+            target.abortTransfer(discardPartial);
         } catch (Throwable ignored) {
         }
     }

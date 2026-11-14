@@ -616,12 +616,19 @@ impl Receiver {
 
     /// 收尾：恢复修改时间、放掉所有文件句柄。
     ///
-    /// 305：没传完的文件**不再删除** —— 把"已经收到哪些块"的日志写到旁边
+    /// 305：没传完的文件默认**不删除** —— 把"已经收到哪些块"的日志写到旁边
     /// （`<文件名>.hfxpart`），下次同一个文件（大小/修改时间一致）再传时从这里续上。
     /// 有位图就不会出现 303 当初担心的"大小对、内容有洞"的假文件。
+    ///
+    /// @param keep_incomplete 没传完的文件要不要留（用户取消时就问过这一句）：
+    ///   - true（默认）＝ 留文件和续传日志，下次续传；
+    ///   - false ＝ 手机端点的是「不保留进度」：半截文件和 `.hfxpart` 一起删掉，
+    ///     下次同一个文件从头传（1.7GB 的文件预分配了整份大小，留着就是白占盘）。
     /// 返回（保留的未完成文件数, 这些文件已经收到的字节数）。
-    pub fn finish_with(&self, _keep_incomplete: bool) -> io::Result<(usize, u64)> {
+    pub fn finish_with(&self, keep_incomplete: bool) -> io::Result<(usize, u64)> {
         let mut kept: Vec<(PathBuf, u64)> = Vec::new();
+        // 用户选了「不保留」的文件：句柄放掉之后再删（Windows 上开着删不掉）
+        let mut dropped: Vec<PathBuf> = Vec::new();
         {
             let mut entries = self
                 .entries
@@ -640,6 +647,11 @@ impl Receiver {
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 match journal.as_mut() {
                     Some(journal) if !journal.all_done() => {
+                        if !keep_incomplete {
+                            // 「不保留」：续传日志一行都不写，收尾时连文件一起删
+                            dropped.push(path.clone());
+                            continue;
+                        }
                         if let Err(e) = journal.save(path) {
                             crate::log::warn(&format!(
                                 "{} {}: {}",
@@ -665,6 +677,27 @@ impl Receiver {
             }
             // 句柄必须全部放掉：Windows 上还开着的文件删不掉
             let _handles: Vec<_> = entries.drain().collect();
+        }
+        // 手机端点了「不保留」：文件和续传记录都删掉，下次同一个文件从头传
+        for path in &dropped {
+            crate::journal::ReceiveJournal::remove(path);
+            match fs::remove_file(path) {
+                Ok(()) => crate::log::warn(&format!(
+                    "{} {}",
+                    crate::i18n::tr(
+                        "已删除未接收完的文件（手机端选择不保留）",
+                        "removed the incomplete file (the phone chose not to keep it)"
+                    ),
+                    path.display()
+                )),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => crate::log::warn(&format!(
+                    "{} {}: {}",
+                    crate::i18n::tr("删除未接收完的文件失败", "cannot remove the incomplete file"),
+                    path.display(),
+                    e
+                )),
+            }
         }
         Ok((kept.len(), kept.iter().map(|(_, got)| *got).sum()))
     }
@@ -750,20 +783,45 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_files_are_removed() {
+    fn incomplete_files_are_removed_when_discarding() {
         let dir = temp_dir("incomplete");
         let receiver = Receiver::new(util::normalize_dir(&dir));
         let partial = dir.join("partial.bin");
         let partial_str = partial.to_string_lossy().to_string();
-        // 2 块的文件只写第一块：没接收完，收尾时应该被删掉
+        // 2 块的文件只写第一块：没接收完
         receiver
             .write_block(0, &partial_str, 2_097_152, 0, 1_700_000_000_000, &[1u8; 1024])
             .unwrap();
         assert!(partial.exists());
-        let (files, lost) = receiver.finish_with(false).unwrap();
-        assert_eq!(files, 1);
+        // 手机端取消时选了「不保留进度」：文件和续传日志都要删掉
+        let (kept, lost) = receiver.finish_with(false).unwrap();
+        assert_eq!(kept, 0);
+        assert_eq!(lost, 0);
+        assert!(!partial.exists(), "不保留时半截文件应该被删掉");
+        assert!(
+            !crate::journal::ReceiveJournal::sidecar_path(&partial).exists(),
+            "不保留时续传日志也应该被删掉"
+        );
+    }
+
+    #[test]
+    fn incomplete_files_are_kept_for_resume() {
+        let dir = temp_dir("incomplete-keep");
+        let receiver = Receiver::new(util::normalize_dir(&dir));
+        let partial = dir.join("keep.bin");
+        let partial_str = partial.to_string_lossy().to_string();
+        receiver
+            .write_block(0, &partial_str, 2_097_152, 0, 1_700_000_000_000, &[1u8; 1024])
+            .unwrap();
+        // 默认（保留）：文件和 <文件名>.hfxpart 都留着，下次同一个文件从这里续传
+        let (kept, lost) = receiver.finish_with(true).unwrap();
+        assert_eq!(kept, 1);
         assert_eq!(lost, 1024);
-        assert!(!partial.exists(), "半截文件应该被删掉");
+        assert!(partial.exists(), "保留时半截文件要留着");
+        assert!(
+            crate::journal::ReceiveJournal::sidecar_path(&partial).exists(),
+            "保留时要写出续传日志"
+        );
     }
 
     #[test]

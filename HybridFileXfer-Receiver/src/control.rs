@@ -15,6 +15,14 @@ pub static RECEIVING: AtomicBool = AtomicBool::new(false);
 /// 手机端最近一次上报的暂停状态：只有它变了才说明是手机点的暂停，
 /// 这时才把电脑本地的暂停开关同步过去（否则电脑自己点的暂停会被手机的状态覆盖）
 pub static PHONE_PAUSED: AtomicBool = AtomicBool::new(false);
+/// 手机上取消时选了「不保留进度」（CANCEL_DISCARD）：收尾时把这次写到一半的文件
+/// 和 `.hfxpart` 续传记录一起删掉，下次同一个文件从头传。
+///
+/// 用全局原子量而不是给 handle_receive 加参数：取消这一帧可能在任何时候到
+/// （传输中、收尾算校验时、甚至传输线程都退出了才到），收到的那一处只管置位，
+/// 由收尾的 finish_with 一次性消费。每次接收开始（ReceivingGuard::begin）都会清掉，
+/// 不会把上一次的选择带到下一次。
+pub static DISCARD_PARTIAL: AtomicBool = AtomicBool::new(false);
 
 pub fn pause(on: bool) {
     PAUSE_SEND.store(on, Ordering::Relaxed);
@@ -37,6 +45,17 @@ pub fn reset() {
     PAUSE_SEND.store(false, Ordering::Relaxed);
     CANCEL_SEND.store(false, Ordering::Relaxed);
     PHONE_PAUSED.store(false, Ordering::Relaxed);
+    DISCARD_PARTIAL.store(false, Ordering::Relaxed);
+}
+
+/// 手机端要求「不保留进度」（收尾时删掉半截文件和续传日志）
+pub fn set_discard_partial(on: bool) {
+    DISCARD_PARTIAL.store(on, Ordering::Relaxed);
+}
+
+/// 本次接收是不是要丢弃半截文件（由 finish_with 消费；ReceivingGuard 结束时清掉）
+pub fn discard_partial() -> bool {
+    DISCARD_PARTIAL.load(Ordering::Relaxed)
 }
 
 pub fn sending() -> bool {

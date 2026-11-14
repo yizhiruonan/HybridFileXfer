@@ -518,14 +518,21 @@ fn report_connected(session: &Session, on_state: &StateSink) {
 fn run_session(session: &mut Session, options: &EngineOptions, stop: &Arc<AtomicBool>) -> SessionEnd {
     let receiver = Arc::new(Receiver::with_shared(crate::webserve::current_dir()));
     let end = session.run(&receiver, stop);
-    // 会话结束（断开/被停止/出错）：把没收完的半截文件清掉，界面进度也复位，
-    // 否则卡片上会一直挂着一个停住不动的假进度
-    if let Ok((removed, _lost)) = receiver.finish_with(false) {
-        if removed > 0 {
+    // 会话结束（断开/被停止/出错）：把还开着的文件句柄放掉、续传日志落盘，
+    // 界面进度也复位，否则卡片上会一直挂着一个停住不动的假进度。
+    //
+    // 这里要传 true（保留）：掉线/被杀不是用户主动取消，半截文件留着，
+    // 下次同一个文件还能续传。真正"删掉"只有一条路 —— 手机端取消时选了「不保留进度」
+    // （CANCEL_DISCARD），那个选择由 handle_receive 自己带着走。
+    if let Ok((kept, _lost)) = receiver.finish_with(true) {
+        if kept > 0 {
             log::warn(&format!(
                 "{} {}",
-                tr("清理了未接收完成的文件：", "removed incomplete files:"),
-                removed
+                tr(
+                    "保留未接收完成的文件（可续传）：",
+                    "kept incomplete files (resumable):"
+                ),
+                kept
             ));
         }
     }

@@ -103,6 +103,14 @@ public class ShareActivity extends AppCompatActivity {
     private volatile boolean cancelled;
     private volatile boolean finished;
     private volatile boolean transferring;
+    /**
+     * 本次发送的「轮次」：二次分享（singleTop）时自增。
+     *
+     * <p>上一轮的准备线程 / 发送线程收尾时都会拿自己那一轮的号码和它对一下，
+     * 号码变了就什么都不碰（不改状态、不刷面板、不自动关窗口）——
+     * 否则上一轮的「失败」「完成」会把刚开始的这一轮直接掐掉。
+     */
+    private volatile int round;
     /** 已经「收起」到后台（传输中点了遮罩 / 返回键）：这时再点什么都不要再把 Activity 收掉 */
     private boolean collapsed;
     private volatile HFXServer server;
@@ -210,6 +218,8 @@ public class ShareActivity extends AppCompatActivity {
                 this::cancelTransfer,
                 this::pauseTransfer,
                 this::resumeTransfer));
+        // 「取消发送」先弹确认框（已传的部分要不要保留），两个选项各自落到这里
+        ShareProgress.setCancelHandlers(this::cancelKeepingProgress, this::cancelDiscardingProgress);
         // 窗口跟着卡片走：宽高都 WRAP_CONTENT，背景透明 —— 窗口自带的圆角背景会变成
         // 「一个白框套着卡片」，所以只留卡片本身。
         getWindow().setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
@@ -235,13 +245,26 @@ public class ShareActivity extends AppCompatActivity {
         handleIntent(getIntent());
     }
 
+    /**
+     * 二次分享（singleTop）：把上一轮那一整套状态整块丢掉，再当一次全新的发送。
+     *
+     * <p>用户报的「界面错位 / 上一次的发送还没完成」就在这儿：第一次分享的弹窗还开着
+     * （传完了、失败了、或者被暂停在「0 B / 1.78 GB · 已暂停」），这时再从 MT 管理器分享一次，
+     * 以前这里只调了 {@link #handleIntent}，而 {@code finished} 还是上一轮的 true ——
+     * {@link #startNextGroup} 第一句 {@code if (finished) return;} 直接返回，
+     * 新的传输一次都没跑，面板就停在上一轮那堆残留上
+     * （14 条通道全是「0 B 正在发送数据…」、状态还是「已暂停」）。
+     *
+     * <p>以前还有个「传输中再来一次就 Toast share_busy」的分支：那个 Toast 一瞬就没了，
+     * 用户看到的就是"什么都没发生、界面还是老样子"。现在改成把上一轮取消掉、
+     * 直接开始发新的这一次（用户既然又分享了一次，要发的是新文件）。
+     */
     @Override
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
-        if (transferring) {
-            Toast.makeText(this, R.string.share_busy, Toast.LENGTH_SHORT).show();
-            return;
-        }
+        // getIntent() 也要换掉：后面别的地方读的还是最初那一次
+        setIntent(intent);
+        restartWithNewShare();
         handleIntent(intent);
     }
 
@@ -319,12 +342,50 @@ public class ShareActivity extends AppCompatActivity {
     }
 
     /**
-     * 面板上的「取消发送」：原来 share_action 按钮里那段取消逻辑原样搬过来。
+     * 面板上的「取消发送」：先问一句「已经传过去的那部分要不要保留」，再真的取消。
      *
-     * <p>传输线程是阻塞读写的，没有单独的取消指令：直接断开这条连接，
-     * 电脑端会立刻停止并自动重连；半截文件留在电脑上（电脑端自己清理）。
+     * <ul>
+     *   <li><b>保留进度</b>：什么都不用做 —— 电脑端本来就会把这次的不完整文件和
+     *       {@code <文件名>.hfxpart} 留下来，下次发同一个文件只补缺的块（断点续传）；</li>
+     *   <li><b>不保留</b>：取消时多发一帧 {@code CANCEL_DISCARD}，电脑端收尾时把半截文件和
+     *       续传记录一起删掉，下次同一个文件从头传（1.78 GB 的文件预分配了整份大小，
+     *       留着就是白占盘）。</li>
+     * </ul>
+     *
+     * <p>还没开始传（准备 / 等电脑连接 / 正在复制）就没有进度可留，直接取消。
      */
     private void cancelTransfer() {
+        if (finished) {
+            finish();
+            return;
+        }
+        if (!transferring) {
+            doCancelTransfer(true);
+            return;
+        }
+        ShareProgress.showCancelConfirm();
+    }
+
+    /** 确认框里选了「保留进度」：走原来的取消逻辑，电脑上的半截文件留着下次续传 */
+    private void cancelKeepingProgress() {
+        doCancelTransfer(true);
+    }
+
+    /** 确认框里选了「不保留」：让电脑端把这次的不完整文件和续传记录删掉 */
+    private void cancelDiscardingProgress() {
+        doCancelTransfer(false);
+    }
+
+    /**
+     * 真正的取消动作（原来 share_action 那段逻辑）。
+     *
+     * <p>取消只关传输通道、控制通道留着（304），电脑端收尾完会把通道重建回来；
+     * 传输线程是阻塞读写的，靠 {@code ServerService.cancelTransfer} 关通道让它退出。
+     *
+     * @param keepProgress true = 保留已传的部分（下次续传）；
+     *                     false = 电脑端删掉不完整文件和续传记录（下次从头传）
+     */
+    private void doCancelTransfer(boolean keepProgress) {
         if (finished) {
             finish();
             return;
@@ -333,13 +394,84 @@ public class ShareActivity extends AppCompatActivity {
         finished = true;
         transferring = false;
         if (server != null) {
-            ServerService.cancelTransfer(server.getId());
+            ServerService.cancelTransfer(server.getId(), !keepProgress);
         }
         // 采样循环先停：后面那一次「清零」不能被下一拍的真值又盖回去
         frameClock.stop();
         // 面板最后刷一次：进度清零、速率收起、文案换成「已取消」
-        flushPanel(getString(R.string.share_cancelled), true);
+        flushPanel(keepProgress
+                ? getString(R.string.share_cancelled) + "（保留进度，下次接着传）"
+                : getString(R.string.share_cancelled) + "（已让电脑删除未完成的文件）", true);
         handler.postDelayed(this::finish, 800);
+    }
+
+    /**
+     * 二次分享：上一轮的状态整块清干净，再当一次全新的发送。
+     *
+     * <p>要清的是三样东西：
+     * <ol>
+     *   <li>本页自己的状态机（finished / cancelled / transferring、进度、账本基线、面板文案）；</li>
+     *   <li>上一轮排着队的收尾动作（「延时 800ms 关窗口」「延时 1.5s 关窗口」）；</li>
+     *   <li>HFXServer 上的账本（sendProgress / blockProgress / 校验进度）——
+     *       面板每一拍都会把它们画出来，这就是「14 条通道 0 B 正在发送数据…」的残留来源。</li>
+     * </ol>
+     */
+    private void restartWithNewShare() {
+        // 这一轮作废：上一轮还在跑的准备线程 / 发送线程看到号码变了就不再碰界面
+        round++;
+        // 新的一次分享可能指定了另一台电脑（多台在线时）：从新 intent 里重取一遍
+        targetConnectionId = getIntent().getIntExtra(EXTRA_CONNECTION_ID, -1);
+        HFXServer previous = server;
+        if (transferring && previous != null) {
+            try {
+                // 上一轮还在传：先取消掉（这不是用户点了「不保留」，只是"换一份新的发送"，
+                // 已传的部分照旧保留），否则两条发送线程会抢同一条连接上的控制通道
+                ServerService.cancelTransfer(previous.getId());
+            } catch (Throwable ignored) {
+            }
+        }
+        cancelled = false;
+        finished = false;
+        transferring = false;
+        collapsed = false;
+        waitingPc = false;
+        statusText = "";
+        resultText = "";
+        remoteTarget = "";
+        totalBytes = 0L;
+        completedBytes = 0L;
+        currentGroupTotal = 0L;
+        currentGroupSent = 0L;
+        currentFileName = "";
+        peakSpeedBytes = 0L;
+        startTime = 0L;
+        sentFileNames.clear();
+        sentFileCount = 0;
+        channelSpeeds.clear();
+        groups.clear();
+        frameClock.stop();
+        lastSampleAt = 0L;
+        // 速率窗口、显示字节、通道明细、doneChannels 一起归零（不然会接着上一轮的数跑）
+        resetProgressSmoothing();
+        // 上一轮排着队的收尾动作也一起撤掉（这个 handler 只服务本页的界面刷新）
+        handler.removeCallbacksAndMessages(null);
+        if (previous != null) {
+            try {
+                // 上一轮的账本：新任务在 sendFiles 之前本来也会 reset，
+                // 但二次分享这条路以前根本没走到那里，所以这里先清一遍
+                previous.sendProgress.reset();
+                previous.blockProgress.reset();
+                HFXService.resetVerifyProgress();
+            } catch (Throwable ignored) {
+            }
+        }
+        // server 重新按"现在还在连的那台"拿（上一台可能已经断了，ensureConnected 会给新的）
+        server = null;
+        // 面板立刻换成干净的空状态：active=false（底部是「关闭」而不是「继续 / 取消发送」）
+        ShareProgress.update(false, false, "", 0L, 0L, 0L,
+                Collections.emptyList(), Collections.emptyList(), "",
+                previous != null ? previous.getDisplayName() : "");
+        ShareProgress.hideCancelConfirm();
     }
 
     /** 面板上的「暂停发送」：和双窗口弹窗一样，直接叫 HFXServer 关上暂停闸门 */
@@ -380,7 +512,13 @@ public class ShareActivity extends AppCompatActivity {
             return;
         }
         showStatus(getString(R.string.share_preparing));
-        new Thread(() -> prepareAndSend(uris), "SharePrepare").start();
+        final int myRound = round;
+        new Thread(() -> prepareAndSend(uris, myRound), "SharePrepare").start();
+    }
+
+    /** 这一轮还算数吗（二次分享会把 round 顶掉，上一轮的线程看到号码变了就该收工） */
+    private boolean isCurrentRound(int myRound) {
+        return myRound == round;
     }
 
     private List<Uri> extractUris(Intent intent) {
@@ -437,11 +575,11 @@ public class ShareActivity extends AppCompatActivity {
     // 准备 + 发送（后台线程）
     // ------------------------------------------------------------------
 
-    private void prepareAndSend(List<Uri> uris) {
+    private void prepareAndSend(List<Uri> uris, int myRound) {
         List<File> files = new ArrayList<>();
         long total = 0;
         for (int i = 0; i < uris.size(); i++) {
-            if (cancelled) {
+            if (cancelled || !isCurrentRound(myRound)) {
                 return;
             }
             final int index = i + 1;
@@ -454,6 +592,10 @@ public class ShareActivity extends AppCompatActivity {
                 }
             }
         }
+        if (!isCurrentRound(myRound)) {
+            // 复制文件期间又被分享了一次：这一轮作废，别碰界面
+            return;
+        }
         if (files.isEmpty()) {
             fail(getString(R.string.share_no_file));
             return;
@@ -465,9 +607,17 @@ public class ShareActivity extends AppCompatActivity {
 
         showStatus(getString(R.string.share_waiting_pc));
         if (!ensureConnected()) {
-            fail(getString(R.string.share_pc_not_connected));
+            if (isCurrentRound(myRound)) {
+                fail(getString(R.string.share_pc_not_connected));
+            }
             return;
         }
+        if (!isCurrentRound(myRound)) {
+            return;
+        }
+        // 上一轮如果还在收尾（我们刚把它取消掉）：等它真的退出，否则两条发送线程会
+        // 抢同一条连接上的控制通道（旧线程 endTransfer 还会把新线程的 transferring 清掉）
+        waitPreviousTransferIdle(server, myRound);
         // 连上了：把「文件会存到电脑上的哪个目录」算出来（以前是 share_hint 那行），
         // 面板那行说明会以「保存到：电脑名 目录」的形式显示它（见 currentNote）。
         // 和 startNextGroup 里真正用来发的是同一个方法，不会显示一个目录、实际发到另一个。
@@ -504,7 +654,32 @@ public class ShareActivity extends AppCompatActivity {
             }
             groups.add(new Group(entry.getKey(), groupTotal, entry.getValue()));
         }
-        handler.post(this::startNextGroup);
+        final int roundForGroup = myRound;
+        handler.post(() -> startNextGroup(roundForGroup));
+    }
+
+    /**
+     * 等上一轮那条发送线程真的退出（它现在正被取消，通道已经关了，正常几十毫秒就结束）。
+     *
+     * <p>为什么要等：{@code HFXService} 的 {@code transferring} / {@code sendingFiles}
+     * 是"这一次传输"的标志，上一轮退出时会无条件清掉 —— 如果新的这一轮已经开始，
+     * 它清掉的就是新那一轮的标志，会话线程于是又去读控制通道，两个读者一起把帧流读串。
+     * 传输通道本身也是同一批，不能两轮同时用。
+     */
+    private void waitPreviousTransferIdle(HFXServer srv, int myRound) {
+        if (srv == null) {
+            return;
+        }
+        long deadline = System.currentTimeMillis() + 10_000L;
+        while (srv.isTransferring() && System.currentTimeMillis() < deadline
+                && !cancelled && isCurrentRound(myRound)) {
+            try {
+                Thread.sleep(50L);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
     }
 
     private boolean ensureConnected() {
@@ -574,7 +749,11 @@ public class ShareActivity extends AppCompatActivity {
         return remoteBase;
     }
 
-    private void startNextGroup() {
+    private void startNextGroup(int myRound) {
+        if (!isCurrentRound(myRound)) {
+            // 上一轮的收尾（新一轮已经开始了）：这一轮什么都不能碰
+            return;
+        }
         if (finished) {
             return;
         }
@@ -611,7 +790,7 @@ public class ShareActivity extends AppCompatActivity {
             }
             remoteTarget = remoteBase;
             Directory remoteDir = new Directory(remoteBase, server.getRemoteFileSystem());
-            new SendFilesToRemoteTask(new TransferHandler(), server, group.files, localDir, remoteDir).execute();
+            new SendFilesToRemoteTask(new TransferHandler(myRound), server, group.files, localDir, remoteDir).execute();
         } catch (Throwable e) {
             fail(String.valueOf(e));
         }
@@ -676,6 +855,13 @@ public class ShareActivity extends AppCompatActivity {
 
     private class TransferHandler implements BTransferFileCallback {
 
+        /** 这一组属于哪一轮：二次分享把 round 顶掉以后，上一轮的回调一律不认 */
+        private final int myRound;
+
+        TransferHandler(int myRound) {
+            this.myRound = myRound;
+        }
+
         @Override
         public void onFileUploading(String iName, String path, long targetSize, long totalSize) {
             // 只记文件名。进度不在这里算：分段发送时 targetSize 是「这一块的末尾位置」，
@@ -723,16 +909,26 @@ public class ShareActivity extends AppCompatActivity {
 
         @Override
         public void onReadFileError(String message) {
+            if (!isCurrentRound(myRound)) {
+                return;
+            }
             fail(message);
         }
 
         @Override
         public void onWriteFileError(String message) {
+            if (!isCurrentRound(myRound)) {
+                return;
+            }
             fail(message);
         }
 
         @Override
         public void onComplete(boolean isUpload, long traffic, long time) {
+            if (!isCurrentRound(myRound)) {
+                // 上一轮被取消后走到这里：这一轮已经作废，记账和下一组都不能碰
+                return;
+            }
             // 只记账，不直接改进度条：显示值是按速率逐帧推的，这里再按真值顶一下会把它推到真值前面。
             completedBytes += currentGroupTotal;
             // 这一组的字节已经并进 completedBytes 了，但 sendProgress 里的账本还是这一组的
@@ -740,16 +936,23 @@ public class ShareActivity extends AppCompatActivity {
             // 再和 completedBytes 相加就把这一组算了两遍 —— 真值凭空多出一整组，
             // 界面会闪一下满进度。把「这一组的账本路径」记下来，采样时按它识别陈旧快照。
             accountedLedgerPath = ledgerPath;
-            startNextGroup();
+            startNextGroup(myRound);
         }
 
         @Override
         public void onIncomplete() {
+            if (!isCurrentRound(myRound)) {
+                // 这一轮是我们自己取消掉的（二次分享会先取消上一轮），别把失败甩到新的一轮上
+                return;
+            }
             fail(getString(R.string.chuan_shu_shi_fa_sheng_yi_chang));
         }
 
         @Override
         public void onError(Throwable th) {
+            if (!isCurrentRound(myRound)) {
+                return;
+            }
             fail(String.valueOf(th));
         }
 

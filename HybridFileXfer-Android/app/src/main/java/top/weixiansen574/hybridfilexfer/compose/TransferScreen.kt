@@ -126,6 +126,13 @@ internal fun TransferScreen(
     // 双窗口里发送/接收时的进度弹窗（和经典界面的「发送到电脑」一致）
     var xferPopup by remember { mutableStateOf(false) }
     var xferPopupSending by remember { mutableStateOf(true) }
+    /** 「取消传输」的确认框（已传的部分要不要保留），见 [CancelTransferDialog] */
+    var cancelConfirm by remember { mutableStateOf(false) }
+    /**
+     * 接收方向（电脑 → 手机）用户选了「不保留」：等这次接收真的收尾之后，
+     * 把手机上没传完的文件和续传日志删掉。发送方向不用它 —— 那是电脑端自己删。
+     */
+    val discardReceived = remember { java.util.concurrent.atomic.AtomicBoolean(false) }
     var xferPopupName by remember { mutableStateOf("") }
     var xferPopupDone by remember { mutableLongStateOf(0L) }
     var xferPopupTotal by remember { mutableLongStateOf(0L) }
@@ -338,6 +345,19 @@ internal fun TransferScreen(
                 }
                 // 取消时 sendFilesToRemote/Shelf 是正常返回的，靠这个标志区分
                 val cancelled = server.isTransferCancelled()
+                // 接收方向「不保留进度」：半截文件在本机，取消确认框选了不保留就在这儿删
+                // （对称的做法：发送方向是电脑端收到 CANCEL_DISCARD 后自己删）
+                if (cancelled && !fromLeft && discardReceived.getAndSet(false)) {
+                    files.forEach { file ->
+                        if (!file.isDirectory) {
+                            runCatching {
+                                val target = java.io.File(localDir.path, file.name)
+                                target.delete()
+                                top.weixiansen574.hybridfilexfer.core.ResumeJournal.remove(target.absolutePath)
+                            }
+                        }
+                    }
+                }
                 // 取消的这次传输不能删源文件：不判这一下，"移动"就会在传了一半的情况下
                 // 把源文件删掉
                 if (move && !cancelled) {
@@ -376,6 +396,42 @@ internal fun TransferScreen(
                 }
             }
         }
+    }
+
+    /** 弹「取消传输」确认框（已传的部分保留还是删掉） */
+    fun askCancelTransfer() {
+        if (!busy) {
+            return
+        }
+        cancelConfirm = true
+    }
+
+    /**
+     * 真的取消这次传输（用户在确认框里选过了）。
+     *
+     * @param keep true = 保留进度：什么都不删，下次同一个文件断点续传；
+     *             false = 不保留：这次没传完的部分（文件和续传记录）删掉，下次从头传。
+     *             发送方向是让电脑端删（多一帧 CANCEL_DISCARD），接收方向是本机删。
+     */
+    fun cancelTransferNow(keep: Boolean) {
+        cancelConfirm = false
+        xferPopupPaused = false
+        xferPopup = false
+        if (xferPopupSending) {
+            // 手机 → 电脑：半截文件在电脑上，交给电脑端在收尾时删
+            runCatching { server.abortTransfer(!keep) }
+        } else {
+            // 电脑 → 手机：半截文件在本机，让 startTransfer 收尾时删（见上面的 discardReceived）
+            discardReceived.set(!keep)
+            runCatching { server.abortTransfer() }
+        }
+        // 取消后这条连接会重建、传输页可能随即卸载，页内提示来不及显示；
+        // 用系统 Toast 才能在页面切走之后还看得到。
+        android.widget.Toast.makeText(
+            ctx,
+            if (keep) "已取消传输（保留进度，下次接着传）" else "已取消传输（未完成的部分已删除）",
+            android.widget.Toast.LENGTH_SHORT,
+        ).show()
     }
 
     /**
@@ -818,18 +874,20 @@ internal fun TransferScreen(
                 xferPopupPaused = false
                 server.resumeTransfer()
             },
-            onCancel = {
-                xferPopupPaused = false
-                xferPopup = false
-                runCatching { server.abortTransfer() }
-                // 取消会让这条连接整体断开、传输页随即卸载，页内弹窗根本来不及显示；
-                // 用系统 Toast 才能在页面切走之后还看得到。
-                android.widget.Toast.makeText(
-                    ctx,
-                    "已取消传输",
-                    android.widget.Toast.LENGTH_SHORT,
-                ).show()
-            },
+            // 取消不再"一按就断"：先问一句已经传过去的那部分要不要保留
+            onCancel = { askCancelTransfer() },
+        )
+    }
+
+    // 「取消传输」确认框自己和面板一样是个 Dialog 窗口，所以放在 if (xferPopup) 外面 ——
+    // 用户选了之后 xferPopup 会立刻收起，确认框要能跟着一起消失
+    if (cancelConfirm) {
+        CancelTransferDialog(
+            // sending=true：半截文件在电脑上（发送方向）；false：在本机（接收方向）
+            sending = xferPopupSending,
+            onKeep = { cancelTransferNow(true) },
+            onDiscard = { cancelTransferNow(false) },
+            onDismiss = { cancelConfirm = false },
         )
     }
 

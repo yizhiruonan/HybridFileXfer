@@ -499,6 +499,7 @@ impl Session {
                     // 重建循环也跟着停摆。以前这里一律 break + 不读载荷，帧流直接错位。
                     controller::PING
                     | controller::CANCEL
+                    | controller::CANCEL_DISCARD
                     | controller::PAUSE_STATE
                     | controller::LIST_FILES
                     | controller::DELETE_FILE
@@ -716,6 +717,17 @@ impl Session {
                     crate::control::cancel();
                     return Ok(PeerResult::cancelled());
                 }
+                // 同上，只是手机端还选了「不保留进度」：先记下来，收尾时把这次
+                // 写到一半的文件和 .hfxpart 一起删掉（见 handle_receive 的 finish_with）
+                controller::CANCEL_DISCARD => {
+                    log::warn(crate::i18n::tr(
+                        "手机端取消了传输（不保留已传的部分）",
+                        "the phone cancelled the transfer and asked to discard it",
+                    ));
+                    crate::control::set_discard_partial(true);
+                    crate::control::cancel();
+                    return Ok(PeerResult::cancelled());
+                }
                 // 收尾 / 算校验这两分钟里手机界面照样会翻目录、问待推送文件，而且它
                 // 是在自己的锁里等应答：必须当场回，否则它卡住、重建也跟着停摆。
                 controller::LIST_FILES => self.handle_list_files()?,
@@ -844,6 +856,16 @@ impl Session {
                     "手机端取消了传输",
                     "the phone cancelled the transfer",
                 ));
+                crate::control::cancel();
+            }
+            // 304 + 取消确认框：手机端取消时选了「不保留进度」——
+            // 除了当取消处理，还要让收尾把半截文件和续传日志删掉
+            controller::CANCEL_DISCARD => {
+                log::warn(crate::i18n::tr(
+                    "手机端取消了传输（不保留已传的部分）",
+                    "the phone cancelled the transfer and asked to discard it",
+                ));
+                crate::control::set_discard_partial(true);
                 crate::control::cancel();
             }
             controller::RESULT => {
@@ -1394,7 +1416,8 @@ impl Session {
         let bytes = receiver.bytes();
         let files = receiver.file_count();
         let elapsed = started.elapsed().as_secs_f64().max(0.001);
-        // 中断/出错时把没收完的半截文件删掉，别留在电脑上
+        // 这次到底收全了没有。没传完要不要留在电脑上由下面的 keep_incomplete 决定：
+        // 默认留着（续传），手机端点了「不保留进度」才删。
         let complete = hard_error.is_none() && aborts.is_empty();
         // 303：先把落盘文件列表记下来，finish_with() 会把条目清空
         let received = receiver.received_files();
@@ -1408,7 +1431,17 @@ impl Session {
             crate::receiver::human_bytes(bytes),
             ""
         ));
-        match receiver.finish_with(complete) {
+        // 取消确认框：手机端取消时选了「不保留进度」，收尾就把这次写到一半的文件和
+        // `.hfxpart` 续传记录一起删掉（下次同一个文件从头传）。必须在 `_receiving`
+        // 这个 guard 结束之前读 —— 它 drop 时会把 DISCARD_PARTIAL 一起 reset 掉。
+        let keep_incomplete = !crate::control::discard_partial();
+        if !keep_incomplete {
+            log::warn(crate::i18n::tr(
+                "手机端选择不保留：这次没传完的文件会被删掉",
+                "the phone asked to discard: incomplete files will be removed",
+            ));
+        }
+        match receiver.finish_with(keep_incomplete) {
             Ok((kept, kept_bytes)) if kept > 0 => log::warn(&format!(
                 "{} {} · {}",
                 crate::i18n::tr(

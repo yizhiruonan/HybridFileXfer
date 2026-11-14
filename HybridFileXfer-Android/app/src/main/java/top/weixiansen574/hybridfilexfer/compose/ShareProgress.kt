@@ -77,6 +77,18 @@ internal object ShareProgress {
     /** 面板按钮的落点，[setActions] 之前是 null（点了也不会有反应，不会崩） */
     private val actions = mutableStateOf<ShareActions?>(null)
 
+    /**
+     * 「取消发送」的确认框现在是不是开着（已传的部分要不要保留）。
+     *
+     * 面板上的「取消发送」不再是"一按就断"：先弹 [CancelTransferDialog]，
+     * 用户选了才真正取消。框开着的时候传输还在跑（用户可以选「继续传输」回去）。
+     */
+    private val cancelConfirm = mutableStateOf(false)
+
+    /** 确认框的两个落点，[setCancelHandlers] 之前是 null（点了只会把框关掉） */
+    private var cancelKeep: Runnable? = null
+    private var cancelDiscard: Runnable? = null
+
     private var owner: Owner? = null
 
     /**
@@ -120,6 +132,21 @@ internal object ShareProgress {
                         closeWhenIdle = true,
                         widthDp = 390.dp,
                     )
+                    // 取消确认框：和双窗口那边是同一个 composable（Dialogs.kt）
+                    if (cancelConfirm.value) {
+                        CancelTransferDialog(
+                            sending = true,
+                            onKeep = {
+                                cancelConfirm.value = false
+                                cancelKeep?.run()
+                            },
+                            onDiscard = {
+                                cancelConfirm.value = false
+                                cancelDiscard?.run()
+                            },
+                            onDismiss = { cancelConfirm.value = false },
+                        )
+                    }
                 }
             }
         }
@@ -131,6 +158,30 @@ internal object ShareProgress {
     @JvmStatic
     fun setActions(next: ShareActions) {
         actions.value = next
+    }
+
+    /**
+     * 装「取消发送」确认框的两个落点（在 [host] 之后随时可调，传 null 就只关框）。
+     *
+     * @param keep 用户选了「保留进度」：走原来的取消逻辑，电脑上的半截文件留着下次续传
+     * @param discard 用户选了「不保留」：让电脑端把这次的不完整文件和续传记录删掉
+     */
+    @JvmStatic
+    fun setCancelHandlers(keep: Runnable?, discard: Runnable?) {
+        cancelKeep = keep
+        cancelDiscard = discard
+    }
+
+    /** 弹「取消发送」确认框（面板上的「取消发送」按一下就走这里） */
+    @JvmStatic
+    fun showCancelConfirm() {
+        cancelConfirm.value = true
+    }
+
+    /** 收起确认框（开始新一次发送时要保证它是关着的） */
+    @JvmStatic
+    fun hideCancelConfirm() {
+        cancelConfirm.value = false
     }
 
     /** 把最新的 UiState 推进面板（快照写入，任何线程调都安全；实际调用都在主线程） */
@@ -185,6 +236,9 @@ internal object ShareProgress {
         val current = owner
         owner = null
         actions.value = null
+        cancelKeep = null
+        cancelDiscard = null
+        cancelConfirm.value = false
         current?.stop()
         state.value = UiState()
     }

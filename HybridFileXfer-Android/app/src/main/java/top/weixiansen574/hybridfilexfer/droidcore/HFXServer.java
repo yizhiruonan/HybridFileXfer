@@ -843,8 +843,20 @@ public class HFXServer extends HFXService {
      * AsynchronousCloseException，等会话线程收尾时再统一释放。
      */
     public void abortTransfer() {
-        top.weixiansen574.hybridfilexfer.core.HFXLog.d("abortTransfer: close transfer channels only",
-                new Exception("abortTransfer caller"));
+        abortTransfer(false);
+    }
+
+    /**
+     * 取消正在进行的传输，并告诉电脑端「已传的部分要不要保留」。
+     *
+     * @param discardPartial true = 用户选了「不保留进度」：多发一帧
+     *        {@link ControllerIdentifiers#CANCEL_DISCARD} 代替 {@code CANCEL}，电脑端收尾时
+     *        把这次写到一半的文件和 {@code .hfxpart} 续传记录一起删掉（下次从头传）；
+     *        false = 保留（现在的行为，下次同一个文件续传）。
+     */
+    public void abortTransfer(boolean discardPartial) {
+        top.weixiansen574.hybridfilexfer.core.HFXLog.d("abortTransfer: close transfer channels only, discard="
+                + discardPartial, new Exception("abortTransfer caller"));
         transferCancelled = true;
         needsRebuild = true;
         // 取消时把暂停闸门也放开：不放开的话 isTransferPaused() 一直是 true，
@@ -866,11 +878,18 @@ public class HFXServer extends HFXService {
             DataByteChannel notify = ctChannel;
             if (notify != null && notify.isOpen()) {
                 try {
+                    // 用户选了「不保留进度」就发 CANCEL_DISCARD：电脑端除了当取消处理，
+                    // 收尾时还会把这次的不完整文件和 .hfxpart 续传记录一起删掉。
+                    // 两帧都是"不带载荷"，电脑端的帧流不会因此错位。
+                    short opcode = discardPartial
+                            ? top.weixiansen574.hybridfilexfer.core.ControllerIdentifiers.CANCEL_DISCARD
+                            : top.weixiansen574.hybridfilexfer.core.ControllerIdentifiers.CANCEL;
                     synchronized (controlLock) {
                         // DataByteChannel 直接写 socket，没有缓冲，不需要 flush
-                        notify.writeShort(top.weixiansen574.hybridfilexfer.core.ControllerIdentifiers.CANCEL);
+                        notify.writeShort(opcode);
                     }
-                    top.weixiansen574.hybridfilexfer.core.HFXLog.d("abortTransfer: CANCEL written");
+                    top.weixiansen574.hybridfilexfer.core.HFXLog.d("abortTransfer: CANCEL written, discard="
+                            + discardPartial);
                 } catch (Throwable e) {
                     // 电脑可能已经不在了，发失败无所谓；下面照样关传输通道
                     top.weixiansen574.hybridfilexfer.core.HFXLog.d("abortTransfer: CANCEL write failed", e);

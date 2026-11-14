@@ -886,3 +886,86 @@ internal fun KeepPartialDialog(paths: List<String>, onKeep: () -> Unit, onDelete
         }
     }
 }
+
+/**
+ * 「取消传输」前的确认框：已经传过去的那部分要不要保留。
+ *
+ * <p>两个落点的语义（发送方向和接收方向各说各的，因为"半截文件"在哪一端不一样）：
+ * <ul>
+ *   <li><b>保留进度</b>：什么都不删 —— 断点续传。发送方向电脑上留着
+ *       {@code <文件名>.hfxpart} 续传记录，下次发同一个文件只补缺的块；
+ *       接收方向手机上留着这次不完整的文件，下次同一个文件从断点续传。</li>
+ *   <li><b>不保留</b>：删掉这次的不完整文件和续传记录，下次同一个文件从头传。
+ *       发送方向是电脑端删（手机多发一帧 {@code CANCEL_DISCARD}）；接收方向是本机删。</li>
+ * </ul>
+ *
+ * <p>分享面板（[ShareProgress]）和双窗口弹窗（TransferScreen.kt）共用这一个，
+ * 样式和上面的 [KeepPartialDialog] 一致。
+ *
+ * @param sending true = 手机发给电脑（半截文件在电脑上）；false = 从电脑收文件（半截文件在本机）
+ */
+@Composable
+internal fun CancelTransferDialog(
+    sending: Boolean,
+    onKeep: () -> Unit,
+    onDiscard: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val colorScheme = MiuixTheme.colorScheme
+    Dialog(
+        // 点框外面 / 按返回键 = 取消这次「取消」：传输继续
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false),
+    ) {
+        Box(
+            modifier = Modifier.fillMaxSize().background(Color.Transparent).clickable { onDismiss() },
+            contentAlignment = Alignment.Center,
+        ) {
+            FullScreenWindow()
+            Column(
+                modifier = Modifier.width(320.dp).clip(RoundedCornerShape(24.dp))
+                    .background(colorScheme.surfaceContainer).clickable { }.padding(20.dp),
+            ) {
+                Text(if (sending) "取消发送？" else "取消接收？", fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                Text(
+                    if (sending) {
+                        "已经传到电脑上的那部分要保留吗？"
+                    } else {
+                        "已经收到手机上的那部分要保留吗？"
+                    },
+                    fontSize = 13.sp,
+                    color = colorScheme.onSurfaceVariantSummary,
+                    modifier = Modifier.padding(top = 8.dp),
+                )
+                Text(
+                    if (sending) {
+                        "保留：下次发同一个文件时只补没传完的块，接着传。\n" +
+                            "不保留：电脑上这次的不完整文件和续传记录会被删掉，下次从头传。"
+                    } else {
+                        "保留：手机上留下这次不完整的文件，下次同一个文件接着传。\n" +
+                            "不保留：删掉手机这次的不完整文件和续传记录，下次从头传。"
+                    },
+                    fontSize = 12.sp,
+                    color = colorScheme.onSurfaceVariantSummary,
+                    modifier = Modifier.padding(top = 10.dp),
+                )
+                // 竖着排三颗：横排两颗中文按钮在窄屏上会被挤成两行
+                Button(
+                    onClick = onKeep,
+                    modifier = Modifier.fillMaxWidth().padding(top = 16.dp),
+                    colors = ButtonDefaults.buttonColorsPrimary(),
+                ) { Text("保留进度", color = Color.White) }
+                TextButton(
+                    text = "不保留，删掉未完成文件",
+                    onClick = onDiscard,
+                    modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                )
+                TextButton(
+                    text = "继续传输",
+                    onClick = onDismiss,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+        }
+    }
+}
