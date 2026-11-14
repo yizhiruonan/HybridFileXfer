@@ -1204,16 +1204,32 @@ public class HFXServer extends HFXService {
         releaseBuffers();
         DataByteChannel channel = ctChannel;
         ctChannel = null;
+        top.weixiansen574.hybridfilexfer.core.HFXLog.d("disconnect: 控制通道="
+                + (channel == null ? "null" : String.valueOf(channel.getRemoteAddress()))
+                + " 传输通道=" + (connections == null ? "null" : String.valueOf(connections.size())), null);
         if (channel != null) {
+            // 收尾每一步都用 Throwable 兜住，别让某一步的异常把后面的步骤全跳过：
+            // 以前 writeShort(SHUTDOWN) 抛的不是 IOException（运行时异常）时，这个方法直接跳出，
+            // 控制通道既不发 FIN 也不关 —— 手机端 /proc/net/tcp 里这条连接一直挂着，
+            // 电脑端只能等心跳超时（原本 100 秒，压到 12 秒）才发现手机停了服务。
+            // 兜住之后电脑端 0.4 秒就收到「手机端已停止服务」。
             try {
                 //通知断开连接
                 channel.writeShort(ControllerIdentifiers.SHUTDOWN);
-            } catch (IOException ignored) {
+            } catch (Throwable ignored) {
+            }
+            // 再把 FIN 打出去：直接 close() 不一定让对端看到 EOF（adb 转发这条通道实测如此）
+            try {
+                java.nio.channels.SocketChannel rawChannel = channel.getSocketChannel();
+                if (rawChannel != null) {
+                    rawChannel.shutdownOutput();
+                }
+            } catch (Throwable ignored) {
             }
             //释放控制通道，避免反复重连时残留socket
             try {
                 channel.close();
-            } catch (IOException ignored) {
+            } catch (Throwable ignored) {
             }
         }
         closeConnections(connections);

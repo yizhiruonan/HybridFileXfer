@@ -166,6 +166,8 @@ struct AdbCycle {
     seen: bool,
     /// 上一次启动手机端服务是否成功：失败了就 2 秒重试一次，别等 10 秒
     last_start_ok: bool,
+    /// 上一次打印「adb 连接没成功」的时间，避免每秒刷一行
+    last_fail_log: Instant,
 }
 
 impl AdbCycle {
@@ -176,6 +178,7 @@ impl AdbCycle {
             last_notice: None,
             seen: false,
             last_start_ok: true,
+            last_fail_log: Instant::now() - Duration::from_secs(60),
         }
     }
 
@@ -265,9 +268,11 @@ impl AdbCycle {
                 return Attempt::Retry;
             }
         } else {
-            // 启动服务失败过就 2 秒重试一次（之前固定 10 秒，手机上要等很久才连上）
+            // 手机端服务可能刚被用户停掉（或刚被系统杀掉），所以要定期把它拉起来。
+            // 以前成功过就隔 10 秒才拉，用户看到的是「手机点停止、电脑等十几秒才又连上」；
+            // 现在固定 3 秒，服务本来就活着时 am start-foreground-service 是个很快的空操作。
             let interval = if self.last_start_ok {
-                Duration::from_secs(10)
+                Duration::from_secs(3)
             } else {
                 Duration::from_secs(2)
             };
@@ -307,10 +312,13 @@ impl AdbCycle {
                 }
             }
         }
-        log::debug(&format!(
-            "connect via adb: {}",
-            last_error.unwrap_or_else(|| "timeout".to_string())
-        ));
+        if self.last_fail_log.elapsed() >= Duration::from_secs(10) {
+            log::info(&format!(
+                "adb 连接没成功（稍后重试）：{}",
+                last_error.unwrap_or_else(|| "timeout".to_string())
+            ));
+            self.last_fail_log = Instant::now();
+        }
         Attempt::Retry
     }
 }
