@@ -326,8 +326,9 @@ private fun formatSpeed(bytesPerSecond: Long): String {
         return "无记录"
     }
     val mb = bytesPerSecond / 1024.0 / 1024.0
+    // 一位小数就够：两位小数时 106.48 → 107.02 这种末位变化看着像在抖
     return if (mb >= 1) {
-        String.format(java.util.Locale.US, "%.2f MB/s", mb)
+        String.format(java.util.Locale.US, "%.1f MB/s", mb)
     } else {
         String.format(java.util.Locale.US, "%.0f KB/s", bytesPerSecond / 1024.0)
     }
@@ -361,29 +362,49 @@ internal fun ReceiveProgressPanel(
     val colorScheme = MiuixTheme.colorScheme
     val haptic = LocalHapticFeedback.current
     // 用累计字节数算速率：多台电脑同时接收时显示的是合计速率。
-    // 采样值先做一次指数平滑，再交给动画逐帧插值，数字才是"滑"的而不是一跳一跳。
+    //
+    // 采样改成「滑动窗口 + 轻度指数平滑 + 逐帧补间」三层，数字才不"僵"：
+    // 老写法是「距上次被采用 ≥100ms 的瞬时值」再和上一帧 6:4 混合 —— 100ms 的窗口太短，
+    // 块一到就是一波尖峰、块没到就是 0，混合权重又大，于是数字在 90~115 之间一格一格地蹦
+    // （用户反馈「速率数值跳动有点僵硬」）。
+    // 现在窗口取最近 600ms：窗口内的字节差本身就是平均值，尖峰被摊平；
+    // 再和上一帧 3:1 混合，只削掉残余抖动，不拖慢响应。
     var lastBytes by remember { mutableStateOf(state.xferBytes) }
-    var lastAt by remember { mutableStateOf(System.currentTimeMillis()) }
     var targetSpeed by remember { mutableStateOf(0f) }
+    val samples = remember { ArrayDeque<Pair<Long, Long>>() } // (时刻, 累计字节)
+    val windowMs = 600L
 
-    // 速率只在"距上次被采用的采样 ≥100ms"时算一次：基准时刻和基准字节<b>只在采用时前移</b>。
-    // 旧写法是无条件前移基准，于是 50ms 一帧的刷新每次都被判成"间隔太短"直接丢掉 ——
-    // 速率列就再也更新不了（主页/悬浮窗都是 50ms 喂一份，正好踩这个坑）。
     LaunchedEffect(state.xferBytes) {
         val now = System.currentTimeMillis()
-        val dt = now - lastAt
-        val instant = if (dt > 0 && state.xferBytes >= lastBytes) (state.xferBytes - lastBytes) * 1000f / dt else 0f
-        // 悬浮窗刚弹出来时会算出十几 GB/s 的离谱值，丢掉这次采样（基准不动，下次接着算）
-        if (dt >= 100L && instant <= 2000f * 1024f * 1024f) {
-            targetSpeed = if (targetSpeed <= 0f) instant else targetSpeed * 0.6f + instant * 0.4f
-            lastBytes = state.xferBytes
-            lastAt = now
+        val bytes = state.xferBytes
+        // 新的一次传输（字节变小）或者隔了很久没刷新：窗口重来
+        if (bytes < lastBytes || samples.isEmpty()) {
+            samples.clear()
+            samples.addLast(now to bytes)
+            lastBytes = bytes
+            targetSpeed = 0f
+            return@LaunchedEffect
+        }
+        lastBytes = bytes
+        samples.addLast(now to bytes)
+        // 只留窗口内的点；至少留两个，否则算不出间隔
+        while (samples.size > 2 && now - samples.first().first > windowMs) {
+            samples.removeFirst()
+        }
+        val oldest = samples.first()
+        val dt = now - oldest.first
+        // 悬浮窗刚弹出来 / 中断后重连时会算出十几 GB/s 的离谱值，这种情况不采信
+        if (dt >= 200L && bytes >= oldest.second) {
+            val instant = (bytes - oldest.second) * 1000f / dt
+            if (instant <= 2000f * 1024f * 1024f) {
+                targetSpeed = if (targetSpeed <= 0f) instant else targetSpeed * 0.75f + instant * 0.25f
+            }
         }
     }
     val animatedSpeed by androidx.compose.animation.core.animateFloatAsState(
         targetValue = targetSpeed,
         animationSpec = androidx.compose.animation.core.tween(
-            durationMillis = 300,
+            durationMillis = 220,
             easing = androidx.compose.animation.core.LinearEasing,
         ),
         label = "speed",
