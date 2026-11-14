@@ -851,14 +851,17 @@ fn human(bytes: u64) -> String {
 
 /// 速度（字节/秒）-> 人类可读
 fn human_speed(bps: f64) -> String {
-    if bps <= 0.0 {
-        return "0 MB/s".to_string();
-    }
+    // 单位要跟着量级走：蓝牙那种 0.2~0.3 MB/s 的通道，按 MB 只有一位小数会显示成 0，
+    // 看着像断了；慢速一律降到 KB/s，再慢给 B/s，静态时为 0 KB/s
     let mb = bps / (1024.0 * 1024.0);
-    if mb >= 1.0 {
+    if bps <= 0.0 {
+        "0 KB/s".to_string()
+    } else if mb >= 1.0 {
         format!("{:.1} MB/s", mb)
-    } else {
+    } else if bps >= 1024.0 {
         format!("{:.0} KB/s", bps / 1024.0)
+    } else {
+        format!("{:.0} B/s", bps)
     }
 }
 
