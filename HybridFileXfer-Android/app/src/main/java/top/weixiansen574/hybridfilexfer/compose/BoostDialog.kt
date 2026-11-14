@@ -328,7 +328,8 @@ internal fun BoostDialog(
                         modifier = Modifier.fillMaxWidth().padding(top = 16.dp),
                         horizontalArrangement = Arrangement.spacedBy(10.dp),
                     ) {
-                        TextButton(text = "不再提示", onClick = onDismissForever, modifier = Modifier.weight(1f))
+                        // 「不再提示」单独放一行：325dp 宽度里三个按钮挤在一起，
+                        // 「不再提示」四个字会被压成两行，看着别扭
                         TextButton(text = "稍后", onClick = onDismiss, modifier = Modifier.weight(1f))
                         Button(
                             onClick = {
@@ -348,6 +349,11 @@ internal fun BoostDialog(
                             Text("确定")
                         }
                     }
+                    TextButton(
+                        text = "不再提示",
+                        onClick = onDismissForever,
+                        modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                    )
                 }
             }
         }
