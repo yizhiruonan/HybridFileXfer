@@ -963,6 +963,7 @@ public class ServerService extends Service implements ServiceConnection {
             return;
         }
         this.listener = listener;
+        top.weixiansen574.hybridfilexfer.core.HFXLog.d("监听就绪，端口 " + port);
         setState(STATE_WAITING);
         try {
             while (active && gen == generation) {
@@ -980,6 +981,7 @@ public class ServerService extends Service implements ServiceConnection {
                 if (control == null) {
                     continue;
                 }
+                top.weixiansen574.hybridfilexfer.core.HFXLog.d("收到控制通道，开始握手");
                 int limit = maxConnections();
                 if (HFXServer.count() >= limit) {
                     // 先清掉已经死掉但还没被心跳回收的连接（电脑重启后常见）
@@ -1004,6 +1006,7 @@ public class ServerService extends Service implements ServiceConnection {
                     guard.cancel();
                 }
                 if (connected && gen == generation) {
+                    top.weixiansen574.hybridfilexfer.core.HFXLog.d("握手完成（" + HFXServer.count() + " 台在线）");
                     setState(STATE_CONNECTED);
                     Thread session = new Thread(() -> sessionLoop(server, gen), "HFX-Session-" + server.getId());
                     session.start();

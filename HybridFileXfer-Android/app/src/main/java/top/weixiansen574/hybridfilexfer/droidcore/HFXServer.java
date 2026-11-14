@@ -44,8 +44,27 @@ public class HFXServer extends HFXService {
     private static final java.util.Map<Integer, HFXServer> INSTANCES = new java.util.concurrent.ConcurrentHashMap<>();
     private static final java.util.concurrent.atomic.AtomicInteger NEXT_ID = new java.util.concurrent.atomic.AtomicInteger(1);
     private static final String LABELS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-    /** 等一条传输通道的超时（电脑端整体握手超时是 15s） */
-    private static final int TRANSFER_WAIT_MS = 12000;
+    /**
+     * 等一条传输通道的超时。
+     *
+     * <p>电脑端是先把自己的连接建好、再在控制通道上回「这条连上了」，所以这条连接
+     * 正常情况下已经在 accept 队列里，只是等 accept 线程分类（100ms）。12 秒纯粹是浪费：
+     * 走蓝牙共享网络时（BNEP 建链慢、经常连上一半就掉），一旦某条通道迟迟到不了，
+     * 手机就在这儿干等 12 秒 × 若干条，然后整次握手抛异常、电脑重连 —— 用户看到的就是
+     * 「加进蓝牙局域网后要等一分钟才连上」（5 次重试 × 12 秒）。
+     *
+     * <p>现在只等 3 秒；等了还没有就把这条通道回绝掉，**其余通道照常握手成功**，
+     * 迟到的连接由 ServerListener 的 spareTransfers 接住，用不着整盘重来。
+     */
+    private static final int TRANSFER_WAIT_MS = 3000;
+    /**
+     * 所有传输通道加起来的等待预算。
+     *
+     * <p>按条算的 3 秒在最坏情况下会累加（蓝牙 4 条都卡住就是 12 秒），
+     * 而正常情况所有连接在 100ms 内就到齐了。整次握手最多为"等通道"花 6 秒，
+     * 超过就把剩下的回绝掉，先连上再说话。
+     */
+    private static final int TRANSFER_WAIT_TOTAL_MS = 6000;
 
     protected final IIOService ioService;
     protected int remoteFileSystem;
@@ -245,17 +264,26 @@ public class HFXServer extends HFXService {
             // 写时复制：304 取消后重建通道时会在会话线程里往里加，
             // 而 getChannelDetails() / hasDeadChannel() 会在界面线程并发读它
             connections = new CopyOnWriteArrayList<>();
+            long transferBudgetEnd = System.currentTimeMillis() + TRANSFER_WAIT_TOTAL_MS;
             for (int i = 0; i < interfaceList.size(); i++) {
                 //对方连接通道是否成功
                 boolean succeed = ctChannel.readBoolean();
                 //对方所连接通道的名称（由控制器通道发送名称）
                 String name = ctChannel.readUTF();
+                long nameAt = System.currentTimeMillis();
+                top.weixiansen574.hybridfilexfer.core.HFXLog.d("握手：" + name + (succeed ? " 已连" : " 不通"));
                 if (succeed) {
                     //从共享套接字上取一条传输通道（别的电脑的控制通道会被暂存，不会认错）
-                    SocketChannel socket = listener.takeTransfer(TRANSFER_WAIT_MS);
+                    long left = Math.min(TRANSFER_WAIT_MS, transferBudgetEnd - System.currentTimeMillis());
+                    SocketChannel socket = left <= 0 ? null : listener.takeTransfer(left);
+                    top.weixiansen574.hybridfilexfer.core.HFXLog.d("握手：" + name + " 传输通道 " + (socket != null ? "已到" : "等超时")
+                            + "，等了 " + (System.currentTimeMillis() - nameAt) + "ms");
                     if (socket == null) {
+                        // 只回绝这一条，别把整次握手带崩：走蓝牙时经常有一条通道卡住，
+                        // 以前会让电脑重连，重连又卡在同一条上，一分钟都连不进来
                         ctChannel.writeBoolean(false);
-                        throw new IOException("waiting for transfer channel " + name + " timed out");
+                        callback.onAcceptFailed(name);
+                        continue;
                     }
                     connections.add(new TransferConnection(name, new DataByteChannel(socket)));
                     ctChannel.writeBoolean(true);
