@@ -284,7 +284,12 @@ public class ClientActivity extends AppCompatActivity implements ServiceConnecti
 
             @Override
             public void onIncomplete() {
-                Toast.makeText(context, R.string.chuan_shu_shi_fa_sheng_yi_chang, Toast.LENGTH_LONG).show();
+                // 电脑端主动中断 = 已取消（未完成），不是「传输异常、请返回重连」
+                boolean peerCancelled = client != null && client.isPeerCancelled();
+                Toast.makeText(context,
+                        peerCancelled ? R.string.chuan_shu_bei_dian_nao_qu_xiao
+                                : R.string.chuan_shu_shi_fa_sheng_yi_chang,
+                        Toast.LENGTH_LONG).show();
                 finish();
             }
 

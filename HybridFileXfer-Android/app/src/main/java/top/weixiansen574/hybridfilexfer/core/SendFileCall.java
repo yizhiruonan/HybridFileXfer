@@ -13,6 +13,17 @@ public class SendFileCall implements Callable<Void> {
     private final TransferPause pause;
     /** 这条通道在分段计划里的序号（自己只领自己那段的块） */
     private final int channelIndex;
+    /** 所属服务：写异常要问它「这次传输是不是已经被对端取消了」 */
+    private final HFXService owner;
+
+    /**
+     * 通道被关掉之后，等「对端取消」标志落位的最长时间。
+     *
+     * <p>电脑端「取消 → 保留进度」的顺序是<b>先 shutdown 传输通道、再发 CANCEL</b>，
+     * 手机端的发块线程会先撞上写异常，读控制通道的线程几十毫秒后才读到 CANCEL。
+     * 等这么久就够它落位；真异常（拔网线）也只是晚 1.5 秒报出来。
+     */
+    private static final long CANCEL_SETTLE_MS = 1500L;
 
     /**
      * 一块数据分几片写。蓝牙共享网络实测只有 50~60 KB/s，一块 1MB 要写十几秒；
@@ -23,14 +34,52 @@ public class SendFileCall implements Callable<Void> {
     private static final int SLICE_WRITE_BYTES = 64 * 1024;
 
     public SendFileCall(ReadFileCall readFileCall, TransferConnection connection,
-                        TransferFileCallback callback, TransferPause pause, int channelIndex) {
+                        TransferFileCallback callback, TransferPause pause, int channelIndex,
+                        HFXService owner) {
         this.readFileCall = readFileCall;
         this.connection = connection;
         this.channel = connection.channel;
         this.callback = callback;
         this.pause = pause;
         this.channelIndex = channelIndex;
+        this.owner = owner;
         connection.resetTotalTrafficInfo();
+    }
+
+    /**
+     * 这次异常该按「取消」处理，还是按「通道错误」报？
+     *
+     * <p>判据（任一成立就是取消）：
+     * <ol>
+     *   <li>这条通道自己被打过「取消」标（本端取消 / 电脑端取消时 {@code shutdownTransferChannels} 打的）；</li>
+     *   <li>{@link HFXService#isCancelLike()}：本次传输已经被判定为取消（对端 CANCEL 已读到、
+     *       待重建、或本端取消）；</li>
+     *   <li>异常来自通道被关（IOException），且在这之后的一个短窗口内（{@link #CANCEL_SETTLE_MS}）
+     *       对端取消标志落位了 —— 这就是电脑端「先关通道再发 CANCEL」的竞态：
+     *       这一刻标志还是 false，但它马上就要变 true。</li>
+     * </ol>
+     *
+     * <p>只有三条都不成立才真的是通道错误（拔网线、电脑崩溃、缓冲区写坏）。
+     */
+    private boolean isCancelledLike(Throwable e) {
+        if (connection.isCancelled()) {
+            return true;
+        }
+        HFXService service = owner;
+        if (service == null) {
+            return false;
+        }
+        if (service.isCancelLike()) {
+            return true;
+        }
+        if (e != null && !(e instanceof java.io.IOException)) {
+            // 不是通道层的异常（比如缓冲区被并发写坏）：跟取消无关，别等
+            return false;
+        }
+        // e == null 是「别的通道出事了」那个中断标记：一样要等，因为电脑端取消时
+        // 全部通道是同时被 shutdown 的，这边几乎同时收到写异常 / 中断标记，
+        // 谁先到都说明不了"是不是取消"，只有那个标志能说明。
+        return service.awaitCancelSignal(CANCEL_SETTLE_MS);
     }
 
     @Override
@@ -80,7 +129,12 @@ public class SendFileCall implements Callable<Void> {
                                 System.currentTimeMillis() - startTime);
                     } else if (fileBlock == ReadFileCall.INTERRUPT) {
                         channel.writeShort(TransferIdentifiers.END_OF_INTERRUPTED);
-                        callback.onChannelError(connection.iName,TransferFileCallback.ERROR_TYPE_INTERRUPT, null);
+                        // 「别的通道断了 / 被关了」：如果这次传输已经被判定为取消（电脑端点「取消」时
+                        // 会先关掉全部传输通道），这只是取消的连带反应，不当错误报；
+                        // 真断线（拔网线）时下面这个判据不成立，照旧报中断。
+                        if (!isCancelledLike(null)) {
+                            callback.onChannelError(connection.iName,TransferFileCallback.ERROR_TYPE_INTERRUPT, null);
+                        }
                     } else if (fileBlock == ReadFileCall.READ_ERROR) {
                         channel.writeShort(TransferIdentifiers.END_OF_READ_ERROR);
                         callback.onChannelError(connection.iName,TransferFileCallback.ERROR_TYPE_READ_ERROR, null);
@@ -136,9 +190,15 @@ public class SendFileCall implements Callable<Void> {
                 readFileCall.recycleBuffer(fileBlock.data);
             }
             readFileCall.shutdownByConnectionBreak();
-            // 用户点「取消」时通道是被我们自己关掉的，ClosedChannelException /
-            // AsynchronousCloseException 都是预期内的收尾，不该再弹"通道错误"。
-            if (!connection.isCancelled()) {
+            // 取消时通道是被我们自己或电脑端关掉的，ClosedChannelException /
+            // AsynchronousCloseException 都是预期内的收尾，不该再弹「通道错误」。
+            //
+            // 这里的判据不能只看 connection.isCancelled()：电脑端点「取消 → 保留进度」是
+            // 先 shutdown 传输通道、再发 CANCEL 帧，写异常往往比 CANCEL 早到几十毫秒，
+            // 那一刻 isCancelled() 还是 false —— 于是被判成「传输时发生异常」，
+            // 界面弹出「发送失败：传输时发生异常，请返回重连」（真机复现的就是这一条）。
+            // isCancelledLike() 会等那一小会儿，让「对端取消」标志落位。
+            if (!isCancelledLike(e)) {
                 callback.onChannelError(connection.iName,TransferFileCallback.ERROR_TYPE_EXCEPTION, e.toString());
             }
             throw e;

@@ -275,7 +275,11 @@ internal fun TransferScreen(
         override fun onChannelError(iName: String?, errorType: Int, message: String?) {
             // 用户主动取消时通道是我们自己关掉的，收尾异常不该报成"通道错误"；
             // 一条通道被别的通道拖停（INTERRUPT）也只是结果，不是错误。
-            if (server.isTransferCancelled() || errorType == TransferFileCallback.ERROR_TYPE_INTERRUPT) return
+            // isPeerCancelled：电脑端点「取消→保留进度」是先 shutdown 传输通道再发 CANCEL，
+            // 手机端的写异常往往比 CANCEL 帧早到，光看 isTransferCancelled 会漏掉这个窗口，
+            // 于是弹一条「通道错误：java.nio.channels.ClosedChannelException」（真机复现过）。
+            if (server.isTransferCancelled() || server.isPeerCancelled()
+                || errorType == TransferFileCallback.ERROR_TYPE_INTERRUPT) return
             toast("通道错误：" + (message ?: ""))
         }
 
@@ -308,8 +312,14 @@ internal fun TransferScreen(
                 xferPopup = false
                 xferPopupWaiting = false
                 GlobalTransferOverlay.reportSend(null)
-                // 取消和真中断要分开显示：取消是用户自己点的，别写成"传输中断"
-                message = if (server.isTransferCancelled()) "已取消传输" else "传输中断"
+                // 取消和真中断要分开显示：取消是用户自己点的（或电脑端点的），别写成"传输中断"。
+                // 电脑端取消要说得清楚"未完成、可续传"——它是保留进度取消，电脑上的半截文件
+                // 和 .hfxpart 都留着，重新传同一个文件就是从断点接着传。
+                message = when {
+                    server.isPeerCancelled() -> "已取消（未完成）：电脑端中断了传输，已传部分保留，可续传"
+                    server.isTransferCancelled() -> "已取消传输"
+                    else -> "传输中断"
+                }
             }
         }
     }
@@ -345,6 +355,9 @@ internal fun TransferScreen(
                 }
                 // 取消时 sendFilesToRemote/Shelf 是正常返回的，靠这个标志区分
                 val cancelled = server.isTransferCancelled()
+                // 其中「电脑端点的取消」单独拿出来：它不是本机用户的操作，
+                // 文案要说清楚「未完成、可续传」，别让用户以为是自己误触
+                val peerCancelled = server.isPeerCancelled()
                 // 接收方向「不保留进度」：半截文件在本机，取消确认框选了不保留就在这儿删
                 // （对称的做法：发送方向是电脑端收到 CANCEL_DISCARD 后自己删）
                 if (cancelled && !fromLeft && discardReceived.getAndSet(false)) {
@@ -380,6 +393,7 @@ internal fun TransferScreen(
                     // 用户取消后这里以前无条件写"复制完成"，界面就弹「复制完成」——
                     // 实际文件只传了一半，用户还以为是电脑端的问题。
                     message = when {
+                        peerCancelled -> "已取消（未完成）：电脑端中断了传输，已传部分保留，可续传"
                         cancelled -> "已取消传输"
                         move -> "移动完成"
                         else -> "复制完成"

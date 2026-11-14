@@ -92,6 +92,29 @@ public abstract class HFXService {
      */
     protected volatile boolean needsRebuild = false;
     /**
+     * 「电脑端取消」标记：用户在电脑上点了「取消 → 保留进度」/「中断发送」。
+     *
+     * <p>为什么不复用 {@link #transferCancelled}：电脑端的顺序是
+     * <b>先 shutdown 传输通道，再发 CANCEL 帧</b>（它必须先把 socket 关掉，
+     * 手机端阻塞在 write 里的发块线程才停得下来）。于是手机端这边有两件事同时在跑：
+     * <ul>
+     *   <li>发块线程先撞上那次写异常（ClosedChannelException / AsynchronousCloseException），</li>
+     *   <li>读控制通道的线程过一会儿才读到 CANCEL。</li>
+     * </ul>
+     * 两者之间有几十毫秒的窗口：那一刻 transferCancelled 还是 false，
+     * 写异常就被判成「通道错误」，界面弹「发送失败：传输时发生异常，请返回重连！」
+     * （真机复现的就是这一条）。
+     *
+     * <p>现在这个标志是<b>唯一</b>的「对端取消」判据：
+     * <ul>
+     *   <li>{@link #cancelByPeer(String)} 第一行就置位（早于任何关通道动作）；</li>
+     *   <li>读帧线程读到 CANCEL / REBUILD_REQ 时补一次（幂等）；</li>
+     *   <li>所有异常分类都看 {@link #isCancelLike()}，写异常还会等一小会儿让它落位；</li>
+     *   <li>下一次传输开跑时由 {@link #beginTransfer()} 清零，不影响下一轮。</li>
+     * </ul>
+     */
+    protected volatile boolean peerCancelled;
+    /**
      * 304：在别的读循环里顺手读到的、还没处理的控制帧头。
      *
      * <p>取消/重建期间帧序不是我们预期的（电脑可能在飞 PAUSE_STATE 的回报、也可能已经开始
@@ -214,6 +237,57 @@ public abstract class HFXService {
         needsRebuild = value;
     }
 
+    /** 本次传输是不是「电脑端取消的」（界面据此显示"已取消/未完成"，而不是「发送失败」） */
+    public boolean isPeerCancelled() {
+        return peerCancelled;
+    }
+
+    /**
+     * 本次传输是不是已经作废（本端取消 / 对端取消 / 等电脑重建通道）。
+     *
+     * <p>异常分类的统一判据：传输线程的 ClosedChannelException / AsynchronousCloseException
+     * 在这些状态下都是预期收尾，不能报成「通道错误」。
+     */
+    public boolean isCancelLike() {
+        return peerCancelled || transferCancelled || needsRebuild;
+    }
+
+    /**
+     * 等一次「对端取消」信号（有界，最多 {@code timeoutMs}）。
+     *
+     * <p>电脑端是先关传输通道、再发 CANCEL；手机端的发块线程往往先撞上写异常。
+     * 写异常真伪的判据只有「对端取消没取消」，所以这里给它一个很短的窗口，
+     * 让读控制通道的线程把 CANCEL 读进来（正常几毫秒到几十毫秒就到）。
+     *
+     * <p>超时时间要远小于"看起来像卡死"的量级：真出错（拔网线、电脑崩溃）时
+     * 只是晚 {@code timeoutMs} 报出来，而取消时不会误报。
+     *
+     * @return true 表示这段时间里确实被判成了取消（本端或对端）
+     */
+    protected boolean awaitCancelSignal(long timeoutMs) {
+        if (isCancelLike()) {
+            return true;
+        }
+        long deadline = System.currentTimeMillis() + Math.max(0, timeoutMs);
+        while (System.currentTimeMillis() < deadline) {
+            if (isCancelLike()) {
+                return true;
+            }
+            // 控制通道已经没了：这是真断线，不用再等（取消时控制通道一直是活的）
+            DataByteChannel channel = ctChannel;
+            if (channel == null || !channel.isOpen()) {
+                return false;
+            }
+            try {
+                Thread.sleep(20);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return isCancelLike();
+            }
+        }
+        return isCancelLike();
+    }
+
     protected void stashRebuildName(String name) {
         if (name != null) {
             pendingRebuildNames.add(name);
@@ -243,7 +317,12 @@ public abstract class HFXService {
      * receiveFiles 的收尾里是持锁调的），这里只碰通道和闸门。
      */
     protected void cancelByPeer(String reason) {
-        if (!transferCancelled) {
+        // 第一件事就是立「对端取消」的旗：它必须早于下面任何一次关通道的动作。
+        // 关通道会让发块线程立刻抛写异常，那个 catch 只看这个标志（见 SendFileCall），
+        // 标志晚一步，用户看到的就还是「传输时发生异常，请返回重连」。
+        boolean first = !peerCancelled;
+        peerCancelled = true;
+        if (first || !transferCancelled) {
             top.weixiansen574.hybridfilexfer.core.HFXLog.d("cancelByPeer: " + reason);
         }
         transferCancelled = true;
@@ -341,7 +420,8 @@ public abstract class HFXService {
         List<FutureTask<Void>> transferTasks = new ArrayList<>(connections.size());
         for (int i = 0; i < connections.size(); i++) {
             TransferConnection connection = connections.get(i);
-            FutureTask<Void> task = new FutureTask<>(new SendFileCall(readFileCall, connection, callback, pauseGate, i));
+            // 传 this 进去：写异常的分类要问「这次传输是不是已经被对端取消了」（见 SendFileCall）
+            FutureTask<Void> task = new FutureTask<>(new SendFileCall(readFileCall, connection, callback, pauseGate, i, this));
             transferTasks.add(task);
             Thread thread = new Thread(task);
             thread.setName("UL_" + connection.iName);
@@ -1087,9 +1167,12 @@ public abstract class HFXService {
                         break;
                     case ControllerIdentifiers.REBUILD_REQ:
                         stashRebuildName(ctChannel.readUTF());
+                        // 电脑端已经在重建传输通道：这就是「对端取消」的另一种形态
+                        peerCancelled = true;
                         needsRebuild = true;
                         return;
                     case ControllerIdentifiers.CANCEL:
+                        peerCancelled = true;
                         transferCancelled = true;
                         needsRebuild = true;
                         return;
@@ -1145,10 +1228,12 @@ public abstract class HFXService {
                     case ControllerIdentifiers.REBUILD_REQ:
                         ctChannel.consumePushback(2);
                         stashRebuildName(ctChannel.readUTF());
+                        peerCancelled = true;
                         needsRebuild = true;
                         break;
                     case ControllerIdentifiers.CANCEL:
                         ctChannel.consumePushback(2);
+                        peerCancelled = true;
                         transferCancelled = true;
                         needsRebuild = true;
                         break;

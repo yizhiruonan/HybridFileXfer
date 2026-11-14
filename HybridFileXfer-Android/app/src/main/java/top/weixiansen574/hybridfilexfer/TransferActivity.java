@@ -419,7 +419,16 @@ public class TransferActivity extends AppCompatActivity {
 
         @Override
         public void onIncomplete() {
-            Toast.makeText(context, R.string.chuan_shu_shi_fa_sheng_yi_chang, Toast.LENGTH_LONG).show();
+            // 电脑端点「取消」也是一种「未完成」，但会话没断、通道会被重建回来，
+            // 这时候再说「请返回重连」就是错的（用户就是按这个文案误以为要重连）
+            // 这个 handler 是静态内部类，拿不到 Activity 的 server 字段；
+            // 走 ServerService（多台电脑时取第一台，这里本来就是单连接的老界面）
+            HFXServer currentServer = ServerService.getServer();
+            boolean peerCancelled = currentServer != null && currentServer.isPeerCancelled();
+            Toast.makeText(context,
+                    peerCancelled ? R.string.chuan_shu_bei_dian_nao_qu_xiao
+                            : R.string.chuan_shu_shi_fa_sheng_yi_chang,
+                    Toast.LENGTH_LONG).show();
             transferDialog.setCloseBtnEnable(true);
             transferDialog.setButton(context.getString(R.string.exit), v -> context.finish());
             context.setResult(MainActivity.RESULT_CODE_SERVER_DISCONNECT);

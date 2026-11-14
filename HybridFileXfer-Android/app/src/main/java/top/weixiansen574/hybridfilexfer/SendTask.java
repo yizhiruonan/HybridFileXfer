@@ -92,9 +92,11 @@ public final class SendTask {
     /** 等这条连接上一次传输真的退出（它现在正被取消）最多等这么久 */
     private static final long PREV_IDLE_TIMEOUT_MS = 10_000L;
 
-    /** 「这一轮被取消 / 被让出」的哨兵值：和真正的错误文案区分开 */
+    /** 「这一轮被取消 / 被让出 / 被电脑端取消」的哨兵值：和真正的错误文案区分开 */
     private static final String ERR_ABANDONED = "\u0000abandoned";
     private static final String ERR_SUSPENDED = "\u0000suspended";
+    /** 电脑端点「取消 → 保留进度」：传输作废，但不是错误，也不该提示"请返回重连" */
+    private static final String ERR_PEER_CANCELLED = "\u0000peercancelled";
 
     public final int taskId;
     private final long createdAt = System.currentTimeMillis();
@@ -523,6 +525,11 @@ public final class SendTask {
             if (ERR_ABANDONED.equals(error) || ERR_SUSPENDED.equals(error)) {
                 return;
             }
+            if (ERR_PEER_CANCELLED.equals(error)) {
+                // 电脑端点「取消 → 保留进度」：收成「已取消（未完成）」，不是「发送失败」
+                finishPeerCancelled();
+                return;
+            }
             if (error != null) {
                 fail(error);
                 return;
@@ -542,7 +549,8 @@ public final class SendTask {
     /**
      * 发一组（同一个目录下的文件）。
      *
-     * @return null = 成功；{@link #ERR_ABANDONED} / {@link #ERR_SUSPENDED} 两个哨兵；
+     * @return null = 成功；{@link #ERR_ABANDONED} / {@link #ERR_SUSPENDED} /
+     *         {@link #ERR_PEER_CANCELLED} 三个哨兵（都不是失败）；
      *         其它字符串 = 要写进面板的失败原因
      */
     private String transferGroup(HFXServer srv, Group group) {
@@ -590,8 +598,19 @@ public final class SendTask {
             if (handoverActive || state == STATE_SUSPENDED) {
                 return ERR_SUSPENDED;
             }
+            // 电脑端点了「取消 → 保留进度」：控制通道/传输通道的异常都是这次取消的连带结果，
+            // 不是本端的错误（HFXService 已经把这次传输标成 peerCancelled）
+            if (isPeerCancelledRound(srv)) {
+                HFXLog.d("task " + taskId + ": 电脑端已取消，异常按取消收尾：" + e);
+                return ERR_PEER_CANCELLED;
+            }
             HFXLog.d("task " + taskId + ": 发送异常", e);
             return String.valueOf(e);
+        }
+        // 电脑端取消优先于其它结论：它可能同时留下一条"读文件中断/写失败"的回调，
+        // 那些都是取消的连带结果，别拿来当失败原因
+        if (isPeerCancelledRound(srv)) {
+            return ERR_PEER_CANCELLED;
         }
         if (outcome.error != null) {
             if (handoverActive || state == STATE_SUSPENDED) {
@@ -606,9 +625,34 @@ public final class SendTask {
             if (handoverActive || state == STATE_SUSPENDED) {
                 return ERR_SUSPENDED;
             }
+            // 原来这里直接返回「传输时发生异常，请返回重连！」—— 电脑端点「取消 → 保留进度」
+            // 走的正是这条路（取消 → 本次传输作废 → onIncomplete → 没有 error 文案），
+            // 于是手机上弹出一句「发送失败：传输时发生异常，请返回重连！」，
+            // 而实际上通道好好的（取消后电脑会把传输通道重建回来）。
+            if (isPeerCancelledRound(srv)) {
+                return ERR_PEER_CANCELLED;
+            }
             return appContext.getString(R.string.chuan_shu_shi_fa_sheng_yi_chang);
         }
         return null;
+    }
+
+    /**
+     * 这一轮是不是「电脑端点了取消」造成的作废。
+     *
+     * <p>只看 {@link HFXServer#isPeerCancelled()}（对端取消专用标志），<b>不能</b>看
+     * {@code isTransferCancelled()}：那个是「本端也取消」的宽泛标志，让出通道
+     * （{@code abortTransfer}）和用户点取消都会置它，会把「让出通道」误判成电脑端取消。
+     */
+    private boolean isPeerCancelledRound(HFXServer srv) {
+        if (srv == null) {
+            return false;
+        }
+        try {
+            return srv.isPeerCancelled();
+        } catch (Throwable e) {
+            return false;
+        }
     }
 
     private void awaitUnpaused() {
@@ -694,6 +738,40 @@ public final class SendTask {
             } catch (Throwable ignored) {
             }
         });
+        SendTasks.onSettled(this);
+    }
+
+    /**
+     * 电脑端点「取消 → 保留进度」后的收尾：状态记「已取消」，结果文案写「未完成，可续传」。
+     *
+     * <p>和用户在本机点取消一样，<b>不是失败</b>：不弹「发送失败」、不出现「请返回重连」
+     * （电脑端取消后会把传输通道重建回来，会话根本不断）。电脑上已经收到的块和
+     * {@code .hfxpart} 都留着，用户重新分享同一个文件就是从断点接着传。
+     */
+    private void finishPeerCancelled() {
+        synchronized (stateLock) {
+            if (terminal) {
+                return;
+            }
+            terminal = true;
+            state = STATE_CANCELLED;
+            statusText = "";
+            pausedByUser = false;
+        }
+        String text = appContext.getString(R.string.share_peer_cancelled);
+        resultText = text;
+        HFXLog.d("task " + taskId + ": " + text);
+        try {
+            main.post(() -> {
+                try {
+                    // 电脑端取消不是用户在本机点的，面板 800ms 就自己收起来了，
+                    // 用长一点的 toast 保证用户能看清「已取消 / 可续传」
+                    Toast.makeText(appContext, text, Toast.LENGTH_LONG).show();
+                } catch (Throwable ignored) {
+                }
+            });
+        } catch (Throwable ignored) {
+        }
         SendTasks.onSettled(this);
     }
 

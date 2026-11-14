@@ -951,8 +951,11 @@ public class HFXServer extends HFXService {
                 transferring = true;
                 // 传输线程马上要读控制通道（RESULT / PAUSE_REPLY），会话线程从现在起只能写。
                 sendingFiles = true;
-                // 上一次的"已取消"不能留到这一次，否则真出错时会被当成取消吞掉
+                // 上一次的"已取消"不能留到这一次，否则真出错时会被当成取消吞掉。
+                // peerCancelled 必须一起清：上一轮是电脑端点「取消→保留进度」的话，
+                // 这一轮要是真出错，会被这个残留的旗吞成「已取消」，用户永远看不到原因。
                 transferCancelled = false;
+                peerCancelled = false;
             }
         }
         top.weixiansen574.hybridfilexfer.core.HFXLog.d("beginTransfer: transferring=true, sendingFiles=" + sendingFiles);

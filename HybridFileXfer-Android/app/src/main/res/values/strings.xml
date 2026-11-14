@@ -37,6 +37,7 @@
     <string name="bookmark_added_local">Added to local bookmark list</string>
     <string name="shu_qian_yi_cun_zai">Bookmark already exists</string>
     <string name="chuan_shu_shi_fa_sheng_yi_chang">An error occurred during transfer, please reconnect!</string>
+    <string name="chuan_shu_bei_dian_nao_qu_xiao">Cancelled (incomplete): the computer stopped this transfer; the part already transferred is kept.</string>
     <string name="exit">Exit</string>
     <string name="conn">Conn</string>
     <string name="mode_">Mode:</string>
@@ -153,6 +154,7 @@
     <string name="share_complete">Sent to the computer: %1$s</string>
     <string name="share_busy">A transfer is running, please wait…</string>
     <string name="share_cancelled">Cancelled</string>
+    <string name="share_peer_cancelled">Cancelled (incomplete): the computer stopped this transfer. The part already sent is kept — share the same file again to resume.</string>
     <string name="auto_connect">Auto connect</string>
     <string name="auto_connect_enabled">Auto connect is on: the phone keeps waiting for the computer</string>
     <string name="auto_connect_disabled">Auto connect is off</string>

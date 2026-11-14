@@ -36,6 +36,7 @@
     <string name="bookmark_added_local">已添加至本地书签列表</string>
     <string name="shu_qian_yi_cun_zai">书签已存在</string>
     <string name="chuan_shu_shi_fa_sheng_yi_chang">传输时发生异常，请返回重连！</string>
+    <string name="chuan_shu_bei_dian_nao_qu_xiao">已取消（未完成）：电脑端中断了这次传输，已传部分保留</string>
     <string name="exit">退出</string>
     <string name="conn">连接</string>
     <string name="mode_">模式:</string>
@@ -152,6 +153,7 @@
     <string name="share_complete">已发送到电脑：%1$s</string>
     <string name="share_busy">正在传输，请稍候…</string>
     <string name="share_cancelled">已取消</string>
+    <string name="share_peer_cancelled">已取消（未完成）：电脑端中断了传输，已传部分保留，重新分享即可续传</string>
     <string name="auto_connect">自动连接</string>
     <string name="auto_connect_enabled">已开启自动连接，手机会一直等待电脑连接</string>
     <string name="auto_connect_disabled">已关闭自动连接</string>
