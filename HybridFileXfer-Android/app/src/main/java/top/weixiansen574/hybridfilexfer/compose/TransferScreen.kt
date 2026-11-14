@@ -680,9 +680,17 @@ internal fun TransferScreen(
                     .let { if (xferPopupTotal > 0) it.coerceAtMost(xferPopupTotal) else it }
                 else -> xferPopupResumeBase + sum
             }
-            // 数据发完的判定只有一条：按块真值追平总字节（done >= xferPopupTotal）。
-            // 这条对发送/接收两个方向都一样，不会像「通道全部收工」那样提前触发。
-            if (!xferPopupWaiting && xferPopupTotal > 0 && done >= xferPopupTotal) {
+            // 数据发完要**两条**都成立：
+            //   ① 按块真值追平总字节（done >= xferPopupTotal）；
+            //   ② 发送方向还要每条通道都收到 EOF —— 慢通道上那块被快通道"救"过去重发以后，
+            //      账本会先满（done = total），可慢通道的 socket 里那几 MB 还在往外挤（实测
+            //      蓝牙那两条要挤一分多钟）。这时候就报「等待电脑校验…」的话，用户看到的是
+            //      「没传完就进校验、分段条不动了、速度也没了，校验进度条还一直是 0」。
+            // 接收方向没有 EOF 回调，只看 ①（收到的块才算 done，本来就不会提前）。
+            val allChannelsFinished = xferPopupDoneNames.containsAll(snapshot.map { it.name })
+            val dataFinished = xferPopupTotal > 0 && done >= xferPopupTotal &&
+                (!xferPopupSending || allChannelsFinished)
+            if (!xferPopupWaiting && dataFinished) {
                 xferPopupWaiting = true
             }
             // 校验阶段：数据已经发完，两端在复算整文件 SHA-256。
@@ -691,8 +699,7 @@ internal fun TransferScreen(
             // 数据阶段结束的判定两个方向不一样：发送方向看"每条通道的 EOF 都发出去了"，
             // 接收方向没有这个回调，就看按块真值是不是已经满 —— 两边都要能进校验阶段，
             // 否则接收方向校验时（手机自己在算 SHA-256，最该有进度的那一边）进度条是死的。
-            val dataPhaseDone = xferPopupWaiting ||
-                (xferPopupTotal > 0 && done >= xferPopupTotal)
+            val dataPhaseDone = xferPopupWaiting || dataFinished
             val verifyTotal = if (dataPhaseDone) {
                 top.weixiansen574.hybridfilexfer.core.HFXService.verifyTotalBytes()
             } else 0L
