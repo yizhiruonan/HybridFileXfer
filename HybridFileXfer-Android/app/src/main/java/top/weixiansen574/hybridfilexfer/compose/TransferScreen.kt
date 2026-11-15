@@ -78,6 +78,18 @@ import top.yukonga.miuix.kmp.basic.TopAppBar
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 
 /**
+ * 一次「复制 / 移动」请求。
+ *
+ * <p>点下按钮那一刻就把文件和方向定下来，排进队列以后即使焦点窗口换了、选择被清掉，
+ * 轮到它的时候还是发当时选的那些东西（不然「排队」等于没排）。
+ */
+internal class TransferJob(
+    val files: List<RemoteFile>,
+    val move: Boolean,
+    val fromLeft: Boolean,
+)
+
+/**
  * 左右双窗口文件管理器（旧版 TransferActivity 的新界面版本）。
  *
  * 左边手机、右边电脑，行样式和底部工具条参考 MT 管理器的双窗口，
@@ -159,6 +171,10 @@ internal fun TransferScreen(
     var xferPopupTotalShown by remember { mutableLongStateOf(0L) }
     /** 校验百分比；-1 表示当前不在校验 */
     var xferPopupVerifyPercent by remember { mutableIntStateOf(-1) }
+    /** 上一批还没传完时又点了复制/移动：按点击顺序排在这里，见 startTransfer / drainPendingJobs */
+    val pendingJobs = remember { ArrayDeque<TransferJob>() }
+    /** 中断收尾时加一，让外面把队列里的下一批接上（onIncomplete 在匿名对象里，够不到局部函数） */
+    var drainTick by remember { mutableIntStateOf(0) }
 
     fun toast(text: String) {
         main.post { message = text }
@@ -320,15 +336,18 @@ internal fun TransferScreen(
                     server.isTransferCancelled() -> "已取消传输"
                     else -> "传输中断"
                 }
+                // 这一批中断了：队列里还有就走 drainTick，接着发下一批
+                // （这里在匿名对象里，局部函数还没声明到，所以用 tick 让外面的 effect 去 drain）
+                drainTick++
             }
         }
     }
 
-    /** 复制/移动：把焦点窗口里选中的项目送到另一个窗口的当前目录 */
-    fun startTransfer(move: Boolean, fromLeft: Boolean) {
-        val files = if (fromLeft) localFiles.filter { it.path in localSel }
-        else remoteFiles.filter { it.path in remoteSel }
-        if (files.isEmpty() || busy) return
+    /** 真的开一批（以前 startTransfer 的正文，原样搬过来） */
+    fun runTransfer(job: TransferJob) {
+        val files = job.files
+        val move = job.move
+        val fromLeft = job.fromLeft
         busy = true
         statusText = if (move) "正在移动…" else "正在复制…"
         xferPopupSending = fromLeft
@@ -399,6 +418,8 @@ internal fun TransferScreen(
                         else -> "复制完成"
                     }
                     refreshTick++
+                    // 这一批收尾了：队列里还有就接着发下一批（走 drainTick，见下面的 LaunchedEffect）
+                    drainTick++
                 }
             } catch (e: Throwable) {
                 main.post {
@@ -407,8 +428,55 @@ internal fun TransferScreen(
                     xferPopup = false
                     GlobalTransferOverlay.reportSend(null)
                     toast((if (move) "移动失败：" else "复制失败：") + e.message)
+                    drainTick++
                 }
             }
+        }
+    }
+
+    /**
+     * 复制/移动：把焦点窗口里选中的项目送到另一个窗口的当前目录。
+     *
+     * <p>上一批还在传的时候又点了一次，不能就这么扔掉 —— 用户报的 BUG-1 就是这个：
+     * 长按点「复制」发了任务 1，关掉进度窗口，再发任务 2，面板不弹、通知栏什么都没有。
+     * 以前这里 `if (files.isEmpty() || busy) return` 一句就退了，<b>连提示都没有</b>，
+     * 看起来就像 App 没反应。现在按点击顺序排队，前一批收尾后自动开下一批。
+     */
+    fun startTransfer(move: Boolean, fromLeft: Boolean) {
+        val files = if (fromLeft) localFiles.filter { it.path in localSel }
+        else remoteFiles.filter { it.path in remoteSel }
+        if (files.isEmpty()) return
+        val job = TransferJob(files.toList(), move, fromLeft)
+        if (busy) {
+            if (pendingJobs.size >= 50) {
+                toast("排队太多了，等前面几批传完再点")
+                return
+            }
+            pendingJobs.addLast(job)
+            // 关掉进度窗口 ≠ 不看进度：这一下把它重新打开，让用户看到「正在传」
+            xferPopup = true
+            toast("已排队（前面还有 " + pendingJobs.size + " 批），这批传完接着发")
+            return
+        }
+        runTransfer(job)
+    }
+
+    /**
+     * 一批收尾之后接着发队列里的下一批（没有就什么都不做）。
+     *
+     * <p>不能紧贴着上一批的尾巴就开：上一轮 sendFiles 返回后，通道上还会飘来
+     * 收尾帧（RESULT / 结论帧）。下一批立刻开始读，读到的就是上一轮的帧，
+     * 于是抛 "unexpected control frame while waiting for RESULT"（2026-11-15 22:47 实测：
+     * 文件其实已经传过去了，但手机上会报一次复制失败）。所以先占住 busy，
+     * 等 400ms 把上一轮的尾巴让过去再开。
+     */
+    fun drainPendingJobs() {
+        if (busy) return
+        val next = pendingJobs.removeFirstOrNull() ?: return
+        busy = true
+        scope.launch {
+            kotlinx.coroutines.delay(400)
+            runTransfer(next)
         }
     }
 
@@ -683,6 +751,11 @@ internal fun TransferScreen(
     //     和主进度条（按累计字节算的 done）也对不上；接收方向则干脆按通道等分画假分段；
     //   · 每秒一次 onSpeedInfo + 用速率合成插值推 done，下一秒真值再盖回来（每秒回跳一格）。
     // 现在只喂真值，平滑全部交给面板（200ms tween / 分段 120ms）。
+    // 一批被取消 / 中断收尾之后，队列里还有就接着发下一批（正常完成那条路在 runTransfer 里直接 drain）
+    LaunchedEffect(drainTick) {
+        if (drainTick > 0) drainPendingJobs()
+    }
+
     LaunchedEffect(busy) {
         // 上一帧的累计字节（算速率）、已经显示过的累计字节（防回退）、低通后的速率
         val previous = HashMap<String, Long>()
