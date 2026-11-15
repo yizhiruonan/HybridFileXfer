@@ -135,6 +135,21 @@ public final class SendTask {
     private volatile long totalBytes;
     /** 已经整组发完的字节（组与组之间记账，当前组按块的真值另外取） */
     private volatile long completedBytes;
+    /**
+     * <b>本组里已经整份发完</b>的文件字节数。
+     *
+     * <p>块账本（{@code sendProgress}）一个文件一本：一个组里换文件时它从 0 重新记账。
+     * 多选分享就是把好几个文件塞进同一个组（同目录合并），于是换文件那一刻
+     * {@link #getDoneBytes()} 会从「第一个文件的大小」直接掉回 0 —— 实测面板从
+     * {@code 1.62 GB / 5.09 GB} 跳成 {@code 1.0 MB / 5.09 GB}，速度变「无记录」，
+     * 队列行（没有面板那层「只增不减」）更是一直显示 0%。
+     * 这里把发完的文件累加进来，换文件只增不减。
+     */
+    private volatile long groupFilesDone;
+    /** 当前这块账本属于哪个文件 / 这个文件多大（{@link #onFileUploading} 里滚动更新） */
+    private String ledgerFilePath;
+    private long ledgerFileSize;
+    private final Object ledgerLock = new Object();
     /** 这一轮由「断点续传」跳过的字节（电脑上已经有了，不在 sendProgress 的账本里） */
     private volatile long resumeSkipped;
     private volatile long currentGroupTotal;
@@ -150,6 +165,16 @@ public final class SendTask {
     private volatile long peakSpeedBytes;
 
     private volatile int sentFileCount;
+    /** 这次分享一共几个（还没解析完也能知道，给「3 个文件」这种占位文案用） */
+    private volatile int pendingFileCount;
+    /**
+     * 还没开始复制 / 传输时就能拿到的文件名。
+     *
+     * <p>content:// 的分享要先把文件复制到缓存才知道真实路径，那之前面板标题、队列行、
+     * 通知都是空的。这里在 {@link #start} 里顺手查一次 {@code DISPLAY_NAME}，
+     * 让排队的任务一进队列就有名字可显示（多选分享时每个文件一个任务，队列里全是名字）。
+     */
+    private volatile String pendingDisplayName = "";
     private final List<String> sentFileNames = new ArrayList<>();
     private final Map<String, Double> channelSpeeds = new LinkedHashMap<>();
     private final java.util.Set<String> doneChannels =
@@ -172,6 +197,20 @@ public final class SendTask {
     public void start(List<Uri> sources) {
         if (sources != null) {
             uris.addAll(sources);
+            // 多选分享时先记下总个数：正在把 content:// 复制到缓存的那段时间还没有文件名，
+            // 面板标题 / 队列行要靠它显示「3 个文件」而不是一个「…」
+            pendingFileCount = sources.size();
+            // 先问一下名字（很便宜的一次 ContentResolver 查询），复制开始前队列里就有名字
+            if (sources.size() == 1) {
+                try {
+                    String name = queryDisplayName(sources.get(0));
+                    if (name != null && !name.isEmpty()) {
+                        pendingDisplayName = name;
+                    }
+                } catch (Throwable ignored) {
+                    // 查询失败就用后面的兜底文案
+                }
+            }
         }
         statusText = appContext.getString(R.string.share_preparing);
         startRun();
@@ -546,6 +585,12 @@ public final class SendTask {
             }
             groups.poll();
             completedBytes += group.totalBytes;
+            // 整组的字节已经进 completedBytes，按文件累加的那份必须清掉，不然算两遍
+            synchronized (ledgerLock) {
+                groupFilesDone = 0L;
+                ledgerFilePath = null;
+                ledgerFileSize = 0L;
+            }
             // 续传跳过的字节已经算在 group.totalBytes 里了（那是整组的字节数），
             // 不清掉它就等于把这一组算两遍 —— 真机实测「300 MB 的文件显示 589 MB / 300 MB」，
             // 队列行、通知栏的数字跟着一起错。
@@ -570,6 +615,12 @@ public final class SendTask {
     private String transferGroup(HFXServer srv, Group group) {
         currentGroupTotal = group.totalBytes;
         resumeSkipped = 0L;
+        // 新的一组：换文件计数从头来（上一组的字节已经并进 completedBytes 了）
+        synchronized (ledgerLock) {
+            groupFilesDone = 0L;
+            ledgerFilePath = null;
+            ledgerFileSize = 0L;
+        }
         currentFileName = group.firstFileName();
         doneChannels.clear();
         if (startTime == 0L) {
@@ -987,10 +1038,25 @@ public final class SendTask {
 
         @Override
         public void onFileUploading(String iName, String path, long targetSize, long totalSize) {
-            // 只记文件名。进度不在回调里算：分段发送时 targetSize 是「这一块的末尾位置」，
-            // 块是乱序并行到达的，拿它当进度会跳来跳去
-            if (path != null && !path.isEmpty()) {
-                currentFileName = new File(path).getName();
+            // 进度不在回调里算：分段发送时 targetSize 是「这一块的末尾位置」，
+            // 块是乱序并行到达的，拿它当进度会跳来跳去。这里只做两件事：
+            // 记文件名，以及认出「换文件了」——把上一个文件的整份字节并进 groupFilesDone。
+            if (path == null || path.isEmpty()) {
+                return;
+            }
+            currentFileName = new File(path).getName();
+            synchronized (ledgerLock) {
+                if (ledgerFilePath != null && !ledgerFilePath.equals(path)) {
+                    // 上一个文件整份发完：块账本要换一本重新从 0 记，先把它的字节并进来，
+                    // 顺便把续传跳过数清零（那是上一个文件的，下一本账自己有 onResumeSkipped）
+                    groupFilesDone += ledgerFileSize;
+                    resumeSkipped = 0L;
+                }
+                ledgerFilePath = path;
+                if (totalSize > 0L) {
+                    // 第四个参数就是这个文件的完整大小（第三个数是块的末尾位置）
+                    ledgerFileSize = totalSize;
+                }
             }
         }
 
@@ -1164,7 +1230,8 @@ public final class SendTask {
      * <p>和面板上那个数同一口径（面板在这个数上再加「只增不减」和补间）。
      */
     public long getDoneBytes() {
-        long done = completedBytes + resumeSkipped;
+        // + groupFilesDone：本组里已经整份发完的文件（见字段注释，换文件时进度不能往回跳）
+        long done = completedBytes + resumeSkipped + groupFilesDone;
         HFXServer srv = server;
         if (srv != null) {
             try {
@@ -1193,7 +1260,7 @@ public final class SendTask {
         if (current == STATE_SENDING || current == STATE_PAUSED) {
             return getDoneBytes();
         }
-        return completedBytes + resumeSkipped;
+        return completedBytes + resumeSkipped + groupFilesDone;
     }
 
     /** 队列 / 通知要的文件名：正在传的那个，还没开传就用准备阶段记下的第一个 */
@@ -1203,8 +1270,18 @@ public final class SendTask {
             return current;
         }
         synchronized (sentFileNames) {
-            return sentFileNames.isEmpty() ? "" : sentFileNames.get(0);
+            if (!sentFileNames.isEmpty()) {
+                return sentFileNames.get(0);
+            }
         }
+        String pending = pendingDisplayName;
+        if (pending != null && !pending.isEmpty()) {
+            return pending;
+        }
+        // 多选分享：正在把 content:// 复制到缓存，一个名字都还没有。
+        // 以前这里返回空串 —— 面板标题和队列行就只剩一个「…」（多选后二次分享时最显眼）。
+        int count = Math.max(pendingFileCount, sentFileCount);
+        return count > 1 ? appContext.getString(R.string.share_files_count, count) : "";
     }
 
     /** 当前拍的块快照（分段进度条用），取不到返回 null */

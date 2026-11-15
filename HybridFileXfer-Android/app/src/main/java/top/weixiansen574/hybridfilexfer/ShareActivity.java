@@ -237,6 +237,9 @@ public class ShareActivity extends AppCompatActivity {
     private SendTask createTaskFromIntent() {
         List<android.net.Uri> uris = SendTask.extractUris(getIntent());
         int connectionId = getIntent().getIntExtra(EXTRA_CONNECTION_ID, -1);
+        if (uris.size() > 1) {
+            return createTaskPerFile(uris, connectionId);
+        }
         SendTask created = SendTasks.create(this, connectionId);
         // intent 里补上 taskId：进程被回收后重建、通知栏路由都靠它
         Intent intent = new Intent(getIntent());
@@ -245,6 +248,28 @@ public class ShareActivity extends AppCompatActivity {
         HFXLog.d("share: 新建任务 taskId=" + created.getTaskId() + " files=" + uris.size());
         created.start(uris);
         return created;
+    }
+
+    /**
+     * 多选分享：<b>一个文件一个任务</b>，面板绑第一个。
+     *
+     * <p>以前「一次分享 = 一个任务」，几个文件挤在同一个任务里，于是队列里只有一行、
+     * 换文件那一刻进度往回跳（块账本一个文件一本）、暂停/取消只能整批一起动、
+     * 通知也只有一条。用户要的是每个文件各占一个任务：队列一行一个、进度各算各的、
+     * 每个文件一条通知。这些任务还是排队走同一条发送通道，所以电脑端收到的顺序和结果不变。
+     */
+    private SendTask createTaskPerFile(List<android.net.Uri> uris, int connectionId) {
+        SendTask first = null;
+        for (int i = 0; i < uris.size(); i++) {
+            SendTask created = SendTasks.create(this, connectionId);
+            created.start(java.util.Collections.singletonList(uris.get(i)));
+            if (first == null) {
+                first = created;
+            }
+        }
+        HFXLog.d("share: 多选分享 " + uris.size() + " 个文件 → 拆成 " + uris.size()
+                + " 个任务，面板绑第一个 taskId=" + first.getTaskId());
+        return first;
     }
 
     /** 把这个面板绑到一个任务上，并把当前状态画出来 */
@@ -525,8 +550,10 @@ public class ShareActivity extends AppCompatActivity {
         }
         lastSampleAt = now;
         if (current.isTerminal()) {
-            renderTerminal(current);
-            frameClock.stop();
+            // 挪到队列里的下一个任务时别再停拍（attachTask 已经重新起拍）
+            if (!renderTerminal(current)) {
+                frameClock.stop();
+            }
             return;
         }
         if (current.isTransferActive()) {
@@ -544,9 +571,9 @@ public class ShareActivity extends AppCompatActivity {
      * <p>注意这里<b>只认任务自己的状态</b>：任务不跟着界面生死，所以「这一帧该不该画」
      * 不需要再像以前那样靠 round / activeRound 对号码。
      */
-    private void renderTerminal(SendTask current) {
+    private boolean renderTerminal(SendTask current) {
         if (current == null || panel == null) {
-            return;
+            return false;
         }
         int state = current.getState();
         if (state == SendTask.STATE_DONE) {
@@ -557,8 +584,20 @@ public class ShareActivity extends AppCompatActivity {
             }
         }
         pushPanel(current, false, Collections.emptyList(), buildChannels(current, true));
+        // 多选分享 = 每个文件一个任务：这个收尾了（完成 / 取消 / 失败）、队列里还有没传完的，
+        // 就把面板挪到下一个 —— 否则后面那些文件在传的时候屏幕上什么都没有，只剩通知栏。
+        // 收尾的那个仍然留在队列里（「已完成」/「发送失败」），不会从列表里消失。
+        SendTask next = nextQueuedTask(current.getTaskId());
+        if (next != null) {
+            HFXLog.d("share: task " + current.getTaskId() + " 收尾，面板改绑队列里的 task "
+                    + next.getTaskId());
+            frameClock.stop();
+            finishingScheduled = false;
+            hopTo(next);
+            return true;
+        }
         if (finishingScheduled) {
-            return;
+            return false;
         }
         finishingScheduled = true;
         long delay;
@@ -570,9 +609,30 @@ public class ShareActivity extends AppCompatActivity {
         } else {
             // 失败：窗口留着让人看清原因（点外面 / 返回键退出）
             enableDismissOutside();
-            return;
+            return false;
         }
         handler.postDelayed(this::finishIfAlive, delay);
+        return false;
+    }
+
+    /** 队列里还没收尾的下一个任务（没有就返回 null） */
+    private static SendTask nextQueuedTask(int excludingTaskId) {
+        int id = SendTasks.panelTargetTaskId();
+        if (id < 0 || id == excludingTaskId) {
+            return null;
+        }
+        SendTask next = SendTasks.get(id);
+        return next != null && !next.isTerminal() ? next : null;
+    }
+
+    /** 把面板从收尾的任务挪到队列里的下一个 */
+    private void hopTo(SendTask next) {
+        SendTask old = task;
+        if (old != null && old != next) {
+            old.unbind(this);
+        }
+        task = null;
+        attachTask(next);
     }
 
     private void finishIfAlive() {

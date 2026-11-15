@@ -154,6 +154,16 @@ public final class SendTasks {
         return list;
     }
 
+    /** 队列里还有没收尾的任务吗（在传的 / 排队的 / 准备中的都算） */
+    private static boolean anyLive() {
+        for (SendTask task : TASKS.values()) {
+            if (!task.isTerminal()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     static void onSettled(SendTask task) {
         if (task.hasViews()) {
             // 面板还开着：留着记录，用户还能从通知 / 重新进来看到结果文案
@@ -165,20 +175,34 @@ public final class SendTasks {
             HFXLog.d("queue: task " + task.getTaskId() + " 没有面板但还在传，保留");
             return;
         }
+        if (anyLive()) {
+            // 多选分享 = 每个文件一个任务：这一个传完了，队列里还有别的要传（或者正传着），
+            // 就把它留在列表里（队列末尾显示「已完成」）。删掉的话队列越传越短，
+            // 用户既看不到前面那些传得怎么样，也没法从队列里回看结果。
+            HFXLog.d("queue: task " + task.getTaskId() + " 收尾，队列里还有别的任务，留在列表里");
+            return;
+        }
         TASKS.remove(task.getTaskId());
         SPEEDS.remove(task.getTaskId());
     }
 
     private static void prune() {
+        if (anyLive()) {
+            // 还有任务在传 / 排队：收尾的那些当一个「已完成」留在队列里，别清列表
+            return;
+        }
         for (SendTask task : TASKS.values()) {
             if (task.hasViews()) {
                 continue;
             }
             int state = task.getState();
+            // WAITING 不在回收之列：那是「排队等发送通道」，运行线程还活着（阻塞在
+            // SendTasks.acquire 里），轮到自己就会开跑。多选分享 = 每个文件一个任务，
+            // 排队的那些本来就没有面板 —— 以前按「没面板就回收」删掉，队里就只剩正在传的那个，
+            // 后面的文件再也传不了。
             if (state == SendTask.STATE_DONE || state == SendTask.STATE_FAILED
                     || state == SendTask.STATE_CANCELLED
-                    || state == SendTask.STATE_SUSPENDED
-                    || state == SendTask.STATE_WAITING) {
+                    || state == SendTask.STATE_SUSPENDED) {
                 TASKS.remove(task.getTaskId());
                 SPEEDS.remove(task.getTaskId());
                 HFXLog.d("queue: 回收 task " + task.getTaskId() + "（" + stateName(state) + "，没有面板）");

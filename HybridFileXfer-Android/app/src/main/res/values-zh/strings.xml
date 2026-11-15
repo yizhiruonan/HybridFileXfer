@@ -196,4 +196,5 @@
     <string name="home_subtitle">USB / WIFI 多通道文件互传</string>
 <string name="share_complete_files">已发送：%1$s，峰值 %2$s</string>
 <string name="share_files_fallback">文件</string>
+<string name="share_files_count">%1$d 个文件</string>
 </resources>
