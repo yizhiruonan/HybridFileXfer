@@ -205,6 +205,11 @@ fn main() -> Result<(), slint::PlatformError> {
     }));
 
     let ui = AppWindow::new()?;
+    // 独立传输窗口：只读同一份 PROGRESS，不参与主界面布局。
+    // 传输一开始自己弹出来，结束自己收起 —— 主窗口最小化到托盘时也能看到进度。
+    let xfer_win = TransferWindow::new()?;
+    // 用户在传输窗口上点了「收起」：这一轮就别再弹了（下一轮传输重新允许）
+    let xfer_dismissed = Arc::new(AtomicBool::new(false));
     ui.set_dir_text(state.lock().unwrap().config.receive_dir.display().to_string().into());
     ui.set_port_text(state.lock().unwrap().config.port.to_string().into());
     ui.set_ip_text(ip_text.into());
@@ -342,6 +347,28 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         ui.on_cancel_send(move || {
             hfx_receiver::control::cancel();
+        });
+    }
+    // ---- 独立传输窗口上的两颗按钮（和主窗口同一套控制函数）----
+    {
+        let weak = xfer_win.as_weak();
+        xfer_win.on_toggle_pause(move || {
+            let paused = !hfx_receiver::control::paused();
+            hfx_receiver::control::pause(paused);
+            if let Some(w) = weak.upgrade() {
+                w.set_paused(paused);
+            }
+        });
+    }
+    {
+        let weak = xfer_win.as_weak();
+        let dismissed = Arc::clone(&xfer_dismissed);
+        xfer_win.on_close_window(move || {
+            // 收起 = 藏起来，传输继续（要真停下得去主窗口点「取消接收」）
+            dismissed.store(true, Ordering::Relaxed);
+            if let Some(w) = weak.upgrade() {
+                let _ = w.hide();
+            }
         });
     }
     // ---- 接收方向的「取消」（不只是暂停 / 继续）----
@@ -488,6 +515,10 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let st = Arc::clone(&state);
         let ui_weak = ui.as_weak();
+        // 独立传输窗口：这一轮有没有弹过 / 用户是不是已经把它收起来了
+        let xfer_weak = xfer_win.as_weak();
+        let xfer_dismissed = Arc::clone(&xfer_dismissed);
+        let mut tw_shown = false;
         let mut last_bytes = 0u64;
         let mut last_tick = std::time::Instant::now();
         let mut speed = 0f64;
@@ -673,6 +704,9 @@ fn main() -> Result<(), slint::PlatformError> {
             // ---- 传输进度 ----
             let (path, done, total, session_bytes, files) =
                 hfx_receiver::receiver::PROGRESS.snapshot();
+            // 下面 segs 那一段会把 total 这个名字借去当 f32 用（段宽合计），
+            // 独立窗口那边要的还是字节总数，先留一份
+            let total_bytes = total;
 
             // 速率只按「这次真收到的字节」算：续传基线（磁盘上本来就有的一块）不算进去，
             // 否则续传一开始会跳出一个几 GB/s 的假峰值。
@@ -740,7 +774,7 @@ fn main() -> Result<(), slint::PlatformError> {
                     .next()
                     .unwrap_or(&path)
                     .to_string();
-                ui.set_file_name(short.into());
+                ui.set_file_name(short.clone().into());
                 ui.set_file_progress(if total > 0 { done as f32 / total as f32 } else { 0.0 });
                 ui.set_file_text(format!("{} / {}", human(done), human(total)).into());
                 // 手机来取文件时是"已发送"，手机推过来时才是"已接收"
@@ -778,7 +812,45 @@ fn main() -> Result<(), slint::PlatformError> {
                     });
                     start += span;
                 }
-                ui.set_xfer_segments(slint::ModelRc::new(slint::VecModel::from(segs)));
+                let seg_model = slint::ModelRc::new(slint::VecModel::from(segs));
+                ui.set_xfer_segments(seg_model.clone());
+
+                // ---- 独立传输窗口：同一份数据再喂一遍 ----
+                if let Some(tw) = xfer_weak.upgrade() {
+                    tw.set_action_text(
+                        if ui.get_send_active() {
+                            "正在发送文件"
+                        } else {
+                            "正在接收文件"
+                        }
+                        .into(),
+                    );
+                    tw.set_percent(if total_bytes > 0 {
+                        ((done as f64 / total_bytes as f64) * 100.0).round() as i32
+                    } else {
+                        0
+                    });
+                    tw.set_file_name(short.clone().into());
+                    tw.set_detail_text(
+                        format!("{} / {} · {}", human(done), human(total_bytes), speed_text)
+                    .into());
+                    tw.set_paused(hfx_receiver::control::paused());
+                    tw.set_done(false);
+                    tw.set_segs(seg_model);
+                    // 新一轮传输才重新弹（用户点过「收起」就别再烦他）
+                    if !tw_shown && !xfer_dismissed.load(Ordering::Relaxed) {
+                        tw_shown = true;
+                        let _ = tw.show();
+                    }
+                }
+            } else if tw_shown {
+                // 传输结束：窗口自己收起来，下一轮重新允许弹出
+                tw_shown = false;
+                xfer_dismissed.store(false, Ordering::Relaxed);
+                if let Some(tw) = xfer_weak.upgrade() {
+                    tw.set_done(true);
+                    let _ = tw.hide();
+                }
             }
 
             // 进度卡 / 更新提示出现时调整窗口高度（否则底部按钮会被裁掉）

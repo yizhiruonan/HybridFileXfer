@@ -698,3 +698,104 @@ export component AppWindow inherits Window {
         }
     }
 }
+// ---------------------------------------------------------------------------
+// 独立传输窗口（P1）
+//
+// 为什么单独开一个窗口：主界面里那张进度卡要占版面，而且用户一旦把主窗口
+// 最小化/收起托盘就看不到进度了。这个东西就是「资源管理器复制文件」那种
+// 独立小窗：传输开始时自己弹出来，传完自己消失，主窗口可以一直最小化。
+//
+// P1 只做：文案 + 百分比 + IDM 式分段进度条 + 暂停/继续 + 收起。
+// 分段画法和主界面那张卡共用同一份 segs（一条通道一段），后面加流动动画时
+// 只改这一处，不再抄第二份。
+// 收起 = 把窗口藏起来，传输继续（和手机端「关闭 ≠ 取消」同一个语义）。
+// ---------------------------------------------------------------------------
+export component TransferWindow inherits Window {
+    title: root.done ? "已完成" : "正在传输";
+    preferred-width: 470px;
+    preferred-height: 196px;
+    background: #F3F3F3;
+
+    in-out property <string> action-text: "正在接收文件";
+    in-out property <int> percent: 0;
+    in-out property <string> file-name: "";
+    in-out property <string> detail-text: "";
+    in-out property <[XferSeg]> segs: [];
+    in-out property <bool> paused: false;
+    in-out property <bool> done: false;
+
+    callback toggle-pause();
+    callback close-window();
+
+    VerticalLayout {
+        padding: 18px;
+        spacing: 10px;
+
+        Text {
+            text: root.action-text;
+            font-size: 14px;
+            color: #1A1A1A;
+            overflow: elide;
+        }
+
+        HorizontalLayout {
+            spacing: 8px;
+            Text {
+                text: "已完成 " + root.percent + "%";
+                font-size: 18px;
+                font-weight: 700;
+                color: #1A1A1A;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+            SecondaryButton {
+                label: root.paused ? "继续" : "暂停";
+                visible: !root.done;
+                clicked => { root.toggle-pause(); }
+            }
+            SecondaryButton {
+                label: root.done ? "关闭" : "收起";
+                clicked => { root.close-window(); }
+            }
+        }
+
+        // IDM 式分段：段内从段首往右填，段之间一条红线（和主界面那张卡同一套画法）
+        bar := Rectangle {
+            height: 14px;
+            background: #E4E4E4;
+            clip: true;
+
+            for seg in root.segs : Rectangle {
+                x: bar.width * seg.start;
+                y: 0px;
+                width: bar.width * seg.span * seg.filled;
+                height: bar.height;
+                background: #005FB8;
+            }
+            for seg[i] in root.segs : Rectangle {
+                visible: i > 0;
+                x: bar.width * seg.start;
+                y: 0px;
+                width: 1px;
+                height: bar.height;
+                background: #E53935;
+            }
+        }
+
+        Text {
+            text: root.file-name;
+            font-size: 12.5px;
+            color: #1A1A1A;
+            overflow: elide;
+        }
+
+        Text {
+            text: root.detail-text;
+            font-size: 11px;
+            color: #616161;
+            overflow: elide;
+        }
+
+        Rectangle { vertical-stretch: 1; }
+    }
+}
