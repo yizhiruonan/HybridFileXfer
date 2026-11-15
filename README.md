@@ -52,8 +52,17 @@ Android 13+ 的长按菜单是系统独占的，应用只能加卡片上的按�
 | --- | --- | --- |
 | ![任务队列](docs/share-queue.png) | ![通知分组](docs/notification-group.png) | ![已暂停](docs/share-paused.png) |
 
-想再快一截：设置 →「榨干 IO」会列出还没开的链路（USB 网络共享 / Wi-Fi 6GHz 等）并带你逐个打开 ——
-和进 App 时自动弹的那次引导是同一个弹窗，点过「不再提示」也还能从这里再开。
+想再快一截：设置 →「榨干 IO」会列出还没开的链路（Wi-Fi / USB 数据线 / USB 网络共享 / 热点等）。
+
+- **有 ROOT 或 Shizuku 权限就直接帮你开**：弹窗里会写明「已检测到 ROOT 权限」，缺的那几条当场推一遍
+  （`svc wifi enable`、打开 USB 调试、`svc usb setFunctions rndis,adb` 等），开好的那一行标
+  「刚才用 ROOT 自动打开」，开不成的写「ROOT 自动打开失败」并告诉你去哪儿手动开；
+- **没有权限也能用**：弹窗会说明「下面这些只能手动开」，点「确定」一条条领你去系统设置；
+- 进 App 时自动弹的那次**不会擅自动系统开关**（你可能故意关着 Wi-Fi），要按一下「用 ROOT 一键开启」才开。
+
+| 榨干 IO（有 ROOT 时自动开） |
+| --- |
+| ![榨干 IO](docs/boost-dialog.png) |
 
 ### 电脑 → 手机（右键发送）
 
