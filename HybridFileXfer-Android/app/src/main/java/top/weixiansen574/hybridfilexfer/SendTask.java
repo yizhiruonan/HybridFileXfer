@@ -328,6 +328,14 @@ public final class SendTask {
             cancel(true);
             return;
         }
+        // 还在传（SENDING / PAUSED / SUSPENDED）：面板关掉只是「界面没了」，任务照跑。
+        // 以前这里直接走 onSettled，把正在传的任务从队列表里删掉 —— 表现就是：
+        // 分享第 1 个文件、把面板收起来、再分享第 2 个文件，第 2 个的面板里**看不到第 1 个**
+        // （任务其实还在后台传，通知栏那条进度也一起没了）。
+        if (!terminal) {
+            HFXLog.d("task " + taskId + ": 面板关掉，任务继续（留在队列里）");
+            return;
+        }
         SendTasks.onSettled(this);
     }
 

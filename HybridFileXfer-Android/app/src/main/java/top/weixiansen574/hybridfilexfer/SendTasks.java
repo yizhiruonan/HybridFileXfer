@@ -14,6 +14,7 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import top.weixiansen574.hybridfilexfer.core.HFXLog;
 import top.weixiansen574.hybridfilexfer.droidcore.HFXServer;
 
 /**
@@ -71,7 +72,54 @@ public final class SendTasks {
         int taskId = NEXT_ID.getAndIncrement();
         SendTask task = new SendTask(taskId, context.getApplicationContext(), targetConnectionId);
         TASKS.put(taskId, task);
+        // 排「队列里少一个任务」这类问题时，这一行能看到建新任务时表里还剩谁
+        HFXLog.d("queue: 新建 task " + taskId + " → " + digest());
         return task;
+    }
+
+    /**
+     * 诊断用：队列里都有谁、什么状态、面板还开着没。
+     *
+     * <p>「任务1在传、任务2的面板里却看不到任务1」这种报告，靠这行一眼能分清是
+     * 「表里没有」还是「渲染没画」。
+     */
+    static String digest() {
+        List<SendTask> list = snapshot();
+        if (list.isEmpty()) {
+            return "空";
+        }
+        StringBuilder sb = new StringBuilder();
+        for (SendTask task : list) {
+            if (sb.length() > 0) {
+                sb.append(", ");
+            }
+            sb.append(task.getTaskId()).append(':').append(stateName(task.getState()))
+                    .append(task.hasViews() ? "(有面板)" : "(无面板)");
+        }
+        return sb.toString();
+    }
+
+    private static String stateName(int state) {
+        switch (state) {
+            case SendTask.STATE_PREPARING:
+                return "PREPARING";
+            case SendTask.STATE_WAITING:
+                return "WAITING";
+            case SendTask.STATE_SENDING:
+                return "SENDING";
+            case SendTask.STATE_PAUSED:
+                return "PAUSED";
+            case SendTask.STATE_SUSPENDED:
+                return "SUSPENDED";
+            case SendTask.STATE_DONE:
+                return "DONE";
+            case SendTask.STATE_FAILED:
+                return "FAILED";
+            case SendTask.STATE_CANCELLED:
+                return "CANCELLED";
+            default:
+                return String.valueOf(state);
+        }
     }
 
     public static SendTask get(int taskId) {
@@ -111,6 +159,12 @@ public final class SendTasks {
             // 面板还开着：留着记录，用户还能从通知 / 重新进来看到结果文案
             return;
         }
+        if (!task.isTerminal()) {
+            // 兜底：还在传的任务不能因为「没有面板」就从表里删掉 ——
+            // 别的任务的面板要靠这张表列出队列，通知栏也要靠它挂进度，删了就再也找不回来。
+            HFXLog.d("queue: task " + task.getTaskId() + " 没有面板但还在传，保留");
+            return;
+        }
         TASKS.remove(task.getTaskId());
         SPEEDS.remove(task.getTaskId());
     }
@@ -127,6 +181,7 @@ public final class SendTasks {
                     || state == SendTask.STATE_WAITING) {
                 TASKS.remove(task.getTaskId());
                 SPEEDS.remove(task.getTaskId());
+                HFXLog.d("queue: 回收 task " + task.getTaskId() + "（" + stateName(state) + "，没有面板）");
             }
         }
     }

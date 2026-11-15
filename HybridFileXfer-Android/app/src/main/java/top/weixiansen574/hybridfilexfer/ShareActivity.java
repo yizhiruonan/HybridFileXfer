@@ -93,6 +93,8 @@ public class ShareActivity extends AppCompatActivity {
      * 一点通知面板就把自己关掉。
      */
     private volatile long shownAt;
+    /** 上一次打进日志的队列摘要（内容变了才打） */
+    private String lastQueueDigest;
     /** 窗口刚起多久内的「点外面」不算用户操作（毫秒）：盖住通知栏那一下的 UP 抖动 */
     private static final long OUTSIDE_GRACE_MS = 600L;
     /** 已经排过「延时自动关窗口」 */
@@ -919,6 +921,12 @@ public class ShareActivity extends AppCompatActivity {
             return Collections.emptyList();
         }
         List<SendTasks.TaskInfo> infos = SendTasks.queueSnapshot();
+        // 队列内容变了就打一行（每帧都打太吵）：排查「面板里看不到别的任务」时看这个
+        String digest = SendTasks.digest();
+        if (!digest.equals(lastQueueDigest)) {
+            lastQueueDigest = digest;
+            HFXLog.d("panel task " + current.getTaskId() + " 队列 → " + digest);
+        }
         if (infos.isEmpty()) {
             return Collections.emptyList();
         }
