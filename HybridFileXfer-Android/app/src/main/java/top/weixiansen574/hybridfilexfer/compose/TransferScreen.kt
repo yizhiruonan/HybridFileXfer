@@ -173,6 +173,18 @@ internal fun TransferScreen(
     var xferPopupVerifyPercent by remember { mutableIntStateOf(-1) }
     /** 上一批还没传完时又点了复制/移动：按点击顺序排在这里，见 startTransfer / drainPendingJobs */
     val pendingJobs = remember { ArrayDeque<TransferJob>() }
+    /**
+     * 「排队列表变了」的版本号。pendingJobs 是普通 ArrayDeque，不是 Compose 状态，
+     * 光往里加东西面板不会重组 —— 进度窗口里那段「任务队列」就永远停在第一次画的样子。
+     * 所以入队、出队、取消排队各 +1，面板靠读它来刷新。
+     */
+    var queueVersion by remember { mutableIntStateOf(0) }
+    /**
+     * 正在传的这一批。队列面板第 1 行要显示它自己的文件名，不能拿 xferPopupName ——
+     * 那个字段传的是「当前正在上传的那个文件」的回调值，单文件时是文件名，
+     * 多文件/文件夹时会变成路径，画在队列里又长又不像队列。
+     */
+    var currentJob by remember { mutableStateOf<TransferJob?>(null) }
     /** 中断收尾时加一，让外面把队列里的下一批接上（onIncomplete 在匿名对象里，够不到局部函数） */
     var drainTick by remember { mutableIntStateOf(0) }
 
@@ -349,6 +361,7 @@ internal fun TransferScreen(
         val move = job.move
         val fromLeft = job.fromLeft
         busy = true
+        currentJob = job
         statusText = if (move) "正在移动…" else "正在复制…"
         xferPopupSending = fromLeft
         xferPopupName = ""
@@ -453,7 +466,9 @@ internal fun TransferScreen(
                 return
             }
             pendingJobs.addLast(job)
-            // 关掉进度窗口 ≠ 不看进度：这一下把它重新打开，让用户看到「正在传」
+            queueVersion++
+            // 关掉进度窗口 ≠ 不看进度：这一下把它重新打开，让用户看到「正在传」，
+            // 排队的这几批挂在窗口下半部分的「任务队列」里
             xferPopup = true
             toast("已排队（前面还有 " + pendingJobs.size + " 批），这批传完接着发")
             return
@@ -473,6 +488,7 @@ internal fun TransferScreen(
     fun drainPendingJobs() {
         if (busy) return
         val next = pendingJobs.removeFirstOrNull() ?: return
+        queueVersion++
         busy = true
         scope.launch {
             kotlinx.coroutines.delay(400)
@@ -929,6 +945,48 @@ internal fun TransferScreen(
     }
 
     if (xferPopup) {
+        // 「任务队列」：正在传的这一批排第 1，后面排队的依次往下 —— 窗口打开的是第一个任务，
+        // 队列信息挂在窗口下半部分（用户 2026-11-15 要的就是这个：第二个文件排队时要看得见）。
+        // 没有排队的批（最常见的情况）就传空列表，面板和以前一个像素都不差。
+        // 读 queueVersion：pendingJobs 不是 Compose 状态，靠它触发重组。
+        val pendingSnapshot = remember(queueVersion) { pendingJobs.toList() }
+        val queueRows = ArrayList<QueueRow>()
+        if (pendingSnapshot.isNotEmpty()) {
+            queueRows.add(
+                QueueRow(
+                    0,
+                    1,
+                    // 用这一批自己的文件列表，别用 xferPopupName（那是「当前正上传的那个文件」，
+                    // 多文件/文件夹时会变成路径）
+                    currentJob?.let { queueTitle(it.files) } ?: "正在发送的一批",
+                    formatSizeText(xferPopupDone) + " / " + formatSizeText(xferPopupTotal) + " · " +
+                        server.displayName,
+                    when {
+                        xferPopupPaused -> "已暂停"
+                        xferPopupVerifyPercent >= 0 -> "校验中 " + xferPopupVerifyPercent + "%"
+                        xferPopupWaiting -> "等待电脑校验"
+                        else -> "正在发送"
+                    },
+                    true,
+                    false,
+                    false,
+                ),
+            )
+            pendingSnapshot.forEachIndexed { index, job ->
+                queueRows.add(
+                    QueueRow(
+                        index + 2,
+                        index + 2,
+                        queueTitle(job.files),
+                        formatSizeText(job.files.sumOf { if (it.size > 0) it.size else 0L }) + " · 等待中",
+                        "前面还有 " + (index + 1) + " 个",
+                        false,
+                        true,
+                        true,
+                    ),
+                )
+            }
+        }
         // 分段进度条的数据由上面 50ms 的轮询算好（xferPopupSegments）：一条通道一段，
         // 段宽 = 这一段占多少块，填充 = 段内已完成块占比。和主页接收进度条同一个来源、同一套画法。
         ReceiveProgressPanel(
@@ -953,6 +1011,16 @@ internal fun TransferScreen(
             ),
             onDismiss = { xferPopup = false },
             sending = xferPopupSending,
+            // 排队的这几批画在面板下半部分；点行上的「取消」把它从队列里拿掉
+            queue = queueRows,
+            onQueueCancel = { id ->
+                val at = id - 2
+                if (at >= 0 && at < pendingSnapshot.size) {
+                    pendingJobs.remove(pendingSnapshot[at])
+                    queueVersion++
+                    toast("已取消排队")
+                }
+            },
             onPause = {
                 xferPopupPaused = true
                 server.pauseTransfer()
@@ -1411,6 +1479,10 @@ private fun storageText(path: String): String {
         ""
     }
 }
+
+/** 队列里一行的标题：单个文件用文件名，多个就「N 个文件」 */
+private fun queueTitle(files: List<RemoteFile>): String =
+    if (files.size == 1) files[0].name else files.size.toString() + " 个文件"
 
 private fun formatSizeText(bytes: Long): String {
     if (bytes <= 0) return "0 B"
