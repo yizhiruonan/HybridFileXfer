@@ -58,6 +58,15 @@ class QueueRow(
     @JvmField val current: Boolean,
     /** 这一行能不能「取消」（已收尾的不能） */
     @JvmField val cancellable: Boolean,
+    /**
+     * 这一行还在排队（准备中 / 等通道）。
+     *
+     * <p>「任务队列」这一段以前只在 {@code queue.size > 1} 时画。可「排队中」这个状态本身
+     * 就是因为<b>有别的任务占着通道</b>才出现的，而那一路任务有可能刚好收尾、被回收，
+     * 这一瞬间快照里就只剩排队的那一条 —— 面板上写着「排队中」却找不到队列段，
+     * 报的「显示正在排队而没有显示队列界面」就是这种状态。所以排队中的任务一律画队列段。
+     */
+    @JvmField val queued: Boolean,
 )
 
 /**

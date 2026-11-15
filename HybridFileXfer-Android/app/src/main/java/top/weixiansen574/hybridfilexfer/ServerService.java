@@ -104,6 +104,15 @@ public class ServerService extends Service implements ServiceConnection {
     private static final int NOTIFICATION_RESUME_REQUEST_BASE = 7500;
     private static final int NOTIFICATION_CANCEL_KEEP_REQUEST_BASE = 8000;
     private static final int NOTIFICATION_CANCEL_DELETE_REQUEST_BASE = 8500;
+    /**
+     * 「每个任务一条通知」的 id 段（总通知就是 {@link #NOTIFICATION_ID}，这里 5800 + taskId）。
+     *
+     * <p>用户要的是：<b>每个传输任务各占一条通知，都归到总通知下面</b>，下拉展开后每条自带
+     * 自己的暂停 / 取消按钮，点哪条就开哪个任务的进度面板。
+     */
+    private static final int NOTIFY_ID_TASK_BASE = 5800;
+    /** 通知分组名：子通知（每个任务一条）挂在 {@link #NOTIFICATION_ID} 这个 summary 下面 */
+    private static final String GROUP_TASKS = "hfx.transfer.tasks";
     private static final String CHANNEL_ID = "server";
     private static final long PING_INTERVAL_MS = 3000;
     /** 「进度帧」的最小间隔：前台服务通知是同一个 id 反复 notify，20Hz 地刷会掉帧、发烫，500ms 一帧够了 */
@@ -1680,7 +1689,12 @@ public class ServerService extends Service implements ServiceConnection {
                 .setContentIntent(contentIntent)
                 .setOngoing(true)
                 .setOnlyAlertOnce(true)
-                .setPriority(NotificationCompat.PRIORITY_LOW);
+                .setPriority(NotificationCompat.PRIORITY_LOW)
+                // 这条是「总通知」（summary）：每个任务另有一条自己的子通知
+                // （见 syncTaskNotifications）。收起时通知栏只显示这一条合计，
+                // 下拉展开才逐条列出各任务、各带自己的按钮。
+                .setGroup(GROUP_TASKS)
+                .setGroupSummary(true);
         // 卡片上的按钮（现代 Android 卡片收起时只放前 3 颗，所以有任务时不再挂「停止服务」）：
         //   正在传 / 暂停着：[暂停 或 继续] [取消（保留）] [取消（删除）]
         //   只是在准备 / 排队：[取消（保留）] [取消（删除）]
@@ -2118,6 +2132,161 @@ public class ServerService extends Service implements ServiceConnection {
         return cut >= 0 ? path.substring(cut + 1) : path;
     }
 
+    // ------------------------------------------------------------------
+    // 「每个任务一条通知」：都归到总通知（summary）的分组里
+    // ------------------------------------------------------------------
+
+    /**
+     * 已经贴出去的任务通知 id。
+     *
+     * <p>任务收尾 / 从队列表里消失时要按这个集合把多出来的那几条撤掉 ——
+     * 不撤的话通知栏会一直挂着一堆「已完成」的条目，还得用户手动划。
+     */
+    private volatile java.util.Set<Integer> taskNotifyIds = java.util.Collections.emptySet();
+
+    /**
+     * 把「每个任务一条通知」和任务队列对齐：还在的更新内容、新出现的贴出去、收尾的撤掉。
+     *
+     * <p>调用点就是总通知刷新的那几处（进度帧 500ms 一帧 / 通知按钮 / 服务进前台），
+     * 对同一个 id 反复 notify 是幂等的，{@code setOnlyAlertOnce(true)} 保证不响不弹。
+     *
+     * <p>只有「还在队列里、且没收尾」的任务才占一条子通知：收尾的结果在面板里能看到，
+     * 通知栏留着只会越堆越多（用户的诉求是「每个<b>传输任务</b>占一条」）。
+     */
+    private void syncTaskNotifications() {
+        if (stopping) {
+            return;
+        }
+        NotificationManager manager = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+        if (manager == null) {
+            return;
+        }
+        java.util.Set<Integer> alive = new java.util.HashSet<>();
+        int order = 0;
+        for (SendTasks.TaskInfo info : SendTasks.queueSnapshot()) {
+            if (info.isFinished()) {
+                continue;
+            }
+            int id = NOTIFY_ID_TASK_BASE + info.taskId;
+            alive.add(id);
+            try {
+                manager.notify(id, buildTaskNotification(info, order));
+            } catch (Throwable e) {
+                Log.w(TAG, "贴任务通知失败 taskId=" + info.taskId, e);
+            }
+            order++;
+        }
+        java.util.Set<Integer> old = taskNotifyIds;
+        if (!old.equals(alive)) {
+            for (Integer id : old) {
+                if (!alive.contains(id)) {
+                    try {
+                        manager.cancel(id);
+                    } catch (Throwable e) {
+                        Log.w(TAG, "撤任务通知失败 id=" + id, e);
+                    }
+                }
+            }
+            taskNotifyIds = alive;
+        }
+    }
+
+    /** 撤掉所有任务子通知（服务停止时用；stopForeground 只管总通知那一条） */
+    private void cancelTaskNotifications() {
+        NotificationManager manager = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+        if (manager == null) {
+            return;
+        }
+        for (Integer id : taskNotifyIds) {
+            try {
+                manager.cancel(id);
+            } catch (Throwable ignored) {
+            }
+        }
+        taskNotifyIds = java.util.Collections.emptySet();
+    }
+
+    /**
+     * 某一个任务自己的通知（分组里的子通知）。
+     *
+     * <p>标题就是文件名，正文是「状态 · 百分比 · 已传/总量 · 速率」；
+     * 点它落到这个任务的进度面板（和总通知撞同一个 PendingIntent 也没关系，落点一样）；
+     * 按钮和总通知那三颗一致，只是 taskId 固定成它自己 —— 两个任务同时挂着时，
+     * 想暂停第二个不用先进面板找。
+     */
+    private Notification buildTaskNotification(SendTasks.TaskInfo info, int order) {
+        boolean sending = info.state == SendTask.STATE_SENDING;
+        boolean paused = info.state == SendTask.STATE_PAUSED;
+        boolean suspended = info.state == SendTask.STATE_SUSPENDED;
+        boolean preparing = info.state == SendTask.STATE_PREPARING;
+        boolean queued = info.isQueued();
+
+        String name = shortName(info.fileName);
+        StringBuilder text = new StringBuilder();
+        if (preparing) {
+            text.append("准备中…");
+        } else if (queued) {
+            text.append("排队中");
+            if (info.aheadCount > 0) {
+                text.append("（前面还有 ").append(info.aheadCount).append(" 个任务）");
+            }
+        } else if (paused) {
+            text.append("已暂停");
+        } else if (suspended) {
+            text.append("已让出通道（暂停着）");
+        } else {
+            text.append(sending ? "正在发送" : "正在接收");
+        }
+        if (!queued) {
+            text.append(" · ").append(info.percent()).append('%');
+            if (info.totalBytes > 0) {
+                text.append(" · ").append(GlobalProgress.formatSize(Math.min(info.doneBytes, info.totalBytes)))
+                        .append(" / ").append(GlobalProgress.formatSize(info.totalBytes));
+            }
+            if (sending && info.speed > 0) {
+                text.append(" · ").append(GlobalProgress.formatSpeed(info.speed));
+            }
+        }
+
+        Intent openIntent = SendTasks.panelIntent(this, info.taskId);
+        PendingIntent contentIntent = PendingIntent.getActivity(this,
+                NOTIFICATION_TASK_REQUEST_BASE + info.taskId, openIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+
+        NotificationCompat.Builder builder = new NotificationCompat.Builder(this, CHANNEL_ID)
+                .setSmallIcon(R.drawable.baseline_upload_24)
+                .setContentTitle(name.isEmpty() ? ("传输任务 " + info.taskId) : name)
+                .setContentText(text.toString())
+                .setStyle(new NotificationCompat.BigTextStyle().bigText(text.toString()))
+                .setContentIntent(contentIntent)
+                .setOngoing(true)
+                .setOnlyAlertOnce(true)
+                .setShowWhen(false)
+                .setSilent(true)
+                .setPriority(NotificationCompat.PRIORITY_LOW)
+                .setGroup(GROUP_TASKS)
+                .setGroupSummary(false)
+                // 展开后按队列顺序排：位次补零，字符串排序才和队列一致
+                .setSortKey(String.format(java.util.Locale.US, "%04d", Math.max(0, order)));
+        if (info.totalBytes > 0) {
+            builder.setProgress(100, info.percent(), false);
+        } else {
+            builder.setProgress(0, 0, queued);
+        }
+        boolean live = sending || paused || suspended;
+        if (live) {
+            builder.addAction(0, paused || suspended ? "继续" : "暂停", taskActionIntent(
+                    paused || suspended ? ACTION_TASK_RESUME : ACTION_TASK_PAUSE,
+                    paused || suspended ? NOTIFICATION_RESUME_REQUEST_BASE : NOTIFICATION_PAUSE_REQUEST_BASE,
+                    info.taskId));
+        }
+        builder.addAction(0, "取消（保留）", taskActionIntent(
+                ACTION_TASK_CANCEL_KEEP, NOTIFICATION_CANCEL_KEEP_REQUEST_BASE, info.taskId));
+        builder.addAction(0, "取消（删除）", taskActionIntent(
+                ACTION_TASK_CANCEL_DELETE, NOTIFICATION_CANCEL_DELETE_REQUEST_BASE, info.taskId));
+        return builder.build();
+    }
+
     private void updateNotification() {
         // 「停止流程开始后一律不 post：onDestroy 阶段 post 出去的通知没人再撤」
         if (stopping) {
@@ -2128,6 +2297,8 @@ public class ServerService extends Service implements ServiceConnection {
             if (manager != null) {
                 manager.notify(NOTIFICATION_ID, buildNotification());
             }
+            // 总通知刷新的同时把「每任务一条」的子通知也对齐（同一帧、同一份快照）
+            syncTaskNotifications();
         } catch (Throwable e) {
             Log.w(TAG, "updateNotification failed", e);
         }
@@ -2140,6 +2311,8 @@ public class ServerService extends Service implements ServiceConnection {
             if (manager != null) {
                 manager.cancel(NOTIFICATION_ID);
             }
+            // 总通知撤了，子通知也得一起撤：stopForeground 只认前台那一条
+            cancelTaskNotifications();
         } catch (Throwable e) {
             Log.w(TAG, "cancelNotification failed", e);
         }
@@ -2154,6 +2327,9 @@ public class ServerService extends Service implements ServiceConnection {
             } else {
                 startForeground(NOTIFICATION_ID, notification);
             }
+            // 服务刚起 / 重启时把还活着的任务的下一条通知补回来
+            // （进程被系统杀掉重启后，之前的子通知已经没了，队列里的任务还在）
+            syncTaskNotifications();
         } catch (Throwable e) {
             Log.e(TAG, "startForeground failed", e);
         }

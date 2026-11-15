@@ -85,6 +85,16 @@ public class ShareActivity extends AppCompatActivity {
     private int taskId = -1;
     /** 已经「收起」到后台（传输中点了遮罩 / 返回键）：这时再点什么都不要再把 Activity 收掉 */
     private volatile boolean collapsed;
+    /**
+     * 面板是何时绑上任务的（elapsedRealtime 用 uptimeMillis 那套时钟）。
+     *
+     * <p>从通知栏点过来时，「按在通知上」那一下的 UP 会在面板刚出现时以 ACTION_OUTSIDE
+     * 递进来（窗口是 WRAP_CONTENT 小窗）。这个时间戳用来把那一下放过，别让用户
+     * 一点通知面板就把自己关掉。
+     */
+    private volatile long shownAt;
+    /** 窗口刚起多久内的「点外面」不算用户操作（毫秒）：盖住通知栏那一下的 UP 抖动 */
+    private static final long OUTSIDE_GRACE_MS = 600L;
     /** 已经排过「延时自动关窗口」 */
     private boolean finishingScheduled;
 
@@ -239,6 +249,8 @@ public class ShareActivity extends AppCompatActivity {
     private void attachTask(SendTask target) {
         task = target;
         taskId = target.getTaskId();
+        // 窗口从这一刻起算「新」：见 dispatchTouchEvent 里的 OUTSIDE_GRACE_MS
+        shownAt = SystemClock.uptimeMillis();
         target.bind(this);
         renderNow();
         if (!target.isTerminal()) {
@@ -292,6 +304,16 @@ public class ShareActivity extends AppCompatActivity {
     @Override
     public boolean dispatchTouchEvent(MotionEvent ev) {
         if (ev.getActionMasked() == MotionEvent.ACTION_OUTSIDE) {
+            // 刚起窗口的那一下要放过：从通知栏点过来时，手指是「先按在通知上、面板才起来、
+            // 然后才松开」，那条 UP 会被系统当成落在窗口外面（ACTION_OUTSIDE）。
+            // 以前这里无条件 dismissPanel()：传输中 → 收起面板（用户看到的是「点了通知又回到 App/桌面」），
+            // 排队 / 准备中 → 直接取消任务。两种都像「点通知没反应」，报的「传输时点通知还是跳回主页」就是这条。
+            long age = SystemClock.uptimeMillis() - shownAt;
+            if (age < OUTSIDE_GRACE_MS) {
+                HFXLog.d("share: 忽略窗口刚起时的窗外触摸（" + age + "ms，来自通知栏那一下）");
+                return true;
+            }
+            HFXLog.d("share: 点面板外面 → dismissPanel");
             dismissPanel();
             return true;
         }
@@ -912,7 +934,8 @@ public class ShareActivity extends AppCompatActivity {
                     queueSubtitle(info),
                     queueStatus(info),
                     info.taskId == current.getTaskId(),
-                    !info.isFinished()));
+                    !info.isFinished(),
+                    info.isQueued()));
         }
         return rows;
     }

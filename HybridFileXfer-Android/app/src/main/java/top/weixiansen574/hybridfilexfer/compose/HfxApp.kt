@@ -353,6 +353,12 @@ fun HfxApp(
     // 手动输入保存路径：SAF 不让选的目录（存储根、Android/data 等）用这个绕过去
     var pathDialog by remember { mutableStateOf(false) }
 
+    // 「把通道开满」引导弹窗（BoostDialog）：两个入口共用一个弹窗实例 ——
+    // 主页进来 1.2 秒自动弹一次（条件见 HomePage 的 LaunchedEffect），
+    // 设置页的「榨干 IO」点了也弹它。放在这里而不是 HomePage 里，是因为
+    // Pager 切到设置页时主页不再处于前台，弹窗挂在主页里会跟着一起"藏起来"。
+    var boostVisible by remember { mutableStateOf(false) }
+
     // 选一个目录作为“电脑推送到手机”的保存位置
     val pickPushDir = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
         if (uri != null) {
@@ -684,6 +690,7 @@ fun HfxApp(
                         onTransfer = ::beginTransfer,
                         onOpenConnections = { scope.launch { pagerState.animateScrollToPage(TAB_CONNECTIONS) } },
                         onOpenSettings = { scope.launch { pagerState.animateScrollToPage(TAB_SETTINGS) } },
+                        onBoostPrompt = { boostVisible = true },
                     )
                     TAB_CONNECTIONS -> ConnectionsPage(
                         state = state,
@@ -712,6 +719,7 @@ fun HfxApp(
                             Config.getInstance(activity).maxConnections = value
                             state = readState(activity)
                         },
+                        onBoost = { boostVisible = true },
                     )
                 }
             }
@@ -734,6 +742,16 @@ fun HfxApp(
                 },
             )
         }
+        // 「把通道开满」引导弹窗：主页那个自动弹出和设置里的「榨干 IO」共用这一个实例
+        val boostCtx = LocalContext.current
+        BoostDialog(
+            visible = boostVisible,
+            onDismiss = { boostVisible = false },
+            onDismissForever = {
+                Config.getInstance(boostCtx).setBoostPromptDismissed(true)
+                boostVisible = false
+            },
+        )
         if (showTransfer) {
             val transferServer = ServerService.getServer(transferTarget)
             if (transferServer != null) {
@@ -802,6 +820,7 @@ private fun HomePage(
     onTransfer: () -> Unit,
     onOpenConnections: () -> Unit,
     onOpenSettings: () -> Unit,
+    onBoostPrompt: () -> Unit,
 ) {
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
@@ -878,22 +897,13 @@ private fun HomePage(
     // 「把通道开满」引导：进主页 1.2 秒后弹一次，点过「不再提示」或链路都开好了就不弹。
     // 延时是为了别和首帧的网卡枚举抢资源，也让用户先看到主页本身。
     val ctx = LocalContext.current
-    var boostVisible by remember { mutableStateOf(false) }
     LaunchedEffect(Unit) {
         delay(1200)
         val config = Config.getInstance(ctx)
         if (!config.isBoostPromptDismissed() && boostHasRoom(ctx)) {
-            boostVisible = true
+            onBoostPrompt()
         }
     }
-    BoostDialog(
-        visible = boostVisible,
-        onDismiss = { boostVisible = false },
-        onDismissForever = {
-            Config.getInstance(ctx).setBoostPromptDismissed(true)
-            boostVisible = false
-        },
-    )
 }
 
 /**
@@ -1132,6 +1142,7 @@ private fun SettingsPage(
     onPickPushDir: () -> Unit,
     onTypePushDir: () -> Unit,
     onMaxConnections: (Int) -> Unit,
+    onBoost: () -> Unit,
 ) {
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
@@ -1178,6 +1189,14 @@ private fun SettingsPage(
                     items = listOf("正常", "ROOT", "ADB"),
                     selectedIndex = state.mode.coerceIn(0, 2),
                     onSelectedIndexChange = onModeChange,
+                )
+                // 「榨干 IO」：不想等主页那个自动弹出的引导时，从这里随时再打开一次
+                // （同一个 BoostDialog：列出还没开的通道/网卡，一键跳到对应的系统设置）
+                ArrowPreference(
+                    title = "榨干 IO",
+                    summary = "把还没开的通道逐个打开，速度还能再快一截",
+                    endActions = { ActionText("试试") },
+                    onClick = onBoost,
                 )
                 // 无级拖动 + 吸附到 80/90/100/110 四个刻度点；
                 // 拖动过程中只更新本地值，松手后才真正应用缩放（实时缩放会拖慢整页重排）。

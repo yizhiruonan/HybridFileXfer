@@ -569,7 +569,12 @@ internal fun ReceiveProgressPanel(
             // 队列排在通道明细后面时，节点是存在的（uiautomator 抓得到），用户却看不到 ——
             // 报的「有 2 个以上任务也看不到『任务队列』段」就是这个。排到前面以后，
             // 不管有几条通道，一打开卡片第一眼就能看到队列。
-            if (queue.size > 1) {
+            //
+            // 门槛除了「多于一个任务」还多了一条「当前这个任务在排队」：排队中的任务之所以排队，
+            // 一定是有别的任务占着通道，但那个任务可能刚好那一刻收尾、被回收 —— 快照里就只剩排队这一条，
+            // 面板上写着「排队中」却画不出队列段（报的「显示正在排队而没有显示队列界面」）。
+            // 这种情况也画：一行「等待中（前面还有 N 个）」比一片空白能说明问题。
+            if (queue.size > 1 || queue.any { it.queued }) {
                 QueueSection(queue = queue, onOpen = onQueueOpen, onCancel = onQueueCancel)
             }
             if (state.xferChannels.isNotEmpty()) {
