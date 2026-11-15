@@ -1189,15 +1189,17 @@ impl Session {
                 }
                 if hard_error.is_none() && !peer.digests.is_empty() {
                     match compare_digests(&mine, &peer.digests) {
-                        None => log::info(&format!(
-                            "{} {} {}",
-                            crate::i18n::tr("校验通过：", "verified:"),
-                            mine.len(),
-                            crate::i18n::tr(
-                                "个文件 SHA-256 与手机端一致",
-                                "file(s) match the phone byte for byte"
-                            )
-                        )),
+                        None => {
+                            log::info(&format!(
+                                "{} {} {}",
+                                crate::i18n::tr("校验通过：", "verified:"),
+                                mine.len(),
+                                crate::i18n::tr(
+                                    "个文件 SHA-256 与手机端一致",
+                                    "file(s) match the phone byte for byte"
+                                )
+                            ));
+                        }
                         Some(reason) => {
                             log::error(&format!(
                                 "{} {}",
@@ -1620,6 +1622,10 @@ impl Session {
                                 "file(s) match the phone byte for byte"
                             )
                         ));
+                        // 手机端分享文件夹时勾了「打包成归档发送」：文件名是
+                        // <文件夹名>.hfx.zip。校验通过了才解档（要的就是「送达再解档」），
+                        // 解完把归档本身删掉。
+                        extract_archives(&received);
                     }
                 } else {
                     log::warn(crate::i18n::tr(
@@ -1634,6 +1640,67 @@ impl Session {
             )),
         }
         Ok(())
+    }
+}
+
+/// 解归档：把收到的 "*.hfx.zip" 解开到同名文件夹，然后删掉归档文件本身。
+///
+/// zip 里的条目是 "<文件夹名>/<相对路径>"（手机端就是这么打的），所以直接解到接收
+/// 目录下就会得到一个同名文件夹。用系统自带的 tar 解（Windows 10+ 的 bsdtar 认得
+/// zip），不引新依赖；解档失败就把归档留着，别让用户两头空。
+fn extract_archives(files: &[PathBuf]) {
+    for path in files {
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(name) => name,
+            None => continue,
+        };
+        if !name.ends_with(".hfx.zip") {
+            continue;
+        }
+        let parent = match path.parent() {
+            Some(dir) => dir.to_path_buf(),
+            None => continue,
+        };
+        log::info(&format!("{} {}", crate::i18n::tr("解档中：", "extracting:"), name));
+        let status = std::process::Command::new("tar")
+            .arg("-xf")
+            .arg(path)
+            .arg("-C")
+            .arg(&parent)
+            .status();
+        match status {
+            Ok(code) if code.success() => match std::fs::remove_file(path) {
+                Ok(_) => log::info(&format!(
+                    "{} {}",
+                    crate::i18n::tr("解档完成（归档已删除）：", "extracted (archive removed):"),
+                    name
+                )),
+                Err(e) => log::warn(&format!(
+                    "{} {}: {}",
+                    crate::i18n::tr(
+                        "解档完成，但归档删不掉：",
+                        "extracted, but could not delete the archive:"
+                    ),
+                    name,
+                    e
+                )),
+            },
+            Ok(code) => log::error(&format!(
+                "{} {} (tar exit {:?})",
+                crate::i18n::tr("解档失败，归档留着：", "extraction failed, archive kept:"),
+                name,
+                code.code()
+            )),
+            Err(e) => log::error(&format!(
+                "{} {}: {}",
+                crate::i18n::tr(
+                    "解档失败（找不到 tar），归档留着：",
+                    "extraction failed (no tar), archive kept:"
+                ),
+                name,
+                e
+            )),
+        }
     }
 }
 

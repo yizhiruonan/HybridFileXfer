@@ -17,6 +17,7 @@ import android.util.Log;
 import android.widget.Toast;
 
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -29,6 +30,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.zip.Deflater;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipOutputStream;
 
 import top.weixiansen574.hybridfilexfer.core.BlockProgress;
 import top.weixiansen574.hybridfilexfer.core.HFXLog;
@@ -158,6 +162,17 @@ public final class SendTask {
 
     // ---- 面板 / 通知要的文字 ----
     private volatile String statusText = "";
+
+    /**
+     * 分享的是文件夹时，把用户勾的那个「打包成归档发送」的答案放在这里。
+     * null = 还没人回答（准备线程在 {@link #awaitArchiveChoice} 里等）。
+     */
+    private volatile Boolean archiveChoice;
+    /** 正在等答案的那个文件夹的名字；null = 没在等。面板靠它决定要不要弹勾选框。 */
+    private volatile String awaitingArchiveName;
+    private final Object archiveLock = new Object();
+    /** 没人回答时的兜底上限：面板一定会问，等这么久还没人理就按默认（打包）走 */
+    private static final long ARCHIVE_CHOICE_TIMEOUT_MS = 30_000L;
     private volatile String resultText = "";
     private volatile String remoteTarget = "";
     private volatile String currentFileName = "";
@@ -888,6 +903,24 @@ public final class SendTask {
         if (resolved.isEmpty()) {
             return;
         }
+        // 分享的是文件夹：先问要不要打包成归档文件发（面板上那个默认勾上的勾选框）。
+        // 勾了就打成一个 <文件夹名>.hfx.zip 发过去，电脑端校验通过后自己解档；
+        // 没勾就照旧按文件夹直接发（现在的行为）。
+        if (resolved.size() == 1 && resolved.get(0).isDirectory()) {
+            boolean archive = awaitArchiveChoice(resolved.get(0));
+            if (isAbandoned()) {
+                return;
+            }
+            if (archive) {
+                File zip = packFolder(resolved.get(0));
+                if (isAbandoned() || zip == null) {
+                    return;
+                }
+                resolved.clear();
+                resolved.add(zip);
+                total = zip.length();
+            }
+        }
         files.clear();
         files.addAll(resolved);
         totalBytes = total;
@@ -931,6 +964,159 @@ public final class SendTask {
         }
         HFXLog.d("task " + taskId + ": 准备完成 files=" + files.size()
                 + " groups=" + groups.size() + " total=" + totalBytes);
+    }
+
+
+    /**
+     * 问用户「这个文件夹要不要打成一个归档文件发」，等他的答案。
+     *
+     * <p>打出来的归档和原文件夹是两个不同的东西，所以这个选择必须发生在开始发之前 ——
+     * 准备线程就在这儿等着，答案由 {@link #chooseArchive(boolean)}（面板上的勾选框）送进来。
+     *
+     * <p>万一没人回答（没有面板、界面被系统收了），等 {@link #ARCHIVE_CHOICE_TIMEOUT_MS}
+     * 之后按「打包」这个默认值走 —— 用户要求的就是默认勾选。
+     */
+    private boolean awaitArchiveChoice(File dir) {
+        awaitingArchiveName = dir.getName();
+        HFXLog.d("task " + taskId + ": 分享的是文件夹 " + dir.getName() + "，等用户勾要不要打包");
+        synchronized (archiveLock) {
+            long deadline = System.currentTimeMillis() + ARCHIVE_CHOICE_TIMEOUT_MS;
+            while (archiveChoice == null && !isAbandoned()
+                    && System.currentTimeMillis() < deadline) {
+                statusText = appContext.getString(R.string.share_folder_ask, dir.getName());
+                try {
+                    archiveLock.wait(200L);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+            if (archiveChoice == null) {
+                HFXLog.d("task " + taskId + ": 没人回答要不要打包，按默认（打包）走");
+                archiveChoice = Boolean.TRUE;
+            }
+            awaitingArchiveName = null;
+            return archiveChoice;
+        }
+    }
+
+    /** 面板上那个勾选框的落点：这个文件夹打不打包发（默认 true） */
+    public void chooseArchive(boolean archive) {
+        HFXLog.d("task " + taskId + ": 归档选择 = " + archive);
+        synchronized (archiveLock) {
+            archiveChoice = archive;
+            archiveLock.notifyAll();
+        }
+    }
+
+    /** 正在等打包答案的文件夹名；null = 没在等（面板据此决定要不要弹勾选框） */
+    public String getAwaitingArchiveName() {
+        return awaitingArchiveName;
+    }
+
+    /**
+     * 把文件夹打成一个 zip：条目写成 <文件夹名>/<相对路径>，电脑端解到接收目录就是同名文件夹。
+     *
+     * <p>用 DEFLATED + NO_COMPRESSION 级别：视频、照片这类东西本来压不动，
+     * 真去 deflate 只是白烧 CPU；这样打出来的包几乎和原文件一样大，但一趟读完就打完。
+     *
+     * @return 打好的归档文件；失败（被取消 / IO 出错）返回 null
+     */
+    private File packFolder(File dir) {
+        String name = dir.getName();
+        File cacheDir = new File(appContext.getCacheDir(), "share");
+        if (!cacheDir.exists() && !cacheDir.mkdirs()) {
+            HFXLog.d("task " + taskId + ": 打包失败，建不了缓存目录 " + cacheDir);
+            return null;
+        }
+        File zip = new File(cacheDir, name + ".hfx.zip");
+        // 上一轮留下的同名归档必须删掉：ZipOutputStream 是往后追加的，
+        // 不删就会在同一份文件上接着写，出来的是个坏包（校验必挂）。
+        if (zip.exists() && !zip.delete()) {
+            HFXLog.d("task " + taskId + ": 打包失败，旧归档删不掉 " + zip);
+            return null;
+        }
+        List<File> all = new ArrayList<>();
+        collectForPack(dir, all);
+        long packTotal = 0L;
+        for (File f : all) {
+            packTotal += f.length();
+        }
+        totalBytes = packTotal;
+        completedBytes = 0L;
+        long done = 0L;
+        byte[] buf = new byte[1 << 20];
+        try {
+            try (ZipOutputStream out = new ZipOutputStream(new FileOutputStream(zip))) {
+                out.setLevel(Deflater.NO_COMPRESSION);
+                for (File f : all) {
+                    if (isAbandoned()) {
+                        break;
+                    }
+                    String rel = dir.getAbsolutePath().equals(f.getParent())
+                            ? f.getName() : relativeTo(dir, f);
+                    ZipEntry entry = new ZipEntry(name + "/" + rel);
+                    entry.setTime(f.lastModified());
+                    out.putNextEntry(entry);
+                    try (FileInputStream in = new FileInputStream(f)) {
+                        int n;
+                        while ((n = in.read(buf)) > 0) {
+                            if (isAbandoned()) {
+                                break;
+                            }
+                            out.write(buf, 0, n);
+                            done += n;
+                            completedBytes = done;
+                            statusText = appContext.getString(R.string.share_packing, name,
+                                    packTotal > 0L ? (int) (done * 100L / packTotal) : 0);
+                        }
+                    }
+                    out.closeEntry();
+                }
+                out.finish();
+            }
+        } catch (IOException e) {
+            HFXLog.d("task " + taskId + ": 打包失败 " + e);
+            // 半截归档留着有害（下次同名会当缓存命中），删掉
+            if (zip.exists() && !zip.delete()) {
+                HFXLog.d("task " + taskId + ": 半截归档删不掉 " + zip);
+            }
+            return null;
+        }
+        if (isAbandoned()) {
+            return null;
+        }
+        HFXLog.d("task " + taskId + ": 打包完成 " + zip.getName() + " " + zip.length() + " 字节，"
+                + "共 " + all.size() + " 个文件");
+        return zip;
+    }
+
+    /** 收文件夹里所有文件（不要目录本身） */
+    private static void collectForPack(File dir, List<File> out) {
+        File[] children = dir.listFiles();
+        if (children == null) {
+            return;
+        }
+        for (File child : children) {
+            if (child.isDirectory()) {
+                collectForPack(child, out);
+            } else if (child.isFile()) {
+                out.add(child);
+            }
+        }
+    }
+
+    /** 相对文件夹根的那一段路径，用 / 分隔（zip 里的写法） */
+    private static String relativeTo(File root, File file) {
+        String base = root.getAbsolutePath();
+        String path = file.getAbsolutePath();
+        if (path.startsWith(base)) {
+            path = path.substring(base.length());
+        }
+        while (path.startsWith("/")) {
+            path = path.substring(1);
+        }
+        return path.replace(File.separatorChar, '/');
     }
 
     private boolean ensureConnected() {

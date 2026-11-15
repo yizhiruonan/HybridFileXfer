@@ -10,9 +10,12 @@ import android.os.Looper;
 import android.os.SystemClock;
 import android.util.Log;
 import android.view.MotionEvent;
+import android.widget.CheckBox;
+import android.widget.FrameLayout;
 import android.view.ViewGroup;
 import android.view.WindowManager;
 
+import androidx.appcompat.app.AlertDialog;
 import androidx.appcompat.app.AppCompatActivity;
 
 import java.util.ArrayDeque;
@@ -76,6 +79,9 @@ public class ShareActivity extends AppCompatActivity {
     private static final long SPEED_MAX_BYTES_PER_SEC = 2000L * 1024 * 1024;
 
     private final Handler handler = new Handler(Looper.getMainLooper());
+
+    /** 这个面板是不是已经弹过「文件夹要不要打包」的勾选框（一个面板只问一次） */
+    private boolean archiveDialogShown;
     /** 逐帧节拍（vsync）：每帧看一眼有没有到 100ms 的采样点，见 FrameClock */
     private final FrameClock frameClock = new FrameClock(this::onFrame);
 
@@ -283,6 +289,58 @@ public class ShareActivity extends AppCompatActivity {
         if (!target.isTerminal()) {
             frameClock.start();
         }
+        // 分享的是文件夹时，任务在准备阶段会停下来等「要不要打包成归档」的答案，
+        // 这里盯着它把勾选框弹出来（不用帧回调，准备阶段没有块在动）
+        archiveDialogShown = false;
+        handler.removeCallbacks(this::watchArchiveChoice);
+        handler.postDelayed(this::watchArchiveChoice, 200L);
+    }
+
+    /**
+     * 盯着当前任务：分享的是文件夹、正等着「要不要打成归档发」的答案时，把勾选框弹出来。
+     *
+     * <p>用轮询而不是帧回调：准备阶段没有块在动，帧回调那条路只负责画进度。
+     * 一个面板只问一次（{@link #archiveDialogShown}）；面板改绑到别的任务时重新允许问。
+     */
+    private void watchArchiveChoice() {
+        SendTask current = task;
+        if (current == null || isFinishing() || isDestroyed()) {
+            return;
+        }
+        String folderName = current.getAwaitingArchiveName();
+        if (folderName != null && !archiveDialogShown) {
+            showArchiveChoice(current, folderName);
+            return;
+        }
+        if (folderName != null) {
+            handler.postDelayed(this::watchArchiveChoice, 300L);
+        }
+    }
+
+    /** 分享文件夹时的勾选框：打不打包成归档文件发（默认勾上） */
+    private void showArchiveChoice(SendTask target, String folderName) {
+        archiveDialogShown = true;
+        HFXLog.d("share: 分享的是文件夹 " + folderName + "，弹勾选框");
+        CheckBox box = new CheckBox(this);
+        box.setText(R.string.share_folder_archive);
+        box.setChecked(true);
+        float density = getResources().getDisplayMetrics().density;
+        int pad = (int) (density * 20f);
+        FrameLayout wrap = new FrameLayout(this);
+        wrap.setPadding(pad, (int) (density * 4f), pad, 0);
+        wrap.addView(box);
+        new AlertDialog.Builder(this)
+                .setTitle(getString(R.string.share_folder_title, folderName))
+                .setView(wrap)
+                .setPositiveButton(R.string.share_send,
+                        (dialog, which) -> target.chooseArchive(box.isChecked()))
+                .setNegativeButton(R.string.share_cancel, (dialog, which) -> {
+                    target.chooseArchive(false);
+                    target.cancel(true);
+                    finish();
+                })
+                .setCancelable(false)
+                .show();
     }
 
     /**
