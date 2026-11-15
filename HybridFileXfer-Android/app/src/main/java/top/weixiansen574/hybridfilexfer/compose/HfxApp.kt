@@ -358,6 +358,9 @@ fun HfxApp(
     // 设置页的「榨干 IO」点了也弹它。放在这里而不是 HomePage 里，是因为
     // Pager 切到设置页时主页不再处于前台，弹窗挂在主页里会跟着一起"藏起来"。
     var boostVisible by remember { mutableStateOf(false) }
+    // 这次是怎么打开的：设置里特意点进来（true）→ 有 ROOT/Shizuku 就直接开，
+    // 主页自己冒出来（false）→ 只在弹窗里给一颗「一键开启」，不擅自动系统开关
+    var boostExplicit by remember { mutableStateOf(false) }
 
     // 选一个目录作为“电脑推送到手机”的保存位置
     val pickPushDir = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
@@ -690,7 +693,7 @@ fun HfxApp(
                         onTransfer = ::beginTransfer,
                         onOpenConnections = { scope.launch { pagerState.animateScrollToPage(TAB_CONNECTIONS) } },
                         onOpenSettings = { scope.launch { pagerState.animateScrollToPage(TAB_SETTINGS) } },
-                        onBoostPrompt = { boostVisible = true },
+                        onBoostPrompt = { boostExplicit = false; boostVisible = true },
                     )
                     TAB_CONNECTIONS -> ConnectionsPage(
                         state = state,
@@ -719,7 +722,7 @@ fun HfxApp(
                             Config.getInstance(activity).maxConnections = value
                             state = readState(activity)
                         },
-                        onBoost = { boostVisible = true },
+                        onBoost = { boostExplicit = true; boostVisible = true },
                     )
                 }
             }
@@ -746,6 +749,7 @@ fun HfxApp(
         val boostCtx = LocalContext.current
         BoostDialog(
             visible = boostVisible,
+            autoBoost = boostExplicit,
             onDismiss = { boostVisible = false },
             onDismissForever = {
                 Config.getInstance(boostCtx).setBoostPromptDismissed(true)

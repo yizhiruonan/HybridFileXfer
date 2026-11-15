@@ -88,8 +88,11 @@ private fun runSu(cmd: String): Boolean = try {
     val finished = process.waitFor(4, java.util.concurrent.TimeUnit.SECONDS)
     val out = process.inputStream.bufferedReader().readText().trim()
     val err = process.errorStream.bufferedReader().readText().trim()
-    android.util.Log.i("HFXBoost", "su -c \"" + cmd + "\" -> " + finished + " out=" + out + " err=" + err)
-    finished && process.exitValue() == 0
+    // 以前这里打的是 finished（进程收没收到）而不是退出码，"-> true" 看着像成功、
+    // 其实命令返回非 0 —— 排查 svc usb 那条时就被这行日志带偏过
+    val code = if (finished) process.exitValue() else -1
+    android.util.Log.i("HFXBoost", "su -c \"" + cmd + "\" exit=" + code + " out=" + out + " err=" + err)
+    code == 0
 } catch (e: Throwable) {
     android.util.Log.i("HFXBoost", "su -c \"" + cmd + "\" failed: " + e.message)
     false
@@ -127,6 +130,20 @@ private fun runShizuku(cmd: String): Boolean = try {
 /** 先 root，再 Shizuku/adb；两条路都不通就当没权限 */
 private fun runShell(cmd: String): Boolean = runSu(cmd) || runShizuku(cmd)
 
+/**
+ * 现在能用哪种高权限，返回给用户看的名字（都没有返回 null）。
+ *
+ * <p>弹窗要照着这个结果说人话：有权限就说「已用 ROOT 自动打开」，没有就说「只能手动开」。
+ * 探测本身会起一个 su 进程（没 root 时会等到 4 秒超时），所以**只能在 IO 线程调**。
+ */
+private fun detectPrivilege(): String? = when {
+    // 复用 PrivCheck（设置页那行「ROOT 已授权 / 未授权」用的就是它）：
+    // 它带 30 秒缓存，不会因为弹窗一来就再弹一次 SukiSU 授权框
+    PrivCheck.rootStatus() == "已授权" || PrivCheck.rootStatus() == "等待授权" -> "ROOT"
+    PrivCheck.shizukuStatus() == "已授权" -> "Shizuku（ADB）"
+    else -> null
+}
+
 private fun buildSlots(): List<BoostSlot> = listOf(
     BoostSlot(
         key = "wifi",
@@ -158,8 +175,14 @@ private fun buildSlots(): List<BoostSlot> = listOf(
                 || startActivityQuietly(ctx, Intent(Settings.ACTION_WIRELESS_SETTINGS))
         },
         kick = {
-            runShell("svc usb setFunctions rndis")
-            runShell("cmd usb setFunctions rndis")
+            // 一定要把 rndis **和 adb 一起**挂上：只挂 rndis 会把调试口顶掉，
+            // USB_ADB 那两条通道跟着消失 —— 等于用 2 条换 2 条，白折腾。
+            // 所以这里**不做**「失败就退回只挂 rndis」的兜底：兜底一旦执行，adb 就断了，
+            // 用户手机上的 USB 调试也跟着没了（还得重新插线）。这条 ROM 不认这个写法就老实失败，
+            // 弹窗里会显示「自动打开失败」并让他去系统设置里手动开。
+            // 只用 svc：这台机器上 `cmd usb` 直接报 "No shell command implementation."，
+            // 多试一次只会多一条误导日志（而且它退出 0，"成功"是假的）
+            runShell("svc usb setFunctions rndis,adb")
         },
     ),
     // 蓝牙共享网络（bt-pan）不参与传输了：实测只有 0.2~0.3 MB/s，多轨切分时它是最慢那条，
@@ -170,9 +193,16 @@ private fun buildSlots(): List<BoostSlot> = listOf(
 /** 还有没有可开的链路（全开了就不弹这个引导） */
 internal fun boostHasRoom(ctx: Context): Boolean = buildSlots().any { !it.ready(ctx) }
 
+/**
+ * @param autoBoost 是用户特意点进来的（设置 →「榨干 IO」）还是主页自己冒出来的。
+ *   特意点进来的就**直接开**：有 ROOT / Shizuku 权限时缺的链路立刻推一遍，不再让用户点第二次；
+ *   主页自动弹的那次不自动开 —— 用户可能故意关着 Wi-Fi，每次启动都给他打开就太横了，
+ *   那种情况下弹窗里给一颗「一键开启」按钮，点了才动。
+ */
 @Composable
 internal fun BoostDialog(
     visible: Boolean,
+    autoBoost: Boolean = false,
     onDismiss: () -> Unit,
     onDismissForever: () -> Unit,
 ) {
@@ -196,6 +226,52 @@ internal fun BoostDialog(
     var guiding by remember { mutableStateOf(false) }
     var index by remember { mutableIntStateOf(0) }
     var kicked by remember { mutableStateOf(false) }
+    /**
+     * 现在能用哪种高权限（"ROOT" / "Shizuku（ADB）" / null）：探测一次，整张卡片都照着它说人话。
+     *
+     * <p>有权限的话**打开弹窗就自动开**，不劳用户点「确定」再一条条走：
+     * 缺的那几条先各自跑一遍 [BoostSlot.kick]（svc wifi enable / svc usb setFunctions rndis,adb …），
+     * 再复探网卡；开好的在列表里打 ✓ 并注明「已用 ROOT 自动打开」，没开成的退回手动引导。
+     */
+    var privilege by remember { mutableStateOf<String?>(null) }
+    var probing by remember { mutableStateOf(true) }
+    /** 每条链路自动打开的结果（key → 复探后是否真的起来了） */
+    var autoResult by remember { mutableStateOf<Map<String, Boolean>>(emptyMap()) }
+    var autoRan by remember { mutableStateOf(false) }
+    /** 要不要跑那遍「高权限自动打开」（特意点进来 = 直接跑；主页自动弹 = 等用户点按钮） */
+    var autoRequested by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) {
+        val level = withContext(Dispatchers.IO) { detectPrivilege() }
+        privilege = level
+        probing = false
+        if (level != null && autoBoost) {
+            autoRequested = true
+        }
+    }
+    LaunchedEffect(autoRequested, probing, privilege) {
+        if (!autoRequested || probing || privilege == null || autoRan) {
+            return@LaunchedEffect
+        }
+        // 只自动推「还缺、并且写了 kick」的那几条（USB 数据线没插就什么也做不了）
+        val todo = buildSlots().filter { !it.ready(ctx) && it.kick != null }
+        if (todo.isEmpty()) {
+            autoRan = true
+            return@LaunchedEffect
+        }
+        val result = withContext(Dispatchers.IO) {
+            todo.forEach { it.kick?.invoke() }
+            // 网卡起来要一会儿（rndis 尤其慢），等一拍再复探，别刚开完就判失败
+            delay(900)
+            val map = LinkedHashMap<String, Boolean>()
+            todo.forEach { map[it.key] = it.ready(ctx) }
+            map
+        }
+        autoResult = result
+        autoRan = true
+        // 自动这一遍已经跑过了，逐条引导里别再重复 su
+        kicked = true
+        tick++
+    }
     if (guiding) {
         LaunchedEffect(guiding, index, tick) {
             if (index < missing.size && missing[index].ready(ctx)) {
@@ -229,6 +305,31 @@ internal fun BoostDialog(
                     color = colorScheme.onSurfaceVariantSummary,
                     modifier = Modifier.padding(top = 8.dp),
                 )
+                // 「用的是哪条高权限、有没有已经帮你开了」——一句话讲清楚，别让人猜
+                if (!probing) {
+                    Text(
+                        when {
+                            privilege == null ->
+                                "没有 ROOT / Shizuku 权限：下面这些只能手动开。" +
+                                    "想一键自动开，就把设置 →「连接模式」换成 ROOT 或 ADB 再来一次。"
+                            autoRan -> "已检测到 " + privilege + " 权限：缺的链路已经自动开过一遍了，开好的下面打了 ✓。"
+                            else -> "已检测到 " + privilege + " 权限：点下面的「一键开启」，缺的这几条直接帮你打开" +
+                                "（会动系统开关：Wi-Fi、USB 调试开关等）。"
+                        },
+                        fontSize = 11.sp,
+                        color = colorScheme.onSurfaceVariantSummary,
+                        modifier = Modifier.padding(top = 6.dp),
+                    )
+                    // 主页自动弹的那次不擅自改系统开关，给一颗按钮让用户自己按
+                    if (privilege != null && !autoRan && missing.isNotEmpty()) {
+                        Button(
+                            onClick = { autoRequested = true },
+                            modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                        ) {
+                            Text("用 " + privilege + " 一键开启")
+                        }
+                    }
+                }
                 Spacer(Modifier.height(12.dp))
                 if (!guiding) {
                     // 总览：哪条已就绪、哪条还缺
@@ -242,7 +343,16 @@ internal fun BoostDialog(
                             Column(Modifier.padding(start = 8.dp)) {
                                 Text(slot.title, fontSize = 14.sp)
                                 Text(
-                                    if (ok) "已就绪" else slot.reason,
+                                    when {
+                                        // 这条是刚刚用高权限开起来的：说清楚是谁开的
+                                        ok && autoResult.containsKey(slot.key) ->
+                                            "已就绪 · 刚才用 " + (privilege ?: "高权限") + " 自动打开"
+                                        ok -> "已就绪"
+                                        // 推过但没起来（没插线 / 系统不让开）：退回手动
+                                        autoResult[slot.key] == false ->
+                                            (privilege ?: "高权限") + " 自动打开失败，" + slot.reason
+                                        else -> slot.reason
+                                    },
                                     fontSize = 11.sp,
                                     color = colorScheme.onSurfaceVariantSummary,
                                 )
@@ -315,12 +425,14 @@ internal fun BoostDialog(
                                 guiding = true
                                 index = 0
                                 kicked = true
-                                // 有 root / adb 权限就先自动把还缺的链路全推一遍，
-                                // 推起来的直接从引导里消失，剩下的再一条条让用户点
-                                val todo = missing
-                                scope.launch {
-                                    withContext(Dispatchers.IO) { todo.forEach { it.kick?.invoke() } }
-                                    tick++
+                                // 高权限那一遍在弹窗打开时就跑过了（见上面的 LaunchedEffect）；
+                                // 没有权限 / 自动没开成的，这里只负责逐条领去系统设置手动开
+                                if (!autoRan) {
+                                    val todo = missing
+                                    scope.launch {
+                                        withContext(Dispatchers.IO) { todo.forEach { it.kick?.invoke() } }
+                                        tick++
+                                    }
                                 }
                             },
                             modifier = Modifier.weight(1f),
