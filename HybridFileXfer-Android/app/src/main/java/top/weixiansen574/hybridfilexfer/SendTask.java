@@ -538,6 +538,10 @@ public final class SendTask {
             }
             groups.poll();
             completedBytes += group.totalBytes;
+            // 续传跳过的字节已经算在 group.totalBytes 里了（那是整组的字节数），
+            // 不清掉它就等于把这一组算两遍 —— 真机实测「300 MB 的文件显示 589 MB / 300 MB」，
+            // 队列行、通知栏的数字跟着一起错。
+            resumeSkipped = 0L;
             // 这一组的字节已经并进 completedBytes，账本却还停在它上面：
             // 记下这个路径，采样时按它识别「陈旧快照」，别把同一组算两遍
             accountedLedgerPath = srv.sendProgress.currentPath();

@@ -343,6 +343,31 @@ public final class SendTasks {
     }
 
     /**
+     * 通知栏点一下应该落到哪个任务的面板（没有任务就返回 -1）。
+     *
+     * <p>为什么要这个而不只是用「通知上正在显示的那个任务」：通知只有在<b>有任务占着传输通道</b>
+     * 时才带进度（{@code ServerService#sendTaskView} 的 anyActive），准备中 / 排队中 /
+     * 刚好收尾的那几个瞬间都没有进度可显示 —— 以前那种时候 contentIntent 会退回
+     * 主界面（{@code hfx_show_transfer}），用户点了通知看到的就是「App 主页」。
+     *
+     * <p>顺序直接用队列顺序（{@link #queueSnapshot()}：正在传的在最前、排队的跟上、
+     * 收尾的垫底）：取第一个还没收尾的，全都收尾了就取队头那一个 ——
+     * 这样点通知落到的永远是队列里最"该看"的那个任务的面板。
+     */
+    public static int panelTargetTaskId() {
+        List<TaskInfo> infos = queueSnapshot();
+        if (infos.isEmpty()) {
+            return -1;
+        }
+        for (TaskInfo info : infos) {
+            if (!info.isFinished()) {
+                return info.taskId;
+            }
+        }
+        return infos.get(0).taskId;
+    }
+
+    /**
      * 某个任务前面还有几个任务（面板上「排队中（前面还有 N 个任务）」用它）。
      *
      * <p>任务已经不在表里（刚收尾）时返回 0：文案里少一个数字比抛异常好。

@@ -56,6 +56,23 @@ public class ServerService extends Service implements ServiceConnection {
 
     public static final String ACTION_START = "top.weixiansen574.hybridfilexfer.action.START_SERVER";
     public static final String ACTION_STOP = "top.weixiansen574.hybridfilexfer.action.STOP_SERVER";
+
+    // ---- 通知卡片上的任务级按钮 ----
+    //
+    // 为什么是「通知卡片上的按钮」而不是长按菜单里的项：Android 13+ 长按通知弹出的那个菜单
+    // 完全由系统提供（设置 / 关闭通知 / 静音…），第三方应用**没有任何接口能往里加自己的项**。
+    // 应用能加的只有 Notification.Builder.addAction() 这几颗按钮：卡片收起时只显示前 3 个
+    // （展开后全部显示），所以下面最多挂 3 颗，把「停止服务」那颗让给任务按钮。
+    /** 暂停当前正在传的那个任务 */
+    public static final String ACTION_TASK_PAUSE = "top.weixiansen574.hybridfilexfer.action.TASK_PAUSE";
+    /** 继续（暂停中 / 让出通道的那个任务） */
+    public static final String ACTION_TASK_RESUME = "top.weixiansen574.hybridfilexfer.action.TASK_RESUME";
+    /** 取消，但保留电脑上已经收到的部分（下次同一个文件断点续传） */
+    public static final String ACTION_TASK_CANCEL_KEEP = "top.weixiansen574.hybridfilexfer.action.TASK_CANCEL_KEEP";
+    /** 取消，并让电脑端把这次的不完整文件和 .hfxpart 一起删掉 */
+    public static final String ACTION_TASK_CANCEL_DELETE = "top.weixiansen574.hybridfilexfer.action.TASK_CANCEL_DELETE";
+    /** 任务级 action 带的任务号 */
+    public static final String EXTRA_TASK_ID = "task_id";
     public static final String EXTRA_INTERFACES = "interfaces";
     public static final String EXTRA_MODE = "io_mode";
     public static final String EXTRA_FRESH = "fresh";
@@ -76,6 +93,17 @@ public class ServerService extends Service implements ServiceConnection {
      * 否则「点任务2的通知」会被 FLAG_UPDATE_CURRENT 换成任务1的面板。
      */
     private static final int NOTIFICATION_TASK_REQUEST_BASE = 6400;
+    /**
+     * 任务级按钮（暂停 / 继续 / 取消保留 / 取消删除）的 requestCode 段。
+     *
+     * <p>四段彼此错开、也和 6400+taskId（contentIntent）、1（停止服务）错开：
+     * PendingIntent 是按「requestCode + Intent 是否相等」认人的，撞了就会互相顶掉 ——
+     * 点了「取消」结果开了面板，或者点了任务2的动作落到任务1上。
+     */
+    private static final int NOTIFICATION_PAUSE_REQUEST_BASE = 7000;
+    private static final int NOTIFICATION_RESUME_REQUEST_BASE = 7500;
+    private static final int NOTIFICATION_CANCEL_KEEP_REQUEST_BASE = 8000;
+    private static final int NOTIFICATION_CANCEL_DELETE_REQUEST_BASE = 8500;
     private static final String CHANNEL_ID = "server";
     private static final long PING_INTERVAL_MS = 3000;
     /** 「进度帧」的最小间隔：前台服务通知是同一个 id 反复 notify，20Hz 地刷会掉帧、发烫，500ms 一帧够了 */
@@ -866,6 +894,31 @@ public class ServerService extends Service implements ServiceConnection {
             stopSelf();
             return START_NOT_STICKY;
         }
+        // 通知卡片上的任务按钮（暂停 / 继续 / 取消保留 / 取消删除）。
+        //
+        // 直接作用在任务上，不用先回 App：这几颗按钮就是用户说的「通知里也要能暂停、取消，
+        // 并能选保留 / 不保留」。处理完立刻把通知刷一帧，暂停后按钮马上变成「继续」，
+        // 取消后这条任务从通知里消失（队列里还有别的任务就换成那个任务的进度）。
+        if (ACTION_TASK_PAUSE.equals(action) || ACTION_TASK_RESUME.equals(action)
+                || ACTION_TASK_CANCEL_KEEP.equals(action) || ACTION_TASK_CANCEL_DELETE.equals(action)) {
+            int taskId = intent.getIntExtra(EXTRA_TASK_ID, -1);
+            if (taskId > 0) {
+                if (ACTION_TASK_PAUSE.equals(action)) {
+                    SendTasks.pauseTask(taskId);
+                } else if (ACTION_TASK_RESUME.equals(action)) {
+                    SendTasks.resumeTask(taskId);
+                } else {
+                    // 「取消（保留）」= 电脑上那份半截文件和 .hfxpart 都留着，下次同一个文件续传；
+                    // 「取消（删除）」= 让电脑端把它们一起删掉
+                    SendTasks.cancelTask(taskId, !ACTION_TASK_CANCEL_KEEP.equals(action));
+                }
+                Log.i(TAG, "通知按钮 " + action + " taskId=" + taskId);
+            }
+            // 500ms 的进度门闩不能把这一帧吃掉：暂停 / 继续 / 取消必须在同一条通知上立刻看到
+            progressNotifyAt = 0;
+            updateNotification();
+            return START_STICKY;
+        }
         // 电脑上的接收器用 adb 拉起服务时不会带 action，这里也当成"开始监听"
         if (ACTION_START.equals(action) || action == null) {
             if (intent.getBooleanExtra(EXTRA_FRESH, false)) {
@@ -1557,14 +1610,29 @@ public class ServerService extends Service implements ServiceConnection {
     private Notification buildNotification() {
         // 通知上现在挂着哪一条传输：有分享发送任务就是那个任务（多任务时是聚合视图）
         TransferView view = currentTransferView();
+        // 点通知要落到哪个任务的面板：有进度条就是进度条上那个任务（队列头），
+        // 没有进度条（准备中 / 排队中 / 刚收尾）也照样落到任务面板上。
+        //
+        // 以前这里只认 view.taskId：没有进度可显示的那几段（准备、排队、传完的那 1.5 秒）
+        // contentIntent 退回 MiuixMainActivity，用户点了通知看到的就是「App 主页」——
+        // 报的「点通知仍打开主页」正是这条路。现在只要表里还有任务，就一定落到它的面板。
+        int targetTaskId = (view != null && view.taskId > 0)
+                ? view.taskId : SendTasks.panelTargetTaskId();
         Intent openIntent;
         int requestCode = 0;
-        if (view != null && view.taskId > 0) {
+        if (targetTaskId != lastNotifiedTaskId) {
+            // 只在目标变化时打一行（500ms 一帧全打会把日志刷满）：排查「点通知落到哪」时
+            // 直接看这行 —— taskId=N（任务面板）或者 （主界面）
+            Log.i(TAG, "通知点击目标 taskId=" + targetTaskId
+                    + (targetTaskId > 0 ? "（任务面板）" : "（主界面）"));
+        }
+        lastNotifiedTaskId = targetTaskId;
+        if (targetTaskId > 0) {
             // 点通知 → 回到「这个任务」的进度面板。
             // 面板还在就是它自己（同 taskId 只会有一个窗口），被划掉了就重建一个绑到同一个 taskId，
             // 进度接着显示。requestCode 按 taskId 区分，几个任务的 PendingIntent 不会互相顶掉。
-            openIntent = SendTasks.panelIntent(this, view.taskId);
-            requestCode = NOTIFICATION_TASK_REQUEST_BASE + view.taskId;
+            openIntent = SendTasks.panelIntent(this, targetTaskId);
+            requestCode = NOTIFICATION_TASK_REQUEST_BASE + targetTaskId;
         } else {
             openIntent = new Intent(this, top.weixiansen574.hybridfilexfer.compose.MiuixMainActivity.class);
             openIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
@@ -1612,11 +1680,50 @@ public class ServerService extends Service implements ServiceConnection {
                 .setContentIntent(contentIntent)
                 .setOngoing(true)
                 .setOnlyAlertOnce(true)
-                .setPriority(NotificationCompat.PRIORITY_LOW)
-                .addAction(0, getString(R.string.notification_stop), stopPendingIntent);
+                .setPriority(NotificationCompat.PRIORITY_LOW);
+        // 卡片上的按钮（现代 Android 卡片收起时只放前 3 颗，所以有任务时不再挂「停止服务」）：
+        //   正在传 / 暂停着：[暂停 或 继续] [取消（保留）] [取消（删除）]
+        //   只是在准备 / 排队：[取消（保留）] [取消（删除）]
+        //   完全没有任务：      [停止]（和以前一样，停止整个后台服务）
+        if (targetTaskId > 0) {
+            boolean thisTaskLive = view != null && view.taskId == targetTaskId;
+            if (thisTaskLive) {
+                boolean paused = view.paused;
+                builder.addAction(0, paused ? "继续" : "暂停", taskActionIntent(
+                        paused ? ACTION_TASK_RESUME : ACTION_TASK_PAUSE,
+                        paused ? NOTIFICATION_RESUME_REQUEST_BASE : NOTIFICATION_PAUSE_REQUEST_BASE,
+                        targetTaskId));
+            }
+            builder.addAction(0, "取消（保留）", taskActionIntent(
+                    ACTION_TASK_CANCEL_KEEP, NOTIFICATION_CANCEL_KEEP_REQUEST_BASE, targetTaskId));
+            builder.addAction(0, "取消（删除）", taskActionIntent(
+                    ACTION_TASK_CANCEL_DELETE, NOTIFICATION_CANCEL_DELETE_REQUEST_BASE, targetTaskId));
+        } else {
+            builder.addAction(0, getString(R.string.notification_stop), stopPendingIntent);
+        }
         // 传输中：通知栏直接显示进度（发送/接收挑当前有活动的那一路，全局可见、不依赖悬浮窗权限）
         applyTransferProgress(builder, view);
         return builder.build();
+    }
+
+    /**
+     * 任务级按钮的 PendingIntent（暂停 / 继续 / 取消保留 / 取消删除）。
+     *
+     * <p>用 getForegroundService（O+）：这几颗按钮和「停止」那颗是同一套机制 —— 服务本身
+     * 已经在前台，onStartCommand 一进来又会 goForeground()，从通知点进来的那次允许名单
+     * 也由系统给（NOTIFICATION_SERVICE 的临时放行），不会撞 Android 12+ 的后台启动限制。
+     */
+    private PendingIntent taskActionIntent(String action, int requestCodeBase, int taskId) {
+        Intent intent = new Intent(this, ServerService.class);
+        intent.setAction(action);
+        intent.putExtra(EXTRA_TASK_ID, taskId);
+        int requestCode = requestCodeBase + taskId;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            return PendingIntent.getForegroundService(this, requestCode, intent,
+                    PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+        }
+        return PendingIntent.getService(this, requestCode, intent,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
     }
 
     // ------------------------------------------------------------------
@@ -1631,6 +1738,16 @@ public class ServerService extends Service implements ServiceConnection {
     private long sampleSpeed;
     /** 通知栏现在贴的是不是「正在发送/接收 xx%」：传完时靠它触发一次回落到常驻文案 */
     private volatile boolean progressShown;
+    /**
+     * 通知上一次贴出去时，contentIntent 落在哪个任务（-1 = 落在主界面）。
+     *
+     * <p>没有进度可显示的时候（准备中 / 排队中 / 等电脑连接）通知本来是<b>不刷</b>的 —— 这是为省电，
+     * 每 50ms 无脑 notify 会掉帧、发烫。但「点通知该落到哪个任务的面板」是会变的：
+     * 新任务刚建好的那一瞬间，通知还挂着服务启动时那条「点开主页」的 contentIntent，
+     * 用户点它看到的就是 App 主页（报的「点通知仍打开主页」另一条路）。
+     * 所以记下最后一次贴出去的目标，目标一变就补刷一帧。
+     */
+    private volatile int lastNotifiedTaskId = Integer.MIN_VALUE;
 
     /**
      * 通知栏要显示的一条传输：哪个方向、当前文件、已传多少、速率。
@@ -1919,6 +2036,11 @@ public class ServerService extends Service implements ServiceConnection {
         TransferView view = currentTransferView();
         if (view == null) {
             if (!progressShown) {
+                // 没有进度可显示：只在「点通知落到哪个任务」变了的时候补刷一帧
+                // （任务刚建好 / 排队中 → 通知的 contentIntent 必须换到那个任务的面板）
+                if (SendTasks.panelTargetTaskId() != lastNotifiedTaskId) {
+                    updateNotification();
+                }
                 return;
             }
             // 传输结束 / 取消 / 停止：换回原来的常驻文案（只刷这一次，之后回到"状态变了才刷"）

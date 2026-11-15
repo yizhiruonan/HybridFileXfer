@@ -814,6 +814,30 @@ public class ShareActivity extends AppCompatActivity {
         return middleEllipsis("保存到：" + srv.getDisplayName() + " " + dir.replace('\\', '/'), 42);
     }
 
+    /**
+     * 面板标题那一行要显示的文件名。
+     *
+     * <p>正在传的时候 {@code currentFileName} 是回调给的文件名；还没开传（准备中 / 排队中）
+     * 它是空的，那时用 {@link SendTask#getDisplayFileName()}（准备阶段记下的第一个文件名）——
+     * 以前这里直接用 {@code getCurrentFileName()}，排队中的面板标题就只有一个「…」。
+     */
+    private String panelFileName(SendTask current) {
+        String name = current.getCurrentFileName();
+        if (name != null && !name.isEmpty()) {
+            return name;
+        }
+        return current.getDisplayFileName();
+    }
+
+    /** 只取文件名部分（远端路径 {@code C:\Users\x\a.bin} → {@code a.bin}） */
+    private static String shortName(String path) {
+        if (path == null) {
+            return "";
+        }
+        int cut = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
+        return cut >= 0 ? path.substring(cut + 1) : path;
+    }
+
     /** 太长就从中间省略（面板那行放不下） */
     private static String middleEllipsis(String text, int max) {
         if (text == null) {
@@ -843,7 +867,7 @@ public class ShareActivity extends AppCompatActivity {
         target.update(
                 active,
                 paused,
-                current.getCurrentFileName(),
+                panelFileName(current),
                 shownBytes,
                 truthTotal,
                 shownBytes,
@@ -864,15 +888,16 @@ public class ShareActivity extends AppCompatActivity {
      * <p>快照是只读的（字段都拷好了），顺序就是队列顺序：正在传的在最前，然后按创建顺序排队，
      * 已经收尾但面板还开着的垫底。
      *
-     * <p><b>单任务时返回空列表</b>：面板上就不画「任务队列」这一段，
-     * 单任务的面板和改造前一个像素都不差。
+     * <p><b>「画不画这一段」只在一个地方判断</b>：Dialogs.kt 的 {@code if (queue.size > 1)}。
+     * 这里把所有还活着的任务都交出去（不再自己先判一次 {@code size < 2}）—— 两处门槛
+     * 各判一次的写法，改了一边忘了另一边就是「有 2 个任务却没有队列段」这种查不出原因的怪现象。
      */
     private List<QueueRow> buildQueueRows(SendTask current) {
         if (current == null) {
             return Collections.emptyList();
         }
         List<SendTasks.TaskInfo> infos = SendTasks.queueSnapshot();
-        if (infos.size() < 2) {
+        if (infos.isEmpty()) {
             return Collections.emptyList();
         }
         List<QueueRow> rows = new ArrayList<>(infos.size());
@@ -881,7 +906,9 @@ public class ShareActivity extends AppCompatActivity {
             rows.add(new QueueRow(
                     info.taskId,
                     i + 1,
-                    info.fileName,
+                    // 只留文件名：task.currentFileName 是回调里的**远端完整路径**
+                    // （C:\Users\nil\Downloads\...），直接摆进队列会占满一行还看不清是哪个文件
+                    shortName(info.fileName),
                     queueSubtitle(info),
                     queueStatus(info),
                     info.taskId == current.getTaskId(),
@@ -892,7 +919,10 @@ public class ShareActivity extends AppCompatActivity {
 
     /** 队列行第二行小字：目标电脑 · 已传/总量（正在传的那行再带一个速率） */
     private String queueSubtitle(SendTasks.TaskInfo info) {
-        String label = info.label == null || info.label.isEmpty() ? "等待电脑" : info.label;
+        // 还没连上电脑时 label 是空的：排队中显示「等待电脑」，已经失败 / 取消的显示「未送达」
+        // （以前一律写「等待电脑」，收尾的失败任务看着像还在等）
+        String fallback = info.isFinished() ? "未送达" : "等待电脑";
+        String label = info.label == null || info.label.isEmpty() ? fallback : info.label;
         if (info.totalBytes <= 0L) {
             return label;
         }

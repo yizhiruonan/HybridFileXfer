@@ -562,6 +562,16 @@ internal fun ReceiveProgressPanel(
                 fontSize = 12.sp,
                 color = colorScheme.onSurfaceVariantSummary,
             )
+            // 任务队列：多任务排队时才有（单个任务显示不出来，保持原来的面板不变）。
+            //
+            // 位置在「各通道进度」**上面**不是随便定的：通道明细会随通道数变长
+            // （10 条通道就两百多 dp），卡片到了 heightIn(max = 560.dp) 的边上就只剩上面这一截，
+            // 队列排在通道明细后面时，节点是存在的（uiautomator 抓得到），用户却看不到 ——
+            // 报的「有 2 个以上任务也看不到『任务队列』段」就是这个。排到前面以后，
+            // 不管有几条通道，一打开卡片第一眼就能看到队列。
+            if (queue.size > 1) {
+                QueueSection(queue = queue, onOpen = onQueueOpen, onCancel = onQueueCancel)
+            }
             if (state.xferChannels.isNotEmpty()) {
                 Spacer(Modifier.height(14.dp))
                 Box(Modifier.fillMaxWidth().height(1.dp).background(colorScheme.surfaceVariant))
@@ -614,10 +624,6 @@ internal fun ReceiveProgressPanel(
                         )
                     }
                 }
-            }
-            // 任务队列：多任务排队时才有（单个任务显示不出来，保持原来的面板不变）
-            if (queue.size > 1) {
-                QueueSection(queue = queue, onOpen = onQueueOpen, onCancel = onQueueCancel)
             }
             // 暂停/取消：双窗口（onPause）由调用方控制；应用内接收走 ServerService；
             // 都没有时发送卡片只给「关闭」。
