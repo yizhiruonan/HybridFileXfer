@@ -1638,10 +1638,25 @@ impl Session {
                     ));
                 }
             }
-            false => log::warn(crate::i18n::tr(
-                "手机端报告传输/校验失败",
-                "the phone reported a failed transfer or check",
-            )),
+            false => {
+                log::warn(crate::i18n::tr(
+                    "手机端报告传输/校验失败",
+                    "the phone reported a failed transfer or check",
+                ));
+                // 校验不一致：这次收下的文件是坏的，必须连同续传记录一起扔掉。
+                // 留着它的后果是**修不好**：下一次传同一个文件时，接收端按这张位图回
+                // 「这些块我都有了」，手机端就跳过它们 —— 坏块永远补不上，
+                // 只有重启接收器（内存里的位图清空）才能传成功。
+                // 那 4 次「大小一致但 SHA-256 不一致、重启接收器后重传正常」就是这么来的。
+                let mismatch = peer
+                    .message
+                    .as_deref()
+                    .map(|m| m.contains("SHA-256"))
+                    .unwrap_or(false);
+                if mismatch {
+                    discard_received(&received);
+                }
+            }
         }
         Ok(())
     }
@@ -1652,6 +1667,28 @@ impl Session {
 /// zip 里的条目是 "<文件夹名>/<相对路径>"（手机端就是这么打的），所以直接解到接收
 /// 目录下就会得到一个同名文件夹。用系统自带的 tar 解（Windows 10+ 的 bsdtar 认得
 /// zip），不引新依赖；解档失败就把归档留着，别让用户两头空。
+/// 校验不一致时把收下的文件和它的续传记录一起删掉（见调用处的注释）。
+fn discard_received(files: &[PathBuf]) {
+    for path in files {
+        crate::journal::ReceiveJournal::remove(path);
+        match std::fs::remove_file(path) {
+            Ok(()) => log::warn(&format!(
+                "{} {} {}",
+                crate::i18n::tr("校验不一致，已删除：", "hash mismatch, removed:"),
+                path.display(),
+                crate::i18n::tr("（下次从头重传）", "(next attempt starts over)"),
+            )),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => log::warn(&format!(
+                "{} {}: {}",
+                crate::i18n::tr("删除校验不一致的文件失败", "cannot remove the mismatched file"),
+                path.display(),
+                e
+            )),
+        }
+    }
+}
+
 /// 校验通过之后，把这几份文件的断点续传记录（`<文件名>.hfxpart`）删掉。
 ///
 /// 为什么非删不可：`Receiver::finish_with` 只在"位图认为已经传完"时才顺手删掉它，
@@ -2816,5 +2853,70 @@ mod plan_tests {
             }
         }
         assert!(seen.iter().all(|&x| x), "每个任务都必须被发到");
+    }
+}
+
+#[cfg(test)]
+mod bugfix_tests {
+    use super::*;
+    use std::fs;
+
+    fn tmp(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("hfx-bugfix-{}-{}", name, std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// BUG-2：传完之后旁边的 `.hfxpart` 必须消失，文件本身不动
+    #[test]
+    fn clear_resume_journals_removes_sidecar_only() {
+        let dir = tmp("clear");
+        let file = dir.join("a.bin");
+        fs::write(&file, b"hello").unwrap();
+        let sidecar = crate::journal::ReceiveJournal::sidecar_path(&file);
+        fs::write(&sidecar, b"dummy").unwrap();
+        assert!(sidecar.exists());
+
+        clear_resume_journals(&[file.clone()]);
+
+        assert!(!sidecar.exists(), "sidecar must be gone");
+        assert!(file.exists(), "the file itself must stay");
+    }
+
+    /// 校验不一致：文件和续传记录一起删掉（否则下次传同一个文件还是旧的坏数据）
+    #[test]
+    fn discard_received_removes_file_and_sidecar() {
+        let dir = tmp("discard");
+        let file = dir.join("b.bin");
+        fs::write(&file, b"broken").unwrap();
+        let sidecar = crate::journal::ReceiveJournal::sidecar_path(&file);
+        fs::write(&sidecar, b"dummy").unwrap();
+
+        discard_received(&[file.clone()]);
+
+        assert!(!file.exists(), "the mismatched file must be removed");
+        assert!(!sidecar.exists(), "its sidecar must be removed too");
+    }
+
+    /// 删一个本来就不存在的文件不许 panic（收尾路径上会碰到）
+    #[test]
+    fn discard_received_tolerates_missing_file() {
+        let dir = tmp("missing");
+        let file = dir.join("c.bin");
+        discard_received(&[file.clone()]);
+        assert!(!file.exists());
+    }
+
+    /// 没有续传记录的普通文件：两个函数都得当作没事发生
+    #[test]
+    fn both_helpers_are_noops_without_sidecar() {
+        let dir = tmp("noop");
+        let file = dir.join("d.bin");
+        fs::write(&file, b"x").unwrap();
+        clear_resume_journals(&[file.clone()]);
+        assert!(file.exists());
+        discard_received(&[file.clone()]);
+        assert!(!file.exists());
     }
 }
