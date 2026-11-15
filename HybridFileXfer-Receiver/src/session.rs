@@ -1625,6 +1625,10 @@ impl Session {
                         // 手机端分享文件夹时勾了「打包成归档发送」：文件名是
                         // <文件夹名>.hfx.zip。校验通过了才解档（要的就是「送达再解档」），
                         // 解完把归档本身删掉。
+                        // 文件已经完整（手机端复算的 SHA-256 和本端一致）：续传记录留着不但没用，
+                        // 还会让下次传同一个文件按旧位图"续传"（见 clear_resume_journals 的注释）。
+                        // 放在解档之前：归档本身也要执行这一步。
+                        clear_resume_journals(&received);
                         extract_archives(&received);
                     }
                 } else {
@@ -1648,6 +1652,35 @@ impl Session {
 /// zip 里的条目是 "<文件夹名>/<相对路径>"（手机端就是这么打的），所以直接解到接收
 /// 目录下就会得到一个同名文件夹。用系统自带的 tar 解（Windows 10+ 的 bsdtar 认得
 /// zip），不引新依赖；解档失败就把归档留着，别让用户两头空。
+/// 校验通过之后，把这几份文件的断点续传记录（`<文件名>.hfxpart`）删掉。
+///
+/// 为什么非删不可：`Receiver::finish_with` 只在"位图认为已经传完"时才顺手删掉它，
+/// 而实测会出现**位图没置全、文件却已经校验通过**的情况 ——
+/// 900 MB 的文件传完、接收完成、校验通过之后，旁边还留着一个 145 字节的
+/// `xxx.hfxpart`（145 = 32 字节头 + 113 字节位图，正是 900 块的那份旧记录）。
+/// 留着它，下次传同一个文件就会按这张旧位图"续传"，从错误的偏移接着写 ——
+/// 这正是「大小一致但 SHA-256 对不上」那条待办（NEXT-TODO 第 11 条）最可疑的成因。
+fn clear_resume_journals(files: &[PathBuf]) {
+    let mut removed = 0usize;
+    for path in files {
+        let sidecar = crate::journal::ReceiveJournal::sidecar_path(path);
+        if sidecar.exists() {
+            crate::journal::ReceiveJournal::remove(path);
+            if !sidecar.exists() {
+                removed += 1;
+            }
+        }
+    }
+    if removed > 0 {
+        log::info(&format!(
+            "{} {} {}",
+            crate::i18n::tr("清掉续传记录：", "dropped resume journals:"),
+            removed,
+            crate::i18n::tr("个（文件已经完整，留着会让下次误判成续传）", ""),
+        ));
+    }
+}
+
 fn extract_archives(files: &[PathBuf]) {
     for path in files {
         let name = match path.file_name().and_then(|n| n.to_str()) {
