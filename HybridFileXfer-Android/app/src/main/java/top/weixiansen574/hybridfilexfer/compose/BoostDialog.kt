@@ -64,6 +64,15 @@ private class BoostSlot(
     val open: (Context) -> Boolean,
     /** 最高权限尝试（root / shell），失败不影响后续 */
     val kick: (() -> Unit)? = null,
+    /**
+     * 自动开不成时补一句「为什么」，填了就显示在「XX 自动打开失败」后面。
+     *
+     * <p>USB 网络共享是唯一一条**明知会失败**的：这台 MIUI 的 UsbService 对
+     * `setCurrentFunctions` 一律抛 IllegalArgumentException（连 `adb,mtp` 这种无害组合都拒绝），
+     * 拿真 root 跑也一样（`u:r:su:s0` + uid 0，SELinux 无 avc），是系统层面的策略，
+     * 不是权限不够。不写清楚的话用户会以为是应用没做好。
+     */
+    val autoFailNote: String? = null,
 )
 
 private fun interfaceNames(ctx: Context): List<String> = try {
@@ -174,6 +183,7 @@ private fun buildSlots(): List<BoostSlot> = listOf(
             startActivityQuietly(ctx, Intent("android.settings.TETHER_SETTINGS"))
                 || startActivityQuietly(ctx, Intent(Settings.ACTION_WIRELESS_SETTINGS))
         },
+        autoFailNote = "系统的 USB 功能开关不让应用和 root 动，只能你手点",
         kick = {
             // 一定要把 rndis **和 adb 一起**挂上：只挂 rndis 会把调试口顶掉，
             // USB_ADB 那两条通道跟着消失 —— 等于用 2 条换 2 条，白折腾。
@@ -350,7 +360,9 @@ internal fun BoostDialog(
                                         ok -> "已就绪"
                                         // 推过但没起来（没插线 / 系统不让开）：退回手动
                                         autoResult[slot.key] == false ->
-                                            (privilege ?: "高权限") + " 自动打开失败，" + slot.reason
+                                            (privilege ?: "高权限") + " 自动打开失败" +
+                                                (slot.autoFailNote?.let { "（" + it + "）" } ?: "") +
+                                                "，" + slot.reason
                                         else -> slot.reason
                                     },
                                     fontSize = 11.sp,
