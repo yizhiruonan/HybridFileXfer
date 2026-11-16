@@ -360,6 +360,24 @@ fn main() -> Result<(), slint::PlatformError> {
             }
         });
     }
+    // ---- 流光的步进：16ms 一帧 ----
+    // 亮带从左边扫到右边大约 1.6 秒一趟（每帧 +0.01）。窗口没显示、暂停、或者已经传完
+    // 就直接跳过：进度不动了还在闪，看着像卡住了但其实啥也没发生。
+    let flow_timer = slint::Timer::default();
+    {
+        let weak = xfer_win.as_weak();
+        flow_timer.start(slint::TimerMode::Repeated, Duration::from_millis(16), move || {
+            let Some(tw) = weak.upgrade() else { return };
+            if !tw.window().is_visible() || tw.get_done() || tw.get_paused() {
+                return;
+            }
+            let mut f = tw.get_flow() + 0.010;
+            if f >= 1.0 {
+                f -= 1.0;
+            }
+            tw.set_flow(f);
+        });
+    }
     {
         let weak = xfer_win.as_weak();
         let dismissed = Arc::clone(&xfer_dismissed);
@@ -519,6 +537,8 @@ fn main() -> Result<(), slint::PlatformError> {
         let xfer_weak = xfer_win.as_weak();
         let xfer_dismissed = Arc::clone(&xfer_dismissed);
         let mut tw_shown = false;
+        // 这一轮传完的时刻（用来数「已完成」亮够 3 秒没有）
+        let mut tw_finish_at: Option<std::time::Instant> = None;
         let mut last_bytes = 0u64;
         let mut last_tick = std::time::Instant::now();
         let mut speed = 0f64;
@@ -812,35 +832,76 @@ fn main() -> Result<(), slint::PlatformError> {
                     });
                     start += span;
                 }
+                // 已填充比例（按块算）：流光只在这一段里扫
+                let fill_frac: f32 = segs.iter().map(|s| s.span * s.filled).sum::<f32>().clamp(0.0, 1.0);
                 let seg_model = slint::ModelRc::new(slint::VecModel::from(segs));
                 ui.set_xfer_segments(seg_model.clone());
 
                 // ---- 独立传输窗口：同一份数据再喂一遍 ----
+                // 传完了没有：真机第一次跑出来的是「已完成 100%」+ 0 B/s 一直挂着不消失 ——
+                // 因为 active 只看「有设备连着 + 有进度」，传完之后 PROGRESS 不清零，
+                // 这两个条件依然成立。所以「结束」得单独认：字节满了就算完，
+                // 亮 3 秒「已完成」再自己收起来。
+                // 真机第二次跑出来：传完了 done 停在 599.0/600.0 MB（比 total 少 1MB，
+                // 块计数的尾巴对不上），只按 done>=total 判永远判不到「完成」，
+                // 窗口就挂着「已完成 99%」不消失。所以再认一个信号：
+                // control 那边 receiving()/sending() 都落下去，就是这一轮结束了。
+                let in_flight = hfx_receiver::control::receiving() || hfx_receiver::control::sending();
+                let finished = (total_bytes > 0 && done >= total_bytes) || !in_flight;
                 if let Some(tw) = xfer_weak.upgrade() {
                     tw.set_action_text(
-                        if ui.get_send_active() {
+                        if finished {
+                            if ui.get_send_active() {
+                                "文件已发送完成"
+                            } else {
+                                "文件已接收完成"
+                            }
+                        } else if ui.get_send_active() {
                             "正在发送文件"
                         } else {
                             "正在接收文件"
                         }
                         .into(),
                     );
-                    tw.set_percent(if total_bytes > 0 {
-                        ((done as f64 / total_bytes as f64) * 100.0).round() as i32
+                    // 百分比往下取整：向上四舍五入会在「1.99 / 2.00 GB」就跳成 100%，
+                    // 而这时其实还在传（第一次真机就是 100% 挂着 3.5 MB/s，看着像卡死）。
+                    // 没传完最多显示 99%，满字节了才给 100%。
+                    let pct = if total_bytes > 0 {
+                        ((done.min(total_bytes) as f64 / total_bytes as f64) * 100.0).floor() as i32
                     } else {
                         0
-                    });
+                    };
+                    tw.set_percent(if finished { 100 } else { pct.min(99) });
                     tw.set_file_name(short.clone().into());
                     tw.set_detail_text(
                         format!("{} / {} · {}", human(done), human(total_bytes), speed_text)
                     .into());
                     tw.set_paused(hfx_receiver::control::paused());
-                    tw.set_done(false);
+                    tw.set_done(finished);
+                    tw.set_fill(fill_frac);
                     tw.set_segs(seg_model);
-                    // 新一轮传输才重新弹（用户点过「收起」就别再烦他）
-                    if !tw_shown && !xfer_dismissed.load(Ordering::Relaxed) {
-                        tw_shown = true;
-                        let _ = tw.show();
+                    if finished {
+                        // 第一眼看到「满了」的时候记时间，3 秒后收窗口
+                        if tw_finish_at.is_none() {
+                            tw_finish_at = Some(std::time::Instant::now());
+                        }
+                        if tw_shown
+                            && tw_finish_at
+                                .map(|t| t.elapsed() >= Duration::from_secs(3))
+                                .unwrap_or(false)
+                        {
+                            tw_shown = false;
+                            xfer_dismissed.store(false, Ordering::Relaxed);
+                            let _ = tw.hide();
+                        }
+                    } else {
+                        // 又一轮新传输（文件换了 / 续传接上了）：允许重新弹
+                        tw_finish_at = None;
+                        // 新一轮传输才重新弹（用户点过「收起」就别再烦他）
+                        if !tw_shown && !xfer_dismissed.load(Ordering::Relaxed) {
+                            tw_shown = true;
+                            let _ = tw.show();
+                        }
                     }
                 }
             } else if tw_shown {

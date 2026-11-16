@@ -723,6 +723,10 @@ export component TransferWindow inherits Window {
     in-out property <[XferSeg]> segs: [];
     in-out property <bool> paused: false;
     in-out property <bool> done: false;
+    // 已填充比例（0..1，按块算）：流光只在这段里扫，别扫到灰色空条上
+    in-out property <float> fill: 0.0;
+    // 流光位置（0..1 循环），由 Rust 那边 16ms 的 Timer 推着走
+    in-out property <float> flow: 0.0;
 
     callback toggle-pause();
     callback close-window();
@@ -759,10 +763,13 @@ export component TransferWindow inherits Window {
             }
         }
 
-        // IDM 式分段：段内从段首往右填，段之间一条红线（和主界面那张卡同一套画法）
+        // 进度条：颜色和特效照 Windows 自带的复制弹窗来 ——
+        // 灰底 + 绿色填充（#0F7B0F）+ 一条从左往右扫的流光。
+        // 分段照旧保留（一条通道一段，段间一条深绿细线）：
+        // 段边界会随块归属变，流光一直在动，两个能一起看清。
         bar := Rectangle {
-            height: 14px;
-            background: #E4E4E4;
+            height: 12px;
+            background: #E6E6E6;
             clip: true;
 
             for seg in root.segs : Rectangle {
@@ -770,7 +777,7 @@ export component TransferWindow inherits Window {
                 y: 0px;
                 width: bar.width * seg.span * seg.filled;
                 height: bar.height;
-                background: #005FB8;
+                background: #0F7B0F;
             }
             for seg[i] in root.segs : Rectangle {
                 visible: i > 0;
@@ -778,7 +785,26 @@ export component TransferWindow inherits Window {
                 y: 0px;
                 width: 1px;
                 height: bar.height;
-                background: #E53935;
+                background: #0B5C0B;
+            }
+
+            // 流光：外面这层把范围裁到「已填充」那一段，里面那条渐变亮带
+            // 按 flow（0..1）从左边扫到右边。暂停 / 传完了就停住不动。
+            Rectangle {
+                x: 0px;
+                y: 0px;
+                width: bar.width * Math.max(0.0, Math.min(1.0, root.fill));
+                height: bar.height;
+                clip: true;
+                visible: !root.paused && !root.done;
+
+                Rectangle {
+                    x: bar.width * root.flow - 60px;
+                    y: 0px;
+                    width: 120px;
+                    height: parent.height;
+                    background: @linear-gradient(90deg, #0F7B0F00 0%, #8CFFFFFF 50%, #0F7B0F00 100%);
+                }
             }
         }
 
