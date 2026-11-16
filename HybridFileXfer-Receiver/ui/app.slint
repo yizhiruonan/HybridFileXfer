@@ -412,30 +412,9 @@ export component AppWindow inherits Window {
                     overflow: elide;
                 }
 
-                // 分块进度条：一整条方角，按通道切段，每段都从段首往右填，
-                // 段与段之间画一条红色竖线 —— 和手机端「正在接收文件」弹窗一致。
-                // 全部用绝对定位（bar.width * 比例），不依赖布局，避免填充块被排到中间
-                bar := Rectangle {
-                    height: 12px;
-                    background: #E4E4E4;
-                    clip: true;
-
-                    for seg in root.xfer-segments : Rectangle {
-                        x: bar.width * seg.start;
-                        y: 0px;
-                        width: bar.width * seg.span * seg.filled;
-                        height: bar.height;
-                        background: #005FB8;
-                    }
-                    for seg[i] in root.xfer-segments : Rectangle {
-                        visible: i > 0;
-                        x: bar.width * seg.start;
-                        y: 0px;
-                        width: 1px;
-                        height: bar.height;
-                        background: #E53935;
-                    }
-                }
+                // 进度条已经从主界面删掉：用户要的是「资源管理器复制弹窗」那种独立小窗，
+                // 主界面这块只留「当前文件 / 文件名 / 已接收 x / y · 速率 · N 个文件」+ 按钮。
+                // 进度本身在 TransferWindow 里看（那条才是 1:1 还原系统样式的那条）。
 
                 Text {
                     text: root.session-text;

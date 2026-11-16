@@ -929,7 +929,9 @@ fn main() -> Result<(), slint::PlatformError> {
                 // 状态卡下面那行「已取消…」的提示
                 + if ui.get_notice_text().is_empty() { 0.0 } else { 20.0 }
                 + devices_h
-                + if xfer_now { 190.0 } else { 0.0 }
+                // 190 里去掉了主界面那条进度条（12 高 + spacing 6 = 18），
+                // 否则进度卡一出现，底部按钮会往下飘 18px
+                + if xfer_now { 172.0 } else { 0.0 }
                 + if xfer_now && ui.get_send_active() { 50.0 } else { 0.0 }
                 + if ui.get_update_state() == 2 || ui.get_update_state() == 5 {
                     34.0
