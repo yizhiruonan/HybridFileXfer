@@ -1463,6 +1463,65 @@ impl Session {
         let complete = hard_error.is_none() && aborts.is_empty();
         // 303：先把落盘文件列表记下来，finish_with() 会把条目清空
         let received = receiver.received_files();
+        // 2026-11-17：块账本核对 —— 传输线程全都正常退出了（手机端认为发完了），
+        // 文件大小也一定和声明的一模一样（set_len 提前占满了整份），
+        // 但账本里还缺块 / 缺字节，那就说明盘上的内容有洞。这正是
+        // 「两边大小完全一致、SHA-256 不一致」的现场（NEXT-TODO 第 11 条）。
+        //
+        // 以前这一支当作"数据收齐"往下走：照算 SHA-256、照回 ok 的结论帧，
+        // 只能等手机端报「SHA-256 不一致」，电脑端日志里一句解释都没有。
+        // 现在电脑端自己就能指名道姓：哪个文件缺哪几块、哪几块只写了一半；
+        // 并且按失败收尾 —— 续传位图里那几块是"未完成"，手机端重发时会被补上。
+        if hard_error.is_none() && aborts.is_empty() {
+            let gaps = receiver.missing_blocks();
+            if !gaps.is_empty() {
+                let mut parts: Vec<String> = Vec::new();
+                for (path, indexes, count, short, short_count) in gaps.iter() {
+                    let mut gaps_of_file: Vec<String> = Vec::new();
+                    if *count > 0 {
+                        let list: Vec<String> = indexes.iter().map(|i| format!("#{}", i)).collect();
+                        gaps_of_file.push(format!(
+                            "{} {} {}",
+                            crate::i18n::tr("缺", "missing"),
+                            count,
+                            list.join(" ")
+                        ));
+                    }
+                    if *short_count > 0 {
+                        let list: Vec<String> = short
+                            .iter()
+                            .map(|(i, got, want)| format!("#{}({}/{})", i, got, want))
+                            .collect();
+                        gaps_of_file.push(format!(
+                            "{} {} {}",
+                            crate::i18n::tr("长度不足", "short"),
+                            short_count,
+                            list.join(" ")
+                        ));
+                    }
+                    parts.push(format!("{} [{}]", path.display(), gaps_of_file.join(", ")));
+                }
+                let detail = parts.join("; ");
+                log::error(&format!(
+                    "{}: {}",
+                    crate::i18n::tr(
+                        "块账本与写盘不一致（文件大小会是对的，内容是坏的）",
+                        "the block ledger disagrees with what is on disk (size right, content wrong)"
+                    ),
+                    detail
+                ));
+                if hard_error.is_none() {
+                    hard_error = Some(format!(
+                        "{}: {}",
+                        crate::i18n::tr(
+                            "块账本与写盘不一致（缺块/短块）",
+                            "block ledger mismatch (missing/short blocks)"
+                        ),
+                        detail
+                    ));
+                }
+            }
+        }
         // 收尾阶段的可观测性：收尾时两边都在等对方，卡住时日志必须能指出卡在哪一步
         // （实测出现过「PC 界面已显示 800.0 MB 收满、手机停在等待校验」的僵持，日志里却什么都没有）
         log::info(&format!(
@@ -1528,7 +1587,7 @@ impl Session {
             received.len(),
             crate::i18n::tr("个文件", "file(s)")
         ));
-        let digests = if complete {
+        let digests = if complete && hard_error.is_none() {
             digest_files(&received)
         } else {
             Vec::new()
@@ -2245,6 +2304,18 @@ mod tests {
         blocks: Vec<Block>,
         home_dir: String,
     ) -> thread::JoinHandle<()> {
+        spawn_mock_phone_expecting(listener, folder, blocks, home_dir, true)
+    }
+
+    /// 同 {@link spawn_mock_phone}，但可以要求电脑最后回一个"失败"的结论帧
+    /// （用来断言电脑自己发现了"块账本对不上"，而不是照回 ok 让手机端去喊 SHA 不一致）。
+    fn spawn_mock_phone_expecting(
+        listener: TcpListener,
+        folder: String,
+        blocks: Vec<Block>,
+        home_dir: String,
+        expect_ok: bool,
+    ) -> thread::JoinHandle<()> {
         thread::spawn(move || {
             let (control, _) = listener.accept().unwrap();
             control
@@ -2290,6 +2361,16 @@ mod tests {
             // Heartbeat frames must be ignored by the client.
             proto::write_i16(&mut cw, controller::PING).unwrap();
             proto::write_i16(&mut cw, controller::REQUEST_RECEIVE).unwrap();
+            // 305：REQUEST_RECEIVE 之后紧跟着必须是 RESUME_QUERY（电脑端同步读这一帧），
+            // 一个文件都不查也要发，只是 count = 0。
+            proto::write_i16(&mut cw, controller::RESUME_QUERY).unwrap();
+            proto::write_i32(&mut cw, 0).unwrap();
+            assert_eq!(
+                proto::read_i16(&mut cr).unwrap(),
+                controller::RESUME_REPLY,
+                "电脑端应该用 RESUME_REPLY 帧回答续传查询"
+            );
+            assert_eq!(proto::read_i32(&mut cr).unwrap(), 0);
 
             let first = transfers[0].try_clone().unwrap();
             let second = transfers[1].try_clone().unwrap();
@@ -2336,6 +2417,8 @@ mod tests {
                     proto::write_i64(&mut w, block.total_size as i64).unwrap();
                     proto::write_i32(&mut w, block.index as i32).unwrap();
                     proto::write_i32(&mut w, block.data.len() as i32).unwrap();
+                    // 303：每块后面跟一个 i32 CRC32
+                    proto::write_i32(&mut w, crc32fast::hash(&block.data) as i32).unwrap();
                     w.write_all(&block.data).unwrap();
                 }
                 proto::write_i16(&mut w, transfer::EOF).unwrap();
@@ -2356,6 +2439,8 @@ mod tests {
                     proto::write_i64(&mut w, block.total_size as i64).unwrap();
                     proto::write_i32(&mut w, block.index as i32).unwrap();
                     proto::write_i32(&mut w, block.data.len() as i32).unwrap();
+                    // 303：每块后面跟一个 i32 CRC32
+                    proto::write_i32(&mut w, crc32fast::hash(&block.data) as i32).unwrap();
                     w.write_all(&block.data).unwrap();
                 }
                 proto::write_i16(&mut w, transfer::EOF).unwrap();
@@ -2376,10 +2461,34 @@ mod tests {
 
             // 302 收尾：电脑先给落盘结论（RESULT），手机再回读文件结论（RESULT）
             assert_eq!(proto::read_i16(&mut cr).unwrap(), controller::RESULT);
-            assert!(proto::read_bool(&mut cr).unwrap());
-            proto::write_i16(&mut cw, controller::RESULT).unwrap();
-            proto::write_bool(&mut cw, true).unwrap();
+            let ok = proto::read_bool(&mut cr).unwrap();
+            assert_eq!(ok, expect_ok, "落盘结论帧的 ok 和预期不符");
+            // 303：成功时结论帧后面跟一张指纹表（这里是空的），失败时跟一段错误信息
+            let count = proto::read_i32(&mut cr).unwrap();
+            for _ in 0..count.max(0) {
+                let _size = proto::read_i64(&mut cr).unwrap();
+                let mut sha = [0u8; 32];
+                cr.read_exact(&mut sha).unwrap();
+            }
+            if !ok {
+                // 失败时电脑端必须说清楚是哪几块对不上账（不能只写"接收失败"）
+                let message = proto::read_utf(&mut cr).unwrap();
+                assert!(
+                    message.contains("块") || message.contains("block"),
+                    "失败结论里要指出缺块，实际是：{}",
+                    message
+                );
+            }
+            if expect_ok {
+                // 电脑端会读手机端的"读文件结论"，成功后这条通道才收得干净
+                proto::write_i16(&mut cw, controller::RESULT).unwrap();
+                proto::write_bool(&mut cw, true).unwrap();
+                proto::write_i32(&mut cw, 0).unwrap();
+            }
             proto::write_i16(&mut cw, controller::SHUTDOWN).unwrap();
+            // 别立刻关 socket：电脑端还要读走 SHUTDOWN。马上 drop 这一端会被当成
+            // "连接被重置"（10054），测试就会偶发地变红。
+            thread::sleep(Duration::from_millis(150));
         })
     }
 
@@ -2441,6 +2550,67 @@ mod tests {
         assert_eq!(std::fs::read(&big_path).unwrap(), big);
         assert_eq!(std::fs::read(&small_path).unwrap(), small);
         assert!(std::path::Path::new(&folder_path).is_dir());
+    }
+
+    /// 2026-11-17：手机端把同一块发了两遍、漏了另一块 ——
+    /// 文件大小照样等于声明大小（set_len 预先占满），收到的字节数也"刚好"，
+    /// 但内容是坏的。这就是 NEXT-TODO 第 11 条「大小一致、SHA-256 不一致」。
+    ///
+    /// 以前电脑端会照回 ok 的结论帧、照算 SHA-256，然后在手机端喊不一致之后
+    /// 一句解释都留不下来。现在电脑端自己按块账本发现缺块，回失败的结论帧，
+    /// 结论里点名缺哪一块。
+    #[test]
+    fn a_repeated_block_with_a_hole_fails_the_transfer_locally() {
+        let dir = temp_dir("receive-hole");
+        let home = util::normalize_dir(&dir).to_string_lossy().to_string();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let target = dir.join("hole.bin").to_string_lossy().to_string();
+        let total = 2 * BLOCK_SIZE;
+        let blocks = vec![
+            Block {
+                path: target.clone(),
+                modified_ms: 1_700_000_000_000,
+                total_size: total,
+                index: 0,
+                data: vec![1u8; BLOCK_SIZE as usize],
+            },
+            // 第 0 块又来一遍（内容不同），第 1 块一次都没发
+            Block {
+                path: target.clone(),
+                modified_ms: 1_700_000_000_000,
+                total_size: total,
+                index: 0,
+                data: vec![9u8; BLOCK_SIZE as usize],
+            },
+        ];
+        let server = spawn_mock_phone_expecting(listener, home.clone(), blocks, home.clone(), false);
+
+        let mut session = Session::connect(IpAddr::from([127, 0, 0, 1]), port, &home, 0).unwrap();
+        let receiver = Arc::new(Receiver::new(util::normalize_dir(&dir)));
+        let stop = Arc::new(AtomicBool::new(false));
+        match session.run(&receiver, &stop) {
+            SessionEnd::Shutdown => {}
+            SessionEnd::Disconnected(reason) => panic!("unexpected disconnect: {}", reason),
+            SessionEnd::Stopped => panic!("unexpected stop"),
+        }
+        server.join().unwrap();
+
+        // 大小是对的（预分配），内容有洞 —— 这正是"看起来一切正常"的那种坏文件
+        let data = std::fs::read(&target).unwrap();
+        assert_eq!(data.len() as u64, total, "文件大小仍然是声明的大小");
+        assert!(data[..BLOCK_SIZE as usize].iter().all(|b| *b == 9));
+        assert!(
+            data[BLOCK_SIZE as usize..].iter().all(|b| *b == 0),
+            "第 1 块从没来过，那一段留在盘上是 0"
+        );
+        // 收尾时必须留下"缺第 1 块"的续传记录：下次同一个文件重传会补上这一段
+        let sidecar = crate::journal::ReceiveJournal::sidecar_path(std::path::Path::new(&target));
+        assert!(sidecar.exists(), "没传完（有洞）的文件要留续传记录");
+        let raw = std::fs::read(&sidecar).unwrap();
+        let bitmap = &raw[32..];
+        assert_eq!(bitmap[0] & 0b0000_0001, 1, "第 0 块是收到的");
+        assert_eq!(bitmap[0] & 0b0000_0010, 0, "第 1 块必须留着让重传补");
     }
 }
 // ---------------- 发送方向（电脑 -> 手机） ----------------

@@ -15,6 +15,140 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::proto::BLOCK_SIZE;
 use crate::util;
 
+/// 账本里"这一块还没收到"的标记（u32::MAX：一个块的字节数不可能这么多）
+const BLOCK_MISSING: u32 = u32::MAX;
+
+/// 一个文件"每块应该写多少字节 / 实际写下去多少字节"的账本。
+///
+/// 为什么非要有它：位图（{@link BlockMap}、{@link crate::journal::ReceiveJournal}）
+/// 每块只记 1 个 bit =「这一块来过」，**不记长度**。而 `write_block` 以前对
+/// index 和 length 一个都不校验，于是只要发来一个「短块」（或重复的块、越界的块），
+/// 落盘结果就是：文件大小完全正确（`set_len` 先预分配了整份大小）、中间那一段是 0、
+/// 位图却照样置位说「这块收齐了」。这就是 NEXT-TODO 第 11 条
+/// 「两边大小完全一致、SHA-256 不一致」在落盘这一侧的成因 ——
+/// 只能靠收尾复算 SHA-256 才发现，而且发现之后位图还认为那块是好的，
+/// 重传时会被当成「已收到」跳过，于是永远修不好（要清掉 .hfxpart 才恢复）。
+///
+/// 现在每块都记下期望长度和实际长度：
+///  - 短块 / 越界块当场在日志里指名道姓（第几块、应为多少、实际多少）；
+///  - 短块不会进续传位图，重传时会被重新要一遍，洞补得回来；
+///  - 收尾判断"传完没有"只看这本账，不再看漏块也没人发现的位图。
+struct BlockLedger {
+    total_size: u64,
+    /// 每块的期望字节数（末块可能不满 1MiB）
+    expected: Vec<u32>,
+    /// 每块实际写下去的字节数；`BLOCK_MISSING` = 还没收到
+    written: Vec<u32>,
+    /// 同一个块重复到达的次数（同一个 index 写了不止一次）
+    duplicates: u32,
+}
+
+impl BlockLedger {
+    fn new(total_size: u64) -> BlockLedger {
+        let blocks = (total_size + BLOCK_SIZE - 1) / BLOCK_SIZE.max(1);
+        let mut expected = Vec::with_capacity(blocks as usize);
+        for index in 0..blocks {
+            let start = index * BLOCK_SIZE;
+            expected.push((total_size - start).min(BLOCK_SIZE) as u32);
+        }
+        BlockLedger {
+            total_size,
+            expected,
+            written: vec![BLOCK_MISSING; blocks as usize],
+            duplicates: 0,
+        }
+    }
+
+    fn blocks(&self) -> usize {
+        self.expected.len()
+    }
+
+    /// 第 index 块应有的字节数；越界（不属于这个文件）返回 None
+    fn expected_len(&self, index: u32) -> Option<u32> {
+        self.expected.get(index as usize).copied()
+    }
+
+    /// 305：续传时把「磁盘上本来就有」的块补进账本（位图是唯一凭据）。
+    /// 返回补进来的块数。
+    fn seed_from_bits(&mut self, bits: &[u8]) -> usize {
+        let mut seeded = 0usize;
+        for index in 0..self.blocks() {
+            let byte = index / 8;
+            if byte >= bits.len() {
+                break;
+            }
+            if bits[byte] & (1u8 << (index % 8)) != 0 && self.written[index] == BLOCK_MISSING {
+                self.written[index] = self.expected[index];
+                seeded += 1;
+            }
+        }
+        seeded
+    }
+
+    /// 记下一块。返回 true = 这块之前已经到过（重复块，内容可能不一样）
+    fn record(&mut self, index: u32, len: u32) -> bool {
+        let i = index as usize;
+        if i >= self.written.len() {
+            return false;
+        }
+        let duplicate = self.written[i] != BLOCK_MISSING;
+        if duplicate {
+            self.duplicates += 1;
+        }
+        self.written[i] = len;
+        duplicate
+    }
+
+    /// 一个字节都没收到的块
+    fn missing(&self) -> Vec<u32> {
+        self.written
+            .iter()
+            .enumerate()
+            .filter(|(_, written)| **written == BLOCK_MISSING)
+            .map(|(index, _)| index as u32)
+            .collect()
+    }
+
+    /// 收到过、但长度不够的块（这正是"大小对、内容错"的那一段）
+    fn short(&self) -> Vec<(u32, u32, u32)> {
+        self.written
+            .iter()
+            .zip(self.expected.iter())
+            .enumerate()
+            .filter(|(_, (written, expected))| **written != BLOCK_MISSING && written != expected)
+            .map(|(index, (written, expected))| (index as u32, *written, *expected))
+            .collect()
+    }
+
+    /// 每一块都按应有长度写全了
+    fn is_complete(&self) -> bool {
+        self.written
+            .iter()
+            .zip(self.expected.iter())
+            .all(|(written, expected)| written == expected)
+    }
+
+    fn written_bytes(&self) -> u64 {
+        self.written
+            .iter()
+            .filter(|written| **written != BLOCK_MISSING)
+            .map(|written| *written as u64)
+            .sum()
+    }
+
+    /// 由账本生成续传位图（和 {@link crate::journal::ReceiveJournal} 同一套位序：
+    /// 最低位是这一字节里的第一块）。只有长度对得上的块才算完成。
+    fn to_bits(&self) -> Vec<u8> {
+        let mut bits = vec![0u8; (self.blocks() + 7) / 8];
+        for (index, (written, expected)) in self.written.iter().zip(self.expected.iter()).enumerate() {
+            if written == expected {
+                bits[index / 8] |= 1u8 << (index % 8);
+            }
+        }
+        bits
+    }
+}
+
 struct FileState {
     file: File,
     modified_ms: std::sync::atomic::AtomicI64,
@@ -22,6 +156,8 @@ struct FileState {
     total: u64,
     /// 已写入字节（判断收没收完）
     done: AtomicU64,
+    /// 每块期望长度 / 实际长度的账本（2026-11-17：位图漏块、短块都靠它对出来）
+    ledger: Mutex<BlockLedger>,
     /// 305：断点续传日志（已经收到哪些块）。收尾时按它决定删除日志还是留着重传。
     journal: Mutex<Option<crate::journal::ReceiveJournal>>,
 }
@@ -531,6 +667,65 @@ impl Receiver {
         if modified_ms > current {
             state.modified_ms.store(modified_ms, Ordering::Relaxed);
         }
+        // 2026-11-17：先按"块栅格"核对这一块。
+        //
+        // 落盘偏移是写死的 index * 1MiB，文件长度又由 set_len 提前占满，所以
+        // **只要 index 或 length 有一个不对，写下去的东西就是错的，而文件大小看着完全正常**：
+        //  - 短块（该 1MiB 只来 100KB）→ 这一块剩下的部分是 0，位图却会记成已完成；
+        //  - 块号相同、内容不同（发送端把 A 块的数据配了 B 块的块号）→ 覆盖掉别人，
+        //    另一块的位置永远是 0；
+        //  - 块号越界 → 把文件写到声明大小之外。
+        // 这三种以前全都静默通过，只能等收尾 SHA-256 报「大小一致、内容不同」。
+        let expected_len = {
+            let ledger = state
+                .ledger
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            ledger.expected_len(index)
+        };
+        let expected_len = match expected_len {
+            Some(expected) => expected,
+            None => {
+                if data.is_empty() {
+                    // 空文件 / 末尾多出来的一块空块：不写盘、不记账，进度照样报上去
+                    crate::log::debug(&format!(
+                        "empty block {} ignored for {}",
+                        index,
+                        target.display()
+                    ));
+                    self.progress
+                        .mark_received(channel, raw_path, index, total_size, 0);
+                    PROGRESS.mark_received(channel, raw_path, index, total_size, 0);
+                    return Ok(());
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "block {} is past the end of {} ({} bytes)",
+                        index,
+                        target.display(),
+                        state.total
+                    ),
+                ));
+            }
+        };
+        let len_ok = data.len() as u32 == expected_len;
+        if !len_ok {
+            crate::log::error(&format!(
+                "{} {} #{} ({}: {} {}): {} {}",
+                crate::i18n::tr(
+                    "块长度与文件栅格不符，这一段会留在盘上是空/旧的",
+                    "block length does not match the file grid; this range stays zero/stale"
+                ),
+                target.display(),
+                index,
+                crate::i18n::tr("应为", "expected"),
+                expected_len,
+                crate::i18n::tr("实际", "got"),
+                data.len(),
+                crate::i18n::tr("字节（继续写，收尾会按缺块报出来）", "bytes (kept, reported as a gap)")
+            ));
+        }
         let mut written = 0usize;
         while written < data.len() {
             let n = write_at(&state.file, &data[written..], offset + written as u64)?;
@@ -544,10 +739,35 @@ impl Receiver {
         }
         self.bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
         state.done.fetch_add(data.len() as u64, Ordering::Relaxed);
-        // 305：记下这一块已经落盘（下次中断时就能从这里续上）
-        if let Ok(mut journal) = state.journal.lock() {
-            if let Some(journal) = journal.as_mut() {
-                journal.mark(index as u64);
+        let (duplicate, written_bytes, total_bytes) = {
+            let mut ledger = state
+                .ledger
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let duplicate = ledger.record(index, data.len() as u32);
+            (duplicate, ledger.written_bytes(), ledger.total_size)
+        };
+        if duplicate {
+            // 同一个块号又来了一次：这就是「大小对、内容不同」最典型的现场（另一块被顶掉/从没来过）
+            crate::log::warn(&format!(
+                "{} {} #{} ({}/{} bytes)",
+                crate::i18n::tr(
+                    "重复的块号（同一个块收到两次，另一个块可能永远不来）",
+                    "duplicate block index (same block arrived twice; another may never come)"
+                ),
+                target.display(),
+                index,
+                written_bytes,
+                total_bytes
+            ));
+        }
+        // 305：记下这一块已经落盘（下次中断时就能从这里续上）。
+        // 只有长度对得上的块才记：短块记进去以后重传会被当成"已收到"跳过，那个洞就永远补不上。
+        if len_ok {
+            if let Ok(mut journal) = state.journal.lock() {
+                if let Some(journal) = journal.as_mut() {
+                    journal.mark(index as u64);
+                }
             }
         }
 
@@ -588,11 +808,26 @@ impl Receiver {
         // 有匹配的续传日志就接着用（同一路径、同样大小、同样修改时间），否则新建一份
         let journal = crate::journal::ReceiveJournal::load(target, total_size, modified_ms, BLOCK_SIZE)
             .or_else(|| Some(crate::journal::ReceiveJournal::new(total_size, modified_ms, BLOCK_SIZE)));
+        // 2026-11-17：账本也要把「盘上本来就有」的块补上，否则续传时收尾会把它们算成缺块
+        let mut ledger = BlockLedger::new(total_size);
+        if let Some(journal) = journal.as_ref() {
+            let seeded = ledger.seed_from_bits(&journal.bits);
+            if seeded > 0 {
+                crate::log::info(&format!(
+                    "{} {} {} {}",
+                    crate::i18n::tr("续传：账本按盘上已有块补记", "resume: ledger seeded from disk"),
+                    seeded,
+                    crate::i18n::tr("块", "block(s)"),
+                    target.display()
+                ));
+            }
+        }
         let state = Arc::new(FileState {
             file,
             modified_ms: std::sync::atomic::AtomicI64::new(0),
             total: total_size,
             done: AtomicU64::new(0),
+            ledger: Mutex::new(ledger),
             journal: Mutex::new(journal),
         });
         let mut entries = self
@@ -642,38 +877,67 @@ impl Receiver {
                     crate::log::debug(&format!("cannot set modification time: {}", e));
                 }
                 let got = state.done.load(Ordering::Relaxed);
-                let mut journal = state
-                    .journal
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                match journal.as_mut() {
-                    Some(journal) if !journal.all_done() => {
-                        if !keep_incomplete {
-                            // 「不保留」：续传日志一行都不写，收尾时连文件一起删
-                            dropped.push(path.clone());
-                            continue;
-                        }
-                        if let Err(e) = journal.save(path) {
-                            crate::log::warn(&format!(
-                                "{} {}: {}",
-                                crate::i18n::tr("续传日志写入失败", "cannot write resume journal"),
-                                path.display(),
-                                e
-                            ));
-                        } else {
-                            kept.push((path.clone(), got));
-                            crate::log::warn(&format!(
-                                "{} {}",
-                                crate::i18n::tr(
-                                    "保留未接收完的文件（下次可续传）",
-                                    "kept the incomplete file so it can resume"
-                                ),
-                                path.display()
-                            ));
-                        }
-                    }
-                    // 传完了：续传日志不再需要
-                    _ => crate::journal::ReceiveJournal::remove(path),
+                // 2026-11-17：以"块账本"为准判断传完没有。
+                //
+                // 以前这里看的是位图（journal.all_done()）：位图每块只有 1 bit，
+                // 短块、漏标记都看不出来，于是出现过「文件明明完整、校验也通过了，
+                // 旁边却留下一个 .hfxpart」（BUG-2），也出现过「位图说全了、
+                // 其实中间有一块是 0」的坏文件。账本记的是每块的真实字节数，
+                // 这两种情况都能对上账。
+                let (complete, missing, short, bits) = {
+                    let ledger = state
+                        .ledger
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    (
+                        ledger.is_complete(),
+                        ledger.missing(),
+                        ledger.short(),
+                        ledger.to_bits(),
+                    )
+                };
+                if complete {
+                    // 每一块都按应有的长度落过盘了：续传日志不再需要
+                    crate::journal::ReceiveJournal::remove(path);
+                    continue;
+                }
+                if !keep_incomplete {
+                    // 「不保留」：续传日志一行都不写，收尾时连文件一起删
+                    dropped.push(path.clone());
+                    continue;
+                }
+                // 用账本重建位图再落盘：位图漏掉的标记在这里被纠正，
+                // 写出去的 .hfxpart 一定是真账（缺哪块就缺哪块，重传时补得回来）
+                let mtime = {
+                    let journal = state
+                        .journal
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    journal
+                        .as_ref()
+                        .map(|journal| journal.mtime_ms)
+                        .unwrap_or_else(|| state.modified_ms.load(Ordering::Relaxed))
+                };
+                let mut fresh = crate::journal::ReceiveJournal::new(state.total, mtime, BLOCK_SIZE);
+                fresh.bits = bits;
+                if let Err(e) = fresh.save(path) {
+                    crate::log::warn(&format!(
+                        "{} {}: {}",
+                        crate::i18n::tr("续传日志写入失败", "cannot write resume journal"),
+                        path.display(),
+                        e
+                    ));
+                } else {
+                    kept.push((path.clone(), got));
+                    crate::log::warn(&format!(
+                        "{} {} · {}",
+                        crate::i18n::tr(
+                            "保留未接收完的文件（下次可续传）",
+                            "kept the incomplete file so it can resume"
+                        ),
+                        path.display(),
+                        describe_gaps(&missing, &short)
+                    ));
                 }
             }
             // 句柄必须全部放掉：Windows 上还开着的文件删不掉
@@ -704,6 +968,10 @@ impl Receiver {
     }
 
     /// 305：这个文件已经收到哪些块（续传用）。返回位图；None 表示不能续传（当新文件传）。
+    ///
+    /// 2026-11-17：位图不再直接抄日志里的那份，而是由"块账本"生成 ——
+    /// 账本只有长度对得上的块才算完成。这样即使日志被写坏 / 漏了标记，
+    /// 也不会把一块"只写了一半"的区域告诉发送端"已经有了"。
     pub fn resume_bitmap(&self, raw_path: &str, total_size: u64, modified_ms: i64) -> Option<Vec<u8>> {
         let target = self.resolve(raw_path);
         let journal = crate::journal::ReceiveJournal::load(&target, total_size, modified_ms, BLOCK_SIZE)?;
@@ -717,9 +985,85 @@ impl Receiver {
         }
         // 把这个文件登记进本次会话：即使一块都不用收（已经全在），收尾也要复算它的
         // SHA-256 参与两端比对，否则"文件数不一致"会被判成校验失败。
-        let _ = self.state_for(&target, total_size, modified_ms);
-        Some(journal.bits.clone())
+        let state = self.state_for(&target, total_size, modified_ms).ok()?;
+        let bits = {
+            let ledger = state
+                .ledger
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            ledger.to_bits()
+        };
+        if bits.iter().all(|byte| *byte == 0) {
+            return None;
+        }
+        Some(bits)
     }
+
+    /// 2026-11-17：收尾前对一次"块账本"——哪些文件还有块没落盘 / 长度不够。
+    ///
+    /// 这是「两边大小一致、SHA-256 不一致」唯一能在电脑端被抓住的地方：
+    /// 传输线程全部正常退出（手机端认为发完了）、文件大小也和声明的一模一样
+    /// （set_len 预分配），但账本里还缺块 / 缺字节 —— 那就是落盘内容有洞。
+    /// 返回 (路径, 缺块索引（最多列 16 个）, 缺块数, 短块列表, 短块数)。
+    pub fn missing_blocks(&self) -> Vec<(PathBuf, Vec<u32>, usize, Vec<(u32, u32, u32)>, usize)> {
+        let entries = match self.entries.lock() {
+            Ok(entries) => entries,
+            Err(_) => return Vec::new(),
+        };
+        let mut out = Vec::new();
+        for (path, state) in entries.iter() {
+            let ledger = state
+                .ledger
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let missing = ledger.missing();
+            let short = ledger.short();
+            if missing.is_empty() && short.is_empty() {
+                continue;
+            }
+            out.push((
+                path.clone(),
+                missing.iter().copied().take(16).collect(),
+                missing.len(),
+                short.iter().copied().take(16).collect(),
+                short.len(),
+            ));
+        }
+        out
+    }
+}
+
+/// 缺块 / 短块的简要说明（写进日志）
+fn describe_gaps(missing: &[u32], short: &[(u32, u32, u32)]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if !missing.is_empty() {
+        let list: Vec<String> = missing
+            .iter()
+            .take(8)
+            .map(|index| index.to_string())
+            .collect();
+        parts.push(format!(
+            "{} {} (#{}{})",
+            crate::i18n::tr("缺", "missing"),
+            missing.len(),
+            list.join(" #"),
+            if missing.len() > list.len() { " …" } else { "" }
+        ));
+    }
+    if !short.is_empty() {
+        let list: Vec<String> = short
+            .iter()
+            .take(4)
+            .map(|(index, written, expected)| format!("#{}({}/{})", index, written, expected))
+            .collect();
+        parts.push(format!(
+            "{} {} {}",
+            crate::i18n::tr("长度不足", "short"),
+            short.len(),
+            list.join(" ")
+        ));
+    }
+    parts.join(" · ")
 }
 
 fn apply_modified(file: &File, modified_ms: i64) -> io::Result<()> {
@@ -871,6 +1215,162 @@ mod tests {
         let (files, _) = receiver.finish_with(true).unwrap();
         assert_eq!(files, 0);
         assert_eq!(fs::read(&target).unwrap().len(), 1_048_576);
+    }
+
+    /// 2026-11-17：短块 = 文件大小对、内容错（NEXT-TODO 第 11 条在落盘这一侧的成因）
+    ///
+    /// 落盘偏移是写死的 index * 1MiB，文件长度又由 set_len 提前占满，
+    /// 所以"第 0 块只来了 1024 字节"这种事的后果是：文件大小完全正确、
+    /// 中间一大段是 0，而位图以前还会把这一块记成"已完成"（重传永远跳过它）。
+    #[test]
+    fn short_block_leaves_a_hole_and_is_reported() {
+        let dir = temp_dir("short-block");
+        let receiver = Receiver::new(util::normalize_dir(&dir));
+        let target = dir.join("short.bin");
+        let path = target.to_string_lossy().to_string();
+        let total = 2 * BLOCK_SIZE;
+        let block = BLOCK_SIZE as usize;
+        // 第 0 块只来了 1024 字节（本该 1MiB），第 1 块正常
+        receiver
+            .write_block(0, &path, total, 0, 1_700_000_000_000, &[1u8; 1024])
+            .unwrap();
+        receiver
+            .write_block(0, &path, total, 1, 1_700_000_000_000, &vec![2u8; block])
+            .unwrap();
+
+        // 账本当场就能点名：没有整块缺失，但第 0 块只有 1024/1MiB
+        let gaps = receiver.missing_blocks();
+        assert_eq!(gaps.len(), 1, "有一个文件对不上账");
+        assert_eq!(gaps[0].0, target);
+        assert_eq!(gaps[0].1, Vec::<u32>::new(), "没有整块缺失");
+        assert_eq!(gaps[0].3, vec![(0u32, 1024u32, block as u32)], "第 0 块长度不足");
+
+        // 盘上的样子：大小一模一样，第 0 块的尾巴是 0
+        let data = fs::read(&target).unwrap();
+        assert_eq!(data.len() as u64, total);
+        assert_eq!(&data[..1024], &[1u8; 1024]);
+        assert!(
+            data[1024..block].iter().all(|byte| *byte == 0),
+            "短块后面的洞就是「大小对、内容错」"
+        );
+
+        // 收尾：这一块不许算完成 —— 续传位图里第 0 块保持"没收到"，重传才补得回来
+        assert_eq!(receiver.finish_with(true).unwrap().0, 1);
+        let sidecar = crate::journal::ReceiveJournal::sidecar_path(&target);
+        let raw = fs::read(&sidecar).unwrap();
+        let bitmap = &raw[32..];
+        assert_eq!(
+            bitmap[0] & 0b0000_0001,
+            0,
+            "第 0 块没写全，不能告诉发送端已经有了"
+        );
+        assert_eq!(bitmap[0] & 0b0000_0010, 0b10, "第 1 块是完整的");
+    }
+
+    /// 2026-11-17：同一个块号来了两次、另一个块号一次都没来。
+    ///
+    /// 后果和 NEXT-TODO 第 11 条现场一模一样：**收到的字节数刚好等于文件大小**
+    /// （所以"数据收齐 599.0 MB"这样的日志照样成立），文件大小也完全正确，
+    /// 但中间有一块从来没落盘。只看字节数 / 只看大小的判断永远发现不了它，
+    /// 只有"每块写了多少字节"的账本能。
+    #[test]
+    fn duplicate_block_hides_a_missing_one() {
+        let dir = temp_dir("duplicate");
+        let receiver = Receiver::new(util::normalize_dir(&dir));
+        let target = dir.join("dup.bin");
+        let path = target.to_string_lossy().to_string();
+        let total = 2 * BLOCK_SIZE;
+        let block = BLOCK_SIZE as usize;
+        receiver
+            .write_block(0, &path, total, 0, 1_700_000_000_000, &vec![1u8; block])
+            .unwrap();
+        // 第 0 块又来一遍（内容不同），第 1 块永远没来
+        receiver
+            .write_block(0, &path, total, 0, 1_700_000_000_000, &vec![9u8; block])
+            .unwrap();
+
+        assert_eq!(
+            receiver.bytes(),
+            total,
+            "字节数刚好等于文件大小 —— 只数字节永远发现不了这个洞"
+        );
+        let gaps = receiver.missing_blocks();
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0].1, vec![1u32], "缺的是第 1 块");
+        assert_eq!(gaps[0].2, 1);
+
+        let data = fs::read(&target).unwrap();
+        assert_eq!(data.len() as u64, total);
+        assert!(
+            data[..block].iter().all(|byte| *byte == 9),
+            "第 0 块留下的是后到的那份数据"
+        );
+        assert!(
+            data[block..].iter().all(|byte| *byte == 0),
+            "第 1 块从没来过，整块都是 0"
+        );
+    }
+
+    /// 2026-11-17：块号越界（不属于这个文件）必须当场报错，
+    /// 不能靠写盘把文件"撑"到声明大小之外
+    #[test]
+    fn block_past_the_end_is_rejected() {
+        let dir = temp_dir("past-end");
+        let receiver = Receiver::new(util::normalize_dir(&dir));
+        let target = dir.join("one.bin");
+        let path = target.to_string_lossy().to_string();
+        let error = receiver
+            .write_block(0, &path, BLOCK_SIZE, 1, 1_700_000_000_000, &[1u8; 16])
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::metadata(&target).unwrap().len(), BLOCK_SIZE);
+        assert_eq!(receiver.bytes(), 0, "越界的块一个字节都不能记");
+    }
+
+    /// 2026-11-17：多条通道并发写同一个文件的块，每块必须落在自己的偏移上。
+    ///
+    /// 这条把"多通道不会互相串数据"的前提钉住：写盘全程用 seek_write / write_at
+    /// 定位写（不是共享 File + seek + write），所以并发偏移是安全的。
+    #[test]
+    fn concurrent_blocks_land_on_their_own_offsets() {
+        use std::sync::Arc;
+        use std::thread;
+        const BLOCKS: u32 = 8;
+        let dir = temp_dir("concurrent");
+        let receiver = Arc::new(Receiver::new(util::normalize_dir(&dir)));
+        let target = dir.join("multi.bin");
+        let path = target.to_string_lossy().to_string();
+        let total = BLOCKS as u64 * BLOCK_SIZE;
+        let block = BLOCK_SIZE as usize;
+        let workers: Vec<_> = (0..BLOCKS)
+            .map(|index| {
+                let receiver = Arc::clone(&receiver);
+                let path = path.clone();
+                thread::spawn(move || {
+                    // 每块一种填充值：串了立刻看得出来
+                    let data = vec![(index + 1) as u8; block];
+                    receiver
+                        .write_block(index as u8, &path, total, index, 1_700_000_000_000, &data)
+                        .unwrap();
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert!(receiver.missing_blocks().is_empty(), "八块都该收齐");
+        let data = fs::read(&target).unwrap();
+        assert_eq!(data.len() as u64, total);
+        for index in 0..BLOCKS as usize {
+            let start = index * block;
+            assert!(
+                data[start..start + block]
+                    .iter()
+                    .all(|byte| *byte as usize == index + 1),
+                "第 {} 块被别的通道串了",
+                index
+            );
+        }
     }
 
     #[test]
