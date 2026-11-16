@@ -111,6 +111,91 @@ impl State {
     }
 }
 
+/// 独立传输窗口的「落位 / 置顶」状态。
+///
+/// 窗口只有一个实例，跨轮次复用，所以这份状态也只有一个：
+///   placed_at = 这一轮把它摆在的坐标（物理像素）；和用户拖到的位置比一下就知道他拖过没有；
+///   settle    = 还要补几次「摆位置 + 置顶」—— 窗口刚 show 出来时 hwnd 还没建好、
+///               位置也可能还没生效，补几帧就稳了；补完就再也不动它，免得把用户拖到的位置抢回去。
+#[cfg(windows)]
+#[derive(Default)]
+struct TwWindow {
+    placed_at: Option<(i32, i32)>,
+    settle: u8,
+    hwnd: Option<tray_win::HwndVal>,
+}
+
+/// 补几次落位（150ms 一帧 → 约 0.9 秒）。之后再动窗口就是抢用户的拖动。
+#[cfg(windows)]
+const TW_SETTLE_TICKS: u8 = 6;
+
+#[cfg(windows)]
+impl TwWindow {
+    fn begin(&mut self) {
+        *self = TwWindow::default();
+        self.settle = TW_SETTLE_TICKS;
+    }
+
+    /// 每帧调一次：把窗口摆到目标位置 + 置顶。hwnd 要等窗口真建出来才拿得到。
+    fn tick(&mut self, tw: &TransferWindow) {
+        if self.settle == 0 {
+            return;
+        }
+        self.settle -= 1;
+        if let Some((x, y)) = self.placed_at {
+            let now = tw.window().position();
+            // 位置还没生效（有的后端在窗口建出来之前 set_position 是空操作）
+            if now.x != x || now.y != y {
+                tw.window().set_position(slint::PhysicalPosition::new(x, y));
+            }
+        }
+        if self.hwnd.is_none() {
+            self.hwnd = tray_win::find_transfer_window(WINDOW_TITLE);
+        }
+        if let Some(hwnd) = self.hwnd {
+            tray_win::set_topmost(hwnd);
+        }
+    }
+}
+
+/// 窗口这一轮的物理像素尺寸（逻辑尺寸 × 缩放）。拿不到就用 .slint 里的 preferred-*。
+#[cfg(windows)]
+fn transfer_window_px(tw: &TransferWindow) -> (i32, i32) {
+    let scale = tw.window().scale_factor();
+    let size = tw.window().size();
+    if size.width > 0 && size.height > 0 {
+        (size.width as i32, size.height as i32)
+    } else {
+        // 470 x 196 是 TransferWindow 的 preferred-*（收起状态）
+        ((470.0 * scale) as i32, (196.0 * scale) as i32)
+    }
+}
+
+/// 收起 / 关掉窗口时，如果用户把它拖到别处了，就把坐标记进 config.ini。
+#[cfg(windows)]
+fn save_transfer_pos(tw: &TransferWindow, state: &mut State, placed: Option<(i32, i32)>) {
+    let pos = tw.window().position();
+    // (0,0) 一般是「拿不到位置」而不是真的拖到了左上角
+    if pos.x == 0 && pos.y == 0 {
+        return;
+    }
+    if let Some((px, py)) = placed {
+        // 和我们摆的位置一样 → 用户没拖过，不用写盘
+        if (pos.x - px).abs() <= 4 && (pos.y - py).abs() <= 4 {
+            return;
+        }
+    }
+    if state.config.xfer_win_pos == Some((pos.x, pos.y)) {
+        return;
+    }
+    state.config.xfer_win_pos = Some((pos.x, pos.y));
+    let path = state.config_path.clone();
+    let config = state.config.clone();
+    if let Err(e) = config.save(&path) {
+        log::warn(&format!("保存传输窗口位置失败: {e}"));
+    }
+}
+
 fn main() -> Result<(), slint::PlatformError> {
     let exe_dir = std::env::current_exe()
         .ok()
@@ -210,6 +295,9 @@ fn main() -> Result<(), slint::PlatformError> {
     let xfer_win = TransferWindow::new()?;
     // 用户在传输窗口上点了「收起」：这一轮就别再弹了（下一轮传输重新允许）
     let xfer_dismissed = Arc::new(AtomicBool::new(false));
+    // 传输窗口的落位 / 置顶状态（收起回调也要用，所以放在外面共享）
+    #[cfg(windows)]
+    let tw_state = Arc::new(Mutex::new(TwWindow::default()));
     ui.set_dir_text(state.lock().unwrap().config.receive_dir.display().to_string().into());
     ui.set_port_text(state.lock().unwrap().config.port.to_string().into());
     ui.set_ip_text(ip_text.into());
@@ -381,10 +469,22 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let weak = xfer_win.as_weak();
         let dismissed = Arc::clone(&xfer_dismissed);
+        #[cfg(windows)]
+        let st = Arc::clone(&state);
+        #[cfg(windows)]
+        let tw_state = Arc::clone(&tw_state);
         xfer_win.on_close_window(move || {
-            // 收起 = 藏起来，传输继续（要真停下得去主窗口点「取消接收」）
+            // 收起 = 藏起来，传输继续（要真停下得点窗口里的「取消」）
             dismissed.store(true, Ordering::Relaxed);
             if let Some(w) = weak.upgrade() {
+                #[cfg(windows)]
+                {
+                    // 用户可能把窗口拖到别处了：收起时顺手记住
+                    let placed = tw_state.lock().ok().and_then(|g| g.placed_at);
+                    if let Ok(mut s) = st.lock() {
+                        save_transfer_pos(&w, &mut s, placed);
+                    }
+                }
                 let _ = w.hide();
             }
         });
@@ -536,6 +636,8 @@ fn main() -> Result<(), slint::PlatformError> {
         // 独立传输窗口：这一轮有没有弹过 / 用户是不是已经把它收起来了
         let xfer_weak = xfer_win.as_weak();
         let xfer_dismissed = Arc::clone(&xfer_dismissed);
+        #[cfg(windows)]
+        let tw_state = Arc::clone(&tw_state);
         let mut tw_shown = false;
         // 这一轮传完的时刻（用来数「已完成」亮够 3 秒没有）
         let mut tw_finish_at: Option<std::time::Instant> = None;
@@ -892,6 +994,11 @@ fn main() -> Result<(), slint::PlatformError> {
                         {
                             tw_shown = false;
                             xfer_dismissed.store(false, Ordering::Relaxed);
+                            #[cfg(windows)]
+                            {
+                                let placed = tw_state.lock().ok().and_then(|g| g.placed_at);
+                                save_transfer_pos(&tw, &mut s, placed);
+                            }
                             let _ = tw.hide();
                         }
                     } else {
@@ -900,7 +1007,28 @@ fn main() -> Result<(), slint::PlatformError> {
                         // 新一轮传输才重新弹（用户点过「收起」就别再烦他）
                         if !tw_shown && !xfer_dismissed.load(Ordering::Relaxed) {
                             tw_shown = true;
+                            // 第一次出现：贴到工作区右下角（用户拖过就按记住的位置），
+                            // 窗口建出来后再补几帧落位 + 置顶
+                            #[cfg(windows)]
+                            {
+                                let (pw, ph) = transfer_window_px(&tw);
+                                let origin =
+                                    tray_win::transfer_window_origin(pw, ph, s.config.xfer_win_pos);
+                                if let Ok(mut g) = tw_state.lock() {
+                                    g.begin();
+                                    g.placed_at = Some(origin);
+                                }
+                                tw.window().set_position(slint::PhysicalPosition::new(
+                                    origin.0, origin.1,
+                                ));
+                            }
                             let _ = tw.show();
+                        }
+                        #[cfg(windows)]
+                        if tw_shown {
+                            if let Ok(mut g) = tw_state.lock() {
+                                g.tick(&tw);
+                            }
                         }
                     }
                 }
@@ -910,6 +1038,11 @@ fn main() -> Result<(), slint::PlatformError> {
                 xfer_dismissed.store(false, Ordering::Relaxed);
                 if let Some(tw) = xfer_weak.upgrade() {
                     tw.set_done(true);
+                    #[cfg(windows)]
+                    {
+                        let placed = tw_state.lock().ok().and_then(|g| g.placed_at);
+                        save_transfer_pos(&tw, &mut s, placed);
+                    }
                     let _ = tw.hide();
                 }
             }

@@ -29,6 +29,10 @@ pub struct Config {
     pub max_devices: usize,
     /// 是否在右键「发送到」菜单里放一个「发送到手机」快捷方式
     pub sendto: bool,
+    /// 独立传输窗口上次被用户拖到的位置（物理像素，窗口左上角）。
+    /// None = 还没摆过 / 用户没拖过，第一次出现时自己贴到工作区右下角。
+    /// 两个坐标都必须有：文件被手改坏、只剩半行时当作没存过。
+    pub xfer_win_pos: Option<(i32, i32)>,
 }
 
 impl Default for Config {
@@ -43,6 +47,7 @@ impl Default for Config {
             minimize_to_tray: true,
             max_devices: 3,
             sendto: false,
+            xfer_win_pos: None,
         }
     }
 }
@@ -68,6 +73,9 @@ impl Config {
             Ok(text) => text,
             Err(_) => return cfg,
         };
+        // 传输窗口的坐标分两个键存，两行都读到才算数
+        let mut win_x: Option<i32> = None;
+        let mut win_y: Option<i32> = None;
         for line in text.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
@@ -126,8 +134,17 @@ impl Config {
                 "sendto" | "send_to" => {
                     cfg.sendto = !(value == "0" || value.eq_ignore_ascii_case("false"));
                 }
+                "xfer_win_x" => {
+                    win_x = value.parse::<i32>().ok();
+                }
+                "xfer_win_y" => {
+                    win_y = value.parse::<i32>().ok();
+                }
                 _ => {}
             }
+        }
+        if let (Some(x), Some(y)) = (win_x, win_y) {
+            cfg.xfer_win_pos = Some((x, y));
         }
         cfg
     }
@@ -153,7 +170,11 @@ impl Config {
              # 同时连接的手机数量上限（1-8）\n\
              max_devices = {}\n\
              # 右键「发送到」菜单里显示「发送到手机」（1 显示 / 0 不显示）\n\
-             sendto = {}\n",
+             sendto = {}\n\
+             # 独立传输窗口上次的位置（物理像素，窗口左上角；留空 = 自动贴工作区右下角）\n\
+             # 用户拖过就记住；拔掉副屏 / 改分辨率后位置落到屏幕外会自动回落右下角\n\
+             xfer_win_x = {}\n\
+             xfer_win_y = {}\n",
             self.receive_dir.display(),
             self.port,
             self.adb_path
@@ -169,7 +190,13 @@ impl Config {
             },
             if self.minimize_to_tray { "1" } else { "0" },
             self.max_devices,
-            if self.sendto { "1" } else { "0" }
+            if self.sendto { "1" } else { "0" },
+            self.xfer_win_pos
+                .map(|(x, _)| x.to_string())
+                .unwrap_or_default(),
+            self.xfer_win_pos
+                .map(|(_, y)| y.to_string())
+                .unwrap_or_default()
         );
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);

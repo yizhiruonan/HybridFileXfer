@@ -5,16 +5,20 @@
 use std::sync::Mutex;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows_sys::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL,
+};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    DispatchMessageW, FindWindowW, GetCursorPos, GetMessageW, LoadIconW, PostQuitMessage,
-    SetForegroundWindow, ShowWindow, TrackPopupMenu, TranslateMessage, MSG,
-    MF_STRING, SW_HIDE, SW_SHOW, TPM_BOTTOMALIGN, TPM_RIGHTBUTTON, WM_APP, WM_COMMAND, WM_DESTROY,
-    WM_LBUTTONDBLCLK, WM_RBUTTONUP, WNDCLASSW,
+    DispatchMessageW, EnumWindows, FindWindowW, GetCursorPos, GetMessageW, GetWindowTextLengthW,
+    GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, LoadIconW, PostQuitMessage,
+    SetForegroundWindow, SetWindowPos, ShowWindow, TrackPopupMenu, TranslateMessage, HWND_TOPMOST,
+    MSG, MF_STRING, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOW, TPM_BOTTOMALIGN,
+    TPM_RIGHTBUTTON, WM_APP, WM_COMMAND, WM_DESTROY, WM_LBUTTONDBLCLK, WM_RBUTTONUP, WNDCLASSW,
 };
 
 // windows-sys 0.59 没有导出 RegisterClassW，自己声明
@@ -85,6 +89,143 @@ fn deliver(paths: &[std::path::PathBuf], target: Option<&str>) -> bool {
             0,
             &cds as *const CopyDataStruct as isize,
         ) != 0
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 独立传输窗口：摆位置 / 置顶
+//
+// 之前这个窗口一出来就在系统默认位置 (182,182)，谁在前面谁盖住它。现在：
+//   * 第一次出现贴「鼠标所在那块屏」的工作区右下角（距边 24px，不压任务栏）；
+//   * 用户拖过就记住坐标（config.ini 的 xfer_win_x / xfer_win_y），下次照办；
+//   * 记住的坐标落到屏幕外（拔了副屏、改了分辨率）就回落右下角；
+//   * 一直置顶（HWND_TOPMOST）。
+//
+// hwnd 不能靠标题找：「正在传输 / 已完成」会来回切，切换那一帧正好找不到。
+// 所以按「本进程 + 可见 + 有标题 + 标题不是主窗口」来认。
+// ---------------------------------------------------------------------------
+
+/// 句柄在调用方只当不透明整数传，省得 gui_slint.rs 也去依赖 windows-sys 的类型
+pub type HwndVal = isize;
+
+/// 工作区（不含任务栏），物理像素：(left, top, right, bottom)
+pub type WorkArea = (i32, i32, i32, i32);
+
+fn monitor_work_area(point: POINT, nearest: bool) -> Option<WorkArea> {
+    let flags = if nearest {
+        MONITOR_DEFAULTTONEAREST
+    } else {
+        MONITOR_DEFAULTTONULL
+    };
+    unsafe {
+        let monitor = MonitorFromPoint(point, flags);
+        if monitor.is_null() {
+            return None;
+        }
+        let mut info: MONITORINFO = std::mem::zeroed();
+        info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(monitor, &mut info) == 0 {
+            return None;
+        }
+        Some((
+            info.rcWork.left,
+            info.rcWork.top,
+            info.rcWork.right,
+            info.rcWork.bottom,
+        ))
+    }
+}
+
+/// 窗口该出现在哪（物理像素，左上角）
+///
+/// saved = 用户上次拖到的位置。它必须整块还在某块屏幕上（中心点落在屏幕内就行，
+/// 允许露一半在边外），否则当成「副屏被拔了」，回落到鼠标所在屏的右下角。
+pub fn transfer_window_origin(win_w: i32, win_h: i32, saved: Option<(i32, i32)>) -> (i32, i32) {
+    // 距工作区边缘的距离：资源管理器那个弹窗也是这个量级，不贴死
+    const MARGIN: i32 = 24;
+    if let Some((x, y)) = saved {
+        let center = POINT {
+            x: x + win_w / 2,
+            y: y + win_h / 2,
+        };
+        if monitor_work_area(center, false).is_some() {
+            return (x, y);
+        }
+    }
+    let mut cursor = POINT { x: 0, y: 0 };
+    unsafe {
+        GetCursorPos(&mut cursor);
+    }
+    let (left, top, right, bottom) =
+        monitor_work_area(cursor, true).unwrap_or((0, 0, 1920, 1080));
+    let x = (right - win_w - MARGIN).max(left);
+    let y = (bottom - win_h - MARGIN).max(top);
+    (x, y)
+}
+
+struct FindWindow {
+    pid: u32,
+    main_title: String,
+    found: HWND,
+}
+
+unsafe extern "system" fn find_window_proc(hwnd: HWND, lparam: LPARAM) -> i32 {
+    let state = &mut *(lparam as *mut FindWindow);
+    let mut pid = 0u32;
+    GetWindowThreadProcessId(hwnd, &mut pid);
+    if pid != state.pid {
+        return 1;
+    }
+    if IsWindowVisible(hwnd) == 0 {
+        return 1;
+    }
+    let len = GetWindowTextLengthW(hwnd);
+    if len <= 0 {
+        return 1;
+    }
+    let mut buffer = vec![0u16; len as usize + 1];
+    let n = GetWindowTextW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32);
+    if n <= 0 {
+        return 1;
+    }
+    let title = String::from_utf16_lossy(&buffer[..n as usize]);
+    // 主窗口和托盘窗口（无标题）都不是我们要的
+    if title == state.main_title {
+        return 1;
+    }
+    state.found = hwnd;
+    0 // 找到了就停
+}
+
+/// 本进程里那个独立的传输窗口；还没建出来（窗口刚 show）时返回 None
+pub fn find_transfer_window(main_title: &str) -> Option<HwndVal> {
+    let mut state = FindWindow {
+        pid: std::process::id(),
+        main_title: main_title.to_string(),
+        found: std::ptr::null_mut(),
+    };
+    unsafe {
+        EnumWindows(Some(find_window_proc), &mut state as *mut FindWindow as LPARAM);
+    }
+    if state.found.is_null() {
+        None
+    } else {
+        Some(state.found as isize)
+    }
+}
+
+/// 置顶（不改位置、不改大小、不抢焦点）
+pub fn set_topmost(hwnd: HwndVal) {
+    unsafe {
+        SetWindowPos(
+            hwnd as HWND,
+            HWND_TOPMOST,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
     }
 }
 
