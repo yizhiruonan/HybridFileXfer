@@ -123,11 +123,18 @@ struct TwWindow {
     placed_at: Option<(i32, i32)>,
     settle: u8,
     hwnd: Option<tray_win::HwndVal>,
+    /// 已经按「贴工作区右下角」摆好了（用户拖过就不再抢）
+    anchored: bool,
+    /// 已经置顶过（省得每帧都 SetWindowPos）
+    pinned: bool,
 }
 
 /// 补几次落位（150ms 一帧 → 约 0.9 秒）。之后再动窗口就是抢用户的拖动。
 #[cfg(windows)]
 const TW_SETTLE_TICKS: u8 = 6;
+/// 传输窗口的可见右下角离工作区右下角多少像素（和资源管理器那个弹窗一个量级）
+#[cfg(windows)]
+const TW_MARGIN: i32 = 24;
 
 #[cfg(windows)]
 impl TwWindow {
@@ -136,24 +143,38 @@ impl TwWindow {
         self.settle = TW_SETTLE_TICKS;
     }
 
-    /// 每帧调一次：把窗口摆到目标位置 + 置顶。hwnd 要等窗口真建出来才拿得到。
-    fn tick(&mut self, tw: &TransferWindow) {
+    /// 每帧调一次：把窗口摆到位 + 置顶。hwnd 要等窗口真建出来才拿得到。
+    ///
+    /// 摆位置分两种：
+    ///   * 用户拖过（config 里有坐标）→ 照那个坐标（show 之前已经 set_position 过一次）；
+    ///   * 没拖过 → 贴着工作区右下角。这一步用「量一下现在的可见右下角离工作区还差多少、
+    ///     再挪多少」的写法（tray_win::nudge_to_bottom_right），不去猜标题栏和边框多高，
+    ///     多显示器也是按窗口自己所在那块屏算。
+    fn tick(&mut self, tw: &TransferWindow, saved: Option<(i32, i32)>) {
         if self.settle == 0 {
             return;
         }
         self.settle -= 1;
-        if let Some((x, y)) = self.placed_at {
-            let now = tw.window().position();
-            // 位置还没生效（有的后端在窗口建出来之前 set_position 是空操作）
-            if now.x != x || now.y != y {
-                tw.window().set_position(slint::PhysicalPosition::new(x, y));
-            }
-        }
         if self.hwnd.is_none() {
             self.hwnd = tray_win::find_transfer_window(WINDOW_TITLE);
         }
-        if let Some(hwnd) = self.hwnd {
+        let Some(hwnd) = self.hwnd else { return };
+        if !self.anchored {
+            if saved.is_some() {
+                // 记住的位置：show 之前已经放好了，这里只是再确认一次
+                tw.window().set_position(slint::PhysicalPosition::new(saved.unwrap().0, saved.unwrap().1));
+                self.anchored = true;
+            } else if tray_win::nudge_to_bottom_right(hwnd, TW_MARGIN) {
+                self.anchored = true;
+            }
+        }
+        if !self.pinned {
             tray_win::set_topmost(hwnd);
+            self.pinned = true;
+        }
+        // 记下最终位置：用户之后把它拖走，save_transfer_pos 一对比就知道该存了
+        if let Some(pos) = tray_win::window_position(hwnd) {
+            self.placed_at = Some(pos);
         }
     }
 }
@@ -194,6 +215,166 @@ fn save_transfer_pos(tw: &TransferWindow, state: &mut State, placed: Option<(i32
     if let Err(e) = config.save(&path) {
         log::warn(&format!("保存传输窗口位置失败: {e}"));
     }
+}
+
+// ---------------------------------------------------------------------------
+// 「取消接收」的四个落点：主界面和独立传输窗口共用这一份
+//
+// 点取消 → 先暂停（手机端在暂停同步里看到就停发，别让它在用户看确认框的这几秒里
+// 继续往盘里灌数据）→ 弹「保留 / 不保留 / 继续接收」→ 按选择收尾。
+// 两个窗口注册的回调都是下面这几个函数，语义不许长出第二套。
+// ---------------------------------------------------------------------------
+
+/// 取消被点了一下。返回 false = 这次点击被忽略（没在接收 / 已经在取消中），
+/// 界面据此不弹确认框 —— 同一轮接收只允许取消一次。
+fn cancel_recv_request() -> bool {
+    if !hfx_receiver::control::receiving() {
+        log::warn(i18n::tr(
+            "按钮：取消接收被忽略（当前没有接收在进行）",
+            "cancel receiving ignored: nothing is being received",
+        ));
+        return false;
+    }
+    if hfx_receiver::control::cancel_requested() {
+        // 第一次取消已经在收尾 / 重建里了：这次点击直接复用上一次的结果，
+        // 绝不再往控制通道插第二帧（那会和手机端的重建握手抢帧序）。
+        log::warn(i18n::tr(
+            "按钮：取消接收被忽略（这次取消已经受理过）",
+            "cancel receiving ignored: this cancel was already accepted",
+        ));
+        return false;
+    }
+    hfx_receiver::control::pause(true);
+    log::warn(i18n::tr(
+        "按钮：取消接收（已暂停，等用户选择是否保留进度）",
+        "button: cancel receiving (paused, waiting for the user's choice)",
+    ));
+    true
+}
+
+/// 保留：收尾时留着半截文件和 .hfxpart（下次同一个文件接着传）
+fn cancel_keep(st: &Arc<Mutex<State>>) {
+    if !hfx_receiver::control::cancel_receive(hfx_receiver::control::CancelChoice::Keep) {
+        // 幂等：这次取消已经受理过（收尾 / 重建还没做完）时不再做任何事，
+        // 上一次的结果原样复用，界面不重复提示、控制通道不插第二帧。
+        log::warn(i18n::tr(
+            "按钮：取消接收 · 保留进度被忽略（这次取消已经受理过）",
+            "cancel · keep ignored: this cancel was already accepted",
+        ));
+        return;
+    }
+    log::warn(i18n::tr(
+        "按钮：取消接收 · 保留进度（半截文件和 .hfxpart 留着，可续传）",
+        "button: cancel receiving · keep the partial file (resumable)",
+    ));
+    if let Ok(mut s) = st.lock() {
+        s.cancel_note = Some(
+            i18n::tr(
+                "已取消：保留已收到的部分，下次同一个文件可续传",
+                "cancelled: what already arrived is kept and can be resumed",
+            )
+            .to_string(),
+        );
+    }
+}
+
+/// 不保留：收尾（Receiver::finish_with(false)）会把没传完的文件和续传记录删掉
+fn cancel_discard(st: &Arc<Mutex<State>>) {
+    if !hfx_receiver::control::cancel_receive(hfx_receiver::control::CancelChoice::Discard) {
+        log::warn(i18n::tr(
+            "按钮：取消接收 · 不保留被忽略（这次取消已经受理过）",
+            "cancel · discard ignored: this cancel was already accepted",
+        ));
+        return;
+    }
+    log::warn(i18n::tr(
+        "按钮：取消接收 · 不保留（收尾删掉没传完的文件和续传记录）",
+        "button: cancel receiving · discard the incomplete files",
+    ));
+    if let Ok(mut s) = st.lock() {
+        s.cancel_note = Some(
+            i18n::tr(
+                "已取消：已删除未传完的文件和续传记录",
+                "cancelled: the incomplete files and their resume journals were removed",
+            )
+            .to_string(),
+        );
+    }
+}
+
+/// 确认框里选了「继续接收」：把刚才为了弹框加的暂停放掉，传输照常
+fn cancel_dismiss() {
+    hfx_receiver::control::pause(false);
+    log::info(i18n::tr(
+        "取消接收确认框：选了「继续接收」",
+        "cancel dialog: keep receiving",
+    ));
+}
+
+/// 剩余时间的说法（速率为 0 时调用方不要用这个）
+fn human_eta(secs: u64) -> String {
+    if secs >= 3600 {
+        format!("{} 小时 {} 分", secs / 3600, (secs % 3600) / 60)
+    } else if secs >= 60 {
+        format!("{} 分 {} 秒", secs / 60, secs % 60)
+    } else {
+        format!("{secs} 秒")
+    }
+}
+
+/// 传输窗口收起时的高度（逻辑像素），和 app.slint 的 preferred-height 对得上
+const TW_H_COLLAPSED: f32 = 151.0;
+/// 明细一行的高度（app.slint 里 for 循环的 height: 22px）
+const TW_ROW_H: f32 = 22.0;
+
+/// 传输窗口这一轮该多高：收起 151；展开明细 = 151 + 6 + 行数*22 + 6 + 18；
+/// 弹「取消」确认框时至少 200（卡片 168 + 上下留白），否则卡片会被窗口裁掉。
+/// 把传输窗口摆到该在的位置再显示。
+///
+/// 三处「要弹出来了」都走它（正常开始 / 失败 / 失败后重新弹）：先摆个大概位置（省得在系统默认
+/// 位置闪一下），再让 `TwWindow::tick` 量出真实边框贴到工作区右下角 + 置顶。
+/// 少走一处就是一次真机 bug —— 失败那一轮当初只 `show()` 过，窗口停在 (130,130)。
+fn show_transfer_window(
+    tw: &TransferWindow,
+    s: &mut State,
+    tw_state: &Arc<Mutex<TwWindow>>,
+) {
+    #[cfg(windows)]
+    {
+        // +16 / +40 是边框和标题栏的估算值，只影响这一两帧
+        let (pw, ph) = transfer_window_px(tw);
+        let origin = tray_win::transfer_window_origin(pw + 16, ph + 40, s.config.xfer_win_pos);
+        if let Ok(mut g) = tw_state.lock() {
+            g.begin();
+            g.placed_at = Some(origin);
+        }
+        tw.window()
+            .set_position(slint::PhysicalPosition::new(origin.0, origin.1));
+    }
+    #[cfg(not(windows))]
+    let _ = (s, tw_state);
+    let _ = tw.show();
+    #[cfg(windows)]
+    if let Ok(mut g) = tw_state.lock() {
+        g.tick(tw, s.config.xfer_win_pos);
+    }
+}
+
+fn transfer_window_height(details: bool, rows: usize, cancel_ask: bool, failed: bool) -> f32 {
+    let mut h = TW_H_COLLAPSED;
+    if details {
+        h += 30.0 + rows as f32 * TW_ROW_H;
+    }
+    // 「接收失败：<原因>」那一行（app.slint 里 height: 20px）
+    if failed {
+        h += 20.0;
+    }
+    if cancel_ask {
+        // 确认框的卡片是 404x168（app.slint），窗口比它矮就会被裁掉 ——
+        // 真机第一次点 ✕ 就撞见了「按钮只露出半截」
+        h = h.max(216.0);
+    }
+    h
 }
 
 fn main() -> Result<(), slint::PlatformError> {
@@ -367,6 +548,8 @@ fn main() -> Result<(), slint::PlatformError> {
             ui.set_cancel_ask(false);
             hfx_receiver::control::pause(false);
             hfx_receiver::receiver::PROGRESS.reset();
+            // 上一轮的「接收失败」提示别带进这一轮
+            hfx_receiver::receiver::clear_failure();
             hfx_receiver::session::reset_send_segments();
             log::info("按钮：开始接收");
             s.start_engine(port, mode, dir);
@@ -456,10 +639,13 @@ fn main() -> Result<(), slint::PlatformError> {
         let weak = xfer_win.as_weak();
         flow_timer.start(slint::TimerMode::Repeated, Duration::from_millis(16), move || {
             let Some(tw) = weak.upgrade() else { return };
-            if !tw.window().is_visible() || tw.get_done() || tw.get_paused() {
+            // 速率为 0 / 暂停 / 传完 → 停住（一边 0 MB/s 一边还在流，看着像卡死）
+            if !tw.window().is_visible() || tw.get_done() || tw.get_paused() || !tw.get_flow_on() {
                 return;
             }
-            let mut f = tw.get_flow() + 0.010;
+            // 一趟 2.2 秒：16ms 一帧 → 每帧 +0.0073。以前是 1.6 秒一趟、亮带才 120px，
+            // 逐帧抓屏 20 帧才捞到 3 帧，等于「看不出在流」。
+            let mut f = tw.get_flow() + 0.0073;
             if f >= 1.0 {
                 f -= 1.0;
             }
@@ -475,6 +661,8 @@ fn main() -> Result<(), slint::PlatformError> {
         let tw_state = Arc::clone(&tw_state);
         xfer_win.on_close_window(move || {
             // 收起 = 藏起来，传输继续（要真停下得点窗口里的「取消」）
+            // 失败那一轮点这颗 = 「我知道了」：把失败提示消费掉，下一轮正常弹回来
+            hfx_receiver::receiver::clear_failure();
             dismissed.store(true, Ordering::Relaxed);
             if let Some(w) = weak.upgrade() {
                 #[cfg(windows)]
@@ -489,101 +677,69 @@ fn main() -> Result<(), slint::PlatformError> {
             }
         });
     }
+    // 标题栏的 ✕ 和窗口里的「收起」是同一件事：藏起来，传输继续。
+    // （不接管的话 Slint 会当成「关窗」，窗口状态和这边的 tw_shown 就对不上了）
+    {
+        let weak = xfer_win.as_weak();
+        let dismissed = Arc::clone(&xfer_dismissed);
+        #[cfg(windows)]
+        let st = Arc::clone(&state);
+        #[cfg(windows)]
+        let tw_state = Arc::clone(&tw_state);
+        xfer_win.window().on_close_requested(move || {
+            hfx_receiver::receiver::clear_failure();
+            dismissed.store(true, Ordering::Relaxed);
+            if let Some(w) = weak.upgrade() {
+                #[cfg(windows)]
+                {
+                    let placed = tw_state.lock().ok().and_then(|g| g.placed_at);
+                    if let Ok(mut s) = st.lock() {
+                        save_transfer_pos(&w, &mut s, placed);
+                    }
+                }
+                let _ = w.hide();
+            }
+            slint::CloseRequestResponse::KeepWindowShown
+        });
+    }
+    // 「▾ 详细信息」：只翻一个 bool，窗口高度由主循环那边跟着算
+    //（收起/展开都不动窗口位置：set_size 只改大小）
+    {
+        let weak = xfer_win.as_weak();
+        xfer_win.on_toggle_details(move || {
+            if let Some(w) = weak.upgrade() {
+                // 传完之后明细没意义（窗口正准备收起来），别让它把窗口撑大
+                if w.get_done() {
+                    return;
+                }
+                w.set_details(!w.get_details());
+            }
+        });
+    }
     // ---- 接收方向的「取消」（不只是暂停 / 继续）----
-    // 点「取消」先暂停：手机端在暂停同步里看到电脑暂停就会停发，
-    // 别让它在用户看确认框的这几秒里继续往盘里灌数据。
-    // 返回 bool：false = 这次点击被忽略（没在接收 / 已经在取消中），
-    // Slint 那边据此不弹确认框 —— 同一轮接收只允许取消一次。
-    ui.on_cancel_recv(move || -> bool {
-        if !hfx_receiver::control::receiving() {
-            log::warn(i18n::tr(
-                "按钮：取消接收被忽略（当前没有接收在进行）",
-                "cancel receiving ignored: nothing is being received",
-            ));
-            return false;
-        }
-        if hfx_receiver::control::cancel_requested() {
-            // 第一次取消已经在收尾 / 重建里了：这次点击直接复用上一次的结果，
-            // 绝不再往控制通道插第二帧（那会和手机端的重建握手抢帧序）。
-            log::warn(i18n::tr(
-                "按钮：取消接收被忽略（这次取消已经受理过）",
-                "cancel receiving ignored: this cancel was already accepted",
-            ));
-            return false;
-        }
-        hfx_receiver::control::pause(true);
-        log::warn(i18n::tr(
-            "按钮：取消接收（已暂停，等用户选择是否保留进度）",
-            "button: cancel receiving (paused, waiting for the user's choice)",
-        ));
-        true
-    });
+    // 主界面和独立传输窗口注册的是同一套函数（见上面的 cancel_recv_request / cancel_keep /
+    // cancel_discard / cancel_dismiss），语义只有一份 —— 弹窗上的 ✕ 和主界面上的「取消」
+    // 完全等价：先暂停（手机端跟着停发），再问「保留进度 / 不保留，删掉 / 继续接收」。
+    ui.on_cancel_recv(cancel_recv_request);
+    xfer_win.on_cancel_recv(cancel_recv_request);
     {
         let st = Arc::clone(&state);
-        ui.on_cancel_keep(move || {
-            // 保留：和手机端「保留进度」同一个语义 —— 收尾时留着半截文件和 .hfxpart
-            if !hfx_receiver::control::cancel_receive(
-                hfx_receiver::control::CancelChoice::Keep,
-            ) {
-                // 幂等：这次取消已经受理过（收尾 / 重建还没做完）时不再做任何事，
-                // 上一次的结果原样复用，界面不重复提示、控制通道不插第二帧。
-                log::warn(i18n::tr(
-                    "按钮：取消接收 · 保留进度被忽略（这次取消已经受理过）",
-                    "cancel · keep ignored: this cancel was already accepted",
-                ));
-                return;
-            }
-            log::warn(i18n::tr(
-                "按钮：取消接收 · 保留进度（半截文件和 .hfxpart 留着，可续传）",
-                "button: cancel receiving · keep the partial file (resumable)",
-            ));
-            if let Ok(mut s) = st.lock() {
-                s.cancel_note = Some(
-                    i18n::tr(
-                        "已取消：保留已收到的部分，下次同一个文件可续传",
-                        "cancelled: what already arrived is kept and can be resumed",
-                    )
-                    .to_string(),
-                );
-            }
-        });
+        ui.on_cancel_keep(move || cancel_keep(&st));
     }
     {
         let st = Arc::clone(&state);
-        ui.on_cancel_discard(move || {
-            // 不保留：收尾（Receiver::finish_with(false)）会把没传完的文件和续传记录删掉
-            if !hfx_receiver::control::cancel_receive(
-                hfx_receiver::control::CancelChoice::Discard,
-            ) {
-                log::warn(i18n::tr(
-                    "按钮：取消接收 · 不保留被忽略（这次取消已经受理过）",
-                    "cancel · discard ignored: this cancel was already accepted",
-                ));
-                return;
-            }
-            log::warn(i18n::tr(
-                "按钮：取消接收 · 不保留（收尾删掉没传完的文件和续传记录）",
-                "button: cancel receiving · discard the incomplete files",
-            ));
-            if let Ok(mut s) = st.lock() {
-                s.cancel_note = Some(
-                    i18n::tr(
-                        "已取消：已删除未传完的文件和续传记录",
-                        "cancelled: the incomplete files and their resume journals were removed",
-                    )
-                    .to_string(),
-                );
-            }
-        });
+        xfer_win.on_cancel_keep(move || cancel_keep(&st));
     }
-    ui.on_cancel_dismiss(move || {
-        // 确认框里选了「继续接收」：把刚才加的暂停放掉，传输照常
-        hfx_receiver::control::pause(false);
-        log::info(i18n::tr(
-            "取消接收确认框：选了「继续接收」",
-            "cancel dialog: keep receiving",
-        ));
-    });
+    {
+        let st = Arc::clone(&state);
+        ui.on_cancel_discard(move || cancel_discard(&st));
+    }
+    {
+        let st = Arc::clone(&state);
+        xfer_win.on_cancel_discard(move || cancel_discard(&st));
+    }
+    ui.on_cancel_dismiss(cancel_dismiss);
+    xfer_win.on_cancel_dismiss(cancel_dismiss);
     {
         let st = Arc::clone(&state);
         ui.on_tray_toggled(move |enabled| {
@@ -639,12 +795,18 @@ fn main() -> Result<(), slint::PlatformError> {
         #[cfg(windows)]
         let tw_state = Arc::clone(&tw_state);
         let mut tw_shown = false;
+        // 上一帧的「明细展开 / 取消框在显示」状态：只在变化的那一刻改窗口高度
+        let mut tw_failed_on = false;
+        // 明细行数（= 通道段数）。active 分支算出来的，给外面「每帧跟高度」那段用
+        let mut last_row_count = 0usize;
+        let mut tw_details_on = false;
+        let mut tw_cancel_on = false;
         // 这一轮传完的时刻（用来数「已完成」亮够 3 秒没有）
         let mut tw_finish_at: Option<std::time::Instant> = None;
         let mut last_bytes = 0u64;
         let mut last_tick = std::time::Instant::now();
         let mut speed = 0f64;
-        let mut last_xfer_visible = false;
+
         let mut last_want_h = 0f32;
         let mut boot_hidden = false;
 
@@ -830,6 +992,12 @@ fn main() -> Result<(), slint::PlatformError> {
             // 独立窗口那边要的还是字节总数，先留一份
             let total_bytes = total;
 
+            // 这一轮是不是失败结束的（块账本对不上 / 手机端说指纹不一致）。
+            // 失败不能亮一下「已完成」再自己收起来 —— 用户会以为传完了
+            // （TRANSFER-WINDOW.md §2.1：失败/取消停在窗口上，等用户看见）。
+            let failure_now = hfx_receiver::receiver::last_failure();
+            let failed = failure_now.is_some();
+
             // 速率只按「这次真收到的字节」算：续传基线（磁盘上本来就有的一块）不算进去，
             // 否则续传一开始会跳出一个几 GB/s 的假峰值。
             let received = hfx_receiver::receiver::PROGRESS.received_bytes();
@@ -921,23 +1089,50 @@ fn main() -> Result<(), slint::PlatformError> {
                 // 通道抢走别人的段后，旧的边界会一直留在位图里（切分痕迹）。
                 // 之前发送方向用 SendPlan 的任务区间：边界只在"领任务"那一刻重算，
                 // 和实际发完的块对不上，看起来就是整段一起跳、没有切分痕迹。
-                let raw: Vec<hfx_receiver::receiver::XferSeg> = hfx_receiver::receiver::PROGRESS.segments();
+                let mut raw: Vec<hfx_receiver::receiver::XferSeg> =
+                    hfx_receiver::receiver::PROGRESS.segments();
                 let total: f32 = raw.iter().map(|s| s.span).sum::<f32>().max(1.0);
-                let mut start = 0.0f32;
-                let mut segs: Vec<XferSeg> = Vec::with_capacity(raw.len());
-                for s in &raw {
-                    let span = s.span / total;
-                    segs.push(XferSeg {
-                        start: start.clamp(0.0, 1.0),
-                        span: span.clamp(0.0, 1.0),
-                        filled: s.filled.clamp(0.0, 1.0),
-                    });
-                    start += span;
+                for s in raw.iter_mut() {
+                    s.span = (s.span / total).clamp(0.0, 1.0);
+                    s.filled = s.filled.clamp(0.0, 1.0);
                 }
-                // 已填充比例（按块算）：流光只在这一段里扫
-                let fill_frac: f32 = segs.iter().map(|s| s.span * s.filled).sum::<f32>().clamp(0.0, 1.0);
-                let seg_model = slint::ModelRc::new(slint::VecModel::from(segs));
-                ui.set_xfer_segments(seg_model.clone());
+                // 已填充比例（按块算）：进度条画到哪、流光在哪儿扫都看它
+                let fill_frac: f32 = raw.iter().map(|s| s.span * s.filled).sum::<f32>().clamp(0.0, 1.0);
+
+                // ---- 「详细信息」里的明细行：一段（一条通道负责的连续块区间）一行 ----
+                // 电脑端目前**没有**「每通道速率」这份数据（PROGRESS 只记了每段占多少、
+                // 这段完成了多少），所以这里只显示能从块位图算出来的东西：
+                // 占整条多少 · 这段已收 / 这段总量 · 完成百分比。
+                // 不为了好看编速率 —— 真要每通道速率，得先给 receiver.rs 加数据源。
+                // 多文件的队列同理：PROGRESS 只有当前这一轮，队列要另开数据源。
+                let mut rows: Vec<XferRow> = Vec::with_capacity(raw.len());
+                for (i, s) in raw.iter().enumerate() {
+                    let seg_total = (total_bytes as f64 * s.span as f64) as u64;
+                    let seg_done = (seg_total as f64 * s.filled as f64) as u64;
+                    rows.push(XferRow {
+                        name: format!("通道段 {}", i + 1).into(),
+                        span_text: format!("{:.0}%", s.span * 100.0).into(),
+                        amount: format!("{} / {}", human(seg_done), human(seg_total)).into(),
+                        percent: (s.filled * 100.0).round() as i32,
+                    });
+                }
+                let row_count = rows.len();
+                // 进度条上的切分刻度（IDM 同款）：段是「相邻已完成块换了通道」留下的痕迹，
+                // 位置就是它占整条的比例；条本身仍是从左往右一条（见 app.slint 的说明）。
+                let mut segs: Vec<XferSeg> = Vec::with_capacity(raw.len());
+                let mut seg_at = 0.0f32;
+                for s in raw.iter() {
+                    segs.push(XferSeg {
+                        x: seg_at,
+                        span: s.span,
+                        filled: s.filled,
+                    });
+                    seg_at += s.span;
+                }
+                let segs_model = slint::ModelRc::new(slint::VecModel::from(segs));
+                // 外面那段「每帧跟高度」要用：它跑的时候 active 可能是 false，拿不到 rows
+                last_row_count = row_count;
+                let rows_model = slint::ModelRc::new(slint::VecModel::from(rows));
 
                 // ---- 独立传输窗口：同一份数据再喂一遍 ----
                 // 传完了没有：真机第一次跑出来的是「已完成 100%」+ 0 B/s 一直挂着不消失 ——
@@ -951,20 +1146,42 @@ fn main() -> Result<(), slint::PlatformError> {
                 let in_flight = hfx_receiver::control::receiving() || hfx_receiver::control::sending();
                 let finished = (total_bytes > 0 && done >= total_bytes) || !in_flight;
                 if let Some(tw) = xfer_weak.upgrade() {
+                    // 主文案照参考图的口气：「正在将 xxx（3.00 GB）从手机复制到 HybridFileXfer」
+                    let dir_name = s
+                        .config
+                        .receive_dir
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| s.config.receive_dir.display().to_string());
+                    let size_text = human(total_bytes);
+                    let sending = ui.get_send_active();
                     tw.set_action_text(
-                        if finished {
-                            if ui.get_send_active() {
-                                "文件已发送完成"
-                            } else {
-                                "文件已接收完成"
+                        match (failed, finished, sending) {
+                            (true, _, _) => i18n::tr("接收失败", "receiving failed").to_string(),
+                            (false, true, true) => {
+                                format!("已将 {}（{}）发送到手机", short, size_text)
                             }
-                        } else if ui.get_send_active() {
-                            "正在发送文件"
-                        } else {
-                            "正在接收文件"
+                            (false, true, false) => {
+                                format!("已将 {}（{}）复制到 {}", short, size_text, dir_name)
+                            }
+                            (false, false, true) => {
+                                format!("正在将 {}（{}）从电脑复制到手机", short, size_text)
+                            }
+                            (false, false, false) => {
+                                format!("正在将 {}（{}）从手机复制到 {}", short, size_text, dir_name)
+                            }
                         }
                         .into(),
                     );
+                    // 失败原因挂在窗口上（红色那行），并在主窗口的状态卡下面也留一句
+                    tw.set_failed(failed);
+                    tw.set_fail_text(failure_now.clone().unwrap_or_default().into());
+                    if let Some(reason) = failure_now.as_deref() {
+                        let note = format!("{}：{}", i18n::tr("这次传输失败了", "the transfer failed"), reason);
+                        if ui.get_notice_text() != note {
+                            ui.set_notice_text(note.into());
+                        }
+                    }
                     // 百分比往下取整：向上四舍五入会在「1.99 / 2.00 GB」就跳成 100%，
                     // 而这时其实还在传（第一次真机就是 100% 挂着 3.5 MB/s，看着像卡死）。
                     // 没传完最多显示 99%，满字节了才给 100%。
@@ -973,16 +1190,66 @@ fn main() -> Result<(), slint::PlatformError> {
                     } else {
                         0
                     };
-                    tw.set_percent(if finished { 100 } else { pct.min(99) });
-                    tw.set_file_name(short.clone().into());
+                    // 失败的时候按块算：真机那次字节数明明满了、却缺 2 块，
+                    // 报「未完成 100%」是自相矛盾的，按块算出来是 99%。
+                    let shown_pct = if failed {
+                        // 用 set_failure 那一刻拍下来的百分比：失败之后 PROGRESS 可能已经
+                        // 是上一轮 / 下一轮的数字（真机撞见过「未完成 100%」）
+                        hfx_receiver::receiver::failure_percent().unwrap_or(99)
+                    } else if finished {
+                        100
+                    } else {
+                        pct.min(99)
+                    };
+                    tw.set_percent(shown_pct);
                     tw.set_detail_text(
                         format!("{} / {} · {}", human(done), human(total_bytes), speed_text)
-                    .into());
+                            .into(),
+                    );
                     tw.set_paused(hfx_receiver::control::paused());
                     tw.set_done(finished);
                     tw.set_fill(fill_frac);
-                    tw.set_segs(seg_model);
-                    if finished {
+                    tw.set_rows(rows_model.clone());
+                    tw.set_segs(segs_model.clone());
+                    tw.set_cancelling(hfx_receiver::control::cancel_requested());
+                    // 流光只在「真在传」的时候扫：暂停 / 传完 / 速率掉到 0 都停住
+                    tw.set_flow_on(!finished && !hfx_receiver::control::paused() && speed > 0.5);
+                    // 合计速率 · 剩余时间（剩余时间是算出来的，速率不够就不瞎报）
+                    let summary = if speed > 0.5 && total_bytes > done {
+                        let remain = ((total_bytes - done) as f64 / speed) as u64;
+                        format!("合计 {} · 剩余约 {}", human_speed(speed), human_eta(remain))
+                    } else {
+                        format!("合计 {} · 剩余时间未知", human_speed(speed))
+                    };
+                    tw.set_summary_text(summary.into());
+                    // 高度同步不放在这里：暂停等用户选「保留/不保留」的时候 active 已经是 false，
+                    // 这一支根本不跑，对话框就会被 151 高的窗口裁掉（真机第一次点 ✕ 就是这个下场）。
+                    // 下面 active 分支之外有一段专门干这个。
+                    if failed {
+                        // 失败了：停在窗口上等用户看见。3 秒自动收是对「传完了」才有的礼遇，
+                        // 对失败用就是骗人（用户回头只看到文件在那儿，以为传好了）。
+                        // 窗口要是已经收起来过（上一轮刚自动收完 / 用户点过收起），重新弹出来。
+                        if !tw_shown && !xfer_dismissed.load(Ordering::Relaxed) {
+                            tw_shown = true;
+                            show_transfer_window(&tw, &mut s, &tw_state);
+                        }
+                        #[cfg(windows)]
+                        if tw_shown {
+                            let saved = s.config.xfer_win_pos;
+                            if let Ok(mut g) = tw_state.lock() {
+                                g.tick(&tw, saved);
+                            }
+                        }
+                        if tw.get_details() {
+                            tw.set_details(false);
+                        }
+                        tw_finish_at = None;
+                    } else if finished {
+                        // 传完了就把明细收起来：窗口回到收起高度，
+                        // 3 秒的「已完成」不用顶着 400px 的空白
+                        if tw.get_details() {
+                            tw.set_details(false);
+                        }
                         // 第一眼看到「满了」的时候记时间，3 秒后收窗口
                         if tw_finish_at.is_none() {
                             tw_finish_at = Some(std::time::Instant::now());
@@ -1009,27 +1276,30 @@ fn main() -> Result<(), slint::PlatformError> {
                             tw_shown = true;
                             // 第一次出现：贴到工作区右下角（用户拖过就按记住的位置），
                             // 窗口建出来后再补几帧落位 + 置顶
-                            #[cfg(windows)]
-                            {
-                                let (pw, ph) = transfer_window_px(&tw);
-                                let origin =
-                                    tray_win::transfer_window_origin(pw, ph, s.config.xfer_win_pos);
-                                if let Ok(mut g) = tw_state.lock() {
-                                    g.begin();
-                                    g.placed_at = Some(origin);
-                                }
-                                tw.window().set_position(slint::PhysicalPosition::new(
-                                    origin.0, origin.1,
-                                ));
-                            }
-                            let _ = tw.show();
+                            show_transfer_window(&tw, &mut s, &tw_state);
                         }
                         #[cfg(windows)]
                         if tw_shown {
+                            let saved = s.config.xfer_win_pos;
                             if let Ok(mut g) = tw_state.lock() {
-                                g.tick(&tw);
+                                g.tick(&tw, saved);
                             }
                         }
+                    }
+                }
+            } else if failed {
+                // 失败但已经不在传输中（收尾那一帧就走到了这里）：保证窗口还在，
+                // 别让用户错过「接收失败」这一眼。
+                if let Some(tw) = xfer_weak.upgrade() {
+                    if !tw.window().is_visible() && !xfer_dismissed.load(Ordering::Relaxed) {
+                        tw.set_done(true);
+                        tw.set_failed(true);
+                        tw.set_flow_on(false);
+                        tw.set_fail_text(failure_now.clone().unwrap_or_default().into());
+                        tw.set_action_text(i18n::tr("接收失败", "receiving failed").into());
+                        tw.set_percent(hfx_receiver::receiver::failure_percent().unwrap_or(99));
+                        tw_shown = true;
+                        show_transfer_window(&tw, &mut s, &tw_state);
                     }
                 }
             } else if tw_shown {
@@ -1047,8 +1317,39 @@ fn main() -> Result<(), slint::PlatformError> {
                 }
             }
 
-            // 进度卡 / 更新提示出现时调整窗口高度（否则底部按钮会被裁掉）
-            let xfer_now = ui.get_xfer_visible();
+            // 传输窗口的高度：明细展开 / 取消确认框都会改它，**每帧都要跟**。
+            // 暂停着等用户选的时候上面那三条分支一条都不跑，漏掉这一帧对话框就被裁掉。
+            if let Some(tw) = xfer_weak.upgrade() {
+                if tw.window().is_visible() {
+                    let details_now = tw.get_details();
+                    let cancel_now = tw.get_cancel_ask();
+                    let failed_now = hfx_receiver::receiver::last_failure().is_some();
+                    if details_now != tw_details_on
+                        || cancel_now != tw_cancel_on
+                        || failed_now != tw_failed_on
+                    {
+                        tw_details_on = details_now;
+                        tw_cancel_on = cancel_now;
+                        tw_failed_on = failed_now;
+                        let h = transfer_window_height(
+                            details_now,
+                            last_row_count,
+                            cancel_now,
+                            failed_now,
+                        );
+                        tw.window().set_size(slint::LogicalSize::new(460.0, h));
+                        // 长高之后可能探出屏幕下沿（真机：明细一展开，后 6 行跑到屏幕外），
+                        // 这里只做「越界才推回来」，不抢用户拖过的位置。
+                        #[cfg(windows)]
+                        if let Some(hwnd) = tray_win::find_transfer_window(WINDOW_TITLE) {
+                            tray_win::keep_on_screen(hwnd, TW_MARGIN);
+                        }
+                    }
+                }
+            }
+
+            // 更新提示 / 设备列表出现时调整窗口高度（否则底部按钮会被裁掉）
+            // 进度卡已经从主界面删掉了（进度只在独立传输窗口里看），所以这里不再为它让高度。
             // 展开设备列表后内容会变高，窗口高度要跟着加，否则底部按钮被裁掉
             // 展开后是一行两个的小卡片：每行 46 高 + 行距 6，再留出通道换行与内边距
             let devices_h = if ui.get_devices_expanded() {
@@ -1057,15 +1358,15 @@ fn main() -> Result<(), slint::PlatformError> {
             } else {
                 0.0
             };
+            // 主界面那张进度卡删掉之后，400 的基准高度会剩一大块空白。
+            // 但也不能一味压小：设置卡 + 三个勾选框 + 底部按钮本身就要 ~360，
+            // 压到 300 时真机实测「开始接收」按钮直接被窗口裁掉（UIA 里都找不到）。
+            // 370 还是不够（真机 409 高的窗口里底部按钮被裁掉一半），用回 400。
             let want_h = 400.0
                 + if ui.get_ask_target() { 60.0 } else { 0.0 }
                 // 状态卡下面那行「已取消…」的提示
                 + if ui.get_notice_text().is_empty() { 0.0 } else { 20.0 }
                 + devices_h
-                // 190 里去掉了主界面那条进度条（12 高 + spacing 6 = 18），
-                // 否则进度卡一出现，底部按钮会往下飘 18px
-                + if xfer_now { 172.0 } else { 0.0 }
-                + if xfer_now && ui.get_send_active() { 50.0 } else { 0.0 }
                 + if ui.get_update_state() == 2 || ui.get_update_state() == 5 {
                     34.0
                 } else {
@@ -1073,7 +1374,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 };
             if (want_h - last_want_h).abs() > 0.5 {
                 last_want_h = want_h;
-                last_xfer_visible = xfer_now;
+
                 let scale = ui.window().scale_factor();
                 let current = ui.window().size();
                 let width = current.width as f32 / scale;

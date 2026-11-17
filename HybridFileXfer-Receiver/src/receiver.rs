@@ -318,71 +318,41 @@ impl FileProgress {
             .min(self.total)
     }
 
-    /// IDM 式分段：相邻块的通道归属一变就是一段。
-    /// 段数超过上限（旧的轮询式调度会让它爆炸）时退化成一条整进度。
-    fn segments(&self, max_segments: usize) -> Vec<XferSeg> {
+    /// IDM 式切分：把文件按块**均分**成 `slices` 截，每截各算各的完成度。
+    ///
+    /// 为什么按文件位置均分，而不是按「哪条通道负责哪一段」：
+    /// 接收端只给**已完成**的块记通道号（`owners[i]` 是写盘那一刻才写的），
+    /// 没完成的块根本不知道会归谁 —— 按通道切出来的宽度会随着完成情况乱跳
+    /// （先跑的那条通道一度能占到 90%），画出来就是「中间先绿、两边后绿」。
+    /// 按文件位置均分是稳的，而且这正是 IDM 的样子：几条并行的进度条各走各的，
+    /// 谁先下完谁先满。
+    fn segments(&self, slices: usize) -> Vec<XferSeg> {
         let total = self.blocks.blocks();
         if total == 0 {
             return Vec::new();
         }
-        let mut bounds: Vec<(usize, u8)> = Vec::new();
-        let mut previous: Option<u8> = None;
-        let mut segment_start = 0usize;
-        for i in 0..total {
-            if !self.blocks.is_done(i) {
-                continue;
+        let n = slices.max(1);
+        let per = total.div_ceil(n);
+        let mut out = Vec::with_capacity(n);
+        for k in 0..n {
+            let start = k * per;
+            if start >= total {
+                break;
             }
-            let owner = self.owners.get(i).copied().unwrap_or(u8::MAX);
-            match previous {
-                None => {
-                    // 第一段的起点是「第一个已完成的块」，不是 0：
-                    // 续传时前面的块可能还没到，写死 0 会让这一段从最左边开始填，
-                    // 和它真实所在的位置错位（看着就是「左边一小段蓝 + 中间大片空白」）。
-                    previous = Some(owner);
-                    segment_start = i;
+            let end = (start + per).min(total);
+            let span = (end - start) as f32;
+            let mut done = 0usize;
+            for b in start..end {
+                if self.blocks.is_done(b) {
+                    done += 1;
                 }
-                Some(prev) if prev != owner => {
-                    bounds.push((segment_start, prev));
-                    segment_start = i;
-                    previous = Some(owner);
-                }
-                _ => {}
             }
+            out.push(XferSeg {
+                span,
+                filled: (done as f32 / span).clamp(0.0, 1.0),
+            });
         }
-        let Some(last) = previous else {
-            return Vec::new();
-        };
-        bounds.push((segment_start, last));
-        if bounds.len() > max_segments.max(1) {
-            // 每块都换通道：画出来全是碎条，退回整条
-            let done = self.blocks.count() as f32;
-            return vec![XferSeg {
-                span: total as f32,
-                filled: (done / total as f32).clamp(0.0, 1.0),
-            }];
-        }
-        bounds
-            .iter()
-            .enumerate()
-            .map(|(i, &(start, _owner))| {
-                let end = bounds
-                    .get(i + 1)
-                    .map(|b| b.0)
-                    .unwrap_or(total)
-                    .clamp(start + 1, total);
-                let span = end - start;
-                let mut filled = 0usize;
-                for b in start..end {
-                    if self.blocks.is_done(b) {
-                        filled += 1;
-                    }
-                }
-                XferSeg {
-                    span: span as f32,
-                    filled: (filled as f32 / span as f32).clamp(0.0, 1.0),
-                }
-            })
-            .collect()
+        out
     }
 }
 
@@ -424,8 +394,10 @@ pub struct ProgressState {
     files: Mutex<HashMap<String, FileProgress>>,
 }
 
-/// 进度条上最多画几段；超过就退回成一条整进度
-const MAX_SEGMENTS: usize = 24;
+/// 进度条切几截（IDM 同款：一条杠分几块，每块自己跑自己的进度）。
+///
+/// 10 和手机端默认的 10 条通道对得上；文件块数少于 10 时按块数自动变少。
+const XFER_SLICES: usize = 10;
 
 impl ProgressState {
     pub fn reset(&self) {
@@ -529,7 +501,7 @@ impl ProgressState {
         match self.files.lock() {
             Ok(files) => files
                 .get(&name)
-                .map(|f| f.segments(MAX_SEGMENTS))
+                .map(|f| f.segments(XFER_SLICES))
                 .unwrap_or_default(),
             Err(_) => Vec::new(),
         }
@@ -570,6 +542,48 @@ pub fn progress_for(device: &str) -> Arc<ProgressState> {
 
 /// 第一台设备的进度（单设备场景 / CLI 沿用）
 pub static PROGRESS: LazyLock<ProgressState> = LazyLock::new(ProgressState::default);
+
+/// 上一轮传输的失败原因（GUI 用）。
+///
+/// 为什么要有这一份：块账本对不上、手机端说指纹不一致这类失败，以前只写进日志和
+/// 结论帧，GUI 一概不知道 —— 于是传输窗口亮一下「已完成」然后 3 秒自己收起来，
+/// 用户以为传完了（TRANSFER-WINDOW.md §2.1 明确要求「失败/取消停在窗口上，等用户看见」）。
+/// 这里放一个只进不出的信号，GUI 每帧读一次，用户关掉窗口（或下次开始接收）时清掉。
+static LAST_FAILURE: LazyLock<Mutex<Option<(String, i32)>>> = LazyLock::new(|| Mutex::new(None));
+
+/// 记下这一轮为什么失败（给 GUI 看；日志和结论帧照旧）。
+///
+/// 顺手把失败那一刻的进度百分比（按块算）也拍进快照：失败之后 `PROGRESS` 会停在原地、
+/// 下一轮开始时又会被清掉，界面那边「等下一帧再读」读到的是别的轮次的数字 ——
+/// 真机第一次验证就撞见了：开门就失败的传输，窗口上挂着上一轮的「未完成 100% / 3.00 GB」。
+pub fn set_failure(reason: &str) {
+    let percent = {
+        let segs = PROGRESS.segments();
+        let total: f32 = segs.iter().map(|s| s.span).sum::<f32>().max(1.0);
+        let filled: f32 = segs.iter().map(|s| s.span * s.filled).sum::<f32>();
+        (((filled / total) * 100.0).floor() as i32).clamp(0, 99)
+    };
+    if let Ok(mut slot) = LAST_FAILURE.lock() {
+        *slot = Some((reason.to_string(), percent));
+    }
+}
+
+/// 上一轮的失败原因；没有失败（或者已经被界面消费掉）就是 None。
+pub fn last_failure() -> Option<String> {
+    LAST_FAILURE.lock().ok().and_then(|slot| slot.as_ref().map(|f| f.0.clone()))
+}
+
+/// 失败那一刻的进度百分比（0..=99），界面直接用它，别再去读已经过期的 PROGRESS。
+pub fn failure_percent() -> Option<i32> {
+    LAST_FAILURE.lock().ok().and_then(|slot| slot.as_ref().map(|f| f.1))
+}
+
+/// 清掉失败提示：下一轮开始接收、或者用户把失败的窗口关掉时调用。
+pub fn clear_failure() {
+    if let Ok(mut slot) = LAST_FAILURE.lock() {
+        *slot = None;
+    }
+}
 
 pub struct Receiver {
     /// 本设备独立的进度（多设备并行）

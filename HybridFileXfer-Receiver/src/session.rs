@@ -1313,6 +1313,10 @@ impl Session {
             ));
         }
         log::info(crate::i18n::tr("手机开始发送文件", "the phone is sending files"));
+        // 新一轮开始了：把上一轮的「接收失败」清掉。
+        // 不点「开始接收」、直接由手机发起的那一轮（手机主动发文件）也是从这里进的，
+        // 不清的话上一轮的失败红字会挂在窗口上，看着像这一轮也失败了（真机 2026-11-17 撞见）。
+        crate::receiver::clear_failure();
         // 本次接收从头计数：上一次传过的字节/文件不能算进来（否则收尾日志会写「4 个文件 5.48 GB」）。
         // 必须排在续传查询之前 —— 查询会把"已经全在"的文件登记进本次会话（收尾要复算它的 SHA-256），
         // 排在后面就会把这些登记一起清掉，日志里出现「0 个文件」。
@@ -1613,6 +1617,8 @@ impl Session {
                 crate::i18n::tr("接收失败", "receiving failed"),
                 error
             ));
+            // 界面也要知道：失败不能亮「已完成」然后自己收起来（见 receiver::set_failure）
+            crate::receiver::set_failure(&error);
             // 结论帧带 opcode，手机端 sendFiles 正循环读帧等它
             let _ = self.write_result(false, Some(&error), &[]);
             return Ok(());
@@ -1702,6 +1708,15 @@ impl Session {
                     "手机端报告传输/校验失败",
                     "the phone reported a failed transfer or check",
                 ));
+                // 手机端报的失败（多半是 SHA-256 不一致）同样要让用户在窗口上看见
+                crate::receiver::set_failure(&match peer.message.clone() {
+                    Some(message) if !message.is_empty() => message,
+                    _ => crate::i18n::tr(
+                        "手机端报告传输或校验失败",
+                        "the phone reported a failed transfer or check",
+                    )
+                    .to_string(),
+                });
                 // 校验不一致：这次收下的文件是坏的，必须连同续传记录一起扔掉。
                 // 留着它的后果是**修不好**：下一次传同一个文件时，接收端按这张位图回
                 // 「这些块我都有了」，手机端就跳过它们 —— 坏块永远补不上，

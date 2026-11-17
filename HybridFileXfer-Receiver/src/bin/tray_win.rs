@@ -14,12 +14,24 @@ use windows_sys::Win32::UI::Shell::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    DispatchMessageW, EnumWindows, FindWindowW, GetCursorPos, GetMessageW, GetWindowTextLengthW,
-    GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, LoadIconW, PostQuitMessage,
-    SetForegroundWindow, SetWindowPos, ShowWindow, TrackPopupMenu, TranslateMessage, HWND_TOPMOST,
-    MSG, MF_STRING, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOW, TPM_BOTTOMALIGN,
-    TPM_RIGHTBUTTON, WM_APP, WM_COMMAND, WM_DESTROY, WM_LBUTTONDBLCLK, WM_RBUTTONUP, WNDCLASSW,
+    DispatchMessageW, EnumWindows, FindWindowW, GetCursorPos, GetMessageW, GetWindowRect,
+    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, LoadIconW,
+    PostQuitMessage, SetForegroundWindow, SetWindowPos, ShowWindow, TrackPopupMenu,
+    TranslateMessage, HWND_TOPMOST, MSG, MF_STRING, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_NOZORDER, SW_HIDE, SW_SHOW, TPM_BOTTOMALIGN, TPM_RIGHTBUTTON, WM_APP, WM_COMMAND,
+    WM_DESTROY, WM_LBUTTONDBLCLK, WM_RBUTTONUP, WNDCLASSW,
 };
+
+// windows-sys 0.59 没开 Win32_Graphics_Dwm 特性，自己声明（和上面的 RegisterClassW 一样）
+#[link(name = "dwmapi")]
+extern "system" {
+    fn DwmGetWindowAttribute(
+        hwnd: HWND,
+        dw_attribute: u32,
+        pv_attribute: *mut std::ffi::c_void,
+        cb_attribute: u32,
+    ) -> i32;
+}
 
 // windows-sys 0.59 没有导出 RegisterClassW，自己声明
 #[link(name = "user32")]
@@ -226,6 +238,131 @@ pub fn set_topmost(hwnd: HwndVal) {
             0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
         );
+    }
+}
+
+/// 窗口「看得见的那块」在屏幕上的位置（物理像素）：(left, top, right, bottom)。
+///
+/// GetWindowRect 会带上 DWM 那圈看不见的缩放边框（100% 缩放下左右下各约 8px），
+/// 按它算「贴右下角」会往任务栏里压进去一截，所以改用 DWMWA_EXTENDED_FRAME_BOUNDS。
+pub fn window_visible_rect(hwnd: HwndVal) -> Option<WorkArea> {
+    const DWMWA_EXTENDED_FRAME_BOUNDS: u32 = 9;
+    unsafe {
+        let mut rect: windows_sys::Win32::Foundation::RECT = std::mem::zeroed();
+        let hr = DwmGetWindowAttribute(
+            hwnd as HWND,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            &mut rect as *mut _ as *mut std::ffi::c_void,
+            std::mem::size_of::<windows_sys::Win32::Foundation::RECT>() as u32,
+        );
+        if hr < 0 {
+            return None;
+        }
+        Some((rect.left, rect.top, rect.right, rect.bottom))
+    }
+}
+
+/// 只在「窗口已经探出工作区」时才把它推回来，其余情况一个像素都不动。
+///
+/// 为什么不用 nudge_to_bottom_right 收这个尾：那个是「吸到右下角」，
+/// 用户自己把传输窗口拖到左上角之后，一展开明细又会被弹回右下角 —— 那是抢方向盘。
+/// 这里只处理「长得太高/太靠边被屏幕切掉」这一种情况（真机：明细展开后窗口往下长到
+/// 屏幕外，后 6 行明细根本看不见）。
+pub fn keep_on_screen(hwnd: HwndVal, margin: i32) -> bool {
+    let Some((left, top, right, bottom)) = window_visible_rect(hwnd) else {
+        return false;
+    };
+    let center = POINT {
+        x: (left + right) / 2,
+        y: (top + bottom) / 2,
+    };
+    let Some((work_left, work_top, work_right, work_bottom)) = monitor_work_area(center, true) else {
+        return false;
+    };
+    let mut dx = 0;
+    let mut dy = 0;
+    // 先收右边/下边（越界的方向优先），再把左边/上边拉回工作区内
+    if right > work_right - margin {
+        dx = (work_right - margin) - right;
+    }
+    if bottom > work_bottom - margin {
+        dy = (work_bottom - margin) - bottom;
+    }
+    if left + dx < work_left {
+        dx = work_left - left;
+    }
+    if top + dy < work_top {
+        dy = work_top - top;
+    }
+    if dx == 0 && dy == 0 {
+        return true;
+    }
+    unsafe {
+        let mut outer: windows_sys::Win32::Foundation::RECT = std::mem::zeroed();
+        if GetWindowRect(hwnd as HWND, &mut outer) == 0 {
+            return false;
+        }
+        SetWindowPos(
+            hwnd as HWND,
+            std::ptr::null_mut(),
+            outer.left + dx,
+            outer.top + dy,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+    true
+}
+
+/// 把窗口挪到「可见右下角距工作区右下 margin 像素」的位置。
+///
+/// 用的是「量一下现在还差多少、再挪多少」的写法，不去猜标题栏和边框有多高：
+/// 多显示器时按窗口自己所在那块屏的工作区算（不是主屏），所以副屏也摆得对。
+/// 返回 true = 已经量到并处理过。
+pub fn nudge_to_bottom_right(hwnd: HwndVal, margin: i32) -> bool {
+    let Some((left, top, right, bottom)) = window_visible_rect(hwnd) else {
+        return false;
+    };
+    let center = POINT {
+        x: (left + right) / 2,
+        y: (top + bottom) / 2,
+    };
+    let Some((_, _, work_right, work_bottom)) = monitor_work_area(center, true) else {
+        return false;
+    };
+    let dx = (work_right - margin) - right;
+    let dy = (work_bottom - margin) - bottom;
+    if dx == 0 && dy == 0 {
+        return true;
+    }
+    // 当前的外框左上角（SetWindowPos 要的是绝对坐标，不是位移）
+    unsafe {
+        let mut outer: windows_sys::Win32::Foundation::RECT = std::mem::zeroed();
+        if GetWindowRect(hwnd as HWND, &mut outer) == 0 {
+            return false;
+        }
+        SetWindowPos(
+            hwnd as HWND,
+            std::ptr::null_mut(),
+            outer.left + dx,
+            outer.top + dy,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+    true
+}
+
+/// 窗口当前位置（外框左上角，物理像素）
+pub fn window_position(hwnd: HwndVal) -> Option<(i32, i32)> {
+    unsafe {
+        let mut outer: windows_sys::Win32::Foundation::RECT = std::mem::zeroed();
+        if GetWindowRect(hwnd as HWND, &mut outer) == 0 {
+            return None;
+        }
+        Some((outer.left, outer.top))
     }
 }
 

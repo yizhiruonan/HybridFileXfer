@@ -81,15 +81,6 @@ component SecondaryButton inherits Rectangle {
     ta := TouchArea { clicked => { root.clicked(); } }
 }
 
-export struct XferSeg {
-    // 这一段在整条里的起始位置（0..1）
-    start: float,
-    // 这一段占整条的比例（0..1）
-    span: float,
-    // 这一段已完成比例（0..1）
-    filled: float,
-}
-
 export struct DeviceRow {
     name: string,
     state: string,
@@ -102,6 +93,116 @@ export struct DevicePair {
     left: DeviceRow,
     right: DeviceRow,
     has-right: bool,
+}
+
+// 「详细信息」里的每一行：一段 = 一条通道负责的连续块区间
+// （数据源是 PROGRESS.segments()，电脑端目前没有"每通道速率"，所以这里只有
+//  占整条多少 + 这段自己收了多少 —— 不编数据）
+export struct XferRow {
+    name: string,
+    // 这一段占整条的比例，如 "24%"
+    span-text: string,
+    // 这一段自己：已收 / 该段总量
+    amount: string,
+    // 这一段完成百分比 0..100
+    percent: int,
+}
+
+// 进度条上的「一截」：IDM 那种一条杠被切成几截、各自往前跑的画法。
+// 每截的位置和宽度都是相对整条的比例（0..1），填了多少也是比例。
+export struct XferSeg {
+    // 这一截从整条的哪个位置开始
+    x: float,
+    // 占整条多少
+    span: float,
+    // 这一截自己填了多少（0..1）
+    filled: float,
+}
+
+// ---------------------------------------------------------------------------
+// 取消接收的确认框（主界面 + 独立传输窗口共用同一个组件）
+//
+// 三个选择的语义只写这一份：
+//   「继续接收」= 只是关掉这个框（顺手把"为了不白传"而加的暂停放掉）；
+//   「不保留，删掉」= 删掉没传完的文件和 .hfxpart 续传记录，下次从头传；
+//   「保留进度」= 留着半截文件和续传记录，下次同一个文件接着传。
+// 两个窗口都把这个组件盖在自己上面，回调接到同一套 Rust 处理函数
+// （gui_slint.rs 里 ui / xfer_win 两边注册的是同样的代码）。
+// ---------------------------------------------------------------------------
+component CancelAskDialog inherits Rectangle {
+    // 主界面窗口大，卡片 424x188；传输窗口小，卡片也用小的
+    in property <length> card-width: 424px;
+    in property <length> card-height: 188px;
+
+    callback keep();
+    callback discard();
+    callback dismiss();
+
+    x: 0;
+    y: 0;
+    // 盖满整个窗口：直接用它被放进窗口时的那一层（组件里够不到 parent）
+    width: 100%;
+    height: 100%;
+    background: #00000059;
+
+    // 吃掉遮罩上的点击，别透到下面的按钮（免得误触「停止接收」/「取消」）
+    TouchArea { }
+
+    VerticalLayout {
+        alignment: center;
+        HorizontalLayout {
+            alignment: center;
+            Card {
+                width: root.card-width;
+                height: root.card-height;
+
+                VerticalLayout {
+                    padding: 16px;
+                    spacing: 8px;
+
+                    Text {
+                        text: "取消接收？";
+                        font-size: 15px;
+                        font-weight: 600;
+                        color: #1A1A1A;
+                    }
+                    Text {
+                        text: "已经收到的部分怎么处理？（手机端也会停止这次发送）";
+                        font-size: 11.5px;
+                        color: #616161;
+                        wrap: word-wrap;
+                    }
+                    Text {
+                        text: "保留进度：留半截文件和续传记录，下次接着传；不保留：删掉。";
+                        font-size: 11.5px;
+                        color: #8A8A8A;
+                        wrap: word-wrap;
+                    }
+                    Rectangle { vertical-stretch: 1; }
+                    HorizontalLayout {
+                        height: 32px;
+                        spacing: 8px;
+                        Rectangle { horizontal-stretch: 1; }
+                        SecondaryButton {
+                            width: 92px;
+                            label: "继续接收";
+                            clicked => { root.dismiss(); }
+                        }
+                        SecondaryButton {
+                            width: 128px;
+                            label: "不保留，删掉";
+                            clicked => { root.discard(); }
+                        }
+                        PrimaryButton {
+                            width: 104px;
+                            label: "保留进度";
+                            clicked => { root.keep(); }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 export component AppWindow inherits Window {
@@ -150,8 +251,6 @@ export component AppWindow inherits Window {
     in-out property <float> file-progress: 0.0;
     in-out property <string> file-text: "";
     in-out property <string> session-text: "";
-    // IDM 式分块：一段 = 一条通道负责的连续块区间
-    in-out property <[XferSeg]> xfer-segments: [];
     // 多设备列表（点状态卡展开）
     in-out property <[DeviceRow]> devices: [];
     // 两两配对后的行（一行两个小卡片）
@@ -388,69 +487,10 @@ export component AppWindow inherits Window {
             }
         }
 
-        // ---------------- 进度（传输时才存在） ----------------
-        if root.xfer-visible : Card {
-            vertical-stretch: 0;
-            VerticalLayout {
-                padding-left: 16px;
-                padding-right: 16px;
-                padding-top: 12px;
-                padding-bottom: 12px;
-                spacing: 6px;
-
-                HorizontalLayout {
-                    height: 18px;
-                    Text { text: "当前文件"; font-size: 11px; color: #8A8A8A; vertical-alignment: center; }
-                    Rectangle { horizontal-stretch: 1; }
-                    Text { text: root.file-text; font-size: 11px; color: #1A1A1A; vertical-alignment: center; }
-                }
-
-                Text {
-                    text: root.file-name;
-                    font-size: 12.5px;
-                    color: #1A1A1A;
-                    overflow: elide;
-                }
-
-                // 进度条已经从主界面删掉：用户要的是「资源管理器复制弹窗」那种独立小窗，
-                // 主界面这块只留「当前文件 / 文件名 / 已接收 x / y · 速率 · N 个文件」+ 按钮。
-                // 进度本身在 TransferWindow 里看（那条才是 1:1 还原系统样式的那条）。
-
-                Text {
-                    text: root.session-text;
-                    font-size: 11px;
-                    color: #616161;
-                }
-
-                if root.send-active || root.recv-active : HorizontalLayout {
-                    height: 30px;
-                    spacing: 8px;
-                    Rectangle { horizontal-stretch: 1; }
-                    SecondaryButton {
-                        label: root.send-paused ? "继续" : "暂停";
-                        clicked => { root.toggle-pause-send(); }
-                    }
-                    if root.send-active : SecondaryButton {
-                        label: "中断发送";
-                        clicked => { root.cancel-send(); }
-                    }
-                    // 接收方向原来只有「暂停 / 继续」，用户没法真的取消这次传输。
-                    // 点「取消」先暂停（手机端跟着停发），再问一句已收到的部分怎么处理，
-                    // 语义和手机端的取消确认框一致（保留进度 / 不保留）。
-                    // 已经在取消中（收尾 / 重建）就把按钮收起来：取消是幂等的，
-                    // 第二轮点击既没有意义，又可能和重建握手抢帧序。
-                    if root.recv-active && !root.recv-cancelling : SecondaryButton {
-                        label: "取消";
-                        // cancel-recv 返回 false（被忽略）时不要弹确认框
-                        clicked => {
-                            if (root.cancel-recv()) {
-                                root.cancel-ask = true;
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        // 进度卡已经从主界面删掉（用户：「接收器里的进度条 ui 直接去掉」）。
+        // 传输进度只在独立的 TransferWindow 里看 —— 那里才是主角，主窗口只留设备 / 设置 / 提示。
+        // 下面的 file-text / session-text / xfer-visible 这些属性和回调还留着：
+        // gui_slint.rs 还在往里喂（一张卡换一种画法时不用改协议层），只是没人画了。
 
         // ---------------- 设置 ----------------
         Card {
@@ -606,201 +646,377 @@ export component AppWindow inherits Window {
     }
 
     // ---------------- 取消接收：确认框 ----------------
-    // 盖住整窗的半透明遮罩 + 居中的卡片。三个选择：
-    //   「继续接收」= 只是关掉这个框（顺手把"为了不白传"而加的暂停放掉）；
-    //   「不保留，删掉」= 删掉没传完的文件和 .hfxpart 续传记录，下次从头传；
-    //   「保留进度」= 留着半截文件和续传记录，下次同一个文件接着传。
-    if root.cancel-ask : Rectangle {
-        x: 0;
-        y: 0;
-        width: parent.width;
-        height: parent.height;
-        background: #00000059;
+    // 和独立传输窗口上的「取消」用的是同一个组件（CancelAskDialog，定义在文件前面），
+    // 「继续接收 / 不保留，删掉 / 保留进度」三选一的语义只有那一份。
+    CancelAskDialog {
+        visible: root.cancel-ask;
+        card-width: 424px;
+        card-height: 188px;
+        keep => { root.cancel-ask = false; root.cancel-keep(); }
+        discard => { root.cancel-ask = false; root.cancel-discard(); }
+        dismiss => { root.cancel-ask = false; root.cancel-dismiss(); }
+    }
+}
+// ---------------------------------------------------------------------------
+// 独立传输窗口：外观照「资源管理器复制文件」那个弹窗做
+//
+// 参考图 docs/explorer-copy-dialog.png（449x167，100% 缩放），下面的数都是从图上量的：
+//   * 进度条：整条 395 x 15（x=27..421 / y=92..106），外面 1px #BCBCBC 描边，
+//     四个角是直角（(27,92)、(421,106) 都是 #BCBCBC，没有圆角）；内高 13px，
+//     轨道 #E6E6E6，已填充 #0F7B0F、左右两端同样是方的。
+//   * 左右内边距 26px（图上条子从 x=27 起，客户区从 x=1 起）；
+//     上下文 14px 字；大号百分比 20px；百分比行到条 13px；
+//     条到分隔线 15px；分隔线 1px #E3E3E3 贯穿整窗；分隔线到「详细信息」15px。
+//   * 分隔线位置：y=122（整窗 447 宽那条）。
+//
+// 语义：
+//   * 标题栏 ✕ 与「收起」= 把窗口藏起来，传输继续（和手机端「关闭 ≠ 取消」一样）；
+//     要真停下得点窗口里的「取消」，走的是主界面那套「保留 / 不保留」；
+//   * 传完亮 3 秒「已完成」自己收；
+//   * 位置 / 置顶 / 记住坐标都在 gui_slint.rs（贴工作区右下角 + HWND_TOPMOST）。
+// ---------------------------------------------------------------------------
+export component TransferWindow inherits Window {
+    title: root.failed ? "接收失败" : root.done ? "已完成" : "正在传输";
+    // 和主窗口同一个字体，别让两个窗口的字长得不一样
+    default-font-family: "Microsoft YaHei UI";
+    default-font-size: 13px;
+    preferred-width: 460px;
+    // 收起时的高度 = 14 + 20 + 6 + 30 + 12 + 15 + 14 + 1 + 9 + 20 + 10 = 151
+    // 展开「详细信息」后由 Rust 按行数 set_size（和 gui_slint.rs 的 TW_H_COLLAPSED 对得上）
+    //
+    // 但光靠 Rust 的 set_size 不够：窗口高度最终以 Slint 这边的 preferred-height 为准，
+    // 暂停着等用户选「保留 / 不保留」的时候（那时 active 已经是 false）Rust 那边调 set_size
+    // 窗口并不会长 —— 真机 2026-11-17 就是这么撞见的：确认框上的「继续接收」只露出半截。
+    // 所以这里把「内容需要多高」也声明一遍，和 transfer_window_height() 的公式保持一致。
+    property <length> content-h: 151px
+        + (root.failed ? 20px : 0px)
+        + (root.details ? 30px + root.rows.length * 22px : 0px);
+    // 取消确认框的卡片是 404x168，窗口比它矮就会裁掉按钮
+    preferred-height: root.cancel-ask && root.content-h < 216px ? 216px : root.content-h;
+    background: #FFFFFF;
 
-        // 吃掉遮罩上的点击，别透到下面的按钮（免得误触「停止接收」）
-        TouchArea { }
+    in-out property <string> action-text: "正在接收文件";
+    in-out property <int> percent: 0;
+    // 大号百分比后面那行小字：「210.0 MB / 3.00 GB · 82.9 MB/s」
+    in-out property <string> detail-text: "";
+    in-out property <bool> paused: false;
+    in-out property <bool> done: false;
+    // 这一轮失败了（块账本对不上 / 手机端说指纹不一致）：窗口停在「接收失败」上，
+    // 不自动收 —— 用户不看见就会以为传完了（TRANSFER-WINDOW.md §2.1）。
+    in-out property <bool> failed: false;
+    // 失败原因，例如「缺 2 块 (#1318 #1319)」
+    in-out property <string> fail-text: "";
+    // 「详细信息」展开了没有
+    in-out property <bool> details: false;
+    // 明细：每段（每条通道）一行
+    in-out property <[XferRow]> rows: [];
+    // 进度条上的分段（IDM 同款切分）：每截的位置 / 宽度 / 填充比例
+    in-out property <[XferSeg]> segs: [];
+    // 「合计 82.9 MB/s · 剩余约 25 秒」
+    in-out property <string> summary-text: "";
+    // 已填充比例（0..1，按块算）：流光只在这段里扫，别扫到灰色空条上
+    in-out property <float> fill: 0.0;
+    // 流光位置（0..1 循环），由 Rust 那边 16ms 的 Timer 推着走
+    in-out property <float> flow: 0.0;
+    // 速率掉到 0 / 暂停 / 传完了 → 流光停住（一边 0 MB/s 一边还在流，看着像卡死）
+    in-out property <bool> flow-on: true;
+    // 取消的确认框（和主界面那套是同一个组件、同一套 Rust 处理函数）
+    in-out property <bool> cancel-ask: false;
+    // 这一轮已经受理过取消：把「取消」按钮收起来（同一轮只让取消一次）
+    in-out property <bool> cancelling: false;
 
+    callback toggle-pause();
+    // 收起（标题栏 ✕ 也走它）：藏窗口，传输继续
+    callback close-window();
+    callback toggle-details();
+    // 返回 false = 这次点击被忽略（没在接收 / 已经在取消中），别弹确认框
+    callback cancel-recv() -> bool;
+    callback cancel-keep();
+    callback cancel-discard();
+    callback cancel-dismiss();
+
+    VerticalLayout {
+        spacing: 0px;
+        padding: 0px;
+
+        // ---- 上半：上下文 + 进度条（左右 24px 内边距，参考图是 26）----
         VerticalLayout {
-            alignment: center;
+            padding-left: 24px;
+            padding-right: 24px;
+            spacing: 0px;
+
+            Rectangle { height: 14px; }
+
+            Text {
+                text: root.action-text;
+                font-size: 14px;
+                color: #1A1A1A;
+                height: 20px;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+
+            Rectangle { height: 6px; }
+
             HorizontalLayout {
-                alignment: center;
-                Card {
-                    width: 424px;
-                    height: 188px;
+                height: 30px;
+                spacing: 6px;
 
-                    VerticalLayout {
-                        padding: 16px;
-                        spacing: 8px;
+                Text {
+                    text: (root.failed ? "未完成 " : "已完成 ") + root.percent + "%";
+                    font-size: 20px;
+                    font-weight: 600;
+                    color: root.failed ? #C42B1C : #1A1A1A;
+                    vertical-alignment: center;
+                }
+                Text {
+                    text: root.detail-text;
+                    font-size: 11.5px;
+                    color: #616161;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                    overflow: elide;
+                }
 
-                        Text {
-                            text: "取消接收？";
-                            font-size: 15px;
-                            font-weight: 600;
-                            color: #1A1A1A;
-                        }
-                        Text {
-                            text: "已经收到的部分怎么处理？（手机端也会停止这次发送）";
-                            font-size: 11.5px;
-                            color: #616161;
-                            wrap: word-wrap;
-                        }
-                        Text {
-                            text: "保留进度：留半截文件和续传记录，下次接着传；不保留：删掉。";
-                            font-size: 11.5px;
-                            color: #8A8A8A;
-                            wrap: word-wrap;
-                        }
-                        Rectangle { vertical-stretch: 1; }
-                        HorizontalLayout {
-                            height: 32px;
-                            spacing: 8px;
-                            Rectangle { horizontal-stretch: 1; }
-                            SecondaryButton {
-                                width: 92px;
-                                label: "继续接收";
-                                clicked => { root.cancel-ask = false; root.cancel-dismiss(); }
-                            }
-                            SecondaryButton {
-                                width: 128px;
-                                label: "不保留，删掉";
-                                clicked => { root.cancel-ask = false; root.cancel-discard(); }
-                            }
-                            PrimaryButton {
-                                width: 104px;
-                                label: "保留进度";
-                                clicked => { root.cancel-ask = false; root.cancel-keep(); }
+                // 暂停 / 继续：参考图右边那两颗方框按钮，鼠标移上去才有底色
+                Rectangle {
+                    width: root.paused ? 36px : 30px;
+                    height: 28px;
+                    border-radius: 4px;
+                    background: pause-ta.has-hover ? #F0F0F0 : transparent;
+                    visible: !root.done;
+
+                    // 运行中画两条竖杠（字体里不一定有 ⏸，画出来最稳）
+                    Rectangle {
+                        visible: !root.paused;
+                        x: 10px;
+                        y: 8px;
+                        width: 3px;
+                        height: 12px;
+                        background: #1A1A1A;
+                    }
+                    Rectangle {
+                        visible: !root.paused;
+                        x: 17px;
+                        y: 8px;
+                        width: 3px;
+                        height: 12px;
+                        background: #1A1A1A;
+                    }
+                    Text {
+                        visible: root.paused;
+                        text: "继续";
+                        font-size: 11.5px;
+                        color: #1A1A1A;
+                        width: 100%;
+                        height: 100%;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                    pause-ta := TouchArea { clicked => { root.toggle-pause(); } }
+                }
+
+                // 取消：参考图右边那颗 ✕，接的是「保留 / 不保留」那套流程
+                Rectangle {
+                    width: 30px;
+                    height: 28px;
+                    border-radius: 4px;
+                    background: cancel-ta.has-hover ? #F0F0F0 : transparent;
+                    // 失败时也要留着这颗 ✕：它是把「接收失败」这个窗口关掉的唯一按钮
+                    visible: (!root.done || root.failed) && !root.cancelling;
+
+                    Text {
+                        // × 是 GB2312 里就有的乘号，✕(U+2715) 在 YaHei 里没有，会变豆腐块
+                        text: "×";
+                        font-size: 18px;
+                        color: #1A1A1A;
+                        width: 100%;
+                        height: 100%;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                    cancel-ta := TouchArea {
+                        clicked => {
+                            // 失败那一轮：这颗 ✕ 变成「关掉这个失败提示」
+                            // （已经没有传输在跑了，走取消流程只会被忽略，按钮就成死的了）
+                            if (root.failed) {
+                                root.close-window();
+                            } else if (root.cancel-recv()) {
+                                // 和主界面一样：先暂停（手机端跟着停发），再问保留不保留
+                                root.cancel-ask = true;
                             }
                         }
                     }
                 }
             }
-        }
-    }
-}
-// ---------------------------------------------------------------------------
-// 独立传输窗口（P1）
-//
-// 为什么单独开一个窗口：主界面里那张进度卡要占版面，而且用户一旦把主窗口
-// 最小化/收起托盘就看不到进度了。这个东西就是「资源管理器复制文件」那种
-// 独立小窗：传输开始时自己弹出来，传完自己消失，主窗口可以一直最小化。
-//
-// P1 只做：文案 + 百分比 + IDM 式分段进度条 + 暂停/继续 + 收起。
-// 分段画法和主界面那张卡共用同一份 segs（一条通道一段），后面加流动动画时
-// 只改这一处，不再抄第二份。
-// 收起 = 把窗口藏起来，传输继续（和手机端「关闭 ≠ 取消」同一个语义）。
-// ---------------------------------------------------------------------------
-export component TransferWindow inherits Window {
-    title: root.done ? "已完成" : "正在传输";
-    preferred-width: 470px;
-    preferred-height: 196px;
-    background: #F3F3F3;
 
-    in-out property <string> action-text: "正在接收文件";
-    in-out property <int> percent: 0;
-    in-out property <string> file-name: "";
-    in-out property <string> detail-text: "";
-    in-out property <[XferSeg]> segs: [];
-    in-out property <bool> paused: false;
-    in-out property <bool> done: false;
-    // 已填充比例（0..1，按块算）：流光只在这段里扫，别扫到灰色空条上
-    in-out property <float> fill: 0.0;
-    // 流光位置（0..1 循环），由 Rust 那边 16ms 的 Timer 推着走
-    in-out property <float> flow: 0.0;
+            Rectangle { height: 12px; }
 
-    callback toggle-pause();
-    callback close-window();
-
-    VerticalLayout {
-        padding: 18px;
-        spacing: 10px;
-
-        Text {
-            text: root.action-text;
-            font-size: 14px;
-            color: #1A1A1A;
-            overflow: elide;
-        }
-
-        HorizontalLayout {
-            spacing: 8px;
-            Text {
-                text: "已完成 " + root.percent + "%";
-                font-size: 18px;
-                font-weight: 700;
-                color: #1A1A1A;
-                vertical-alignment: center;
-                horizontal-stretch: 1;
-            }
-            SecondaryButton {
-                label: root.paused ? "继续" : "暂停";
-                visible: !root.done;
-                clicked => { root.toggle-pause(); }
-            }
-            SecondaryButton {
-                label: root.done ? "关闭" : "收起";
-                clicked => { root.close-window(); }
-            }
-        }
-
-        // 进度条：颜色和特效照 Windows 自带的复制弹窗来 ——
-        // 灰底 + 绿色填充（#0F7B0F）+ 一条从左往右扫的流光。
-        // 分段照旧保留（一条通道一段，段间一条深绿细线）：
-        // 段边界会随块归属变，流光一直在动，两个能一起看清。
-        bar := Rectangle {
-            height: 12px;
-            background: #E6E6E6;
-            clip: true;
-
-            for seg in root.segs : Rectangle {
-                x: bar.width * seg.start;
-                y: 0px;
-                width: bar.width * seg.span * seg.filled;
-                height: bar.height;
-                background: #0F7B0F;
-            }
-            for seg[i] in root.segs : Rectangle {
-                visible: i > 0;
-                x: bar.width * seg.start;
-                y: 0px;
-                width: 1px;
-                height: bar.height;
-                background: #0B5C0B;
-            }
-
-            // 流光：外面这层把范围裁到「已填充」那一段，里面那条渐变亮带
-            // 按 flow（0..1）从左边扫到右边。暂停 / 传完了就停住不动。
-            Rectangle {
-                x: 0px;
-                y: 0px;
-                width: bar.width * Math.max(0.0, Math.min(1.0, root.fill));
-                height: bar.height;
+            // 进度条：IDM 同款切分 —— 一条杠按文件位置均分成十截，每截各自往前跑；
+            // 谁先跑满谁先变绿，全部跑满就是一条完整的绿杠。这正是 IDM 那种「多线程下载」的观感。
+            // 底是资源管理器那张参考图量出来的：条高 15px、直角、1px #BCBCBC 描边、
+            // 轨道 #E6E6E6、填充原生绿 #0F7B0F。
+            bar := Rectangle {
+                height: 15px;
+                background: #E6E6E6;
+                border-width: 1px;
+                border-color: #BCBCBC;
+                border-radius: 0px;
                 clip: true;
-                visible: !root.paused && !root.done;
 
-                Rectangle {
-                    x: bar.width * root.flow - 60px;
-                    y: 0px;
-                    width: 120px;
-                    height: parent.height;
-                    background: @linear-gradient(90deg, #0F7B0F00 0%, #8CFFFFFF 50%, #0F7B0F00 100%);
+                // 一截一块，各填各的
+                for seg in root.segs : Rectangle {
+                    x: 1px + (bar.width - 2px) * seg.x;
+                    width: Math.max(0px, (bar.width - 2px) * seg.span);
+                    height: bar.height - 2px;
+                    background: transparent;
+                    clip: true;
+
+                    // 这一截自己填到哪儿
+                    piece := Rectangle {
+                        width: parent.width * Math.max(0.0, Math.min(1.0, seg.filled));
+                        height: 100%;
+                        background: #0F7B0F;
+                        clip: true;
+
+                        // 流光跟着这一截一起扫：每截里都有一道亮带在往右走，
+                        // 十截同相位看着就是「整条都在流」。暂停 / 传完 / 没速率时藏起来。
+                        band := Rectangle {
+                            visible: root.flow-on && piece.width > 16px;
+                            private property <length> band-w: Math.max(20px, Math.min(120px, piece.width * 0.9));
+                            x: piece.width * root.flow - band.band-w / 2;
+                            y: 0px;
+                            width: band.band-w;
+                            height: 100%;
+                            // 注意 Slint 的颜色是 #RRGGBBAA
+                            background: @linear-gradient(90deg,
+                                #0F7B0F00 0%,
+                                #FFFFFF66 40%,
+                                #FFFFFF66 60%,
+                                #0F7B0F00 100%);
+                        }
+                    }
+                }
+
+                // 切分线画在最上面：灰底和绿底上都看得见，IDM 的「一块一块」全靠它
+                for seg in root.segs : Rectangle {
+                    visible: seg.x > 0.0001;
+                    x: 1px + (bar.width - 2px) * seg.x;
+                    width: 1px;
+                    height: bar.height - 2px;
+                    background: #F2F2F2;
                 }
             }
         }
 
-        Text {
-            text: root.file-name;
-            font-size: 12.5px;
-            color: #1A1A1A;
-            overflow: elide;
-        }
+        // ---- 分隔线：贯穿整窗（参考图就是整窗宽，不带内边距）----
+        Rectangle { height: 1px; background: #E3E3E3; }
 
-        Text {
-            text: root.detail-text;
-            font-size: 11px;
-            color: #616161;
-            overflow: elide;
-        }
+        // ---- 下半：「详细信息」开关 + 明细 ----
+        VerticalLayout {
+            padding-left: 24px;
+            padding-right: 24px;
+            spacing: 0px;
 
-        Rectangle { vertical-stretch: 1; }
+            Rectangle { height: 9px; }
+
+            // 整行可点（和资源管理器一样，不用非得点到字上）
+            Rectangle {
+                height: 20px;
+                background: details-ta.has-hover ? #F5F5F5 : transparent;
+
+                Text {
+                    // ▼/▲ 是 GB2312 里的字形，YaHei 一定有；▾/▴ 这种小三角会渲染成豆腐块
+                    text: root.details ? "▲ 详细信息" : "▼ 详细信息";
+                    font-size: 12.5px;
+                    color: #1A1A1A;
+                    width: 100%;
+                    height: 100%;
+                    vertical-alignment: center;
+                }
+                details-ta := TouchArea { clicked => { root.toggle-details(); } }
+            }
+
+            if root.details : VerticalLayout {
+                spacing: 0px;
+
+                Rectangle { height: 6px; }
+
+                // 每段（每条通道）一行：名字 / 占整条多少 / 已收 · 该段总量 / 完成百分比
+                for row in root.rows : HorizontalLayout {
+                    height: 22px;
+                    spacing: 8px;
+
+                    Text {
+                        text: row.name;
+                        font-size: 11.5px;
+                        color: #1A1A1A;
+                        width: 62px;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                    Text {
+                        text: row.span-text;
+                        font-size: 11.5px;
+                        color: #8A8A8A;
+                        width: 44px;
+                        vertical-alignment: center;
+                    }
+                    Text {
+                        text: row.amount;
+                        font-size: 11.5px;
+                        color: #1A1A1A;
+                        horizontal-stretch: 1;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                    Text {
+                        text: row.percent + "%";
+                        font-size: 11.5px;
+                        color: #616161;
+                        width: 40px;
+                        horizontal-alignment: right;
+                        vertical-alignment: center;
+                    }
+                }
+
+                if root.rows.length == 0 : Text {
+                    text: "这一轮还没有分通道数据";
+                    font-size: 11.5px;
+                    color: #8A8A8A;
+                    height: 22px;
+                    vertical-alignment: center;
+                }
+
+                Rectangle { height: 6px; }
+
+                Text {
+                    text: root.summary-text;
+                    font-size: 11.5px;
+                    color: #616161;
+                    height: 18px;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+            }
+
+            Rectangle { height: 10px; }
+
+            // 取消确认框的卡片是 404x168，比收起时的窗口（151）还高。
+            // 窗口高度不是 Rust 调 set_size 说了算：Slint 取的是根布局的需求高度，
+            // set_size 会被夹回去（真机 2026-11-17 实测：要 216，窗口老老实实停在 151，
+            // 确认框底部的「继续接收」只露出半截）。所以这里加一块按需撑开的空白，
+            // 让布局自己要 216 —— 65 = 216 - 151。
+            Rectangle { height: root.cancel-ask ? 65px : 0px; }
+        }
+    }
+
+    CancelAskDialog {
+        visible: root.cancel-ask;
+        card-width: 404px;
+        card-height: 168px;
+        keep => { root.cancel-ask = false; root.cancel-keep(); }
+        discard => { root.cancel-ask = false; root.cancel-discard(); }
+        dismiss => { root.cancel-ask = false; root.cancel-dismiss(); }
     }
 }
