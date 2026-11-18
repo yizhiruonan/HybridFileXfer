@@ -857,10 +857,14 @@ export component TransferWindow inherits Window {
 
             Rectangle { height: 12px; }
 
-            // 进度条：IDM 同款切分 —— 一条杠按文件位置均分成十截，每截各自往前跑；
-            // 谁先跑满谁先变绿，全部跑满就是一条完整的绿杠。这正是 IDM 那种「多线程下载」的观感。
-            // 底是资源管理器那张参考图量出来的：条高 15px、直角、1px #BCBCBC 描边、
+            // 进度条：底是资源管理器那张参考图量出来的 —— 条高 15px、直角、1px #BCBCBC 描边、
             // 轨道 #E6E6E6、填充原生绿 #0F7B0F。
+            //
+            // 填充规则：**分段，每段从自己的左边缘往右填**（用户定的）。
+            // 每段就是某条（或某几条合并后的）通道负责的那段文件，段宽 ∝ 块数，
+            // 填到哪儿 = 这段里已经落盘的块占多少。各段同时推进、跨过切分线互不影响；
+            // 全部填满就是一条完整的绿杠。以前之所以看着像「从中间往两边涨」，
+            // 不是这个画法的问题，是切分点算错了（未知归属在中间一分为二，见 §6.1c）。
             bar := Rectangle {
                 height: 15px;
                 background: #E6E6E6;
@@ -869,7 +873,7 @@ export component TransferWindow inherits Window {
                 border-radius: 0px;
                 clip: true;
 
-                // 一截一块，各填各的
+                // 一截一块，各填各的（段宽 ∝ 这段占整条的比例）
                 for seg in root.segs : Rectangle {
                     x: 1px + (bar.width - 2px) * seg.x;
                     width: Math.max(0px, (bar.width - 2px) * seg.span);
@@ -877,7 +881,6 @@ export component TransferWindow inherits Window {
                     background: transparent;
                     clip: true;
 
-                    // 这一截自己填到哪儿
                     piece := Rectangle {
                         width: parent.width * Math.max(0.0, Math.min(1.0, seg.filled));
                         height: 100%;
@@ -885,19 +888,17 @@ export component TransferWindow inherits Window {
                         clip: true;
 
                         // 流光：**一道光扫整条**，不是每截各扫各的。
-                        // 亮带位置按「整条」算，各截只是把经过自己的那段露出来（clip），
-                        // 所以光从左边一路走到右边，跨过切分线时是连续的 —— 这才是 IDM /
-                        // 资源管理器那种流光的观感（以前每截各从自己左边出发，看着像好几道）。
+                        // 亮带位置用整条坐标算，各截只把经过自己的那段露出来（clip），
+                        // 所以光从左边一路走到右边，跨切分线时是连续的。
                         // 参数照抄 Windows 原生（WPF 默认模板的 PART_GlowRect），不是随手调的：
                         //   带宽 100px；水平渐变 #00FFFFFF 0% → #60FFFFFF 40% → #60FFFFFF 60% →
                         //   #00FFFFFF 100%（0x60 = 37.6% 白，中段 40% 实心、两侧各 30% 羽化）；
-                        //   匀速 200 px/s 从左边外面扫到填充区右边外面，扫完停 1 秒再从头来；
-                        //   只扫已填充的部分（外层 clip）。
+                        //   匀速 200 px/s 从左边外面扫到填充区右边外面，扫完停 1 秒再从头来。
                         // 出处：dotnet/wpf Themes/XAML/ProgressBar.xaml + ProgressBar.cs 的 UpdateAnimation。
                         band := Rectangle {
                             visible: root.flow-on && piece.width > 8px;
                             private property <length> band-w: 100px;
-                            x: (1px + (bar.width - 2px) * root.flow) - (1px + (bar.width - 2px) * seg.x) - band.band-w / 2;
+                            x: (bar.width - 2px) * root.flow - (bar.width - 2px) * seg.x - band.band-w / 2;
                             y: 0px;
                             width: band.band-w;
                             height: 100%;
@@ -911,7 +912,7 @@ export component TransferWindow inherits Window {
                     }
                 }
 
-                // 切分线画在最上面：灰底和绿底上都看得见，IDM 的「一块一块」全靠它
+                // 切分线画在最上面：灰底和绿底上都看得见，一条通道一截全靠它分
                 for seg in root.segs : Rectangle {
                     visible: seg.x > 0.0001;
                     x: 1px + (bar.width - 2px) * seg.x;

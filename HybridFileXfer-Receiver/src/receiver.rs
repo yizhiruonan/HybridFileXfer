@@ -383,14 +383,15 @@ impl FileProgress {
             }
             let prev_known = runs[..idx].iter().rev().find(|r| r.2 != u8::MAX).map(|r| r.2);
             let next_known = runs[idx + 1..].iter().find(|r| r.2 != u8::MAX).map(|r| r.2);
+            // 空档**整段给左边那条通道**，不是两边各一半。
+            //
+            // 一开始写成「不同属主就在中间分开」，真机上就出问题：刚开传时每条通道只交了
+            // 前几块，空档很大，从中间一分，画出来就是「从条子中间往两边涨、然后整体往右平移」
+            // —— 那不是 IDM，是切错了。
+            // 按左邻一条通道算才对：一条通道负责的是一段连续区间，它先交前缀、再补后面的，
+            // 前缀和剩下的属于同一条通道，所以空档跟着左边走（末尾的空档本来就归最后那条）。
             match (prev_known, next_known) {
-                (Some(a), Some(b)) if a == b => filled_runs.push((s, e, a)),
-                (Some(a), Some(b)) => {
-                    let mid = s + (e - s) / 2;
-                    filled_runs.push((s, mid, a));
-                    filled_runs.push((mid, e, b));
-                }
-                (Some(a), None) => filled_runs.push((s, e, a)),
+                (Some(a), _) => filled_runs.push((s, e, a)),
                 (None, Some(b)) => filled_runs.push((s, e, b)),
                 (None, None) => filled_runs.push((s, e, u8::MAX)),
             }

@@ -1221,8 +1221,8 @@ fn main() -> Result<(), slint::PlatformError> {
                         seg_rate_at = Some(now_at);
                     }
                 }
-                // 进度条上的切分刻度（IDM 同款）：段是「相邻已完成块换了通道」留下的痕迹，
-                // 位置就是它占整条的比例；条本身仍是从左往右一条（见 app.slint 的说明）。
+                // 进度条上的切分线：段是「相邻块换了通道」留下的痕迹，位置就是它占整条的比例。
+                // 主条本身是连续填充（见 app.slint 的说明），这里只算每段的起点和宽度。
                 let mut segs: Vec<XferSeg> = Vec::with_capacity(raw.len());
                 let mut seg_at = 0.0f32;
                 for s in raw.iter() {
