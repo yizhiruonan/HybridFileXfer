@@ -714,7 +714,8 @@ export component TransferWindow inherits Window {
     in-out property <[XferRow]> rows: [];
     // 进度条上的分段（IDM 同款切分）：每截的位置 / 宽度 / 填充比例
     in-out property <[XferSeg]> segs: [];
-    // 「合计 82.9 MB/s · 剩余约 25 秒」
+    // 「合计 82.9 MB/s · 剩余约 25 秒」—— 用户选了「去掉这行」，属性留着不显示，
+    // Rust 那边还在算（日志/其它地方要用），界面上不再占一行高度。
     in-out property <string> summary-text: "";
     // 已填充比例（0..1，按块算）：流光只在这段里扫，别扫到灰色空条上
     in-out property <float> fill: 0.0;
@@ -1006,16 +1007,8 @@ export component TransferWindow inherits Window {
                     vertical-alignment: center;
                 }
 
-                Rectangle { height: 6px; }
-
-                Text {
-                    text: root.summary-text;
-                    font-size: 11.5px;
-                    color: #616161;
-                    height: 18px;
-                    vertical-alignment: center;
-                    overflow: elide;
-                }
+                // 精简（用户选的）：「合计 xx · 剩余约 xx 秒」整行去掉 ——
+                // 速率上面那行已经有了，剩余时间只是估算，明细下面再挂一行是多余的。
             }
 
             Rectangle { height: 10px; }

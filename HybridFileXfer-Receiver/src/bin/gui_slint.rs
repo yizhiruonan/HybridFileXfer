@@ -1134,6 +1134,11 @@ fn main() -> Result<(), slint::PlatformError> {
                 // 速率是「这一秒和上一秒的已收字节做差」算出来的（见上面的 seg_rate_*）：
                 // PROGRESS 没有速率数据源，但差值就是速率，不用改协议层就能有。
                 let mut rows: Vec<XferRow> = Vec::with_capacity(raw.len());
+                // 行名先不带序号、行的排序键先攒着：手机端那张表是**按通道号**排的
+                // （1 USB_ADB、2 USB_ADB#2、3 wlan1 …），电脑这边段是按文件位置来的，
+                // 直接照段序排行两边就对不上。排完再统一编号。
+                let mut labels: Vec<String> = Vec::with_capacity(raw.len());
+                let mut row_order: Vec<(u8, f32)> = Vec::with_capacity(raw.len());
                 seg_rate_bytes.clear();
                 for (i, s) in raw.iter().enumerate() {
                     let seg_total = (total_bytes as f64 * s.span as f64) as u64;
@@ -1145,26 +1150,47 @@ fn main() -> Result<(), slint::PlatformError> {
                     } else {
                         "—".to_string()
                     };
-                    // 段名 = 「序号 + 谁在负责」，和手机端那条明细（「1 USB_ADB」）同一个读法。
+                    // 段名 = 「谁在负责」，和手机端那条明细（「1 USB_ADB」）同一个读法（序号后加）。
                     // owner 是通道号（mark_sent / mark_received 记下的那个），从这里换成人能看的名字；
                     // 还没分配的尾段、续传捡回来的块各有各的叫法。
                     let label = if s.owner == u8::MAX {
-                        format!("{}. 未分配", i + 1)
+                        "未分配".to_string()
                     } else if s.owner == hfx_receiver::receiver::OWNER_RESUMED {
-                        format!("{}. 续传", i + 1)
+                        "续传".to_string()
                     } else {
                         match hfx_receiver::receiver::PROGRESS.channel_name(s.owner) {
-                            Some(n) => format!("{}. {}", i + 1, n),
-                            None => format!("{}. 通道 {}", i + 1, s.owner as u32 + 1),
+                            Some(n) => n,
+                            None => format!("通道 {}", s.owner as u32 + 1),
                         }
                     };
+                    labels.push(label);
+                    row_order.push((s.owner, i as f32));
                     rows.push(XferRow {
-                        name: label.into(),
+                        name: "".into(),
                         span_text: format!("{:.0}%", s.span * 100.0).into(),
                         amount: format!("{} / {}", human(seg_done), human(seg_total)).into(),
                         rate: rate_text.into(),
                         percent: (s.filled * 100.0).round() as i32,
                     });
+                }
+                // 按通道号重排（和手机端那张表同序：1 USB_ADB、2 USB_ADB#2 …），再统一编号；
+                // 「未分配 / 多通道合并」的段排最后（它们不对应某一条通道）。
+                {
+                    let mut order: Vec<usize> = (0..rows.len()).collect();
+                    order.sort_by(|&a, &b| {
+                        let (oa, xa) = row_order[a];
+                        let (ob, xb) = row_order[b];
+                        let ka = if oa == u8::MAX { (1u8, u8::MAX) } else { (0u8, oa) };
+                        let kb = if ob == u8::MAX { (1u8, u8::MAX) } else { (0u8, ob) };
+                        ka.cmp(&kb).then(xa.partial_cmp(&xb).unwrap_or(std::cmp::Ordering::Equal))
+                    });
+                    let mut sorted: Vec<XferRow> = Vec::with_capacity(rows.len());
+                    for (new_i, &old_i) in order.iter().enumerate() {
+                        let mut r = rows[old_i].clone();
+                        r.name = format!("{}. {}", new_i + 1, labels[old_i]).into();
+                        sorted.push(r);
+                    }
+                    rows = sorted;
                 }
                 let row_count = rows.len();
                 // 每截速率的取样：约一秒一次。帧是 150ms 一帧，逐帧做差会把
@@ -1278,7 +1304,8 @@ fn main() -> Result<(), slint::PlatformError> {
                     tw.set_cancelling(hfx_receiver::control::cancel_requested());
                     // 流光只在「真在传」的时候扫：暂停 / 传完 / 速率掉到 0 都停住
                     tw.set_flow_on(!finished && !hfx_receiver::control::paused() && speed > 0.5);
-                    // 合计速率 · 剩余时间（剩余时间是算出来的，速率不够就不瞎报）
+                    // 精简：界面上不再显示「合计速率 · 剩余时间」（用户选的），这里照旧算一份
+                    // 交给属性（日志和其它小窗复用），只是布局里不再占那一行高度。
                     let summary = if speed > 0.5 && total_bytes > done {
                         let remain = ((total_bytes - done) as f64 / speed) as u64;
                         format!("合计 {} · 剩余约 {}", human_speed(speed), human_eta(remain))
