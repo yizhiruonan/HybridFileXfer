@@ -318,41 +318,116 @@ impl FileProgress {
             .min(self.total)
     }
 
-    /// IDM 式切分：把文件按块**均分**成 `slices` 截，每截各算各的完成度。
+    /// 段数上限、属主区间上限 —— 和手机端 `BlockProgress` 的两个常量对齐。
+    const MAX_SEGMENTS: usize = 24;
+    const MAX_RUNS: usize = 512;
+
+    /// 进度条上的分段：**和手机端 `BlockProgress.segments()` 是同一套算法**。
     ///
-    /// 为什么按文件位置均分，而不是按「哪条通道负责哪一段」：
-    /// 接收端只给**已完成**的块记通道号（`owners[i]` 是写盘那一刻才写的），
-    /// 没完成的块根本不知道会归谁 —— 按通道切出来的宽度会随着完成情况乱跳
-    /// （先跑的那条通道一度能占到 90%），画出来就是「中间先绿、两边后绿」。
-    /// 按文件位置均分是稳的，而且这正是 IDM 的样子：几条并行的进度条各走各的，
-    /// 谁先下完谁先满。
-    fn segments(&self, slices: usize) -> Vec<XferSeg> {
-        let total = self.blocks.blocks();
+    /// 这里曾经按文件位置均分成 10 截（`XFER_SLICES`），那只是为了让条子「看起来像 IDM」，
+    /// 段边界和手机端那条根本对不上 —— 用户要的是两边**同一条**进度条：手机怎么切，电脑就怎么切。
+    /// 所以下面的算法照抄 Java 版 `BlockProgress.segmentsLocked()`，一步一步对着来：
+    ///
+    /// ① 整条块空间按属主切区间，属主一变就是一条边界。未完成的块属主未知（`u8::MAX`），
+    ///    它们自己成段 —— 这一条很关键：只扫「已完成」的块会让最后一段一路吃到文件末尾，
+    ///    正在传的那几块没有自己的段，切分线就没了；
+    /// ② 相邻两段**都填满**才拼成一条（IDM 的「传完就拼成整条」）。左边满了就吞掉右边
+    ///    还在传的段，会出现「还剩几条通道在传、切分线却全没了」；
+    /// ③ 段数超过 {@link MAX_SEGMENTS} 时合并**最短**的那段，不是整条并成一根；
+    /// ④ 每段的填充 = 段内已完成块 / 段总块，只从左边填（和主进度条同一套口径）。
+    fn segments(&self) -> Vec<XferSeg> {
+        let total = self.blocks.blocks().max(self.owners.len());
         if total == 0 {
             return Vec::new();
         }
-        let n = slices.max(1);
-        let per = total.div_ceil(n);
-        let mut out = Vec::with_capacity(n);
-        for k in 0..n {
-            let start = k * per;
-            if start >= total {
-                break;
+        let filled_in = |start: usize, end: usize| -> usize {
+            (start..end).filter(|&b| self.blocks.is_done(b)).count()
+        };
+
+        // ① 属主 run
+        let mut runs: Vec<(usize, usize, u8)> = Vec::new();
+        let mut previous: Option<u8> = None;
+        let mut run_start = 0usize;
+        for i in 0..total {
+            let owner = self.owners.get(i).copied().unwrap_or(u8::MAX);
+            match previous {
+                None => {
+                    previous = Some(owner);
+                    run_start = 0;
+                }
+                Some(p) if p != owner => {
+                    runs.push((run_start, i, p));
+                    run_start = i;
+                    previous = Some(owner);
+                }
+                _ => {}
             }
-            let end = (start + per).min(total);
-            let span = (end - start) as f32;
-            let mut done = 0usize;
-            for b in start..end {
-                if self.blocks.is_done(b) {
-                    done += 1;
+        }
+        if let Some(p) = previous {
+            runs.push((run_start, total, p));
+        }
+        if runs.len() > Self::MAX_RUNS {
+            // 每块都换通道（旧电脑端按块轮询）：画出来全是碎条，退回整条
+            let done = self.blocks.count() as f32;
+            return vec![XferSeg {
+                span: total as f32,
+                filled: (done / total as f32).clamp(0.0, 1.0),
+            }];
+        }
+
+        // ② 相邻两段都满了才拼（属主不同就记成「混合」= -2）
+        let mut merged: Vec<(usize, usize, i16)> = Vec::new();
+        let mut current: Option<(usize, usize, i16)> = None;
+        let mut current_full = false;
+        for &(s, e, own) in &runs {
+            let full = filled_in(s, e) >= e - s;
+            match current {
+                None => {
+                    current = Some((s, e, own as i16));
+                    current_full = full;
+                }
+                Some((cs, ce, co)) => {
+                    if current_full && full {
+                        current = Some((cs, e, if co != own as i16 { -2 } else { co }));
+                    } else {
+                        merged.push((cs, ce, co));
+                        current = Some((s, e, own as i16));
+                        current_full = full;
+                    }
                 }
             }
-            out.push(XferSeg {
-                span,
-                filled: (done as f32 / span).clamp(0.0, 1.0),
-            });
         }
-        out
+        if let Some(c) = current {
+            merged.push(c);
+        }
+
+        // ③ 段数超上限时合并最短的那段
+        while merged.len() > Self::MAX_SEGMENTS {
+            let mut shortest = 0usize;
+            for i in 1..merged.len() {
+                if merged[i].1 - merged[i].0 < merged[shortest].1 - merged[shortest].0 {
+                    shortest = i;
+                }
+            }
+            let into = if shortest == 0 { 1 } else { shortest - 1 };
+            let (gs, ge, go) = merged[shortest];
+            let t = merged[into];
+            merged[into] = (t.0.min(gs), t.1.max(ge), if t.2 != go { -2 } else { t.2 });
+            merged.remove(shortest);
+        }
+
+        // ④ 每段的填充
+        merged
+            .iter()
+            .map(|&(s, e, _)| {
+                let span = (e - s).max(1);
+                let filled = filled_in(s, e);
+                XferSeg {
+                    span: span as f32,
+                    filled: (filled as f32 / span as f32).clamp(0.0, 1.0),
+                }
+            })
+            .collect()
     }
 }
 
@@ -393,11 +468,6 @@ pub struct ProgressState {
     /// 每个文件一份进度，按目标路径分开
     files: Mutex<HashMap<String, FileProgress>>,
 }
-
-/// 进度条切几截（IDM 同款：一条杠分几块，每块自己跑自己的进度）。
-///
-/// 10 和手机端默认的 10 条通道对得上；文件块数少于 10 时按块数自动变少。
-const XFER_SLICES: usize = 10;
 
 impl ProgressState {
     pub fn reset(&self) {
@@ -489,7 +559,7 @@ impl ProgressState {
         self.session_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    /// 当前文件的 IDM 式分段（一段 = 一条通道负责的连续块区间）
+    /// 当前文件的分段（一段 = 一条通道负责的连续块区间，算法和手机端一致，见 FileProgress::segments）
     pub fn segments(&self) -> Vec<XferSeg> {
         let name = match self.current.read() {
             Ok(g) => g.clone(),
@@ -501,7 +571,7 @@ impl ProgressState {
         match self.files.lock() {
             Ok(files) => files
                 .get(&name)
-                .map(|f| f.segments(XFER_SLICES))
+                .map(|f| f.segments())
                 .unwrap_or_default(),
             Err(_) => Vec::new(),
         }
