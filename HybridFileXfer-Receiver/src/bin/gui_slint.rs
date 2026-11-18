@@ -635,25 +635,44 @@ fn main() -> Result<(), slint::PlatformError> {
             }
         });
     }
-    // ---- 流光的步进：16ms 一帧 ----
-    // 亮带从左边扫到右边大约 1.6 秒一趟（每帧 +0.01）。窗口没显示、暂停、或者已经传完
-    // 就直接跳过：进度不动了还在闪，看着像卡住了但其实啥也没发生。
+    // ---- 流光的步进：照抄 Windows 原生的节奏 ----
+    //
+    // WPF 默认模板（ProgressBar.cs 的 UpdateAnimation）是这么摆的：
+    //   startPos = -glowWidth，endPos = indicatorWidth + glowWidth，
+    //   translateTime = (endPos - startPos) / 200.0   // 注释原文：travel at 200px/second
+    //   pauseTime = 1.0s，Duration = translateTime + pauseTime，Linear、无限循环。
+    // 也就是「匀速 200px/s 扫过整条，扫完停 1 秒，再来」。这里按同样的公式算相位，
+    // flow = 亮带中心在条上的位置（单位：条宽），Slint 那边只负责按这个位置画。
+    //
+    // 窗口没显示 / 暂停 / 传完 / 速率为 0 时不动：进度不动还在闪，看着像卡死。
+    const BAND_PX: f32 = 100.0; // 高光带宽（WPF 就是 100px）
+    const SPEED_PX_S: f32 = 200.0; // 200 px/s（WPF 注释里的原值）
+    const PAUSE_S: f32 = 1.0; // 扫完停 1 秒
+    const BAR_PX: f32 = 428.0; // 条的实际像素宽：窗口 476 - 左右各 24 的内边距
+    let flow_phase = std::cell::Cell::new(0.0f32);
     let flow_timer = slint::Timer::default();
     {
         let weak = xfer_win.as_weak();
         flow_timer.start(slint::TimerMode::Repeated, Duration::from_millis(16), move || {
             let Some(tw) = weak.upgrade() else { return };
-            // 速率为 0 / 暂停 / 传完 → 停住（一边 0 MB/s 一边还在流，看着像卡死）
             if !tw.window().is_visible() || tw.get_done() || tw.get_paused() || !tw.get_flow_on() {
                 return;
             }
-            // 一趟 2.2 秒：16ms 一帧 → 每帧 +0.0073。以前是 1.6 秒一趟、亮带才 120px，
-            // 逐帧抓屏 20 帧才捞到 3 帧，等于「看不出在流」。
-            let mut f = tw.get_flow() + 0.0073;
-            if f >= 1.0 {
-                f -= 1.0;
+            // 填充区宽度（像素）：条宽 × 已填充比例
+            let fill_px = (BAR_PX * tw.get_fill().clamp(0.0, 1.0)).max(1.0);
+            // WPF：从 -带宽 扫到 填充宽 + 带宽 → 距离 = 填充宽 + 2×带宽
+            let travel_px = fill_px + 2.0 * BAND_PX;
+            let sweep_s = travel_px / SPEED_PX_S;
+            let cycle_s = sweep_s + PAUSE_S;
+            let mut phase = flow_phase.get() + 0.016;
+            if phase >= cycle_s {
+                phase -= cycle_s;
             }
-            tw.set_flow(f);
+            flow_phase.set(phase);
+            // 扫描阶段线性走完 travel，剩下的时间（1 秒）停在最右边（已经在填充区外，看不见）
+            let t = (phase / sweep_s).clamp(0.0, 1.0);
+            let x_px = -BAND_PX + travel_px * t; // 亮带左边缘
+            tw.set_flow((x_px + BAND_PX / 2.0) / BAR_PX);
         });
     }
     {

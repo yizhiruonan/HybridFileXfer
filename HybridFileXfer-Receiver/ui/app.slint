@@ -765,7 +765,9 @@ export component TransferWindow inherits Window {
                 spacing: 6px;
 
                 Text {
-                    text: (root.failed ? "未完成 " : "已完成 ") + root.percent + "%";
+                    // 精简：不再拼「已完成 / 未完成」前缀 —— 标题栏已经说明状态，
+                    // 大号数字只报百分比
+                    text: root.percent + "%";
                     font-size: 20px;
                     font-weight: 600;
                     color: root.failed ? #C42B1C : #1A1A1A;
@@ -881,21 +883,29 @@ export component TransferWindow inherits Window {
                         background: #0F7B0F;
                         clip: true;
 
-                        // 流光跟着这一截一起扫：每截里都有一道亮带在往右走，
-                        // 十截同相位看着就是「整条都在流」。暂停 / 传完 / 没速率时藏起来。
+                        // 流光：**一道光扫整条**，不是每截各扫各的。
+                        // 亮带位置按「整条」算，各截只是把经过自己的那段露出来（clip），
+                        // 所以光从左边一路走到右边，跨过切分线时是连续的 —— 这才是 IDM /
+                        // 资源管理器那种流光的观感（以前每截各从自己左边出发，看着像好几道）。
+                        // 参数照抄 Windows 原生（WPF 默认模板的 PART_GlowRect），不是随手调的：
+                        //   带宽 100px；水平渐变 #00FFFFFF 0% → #60FFFFFF 40% → #60FFFFFF 60% →
+                        //   #00FFFFFF 100%（0x60 = 37.6% 白，中段 40% 实心、两侧各 30% 羽化）；
+                        //   匀速 200 px/s 从左边外面扫到填充区右边外面，扫完停 1 秒再从头来；
+                        //   只扫已填充的部分（外层 clip）。
+                        // 出处：dotnet/wpf Themes/XAML/ProgressBar.xaml + ProgressBar.cs 的 UpdateAnimation。
                         band := Rectangle {
-                            visible: root.flow-on && piece.width > 16px;
-                            private property <length> band-w: Math.max(20px, Math.min(120px, piece.width * 0.9));
-                            x: piece.width * root.flow - band.band-w / 2;
+                            visible: root.flow-on && piece.width > 8px;
+                            private property <length> band-w: 100px;
+                            x: (1px + (bar.width - 2px) * root.flow) - (1px + (bar.width - 2px) * seg.x) - band.band-w / 2;
                             y: 0px;
                             width: band.band-w;
                             height: 100%;
-                            // 注意 Slint 的颜色是 #RRGGBBAA
+                            // 注意 Slint 的颜色是 #RRGGBBAA（最后两位是透明度）
                             background: @linear-gradient(90deg,
-                                #0F7B0F00 0%,
-                                #FFFFFF66 40%,
-                                #FFFFFF66 60%,
-                                #0F7B0F00 100%);
+                                #FFFFFF00 0%,
+                                #FFFFFF60 40%,
+                                #FFFFFF60 60%,
+                                #FFFFFF00 100%);
                         }
                     }
                 }
@@ -944,7 +954,8 @@ export component TransferWindow inherits Window {
 
                 Rectangle { height: 6px; }
 
-                // 每段（每条通道）一行：名字 / 占整条多少 / 已收 · 该段总量 / 完成百分比
+                // 每段（每条通道）一行：序号+通道名 / 已收 · 该段总量 / 速率 / 该段完成度
+                // 通道名和手机端明细那张表同名（USB_ADB / wlan0#4），两边的读法一致。
                 for row in root.rows : HorizontalLayout {
                     height: 22px;
                     spacing: 8px;
@@ -953,17 +964,13 @@ export component TransferWindow inherits Window {
                         text: row.name;
                         font-size: 11.5px;
                         color: #1A1A1A;
-                        width: 62px;
+                        // 96px：「10. wlan0#4」这种名字要放得下（原来是 62px，只够「通道段 10」）
+                        width: 96px;
                         vertical-alignment: center;
                         overflow: elide;
                     }
-                    Text {
-                        text: row.span-text;
-                        font-size: 11.5px;
-                        color: #8A8A8A;
-                        width: 44px;
-                        vertical-alignment: center;
-                    }
+                    // 精简：原来这里还有一列「占整条 xx%」，和最后一列（该段完成度）容易混，
+                    // 而且通道多的时候这一列只是把同一件事说两遍，去掉。
                     Text {
                         text: row.amount;
                         font-size: 11.5px;
