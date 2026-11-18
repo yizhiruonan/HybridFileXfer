@@ -220,9 +220,14 @@ fn save_transfer_pos(tw: &TransferWindow, state: &mut State, placed: Option<(i32
 // ---------------------------------------------------------------------------
 // 「取消接收」的四个落点：主界面和独立传输窗口共用这一份
 //
-// 点取消 → 先暂停（手机端在暂停同步里看到就停发，别让它在用户看确认框的这几秒里
-// 继续往盘里灌数据）→ 弹「保留 / 不保留 / 继续接收」→ 按选择收尾。
+// 点取消 → 弹「保留 / 不保留 / 继续接收」→ 按选择收尾（停止发生在选的这一刻，不在弹框这一刻）。
 // 两个窗口注册的回调都是下面这几个函数，语义不许长出第二套。
+//
+// 为什么弹框时**不**先暂停：暂停超过约 25 秒，手机端就判这次传输超时、直接关掉连接
+// （真机日志：15:38:45「手机端暂停了传输」→ 15:39:12「接收已取消 / 重建传输通道失败:
+// failed to fill whole buffer」）。用户要是盯着确认框想一会儿，框还在、传输已经没了，
+// 三个选项全成了摆设。而「保留 / 不保留」只决定半截文件怎么处置，跟这几秒要不要继续收
+// 没有关系 —— 先继续收，用户一选再停，反而更实在（也顺手多收了几十兆）。
 // ---------------------------------------------------------------------------
 
 /// 取消被点了一下。返回 false = 这次点击被忽略（没在接收 / 已经在取消中），
@@ -244,10 +249,9 @@ fn cancel_recv_request() -> bool {
         ));
         return false;
     }
-    hfx_receiver::control::pause(true);
     log::warn(i18n::tr(
-        "按钮：取消接收（已暂停，等用户选择是否保留进度）",
-        "button: cancel receiving (paused, waiting for the user's choice)",
+        "按钮：取消接收（弹确认框；传输先不停，等用户选完再停）",
+        "button: cancel receiving (dialog shown; transfer keeps running until the user chooses)",
     ));
     true
 }
@@ -304,7 +308,7 @@ fn cancel_discard(st: &Arc<Mutex<State>>) {
 
 /// 确认框里选了「继续接收」：把刚才为了弹框加的暂停放掉，传输照常
 fn cancel_dismiss() {
-    hfx_receiver::control::pause(false);
+    // 弹框时没有暂停，所以这里也不用放暂停 —— 传照常（以前这里负责把"为了弹框而加的暂停"放掉）
     log::info(i18n::tr(
         "取消接收确认框：选了「继续接收」",
         "cancel dialog: keep receiving",
@@ -799,6 +803,13 @@ fn main() -> Result<(), slint::PlatformError> {
         let mut tw_failed_on = false;
         // 明细行数（= 通道段数）。active 分支算出来的，给外面「每帧跟高度」那段用
         let mut last_row_count = 0usize;
+        // 每截速率：拿「这一秒」和「上一秒」各截的已收字节做差。
+        // PROGRESS 只记了每段占比和完成度，没有速率数据源 —— 但差值就是速率，
+        // 一秒钟取一次样，既不抖也不用改协议层。
+        let mut seg_rate_bytes: Vec<u64> = Vec::new();
+        let mut seg_rate_prev: Vec<u64> = Vec::new();
+        let mut seg_rates: Vec<f32> = Vec::new();
+        let mut seg_rate_at: Option<std::time::Instant> = None;
         let mut tw_details_on = false;
         let mut tw_cancel_on = false;
         // 这一轮传完的时刻（用来数「已完成」亮够 3 秒没有）
@@ -1041,8 +1052,8 @@ fn main() -> Result<(), slint::PlatformError> {
                     ui.set_notice_text(note.into());
                 }
             }
-            // 传输自己结束了 / 引擎被停了：确认框没意义了，顺手把「为了弹框」加的暂停放掉，
-            // 否则下一次接收会从「已暂停」开始
+            // 传输自己结束了 / 引擎被停了：确认框没意义了，收掉。
+            // （弹框时已经不暂停了，这儿只处理「框还开着，传输先一步跑完」的情况）
             // 已经在取消中（或者接收已经结束）就把确认框收掉：用户第二次点「取消」
             // 时不该再看到它，更不该让那里再选一次「保留 / 不保留」。
             if ui.get_cancel_ask()
@@ -1099,24 +1110,59 @@ fn main() -> Result<(), slint::PlatformError> {
                 // 已填充比例（按块算）：进度条画到哪、流光在哪儿扫都看它
                 let fill_frac: f32 = raw.iter().map(|s| s.span * s.filled).sum::<f32>().clamp(0.0, 1.0);
 
-                // ---- 「详细信息」里的明细行：一段（一条通道负责的连续块区间）一行 ----
-                // 电脑端目前**没有**「每通道速率」这份数据（PROGRESS 只记了每段占多少、
-                // 这段完成了多少），所以这里只显示能从块位图算出来的东西：
-                // 占整条多少 · 这段已收 / 这段总量 · 完成百分比。
-                // 不为了好看编速率 —— 真要每通道速率，得先给 receiver.rs 加数据源。
-                // 多文件的队列同理：PROGRESS 只有当前这一轮，队列要另开数据源。
+                // ---- 「详细信息」里的明细行：一截一行 ----
+                // 每截：占整条多少 · 这段已收 / 这段总量 · 这段自己的速率 · 完成百分比。
+                // 速率是「这一秒和上一秒的已收字节做差」算出来的（见上面的 seg_rate_*）：
+                // PROGRESS 没有速率数据源，但差值就是速率，不用改协议层就能有。
                 let mut rows: Vec<XferRow> = Vec::with_capacity(raw.len());
+                seg_rate_bytes.clear();
                 for (i, s) in raw.iter().enumerate() {
                     let seg_total = (total_bytes as f64 * s.span as f64) as u64;
                     let seg_done = (seg_total as f64 * s.filled as f64) as u64;
+                    seg_rate_bytes.push(seg_done);
+                    let rate = seg_rates.get(i).copied().unwrap_or(0.0);
+                    let rate_text = if rate > 0.05 {
+                        human_speed(rate as f64)
+                    } else {
+                        "—".to_string()
+                    };
                     rows.push(XferRow {
                         name: format!("通道段 {}", i + 1).into(),
                         span_text: format!("{:.0}%", s.span * 100.0).into(),
                         amount: format!("{} / {}", human(seg_done), human(seg_total)).into(),
+                        rate: rate_text.into(),
                         percent: (s.filled * 100.0).round() as i32,
                     });
                 }
                 let row_count = rows.len();
+                // 每截速率的取样：约一秒一次。帧是 150ms 一帧，逐帧做差会把
+                // 块到达的抖动放大成满屏跳动的数字；一秒取一次刚好稳。
+                {
+                    let now_at = std::time::Instant::now();
+                    let due = match seg_rate_at {
+                        Some(t) => now_at.duration_since(t).as_secs_f32() >= 0.9,
+                        None => true,
+                    };
+                    if due {
+                        if let Some(t) = seg_rate_at {
+                            let dt = now_at.duration_since(t).as_secs_f32().max(0.2);
+                            seg_rates = seg_rate_bytes
+                                .iter()
+                                .enumerate()
+                                .map(|(i, &b)| {
+                                    let prev = seg_rate_prev.get(i).copied().unwrap_or(b);
+                                    if b >= prev {
+                                        (b - prev) as f32 / dt
+                                    } else {
+                                        0.0
+                                    }
+                                })
+                                .collect();
+                        }
+                        seg_rate_prev = seg_rate_bytes.clone();
+                        seg_rate_at = Some(now_at);
+                    }
+                }
                 // 进度条上的切分刻度（IDM 同款）：段是「相邻已完成块换了通道」留下的痕迹，
                 // 位置就是它占整条的比例；条本身仍是从左往右一条（见 app.slint 的说明）。
                 let mut segs: Vec<XferSeg> = Vec::with_capacity(raw.len());
@@ -1321,6 +1367,15 @@ fn main() -> Result<(), slint::PlatformError> {
             // 暂停着等用户选的时候上面那三条分支一条都不跑，漏掉这一帧对话框就被裁掉。
             if let Some(tw) = xfer_weak.upgrade() {
                 if tw.window().is_visible() {
+                    // 框还开着、传输自己先跑完了：框里的三个选项已经没有意义，
+                    // 直接收掉（不替用户选 —— 文件已经在盘上了，选「不保留」才会删，那是骗人）
+                    if tw.get_cancel_ask() && hfx_receiver::receiver::last_failure().is_none() {
+                        let pct = hfx_receiver::receiver::PROGRESS.snapshot();
+                        let (_, done_now, total_now, _, _) = &pct;
+                        if *total_now > 0 && *done_now >= *total_now {
+                            tw.set_cancel_ask(false);
+                        }
+                    }
                     let details_now = tw.get_details();
                     let cancel_now = tw.get_cancel_ask();
                     let failed_now = hfx_receiver::receiver::last_failure().is_some();
