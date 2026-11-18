@@ -1126,8 +1126,21 @@ fn main() -> Result<(), slint::PlatformError> {
                     } else {
                         "—".to_string()
                     };
+                    // 段名 = 「序号 + 谁在负责」，和手机端那条明细（「1 USB_ADB」）同一个读法。
+                    // owner 是通道号（mark_sent / mark_received 记下的那个），从这里换成人能看的名字；
+                    // 还没分配的尾段、续传捡回来的块各有各的叫法。
+                    let label = if s.owner == u8::MAX {
+                        format!("{}. 未分配", i + 1)
+                    } else if s.owner == hfx_receiver::receiver::OWNER_RESUMED {
+                        format!("{}. 续传", i + 1)
+                    } else {
+                        match hfx_receiver::receiver::PROGRESS.channel_name(s.owner) {
+                            Some(n) => format!("{}. {}", i + 1, n),
+                            None => format!("{}. 通道 {}", i + 1, s.owner as u32 + 1),
+                        }
+                    };
                     rows.push(XferRow {
-                        name: format!("通道段 {}", i + 1).into(),
+                        name: label.into(),
                         span_text: format!("{:.0}%", s.span * 100.0).into(),
                         amount: format!("{} / {}", human(seg_done), human(seg_total)).into(),
                         rate: rate_text.into(),
@@ -1192,30 +1205,16 @@ fn main() -> Result<(), slint::PlatformError> {
                 let in_flight = hfx_receiver::control::receiving() || hfx_receiver::control::sending();
                 let finished = (total_bytes > 0 && done >= total_bytes) || !in_flight;
                 if let Some(tw) = xfer_weak.upgrade() {
-                    // 主文案照参考图的口气：「正在将 xxx（3.00 GB）从手机复制到 HybridFileXfer」
-                    let dir_name = s
-                        .config
-                        .receive_dir
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_else(|| s.config.receive_dir.display().to_string());
                     let size_text = human(total_bytes);
-                    let sending = ui.get_send_active();
+                    // 界面精简：这一行只留「文件名（大小）」。
+                    // 标题栏已经写了「正在传输 / 已完成 / 接收失败」，再写一遍
+                    // 「正在将 … 从手机复制到 …」是把同一件事说两遍，还把条子挤下去一行。
+                    // 失败原因仍然单独一行红字（那是新信息，不能省）。
                     tw.set_action_text(
-                        match (failed, finished, sending) {
-                            (true, _, _) => i18n::tr("接收失败", "receiving failed").to_string(),
-                            (false, true, true) => {
-                                format!("已将 {}（{}）发送到手机", short, size_text)
-                            }
-                            (false, true, false) => {
-                                format!("已将 {}（{}）复制到 {}", short, size_text, dir_name)
-                            }
-                            (false, false, true) => {
-                                format!("正在将 {}（{}）从电脑复制到手机", short, size_text)
-                            }
-                            (false, false, false) => {
-                                format!("正在将 {}（{}）从手机复制到 {}", short, size_text, dir_name)
-                            }
+                        if failed {
+                            i18n::tr("接收失败", "receiving failed").to_string()
+                        } else {
+                            format!("{}（{}）", short, size_text)
                         }
                         .into(),
                     );

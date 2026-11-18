@@ -263,6 +263,9 @@ pub struct XferSeg {
     pub span: f32,
     /// 这一段已完成比例 0..1
     pub filled: f32,
+    /// 这一段是谁在负责（通道号；u8::MAX = 还没分配 / 多通道合并而成，
+    /// OWNER_RESUMED = 续传时磁盘上本来就有的块）
+    pub owner: u8,
 }
 
 /// 续传时「磁盘上本来就有」的块用这个通道号记账。
@@ -331,6 +334,8 @@ impl FileProgress {
     /// ① 整条块空间按属主切区间，属主一变就是一条边界。未完成的块属主未知（`u8::MAX`），
     ///    它们自己成段 —— 这一条很关键：只扫「已完成」的块会让最后一段一路吃到文件末尾，
     ///    正在传的那几块没有自己的段，切分线就没了；
+    ///    随后再按左右邻居把「未知」的空档补上（见下面的 ①-补）：手机端连还没发的块都
+    ///    知道归谁，电脑端只有收到的才知道，不补就会把一条通道的区间拆成两截，两边条子对不上；
     /// ② 相邻两段**都填满**才拼成一条（IDM 的「传完就拼成整条」）。左边满了就吞掉右边
     ///    还在传的段，会出现「还剩几条通道在传、切分线却全没了」；
     /// ③ 段数超过 {@link MAX_SEGMENTS} 时合并**最短**的那段，不是整条并成一根；
@@ -366,12 +371,45 @@ impl FileProgress {
         if let Some(p) = previous {
             runs.push((run_start, total, p));
         }
+        // ①-补：已知归属之间的空档按邻居补上（手机端发块时就记了归属，连还没发的块
+        // 都知道归谁；电脑端只有收到的块才知道）。不补的话，一条通道的区间会被拆成
+        // 「已收前缀 + 待收剩余」两截，6 条通道就画出 12 截 —— 和手机那条对不上。
+        // 补法只看邻居、不看节流：两边都是同一条通道就整段给它；两边不是同一条就在中间分开。
+        let mut filled_runs: Vec<(usize, usize, u8)> = Vec::with_capacity(runs.len());
+        for (idx, &(s, e, own)) in runs.iter().enumerate() {
+            if own != u8::MAX || s == e {
+                filled_runs.push((s, e, own));
+                continue;
+            }
+            let prev_known = runs[..idx].iter().rev().find(|r| r.2 != u8::MAX).map(|r| r.2);
+            let next_known = runs[idx + 1..].iter().find(|r| r.2 != u8::MAX).map(|r| r.2);
+            match (prev_known, next_known) {
+                (Some(a), Some(b)) if a == b => filled_runs.push((s, e, a)),
+                (Some(a), Some(b)) => {
+                    let mid = s + (e - s) / 2;
+                    filled_runs.push((s, mid, a));
+                    filled_runs.push((mid, e, b));
+                }
+                (Some(a), None) => filled_runs.push((s, e, a)),
+                (None, Some(b)) => filled_runs.push((s, e, b)),
+                (None, None) => filled_runs.push((s, e, u8::MAX)),
+            }
+        }
+        // 补完以后相邻 run 可能变成同一条通道，再压一遍
+        let mut runs: Vec<(usize, usize, u8)> = Vec::with_capacity(filled_runs.len());
+        for (s, e, own) in filled_runs {
+            match runs.last_mut() {
+                Some(last) if last.2 == own && last.1 == s => last.1 = e,
+                _ => runs.push((s, e, own)),
+            }
+        }
         if runs.len() > Self::MAX_RUNS {
             // 每块都换通道（旧电脑端按块轮询）：画出来全是碎条，退回整条
             let done = self.blocks.count() as f32;
             return vec![XferSeg {
                 span: total as f32,
                 filled: (done / total as f32).clamp(0.0, 1.0),
+                owner: u8::MAX,
             }];
         }
 
@@ -419,12 +457,14 @@ impl FileProgress {
         // ④ 每段的填充
         merged
             .iter()
-            .map(|&(s, e, _)| {
+            .map(|&(s, e, owner)| {
                 let span = (e - s).max(1);
                 let filled = filled_in(s, e);
                 XferSeg {
                     span: span as f32,
                     filled: (filled as f32 / span as f32).clamp(0.0, 1.0),
+                    // -2 = 多通道拼起来的，和「还没分配」一样显示成未知
+                    owner: if owner < 0 { u8::MAX } else { owner as u8 },
                 }
             })
             .collect()
@@ -467,6 +507,8 @@ pub struct ProgressState {
     files_started: AtomicU64,
     /// 每个文件一份进度，按目标路径分开
     files: Mutex<HashMap<String, FileProgress>>,
+    /// 通道名表：下标 = 通道号（USB_ADB / wlan1#2 …），明细里按段显示「谁在负责」
+    channels: Mutex<Vec<String>>,
 }
 
 impl ProgressState {
@@ -479,6 +521,9 @@ impl ProgressState {
         self.session_bytes.store(0, Ordering::Relaxed);
         self.resumed_bytes.store(0, Ordering::Relaxed);
         self.files_started.store(0, Ordering::Relaxed);
+        if let Ok(mut channels) = self.channels.lock() {
+            channels.clear();
+        }
         if let Ok(mut files) = self.files.lock() {
             files.clear();
         }
@@ -557,6 +602,22 @@ impl ProgressState {
             }
         }
         self.session_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// 登记通道名（下标 = 通道号）。收到传输前由会话层调用一次，明细里就能写出
+    /// 「USB_ADB / wlan0#2」而不是「通道段 3」。
+    pub fn set_channels(&self, names: Vec<String>) {
+        if let Ok(mut guard) = self.channels.lock() {
+            *guard = names;
+        }
+    }
+
+    /// 通道号 -> 通道名（未登记 / 未分配时返回 None，界面自己决定显示什么）
+    pub fn channel_name(&self, owner: u8) -> Option<String> {
+        self.channels
+            .lock()
+            .ok()
+            .and_then(|names| names.get(owner as usize).cloned())
     }
 
     /// 当前文件的分段（一段 = 一条通道负责的连续块区间，算法和手机端一致，见 FileProgress::segments）

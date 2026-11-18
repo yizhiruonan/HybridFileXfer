@@ -1334,6 +1334,13 @@ impl Session {
         self.handle_resume_query(receiver)?;
         // 接收方向没有发送计划：清掉上一次的发送分段，界面改按"谁写了第几块"还原
         reset_send_segments();
+        // 明细里要写出通道名（USB_ADB / wlan1#2 …），下标必须和下面 spawn 时的 channel 一致
+        crate::receiver::PROGRESS.set_channels(
+            self.transfers
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect(),
+        );
         // 接收期间界面显示「暂停 / 已暂停」，暂停时通知手机端停发
         let _receiving = crate::control::ReceivingGuard::begin();
         let started = Instant::now();
