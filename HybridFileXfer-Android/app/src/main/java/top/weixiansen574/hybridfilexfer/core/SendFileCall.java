@@ -102,6 +102,13 @@ public class SendFileCall implements Callable<Void> {
                     if (readFileCall.trySteal(channelIndex)) {
                         continue;
                     }
+                    if (readFileCall.isReaderFinished() && readFileCall.hasSpecialBlocks()) {
+                        // 读线程已经收工，但公共队列里还有被救回来的块没人发：
+                        // 这时发 EOF 会让这些块永远留在内存里 —— 电脑端就少块
+                        // （真机「缺 1 #4312」就是这么来的：所有通道都拿到 END_POINT 收工了）。
+                        Thread.sleep(2);
+                        continue;
+                    }
                     if (readFileCall.isReaderFinished()) {
                         top.weixiansen574.hybridfilexfer.core.HFXLog.d("通道收工(无活) " + connection.iName
                                 + " 已发 " + connection.getUploadedBytes() + " 字节");
@@ -177,17 +184,34 @@ public class SendFileCall implements Callable<Void> {
                     // 汇报这条通道的真实进度，读线程据此判断谁快谁慢（蓝牙那种要特殊对待）
                     readFileCall.noteChannelBytes(channelIndex, connection.getUploadedBytes());
                 }
-                readFileCall.recycleBuffer(fileBlock.data);
                 // 这一块真的发出去了：进度条按块记真值（分段切割线 + 每段填充都从这里来）
-                readFileCall.noteBlockSent(connection.iName, fileBlock.path,
-                        fileBlock.index, fileBlock.totalSize);
+                // 先把要用的字段取出来，再回收缓冲区、清掉引用（原因见下面）
+                final String sentPath = fileBlock.path;
+                final int sentIndex = fileBlock.index;
+                final long sentSize = fileBlock.totalSize;
+                readFileCall.recycleBuffer(fileBlock.data);
+                // 还回池子之后必须把这个引用清掉。
+                //
+                // 下面 noteBlockSent、下一轮的 pollOwnBlock、pause.awaitResume() 里任何一处
+                // 抛异常，catch 里那句「回收没发完的缓冲区」就会把**同一个** ByteBuffer 再还
+                // 一次 —— 池子里于是有两个条目指向同一块内存，两条通道同时往里读，
+                // 发出去的块长度/内容就错位了（真机症状：跑久了才犯、大小一致但
+                // SHA-256 不一致、偶发「块长度与文件栅格不符」的短块）。
+                fileBlock = null;
+                readFileCall.noteBlockSent(connection.iName, sentPath, sentIndex, sentSize);
             }
         } catch (Exception e) {
             //若发生异常，通知其他传输通道，停止传输
             top.weixiansen574.hybridfilexfer.core.HFXLog.d("SendFileCall[" + connection.iName + "] FAILED, wroteLast=" + fileBlock, e);
-            if (fileBlock != null){
-                //回收文件分块的ByteBuffer，否则导致这个Buffer免费了
+            if (fileBlock != null && fileBlock.data != null) {
+                // 回收没发完的文件分块缓冲区。
+                // 两个条件都不能省：
+                //  · data == null：控制块（EOF / 中断 / 读错误那几个常量块）本来就没有缓冲区，
+                //    直接 add(null) 会在 LinkedBlockingDeque 里抛 NPE，把真正的异常盖掉；
+                //  · fileBlock 已经在正常路径回收过的话，这里再还一次就是双重回收
+                //    （正常路径回收后会把 fileBlock 置 null，所以这里只会看到"没还过"的）。
                 readFileCall.recycleBuffer(fileBlock.data);
+                fileBlock = null;
             }
             readFileCall.shutdownByConnectionBreak();
             // 取消时通道是被我们自己或电脑端关掉的，ClosedChannelException /

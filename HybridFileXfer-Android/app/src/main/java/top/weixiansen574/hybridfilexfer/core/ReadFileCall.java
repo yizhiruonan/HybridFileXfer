@@ -510,6 +510,21 @@ public abstract class ReadFileCall implements Callable<Void> {
         // 快通道全干完了也只能干等它一块一块吐 —— 实测蓝牙队列里那几块让收尾多等了两分半。
         drainSlowQueues();
         readerFinished = true;
+        // 等公共队列被各通道清空再放 END_POINT。
+        //
+        // 顺序反过来的话，拿到 END_POINT 的通道会立刻发 EOF 收工，而被 drainSlowQueues
+        // 救回来的块还躺在公共队列里 —— 一条通道都不会再去发它们，电脑端账本就少块
+        // （真机「缺 1 #4312」就是这么来的：跑几十次撞一次，每次只少一块）。
+        // 有通道被暂停住时这里最多等 5 秒，之后照常收尾（不比原来差）。
+        long waitUntil = System.currentTimeMillis() + 5000L;
+        while (!specialQueue.isEmpty() && System.currentTimeMillis() < waitUntil) {
+            try {
+                Thread.sleep(2);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
         for (int i = 0; i < operateThreadCount; i++) {
             queues[i].add(END_POINT);
         }
@@ -686,6 +701,12 @@ public abstract class ReadFileCall implements Callable<Void> {
     }
 
     public void recycleBuffer(ByteBuffer buffer) {
+        // 控制块（EOF / 中断 / 读错误）没有缓冲区，绝不能 add(null)：
+        // LinkedBlockingDeque 会抛 NPE，而这个方法常在 catch 里被调用，一抛就把真正的
+        // 异常盖掉了（NEXT-TODO 11c 记的那个空指针隐患）。
+        if (buffer == null) {
+            return;
+        }
         buffers.add(buffer);
     }
 
@@ -704,6 +725,18 @@ public abstract class ReadFileCall implements Callable<Void> {
     /** 取一个「谁发都行」的块（文件夹 / 空文件 / 没有健康通道时救回来的块）；没有就返回 null */
     public FileBlock pollSpecialBlock() {
         return specialQueue.poll();
+    }
+
+    /**
+     * 「谁发都行」的队列里还有块吗？
+     *
+     * <p>发块线程在发 EOF 之前必须问一声：收尾时 {@code finishProducing()} 会先把慢通道/卡死通道
+     * 队列里压着的块搬进这个队列，再往每条通道队列里塞 END_POINT。如果某条通道刚拿到 END_POINT
+     * 就收工，而公共队列里还躺着被救回来的块，那些块**一条通道都不会再发** ——
+     * 电脑端账本就少一块（真机：「缺 1 #4312」，跑几百次才撞一次）。
+     */
+    public boolean hasSpecialBlocks() {
+        return !specialQueue.isEmpty();
     }
 
     /** 这条通道自己那段还没产完，或者抢到了别人的一段尾巴 → 还有活干 */
