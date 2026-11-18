@@ -1222,7 +1222,7 @@ fn main() -> Result<(), slint::PlatformError> {
                     }
                 }
                 // 进度条上的切分线：段是「相邻块换了通道」留下的痕迹，位置就是它占整条的比例。
-                // 主条本身是连续填充（见 app.slint 的说明），这里只算每段的起点和宽度。
+                // 主条按段画（每段从自己的左边缘往右填），这里只算每段的起点和宽度。
                 let mut segs: Vec<XferSeg> = Vec::with_capacity(raw.len());
                 let mut seg_at = 0.0f32;
                 for s in raw.iter() {
@@ -1232,6 +1232,19 @@ fn main() -> Result<(), slint::PlatformError> {
                         filled: s.filled,
                     });
                     seg_at += s.span;
+                }
+                // 诊断：设了 HFX_DEBUG_SEGS=1 就把这一帧的段表写进日志（排查「条子画得不像」用）。
+                if std::env::var("HFX_DEBUG_SEGS").is_ok() {
+                    let mut acc = 0.0f32;
+                    let mut line = format!("段表 done={} n={}", done, raw.len());
+                    for s in raw.iter() {
+                        line.push_str(&format!(
+                            " [{:.3}+{:.3} f{:.2} o{}]",
+                            acc, s.span, s.filled, s.owner
+                        ));
+                        acc += s.span;
+                    }
+                    log::debug(&line);
                 }
                 let segs_model = slint::ModelRc::new(slint::VecModel::from(segs));
                 // 外面那段「每帧跟高度」要用：它跑的时候 active 可能是 false，拿不到 rows

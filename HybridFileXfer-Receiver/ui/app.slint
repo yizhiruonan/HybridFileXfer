@@ -882,6 +882,10 @@ export component TransferWindow inherits Window {
                     clip: true;
 
                     piece := Rectangle {
+                        // x 必须显式写 0：不给 x 时 Slint 会把这个块**居中**摆进这一段，
+                        // 于是每段的绿都从段中间往两边长 —— 真机上就是「进度条从中间往两边涨」
+                        // （像素实测：段起点 33、段宽 68、绿的起点 64 ≈ 33 + (68-8)/2）。
+                        x: 0px;
                         width: parent.width * Math.max(0.0, Math.min(1.0, seg.filled));
                         height: 100%;
                         background: #0F7B0F;
