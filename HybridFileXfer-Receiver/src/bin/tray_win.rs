@@ -226,6 +226,41 @@ pub fn find_transfer_window(main_title: &str) -> Option<HwndVal> {
     }
 }
 
+/// 按标题找一个窗口（本进程自己建的，标题是唯一的）。
+///
+/// 和 `find_transfer_window` 的区别：那个是「除了主界面之外的第一个窗口」，
+/// 现在进程里有主界面 / 传输窗口 / 取消确认框三个，谁先被枚举到不一定，
+/// 所以要能按标题精确找。
+pub fn find_window_titled(title: &str) -> Option<HwndVal> {
+    let wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+    let h = unsafe { FindWindowW(std::ptr::null(), wide.as_ptr()) };
+    if h.is_null() {
+        None
+    } else {
+        Some(h as isize)
+    }
+}
+
+/// 置顶 + 抢到前台（要给用户点的窗口才用这个）。
+///
+/// 为什么必须抢前台：传输窗口自己是 HWND_TOPMOST 的（§6.5），取消确认框如果不跟着置顶，
+/// 用户看着框在前、鼠标点下去命中的却是后面那个置顶的传输窗口 ——
+/// 真机 2026-11-19 撞见：点「保留进度」没反应，传输照跑到 100%。
+pub fn bring_to_front(hwnd: HwndVal) {
+    unsafe {
+        SetWindowPos(
+            hwnd as HWND,
+            HWND_TOPMOST,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE,
+        );
+        SetForegroundWindow(hwnd as HWND);
+    }
+}
+
 /// 置顶（不改位置、不改大小、不抢焦点）
 pub fn set_topmost(hwnd: HwndVal) {
     unsafe {

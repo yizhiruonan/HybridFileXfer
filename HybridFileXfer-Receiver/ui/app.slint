@@ -81,6 +81,50 @@ component SecondaryButton inherits Rectangle {
     ta := TouchArea { clicked => { root.clicked(); } }
 }
 
+// 取消确认框（CancelAskWindow）专用的按钮：照 Windows 11 对话框那颗的样子画 ——
+// 浅灰底 + 1px 细边框 + 深色字，**不上蓝底**。
+//
+// 为什么主按钮（默认那颗）也不上蓝：①这一轮用户的要求就是「降饱和」；
+// ②这颗按钮代表的是「保留进度」，不是「马上要执行的操作」，蓝底会把眼睛从
+//   「取消接收？」这个问句上拽走；③经典 Win32 MessageBox 的默认按钮本来就是
+//   灰底 + 粗字 + 更实的描边，Win11 只是把描边换成细的 #D0D0D0。
+//   要恢复成 Win11 的强调色主按钮，把下面 primary 那两行的底色换成 #0067C0、
+//   文字换成 #FFFFFF 即可（一行的事，不动布局）。
+//
+// 颜色出处：
+//   * 次按钮底色 #FAFAFA、边框 #D0D0D0 = Windows 11 ContentDialog 的实测值（用户给的）；
+//   * hover #F5F5F5 是从 #FAFAFA 往下压一档，和按钮自己的常态拉开明度差
+//     （原生按钮的 hover 就是这么来的，压的是明度，不动色相）；
+//   * 默认那颗 #F0F0F0 / hover #E8E8E8：比次按钮再深一档，配合加粗字，一眼看出它是默认项。
+component AskButton inherits Rectangle {
+    in property <string> label;
+    // true = 默认按钮（灰底深一档 + 加粗），false = 普通按钮
+    in property <bool> primary: false;
+    callback clicked;
+
+    height: 32px;
+    border-radius: 4px;
+    border-width: 1px;
+    border-color: #D0D0D0;
+    background: root.primary
+        ? (ta.has-hover ? #E8E8E8 : #F0F0F0)
+        : (ta.has-hover ? #F5F5F5 : #FAFAFA);
+
+    Text {
+        width: parent.width;
+        height: parent.height;
+        text: root.label;
+        // #000000 = 参考图 docs/explorer-copy-dialog.png 文字的最暗像素（(60,141)、(46,50)）
+        color: #000000;
+        font-size: 13px;
+        font-weight: root.primary ? 600 : 400;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    ta := TouchArea { clicked => { root.clicked(); } }
+}
+
 export struct DeviceRow {
     name: string,
     state: string,
@@ -142,9 +186,13 @@ export component CancelAskWindow inherits Window {
     Rectangle {
         width: 100%;
         height: 100%;
+        // 底色 #FFFFFF = 参考图 docs/explorer-copy-dialog.png 客户区 (5,60) 取的，
+        // 原生对话框就是纯白，不用再压（原来的 #FFFFFF 本来就对，保留并注明出处）
         background: #FFFFFF;
         border-width: 1px;
-        border-color: #C8C8C8;
+        // #D0D0D0 = Windows 11 控件的细描边（用户给的 ContentDialog 值），原来是 #C8C8C8；
+        // 压淡一档是为了和「浅灰底按钮」同一套灰度，别让边框抢眼
+        border-color: #D0D0D0;
 
         VerticalLayout {
             padding: 16px;
@@ -154,7 +202,8 @@ export component CancelAskWindow inherits Window {
                 text: "取消接收？";
                 font-size: 15px;
                 font-weight: 600;
-                color: #1A1A1A;
+                // #000000 = 参考图正文文字的最暗像素（(60,141)、(46,50)），原来是 #1A1A1A
+                color: #000000;
             }
             Text {
                 text: "已经收到的部分怎么处理？（选好之后就停，这几秒传输先照常跑）";
@@ -173,19 +222,23 @@ export component CancelAskWindow inherits Window {
                 height: 32px;
                 spacing: 8px;
                 Rectangle { horizontal-stretch: 1; }
-                SecondaryButton {
+                // 三颗都用 AskButton：浅灰底 + 细边框 + 深色字（见文件上半部分的组件注释）。
+                // 以前是 SecondaryButton(#FFFFFF) + PrimaryButton(#005FB8 蓝底白字)，
+                // 那颗蓝底就是用户说的「太鲜艳」；现在默认项只用「深一档的灰 + 加粗」表示。
+                AskButton {
                     width: 92px;
                     label: "继续接收";
                     clicked => { root.dismiss(); }
                 }
-                SecondaryButton {
+                AskButton {
                     width: 128px;
                     label: "不保留，删掉";
                     clicked => { root.discard(); }
                 }
-                PrimaryButton {
+                AskButton {
                     width: 104px;
                     label: "保留进度";
+                    primary: true;
                     clicked => { root.keep(); }
                 }
             }
@@ -648,6 +701,25 @@ export component AppWindow inherits Window {
 //     条到分隔线 15px；分隔线 1px #E3E3E3 贯穿整窗；分隔线到「详细信息」15px。
 //   * 分隔线位置：y=122（整窗 447 宽那条）。
 //
+// 2026-11-19 这一轮「对齐原生」用 System.Drawing 逐像素重量的（图是 100% 缩放，
+// 和本机 96 DPI 同一个尺度，可以直接比）：
+//   * 分隔线 #E3E3E3 —— 取 (10,122)/(200,122)/(440,122) 三个点，整行 447 个像素
+//     全是 #E3E3E3，没有渐变；条底 y=106 到线 y=122 中间隔着 15 行纯白。
+//     → **我们的线颜色本来就对，问题是线贴着条子画（间距 0）**，看着像进度条的
+//       第二道边，所以「扎眼」。现在按图补上 15px 间距。
+//   * 文字 #000000 —— 主文案 (46,50) 一带、明细行「详细信息」(60,141) 一带的最暗
+//     像素都是纯黑（图上那些彩色点是 ClearType 的次像素红蓝边，不是字色）。
+//     原来是 #1A1A1A，按图改成 #000000。
+//   * 三角 ▼ 最暗 #1F1F1F（(31,141..147) 那条细线），本质上还是黑，和文字同色。
+//   * ✕ 图标 (409..416, 64..82) 最暗 #000000；⏸ 同样 #000000。
+//   * 「详细信息」那一行：三角墨迹 x=31..41、文字 x=51..98（4 个字 48px → 12px 字），
+//     墨迹 y=139..149；配 22px 的行高正好是 y=133..155 这个框（行内居中），
+//     也就是「分隔线 122 → 行框 133 = 10px」；文字墨迹离分隔线 15px，和上面那条对上。
+//   * 参考图里没有次级灰字（正文、明细全是黑的），所以「57%」「·」那类淡色没法从图上
+//     取，沿用现有的中性灰 #616161（R=G=B，本来就不存在饱和问题）。
+//   * 进度条三个色在图上逐点复核过，和现在代码里的完全一致（轨道 #E6E6E6、
+//     填充 #0F7B0F、描边 #BCBCBC），这一项**不需要改**，只把出处写进注释。
+//
 // 语义：
 //   * 标题栏 ✕ 与「收起」= 把窗口藏起来，传输继续（和手机端「关闭 ≠ 取消」一样）；
 //     要真停下得点窗口里的「取消」，走的是主界面那套「保留 / 不保留」；
@@ -660,16 +732,23 @@ export component TransferWindow inherits Window {
     default-font-family: "Microsoft YaHei UI";
     default-font-size: 13px;
     preferred-width: 460px;
-    // 收起时的高度 = 14 + 20 + 6 + 30 + 12 + 15 + 14 + 1 + 9 + 20 + 10 = 151
+    // 收起时的高度 = 14 + 20 + 6 + 30 + 13 + 15(条) + 15(条到线) + 1(线) + 10
+    //              + 22(详细信息行) + 10 = 156
+    // （2026-11-19：条到线补了 15px、百分比行到条 12→13、「详细信息」行 20→22，
+    //   所以 151 → 156；gui_slint.rs 的 TW_H_COLLAPSED 同步改了）
     // 展开「详细信息」后由 Rust 按行数 set_size（和 gui_slint.rs 的 TW_H_COLLAPSED 对得上）
     //
     // 但光靠 Rust 的 set_size 不够：窗口高度最终以 Slint 这边的 preferred-height 为准，
     // 暂停着等用户选「保留 / 不保留」的时候（那时 active 已经是 false）Rust 那边调 set_size
     // 窗口并不会长 —— 真机 2026-11-17 就是这么撞见的：确认框上的「继续接收」只露出半截。
     // 所以这里把「内容需要多高」也声明一遍，和 transfer_window_height() 的公式保持一致。
-    property <length> content-h: 151px
+    // 展开这一段只加「6px 间隔 + 每行 22px」：原来的 30px 里多算了 24px，
+    // 展开后窗口底下会留一条空白（真机截图 476x352 里最后一行下面还有 40 多像素白）。
+    // rows 为空时下面画的是「这一轮还没有分通道数据」那一行，同样占 22px，
+    // 所以这里也用 max(1, …)，和 Rust 的 transfer_window_height() 一个算法。
+    property <length> content-h: 156px
         + (root.failed ? 20px : 0px)
-        + (root.details ? 30px + root.rows.length * 22px : 0px);
+        + (root.details ? 6px + Math.max(1, root.rows.length) * 22px : 0px);
     // 确认框现在是独立窗口，不再需要把高度撑到 216 —— 传“细节”让位给它自己的窗口
     preferred-height: root.content-h;
     background: #FFFFFF;
@@ -719,10 +798,11 @@ export component TransferWindow inherits Window {
         spacing: 0px;
         padding: 0px;
 
-        // ---- 上半：上下文 + 进度条（左右 24px 内边距，参考图是 26）----
+        // ---- 上半：上下文 + 进度条（左右 26px 内边距，照参考图量：条子 x=27、客户区 x=1）----
+        // 原来是 24，比原生少 2px —— 用户说「文本位置太挤」，把这 2px 还给原生。
         VerticalLayout {
-            padding-left: 24px;
-            padding-right: 24px;
+            padding-left: 26px;
+            padding-right: 26px;
             spacing: 0px;
 
             Rectangle { height: 14px; }
@@ -730,7 +810,9 @@ export component TransferWindow inherits Window {
             Text {
                 text: root.action-text;
                 font-size: 14px;
-                color: #1A1A1A;
+                // #000000 = 参考图主文案「正在将…」那一行的最暗像素（(46,50) 一带，纯黑），
+                // 原来是 #1A1A1A（比原生浅一档）
+                color: #000000;
                 height: 20px;
                 vertical-alignment: center;
                 overflow: elide;
@@ -748,11 +830,15 @@ export component TransferWindow inherits Window {
                     text: root.percent + "%";
                     font-size: 20px;
                     font-weight: 600;
-                    color: root.failed ? #C42B1C : #1A1A1A;
+                    // #000000 = 参考图「已完成 8%」大字的最暗像素（(28..120, 66..79) 里的纯黑）；
+                    // 失败那一行的红 #C42B1C 没动（参考图里没有失败态可采，沿用现值）
+                    color: root.failed ? #C42B1C : #000000;
                     vertical-alignment: center;
                 }
                 Text {
                     text: root.detail-text;
+                    // #616161 = 沿用现值：参考图里没有次级灰字（正文全是黑的），
+                    // 这已经是中性灰（R=G=B），不存在「太鲜艳」的问题
                     font-size: 11.5px;
                     color: #616161;
                     vertical-alignment: center;
@@ -769,13 +855,14 @@ export component TransferWindow inherits Window {
                     visible: !root.done;
 
                     // 运行中画两条竖杠（字体里不一定有 ⏸，画出来最稳）
+                    // #000000 = 参考图 ⏸ 图标 (355..385, 64..82) 的最暗像素（纯黑），原来是 #1A1A1A
                     Rectangle {
                         visible: !root.paused;
                         x: 10px;
                         y: 8px;
                         width: 3px;
                         height: 12px;
-                        background: #1A1A1A;
+                        background: #000000;
                     }
                     Rectangle {
                         visible: !root.paused;
@@ -783,19 +870,26 @@ export component TransferWindow inherits Window {
                         y: 8px;
                         width: 3px;
                         height: 12px;
-                        background: #1A1A1A;
+                        background: #000000;
                     }
                     Text {
                         visible: root.paused;
                         text: "继续";
                         font-size: 11.5px;
-                        color: #1A1A1A;
+                        color: #000000;
                         width: 100%;
                         height: 100%;
                         horizontal-alignment: center;
                         vertical-alignment: center;
                     }
-                    pause-ta := TouchArea { clicked => { root.toggle-pause(); } }
+                    // 纯图标控件：UIA 里以前什么都列不出来（里面是 Rectangle，没有可访问名），
+                    // 自动化和读屏都点不到/读不出。TouchArea 上加角色 + 名字，
+                    // 名字跟着状态走（和可见的「继续」一致）。
+                    pause-ta := TouchArea {
+                        accessible-role: button;
+                        accessible-label: root.paused ? "继续" : "暂停";  // 英文：Resume / Pause
+                        clicked => { root.toggle-pause(); }
+                    }
                 }
 
                 // 取消：参考图右边那颗 ✕，接的是「保留 / 不保留」那套流程
@@ -811,13 +905,18 @@ export component TransferWindow inherits Window {
                         // × 是 GB2312 里就有的乘号，✕(U+2715) 在 YaHei 里没有，会变豆腐块
                         text: "×";
                         font-size: 18px;
-                        color: #1A1A1A;
+                        // #000000 = 参考图右上角 ✕ 图标 (409..416, 64..82) 的最暗像素，原来是 #1A1A1A
+                        color: #000000;
                         width: 100%;
                         height: 100%;
                         horizontal-alignment: center;
                         vertical-alignment: center;
                     }
+                    // 纯图标控件：UIA 里以前只暴露成一颗 Text「×」，没有按钮角色。
+                    // 加角色 + 名字之后自动化能按「取消接收」点到它（读屏也读得出）。
                     cancel-ta := TouchArea {
+                        accessible-role: button;
+                        accessible-label: "取消接收";  // 英文：Cancel
                         clicked => {
                             // 失败那一轮：这颗 ✕ 变成「关掉这个失败提示」
                             // （已经没有传输在跑了，走取消流程只会被忽略，按钮就成死的了）
@@ -832,10 +931,20 @@ export component TransferWindow inherits Window {
                 }
             }
 
-            Rectangle { height: 12px; }
+            // 百分比行到条 13px：参考图大字墨迹底 y=79、条顶 y=92，中间 13 行。原来是 12。
+            Rectangle { height: 13px; }
 
             // 进度条：底是资源管理器那张参考图量出来的 —— 条高 15px、直角、1px #BCBCBC 描边、
             // 轨道 #E6E6E6、填充原生绿 #0F7B0F。
+            //
+            // 2026-11-19 复核（用户说「进度条配色太鲜艳」）：把参考图和本程序的截图逐点比过，
+            // 三个色**一模一样**，所以这一项不改，只补出处：
+            //   * 描边 #BCBCBC —— 参考图 (27,92) / (200,92) / (200,106)，条子上下各一行；
+            //   * 轨道 #E6E6E6 —— 参考图 (200,93)（条内未填充区域）；
+            //   * 填充 #0F7B0F —— 参考图 (200,97) / (30,93)（左边已填充那段）；
+            //   本程序真机截图 xfer-window-details.png 里同位置取到的也是这三个值。
+            // 最后一段 8% 的绿之所以显得艳，是「窄窄一条高饱和绿」的观感，颜色本身是原生色，
+            // 改浅反而就不像资源管理器了。
             //
             // 填充规则：**分段，每段从自己的左边缘往右填**（用户定的）。
             // 每段就是某条（或某几条合并后的）通道负责的那段文件，段宽 ∝ 块数，
@@ -904,32 +1013,59 @@ export component TransferWindow inherits Window {
             }
         }
 
+        // ---- 条到分隔线 15px（参考图条底 y=106、线 y=122，中间 15 行纯白）----
+        // 这一段以前是 **0**：线直接贴着条子画，看着像进度条自己的第二道边，
+        // 用户说的「分界线太明显」主要就是这个。加上原生那 15px 之后，线才回到
+        // 「段落分隔」的位置上。
+        Rectangle { height: 15px; }
+
         // ---- 分隔线：贯穿整窗（参考图就是整窗宽，不带内边距）----
+        // #E3E3E3 = 参考图 (10,122)/(200,122)/(440,122)，整行 447 个像素全是这个值。
+        // 颜色本来就是对的（不是深灰），扎眼是上面那个 0 间距造成的，所以这里只保留原色。
         Rectangle { height: 1px; background: #E3E3E3; }
 
         // ---- 下半：「详细信息」开关 + 明细 ----
+        // 和上半一样 26px 内边距：参考图里三角的墨迹从 x=31 起、正文从 x=27 起，
+        // 都在同一个 26px 的左边距上（三角字形自己带一点左侧留白）。
         VerticalLayout {
-            padding-left: 24px;
-            padding-right: 24px;
+            padding-left: 26px;
+            padding-right: 26px;
             spacing: 0px;
 
-            Rectangle { height: 9px; }
+            // 分隔线到行框 10px：参考图线 y=122，22px 的行框落在 y=133..155（框内文字居中，
+            // 墨迹 y=139..149），所以「线到行框 10px」= 「线到文字 15px」，
+            // 后者正是顶部注释块里量的那个 15。原来是 9。
+            Rectangle { height: 10px; }
 
             // 整行可点（和资源管理器一样，不用非得点到字上）
+            // 行高 22px = Windows 列表的标准行高（原来是 20）；12px 字 = 参考图
+            // 「详细信息」4 个字量出 48px 宽（x=51..98），也就是 12px 一个字。
             Rectangle {
-                height: 20px;
-                background: details-ta.has-hover ? #F5F5F5 : transparent;
+                height: 22px;
+                // 悬浮时**不刷底色**（用户 2026-11-19：「鼠标悬浮停留时这个详细信息阴影删除，
+                // 或者 1:1 仿原生」）。原生资源管理器这一行确实有 hover 高亮，但我们把整行 460px
+                // 刷成 #F5F5F5 之后，白底窗口里横着一条灰带，比原生那张图里任何一处都显眼 ——
+                // 用户看到的就是「一道阴影」。宁可没有：可点性靠指针形状和 ▲/▼ 已经够了。
+                background: transparent;
 
                 Text {
                     // ▼/▲ 是 GB2312 里的字形，YaHei 一定有；▾/▴ 这种小三角会渲染成豆腐块
+                    // 三角色同文字 #000000：参考图三角墨迹 (31..41, 141..147) 最暗 #1F1F1F，
+                    // 是 12px 细笔画的抗锯齿结果，本质还是黑
                     text: root.details ? "▲ 详细信息" : "▼ 详细信息";
-                    font-size: 12.5px;
-                    color: #1A1A1A;
+                    font-size: 12px;
+                    color: #000000;
                     width: 100%;
                     height: 100%;
                     vertical-alignment: center;
                 }
-                details-ta := TouchArea { clicked => { root.toggle-details(); } }
+                // 这一行也是纯文字控件：UIA 里以前只是一颗 Text，自动化点不到。
+                // 加按钮角色 + 跟着展开状态变的名字。
+                details-ta := TouchArea {
+                    accessible-role: button;
+                    accessible-label: root.details ? "收起详细信息" : "展开详细信息";  // 英文：Collapse/Expand details
+                    clicked => { root.toggle-details(); }
+                }
             }
 
             if root.details : VerticalLayout {
@@ -939,16 +1075,21 @@ export component TransferWindow inherits Window {
 
                 // 每段（每条通道）一行：序号+通道名 / 已收 · 该段总量 / 速率 / 该段完成度
                 // 通道名和手机端明细那张表同名（USB_ADB / wlan0#4），两边的读法一致。
+                // 列：字号统一 12px（原来是 11.5/11 混着），列距 14px（原来是 8px），
+                // 名字列 110px（原来 96）、速率列 78px（原来 74）、百分比列 44px（原来 40）。
+                // 四列铺满 26px 内边距之间的整条宽度，所以左边缘 / 右边缘和上面那行
+                // 「32.0 MB / 600.0 MB · 9.2 MB/s」是同一条线（用户要的对齐）。
+                // 行高仍是 22px（Windows 列表的标准行高），字放大到 12px 之后行距自然松一档。
                 for row in root.rows : HorizontalLayout {
                     height: 22px;
-                    spacing: 8px;
+                    spacing: 14px;
 
                     Text {
                         text: row.name;
-                        font-size: 11.5px;
-                        color: #1A1A1A;
-                        // 96px：「10. wlan0#4」这种名字要放得下（原来是 62px，只够「通道段 10」）
-                        width: 96px;
+                        font-size: 12px;
+                        color: #000000;
+                        // 110px：「10. wlan0#4」这种名字要放得下（原来 96px）
+                        width: 110px;
                         vertical-alignment: center;
                         overflow: elide;
                     }
@@ -956,26 +1097,28 @@ export component TransferWindow inherits Window {
                     // 而且通道多的时候这一列只是把同一件事说两遍，去掉。
                     Text {
                         text: row.amount;
-                        font-size: 11.5px;
-                        color: #1A1A1A;
+                        font-size: 12px;
+                        color: #000000;
                         horizontal-stretch: 1;
                         vertical-alignment: center;
                         overflow: elide;
                     }
                     Text {
                         text: row.rate;
-                        font-size: 11px;
+                        font-size: 12px;
+                        // #616161 = 沿用现值（参考图里没有次级灰字可采，中性灰本来就不艳）
                         color: #616161;
-                        width: 74px;
+                        width: 78px;
                         horizontal-alignment: right;
                         vertical-alignment: center;
                         overflow: elide;
                     }
                     Text {
                         text: row.percent + "%";
-                        font-size: 11.5px;
+                        font-size: 12px;
+                        // #616161 = 同上，「57%」这类淡一点的字
                         color: #616161;
-                        width: 40px;
+                        width: 44px;
                         horizontal-alignment: right;
                         vertical-alignment: center;
                     }
@@ -983,7 +1126,7 @@ export component TransferWindow inherits Window {
 
                 if root.rows.length == 0 : Text {
                     text: "这一轮还没有分通道数据";
-                    font-size: 11.5px;
+                    font-size: 12px;
                     color: #8A8A8A;
                     height: 22px;
                     vertical-alignment: center;

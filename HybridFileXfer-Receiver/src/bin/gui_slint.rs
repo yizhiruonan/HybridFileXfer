@@ -25,6 +25,11 @@ mod tray_win;
 
 /// 窗口标题（托盘线程靠它找到主窗口）
 const WINDOW_TITLE: &str = "多轨快传";
+/// 传输窗口标题（"正在传输" / "已完成" / "接收失败" 会变，所以只在需要时按它找主窗口）
+#[allow(dead_code)]
+const TRANSFER_TITLE: &str = "正在传输";
+/// 取消确认框的窗口标题（app.slint 里 CancelAskWindow 的 title，两边要一致）
+const ASK_TITLE: &str = "取消接收";
 
 struct EngineHandle {
     stop: Arc<AtomicBool>,
@@ -326,13 +331,21 @@ fn human_eta(secs: u64) -> String {
     }
 }
 
-/// 传输窗口收起时的高度（逻辑像素），和 app.slint 的 preferred-height 对得上
-const TW_H_COLLAPSED: f32 = 151.0;
+/// 传输窗口收起时的高度（逻辑像素），和 app.slint 的 preferred-height 对得上。
+///
+/// 2026-11-19「对齐资源管理器」那一轮从 151 改成 156，逐项是：
+/// 14(上留白) + 20(主文案) + 6 + 30(百分比行) + 13(百分比行到条，原 12)
+/// + 15(条) + 15(条到分隔线，原 0 —— 原来线贴着条子画) + 1(分隔线)
+/// + 10(线到「详细信息」行，原 9) + 22(「详细信息」行，原 20) + 10(下留白)。
+const TW_H_COLLAPSED: f32 = 156.0;
 /// 明细一行的高度（app.slint 里 for 循环的 height: 22px）
 const TW_ROW_H: f32 = 22.0;
+/// 「详细信息」展开时行区上方的间隔（app.slint 里那个 Rectangle { height: 6px; }）
+const TW_DETAILS_GAP: f32 = 6.0;
 
-/// 传输窗口这一轮该多高：收起 151；展开明细 = 151 + 6 + 行数*22 + 6 + 18；
-/// 弹「取消」确认框时至少 200（卡片 168 + 上下留白），否则卡片会被窗口裁掉。
+/// 传输窗口这一轮该多高：收起 156；展开明细 = 156 + 6(间隔) + 行数*22
+/// （行数为 0 时按 1 行算：那时 app.slint 画的是「这一轮还没有分通道数据」那一行，同样 22px）。
+/// 弹「取消」确认框时不用再撑高（它是独立窗口）。
 /// 把传输窗口摆到该在的位置再显示。
 ///
 /// 三处「要弹出来了」都走它（正常开始 / 失败 / 失败后重新弹）：先摆个大概位置（省得在系统默认
@@ -367,7 +380,9 @@ fn show_transfer_window(
 fn transfer_window_height(details: bool, rows: usize, failed: bool) -> f32 {
     let mut h = TW_H_COLLAPSED;
     if details {
-        h += 30.0 + rows as f32 * TW_ROW_H;
+        // 原来这里是 30.0 + 行数*22：30 里多算了 24，展开后窗口底下会空一条
+        // （真机截图里最后一行下面还有 40 多像素白）。改成和 app.slint 一致的 6 + 行数*22。
+        h += TW_DETAILS_GAP + rows.max(1) as f32 * TW_ROW_H;
     }
     // 「接收失败：<原因>」那一行（app.slint 里 height: 20px）
     if failed {
@@ -922,6 +937,13 @@ fn main() -> Result<(), slint::PlatformError> {
                     let y = tw_pos.y + (tw_size.height as i32 - aw_size.height as i32) / 2;
                     aw.window()
                         .set_position(slint::PhysicalPosition::new(x.max(0), y.max(0)));
+                    // 传输窗口自己是 HWND_TOPMOST（§6.5），这个确认框也必须跟着置顶 + 抢前台，
+                    // 否则用户看着它在前面、鼠标点下去命中的是后面那个置顶窗口 ——
+                    // 真机 2026-11-19：点「保留进度」毫无反应，传输一路跑到 100%。
+                    #[cfg(windows)]
+                    if let Some(hwnd) = tray_win::find_window_titled(ASK_TITLE) {
+                        tray_win::bring_to_front(hwnd);
+                    }
                 } else if !want && shown {
                     let _ = aw.hide();
                 }
