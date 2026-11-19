@@ -364,7 +364,7 @@ fn show_transfer_window(
     }
 }
 
-fn transfer_window_height(details: bool, rows: usize, cancel_ask: bool, failed: bool) -> f32 {
+fn transfer_window_height(details: bool, rows: usize, failed: bool) -> f32 {
     let mut h = TW_H_COLLAPSED;
     if details {
         h += 30.0 + rows as f32 * TW_ROW_H;
@@ -373,11 +373,7 @@ fn transfer_window_height(details: bool, rows: usize, cancel_ask: bool, failed: 
     if failed {
         h += 20.0;
     }
-    if cancel_ask {
-        // 确认框的卡片是 404x168（app.slint），窗口比它矮就会被裁掉 ——
-        // 真机第一次点 ✕ 就撞见了「按钮只露出半截」
-        h = h.max(216.0);
-    }
+    // 取消确认框现在是独立窗口，不再需要把传输窗口撑到 216 高（TRANSFER-WINDOW.md §6.2）
     h
 }
 
@@ -478,6 +474,9 @@ fn main() -> Result<(), slint::PlatformError> {
     // 独立传输窗口：只读同一份 PROGRESS，不参与主界面布局。
     // 传输一开始自己弹出来，结束自己收起 —— 主窗口最小化到托盘时也能看到进度。
     let xfer_win = TransferWindow::new()?;
+    // 取消确认框的**独立窗口**（用户要求：不要再挤进传输窗口里）。
+    // 传输窗口只负责把 cancel-ask 这个状态位翻成 true/false，这个窗口自己弹/收（见下面的定时器）。
+    let ask_win = CancelAskWindow::new()?;
     // 用户在传输窗口上点了「收起」：这一轮就别再弹了（下一轮传输重新允许）
     let xfer_dismissed = Arc::new(AtomicBool::new(false));
     // 传输窗口的落位 / 置顶状态（收起回调也要用，所以放在外面共享）
@@ -513,6 +512,8 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let st = Arc::clone(&state);
         let ui_weak = ui.as_weak();
+        // 开始接收：顺手把上一轮可能还开着的取消确认框（独立窗口）收掉
+        let tw_weak_start = xfer_win.as_weak();
         ui.on_start_clicked(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             let mut s = st.lock().unwrap();
@@ -549,7 +550,9 @@ fn main() -> Result<(), slint::PlatformError> {
             ui.set_message("".into());
             // 上一次取消留下的提示 / 没关掉的确认框，别带进这一次
             ui.set_notice_text("".into());
-            ui.set_cancel_ask(false);
+            if let Some(tw) = tw_weak_start.upgrade() {
+                tw.set_cancel_ask(false);
+            }
             hfx_receiver::control::pause(false);
             hfx_receiver::receiver::PROGRESS.reset();
             // 上一轮的「接收失败」提示别带进这一轮
@@ -563,6 +566,7 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let st = Arc::clone(&state);
         let ui_weak = ui.as_weak();
+        let tw_weak_stop = xfer_win.as_weak();
         ui.on_stop_clicked(move || {
             let mut s = st.lock().unwrap();
             log::info("按钮：停止接收");
@@ -572,8 +576,10 @@ fn main() -> Result<(), slint::PlatformError> {
             hfx_receiver::control::pause(false);
             if let Some(ui) = ui_weak.upgrade() {
                 ui.set_running(false);
-                ui.set_cancel_ask(false);
                 ui.set_notice_text("".into());
+            }
+            if let Some(tw) = tw_weak_stop.upgrade() {
+                tw.set_cancel_ask(false);
             }
         });
     }
@@ -763,6 +769,63 @@ fn main() -> Result<(), slint::PlatformError> {
     }
     ui.on_cancel_dismiss(cancel_dismiss);
     xfer_win.on_cancel_dismiss(cancel_dismiss);
+    // 独立窗口上的三个按钮：先收窗口、把传输窗口的状态位清零，再走同一套语义
+    {
+        let st = Arc::clone(&state);
+        let tw_weak = xfer_win.as_weak();
+        let aw = ask_win.as_weak();
+        ask_win.on_keep(move || {
+            if let Some(tw) = tw_weak.upgrade() {
+                tw.set_cancel_ask(false);
+            }
+            if let Some(a) = aw.upgrade() {
+                let _ = a.hide();
+            }
+            cancel_keep(&st);
+        });
+    }
+    {
+        let st = Arc::clone(&state);
+        let tw_weak = xfer_win.as_weak();
+        let aw = ask_win.as_weak();
+        ask_win.on_discard(move || {
+            if let Some(tw) = tw_weak.upgrade() {
+                tw.set_cancel_ask(false);
+            }
+            if let Some(a) = aw.upgrade() {
+                let _ = a.hide();
+            }
+            cancel_discard(&st);
+        });
+    }
+    {
+        // 确认框的标题栏 ✕ = 「继续接收」（不改主意），和框里那个按钮一个语义
+        let tw_weak = xfer_win.as_weak();
+        let aw = ask_win.as_weak();
+        ask_win.window().on_close_requested(move || {
+            if let Some(tw) = tw_weak.upgrade() {
+                tw.set_cancel_ask(false);
+            }
+            if let Some(a) = aw.upgrade() {
+                let _ = a.hide();
+            }
+            cancel_dismiss();
+            slint::CloseRequestResponse::KeepWindowShown
+        });
+    }
+    {
+        let tw_weak = xfer_win.as_weak();
+        let aw = ask_win.as_weak();
+        ask_win.on_dismiss(move || {
+            if let Some(tw) = tw_weak.upgrade() {
+                tw.set_cancel_ask(false);
+            }
+            if let Some(a) = aw.upgrade() {
+                let _ = a.hide();
+            }
+            cancel_dismiss();
+        });
+    }
     {
         let st = Arc::clone(&state);
         ui.on_tray_toggled(move |enabled| {
@@ -814,6 +877,8 @@ fn main() -> Result<(), slint::PlatformError> {
         let ui_weak = ui.as_weak();
         // 独立传输窗口：这一轮有没有弹过 / 用户是不是已经把它收起来了
         let xfer_weak = xfer_win.as_weak();
+        // 取消确认框那个独立窗口
+        let ask_weak = ask_win.as_weak();
         let xfer_dismissed = Arc::clone(&xfer_dismissed);
         #[cfg(windows)]
         let tw_state = Arc::clone(&tw_state);
@@ -842,6 +907,25 @@ fn main() -> Result<(), slint::PlatformError> {
 
         timer.start(slint::TimerMode::Repeated, Duration::from_millis(150), move || {
             let Some(ui) = ui_weak.upgrade() else { return };
+            // ---- 取消确认框：独立窗口，跟着 cancel-ask 这个状态位弹/收 ----
+            // 传完 / 已经取消 / 用户选了任意一项 → 状态位被清掉 → 这里把窗口收起来。
+            if let (Some(tw), Some(aw)) = (xfer_weak.upgrade(), ask_weak.upgrade()) {
+                let want = tw.get_cancel_ask();
+                let shown = aw.window().is_visible();
+                if want && !shown {
+                    let _ = aw.show();
+                    // 弹在传输窗口正中（先 show 再量尺寸：没显示时尺寸还不可信）
+                    let tw_pos = tw.window().position();
+                    let tw_size = tw.window().size();
+                    let aw_size = aw.window().size();
+                    let x = tw_pos.x + (tw_size.width as i32 - aw_size.width as i32) / 2;
+                    let y = tw_pos.y + (tw_size.height as i32 - aw_size.height as i32) / 2;
+                    aw.window()
+                        .set_position(slint::PhysicalPosition::new(x.max(0), y.max(0)));
+                } else if !want && shown {
+                    let _ = aw.hide();
+                }
+            }
             let mut s = st.lock().unwrap();
 
             // 「在不在接收」只看引擎：设备数不行 —— 停止过程中设备表里那条还在，
@@ -1075,12 +1159,14 @@ fn main() -> Result<(), slint::PlatformError> {
             // （弹框时已经不暂停了，这儿只处理「框还开着，传输先一步跑完」的情况）
             // 已经在取消中（或者接收已经结束）就把确认框收掉：用户第二次点「取消」
             // 时不该再看到它，更不该让那里再选一次「保留 / 不保留」。
-            if ui.get_cancel_ask()
-                && (!receiving_now || hfx_receiver::control::cancel_requested())
-            {
-                ui.set_cancel_ask(false);
-                if !hfx_receiver::control::cancel_requested() {
-                    hfx_receiver::control::pause(false);
+            // 确认框现在是独立窗口、状态位挂在传输窗口上：这里只在「传输已经不在收」时
+            // 把那个位清掉（定时器会把窗口收起来）。
+            if let Some(tw) = xfer_weak.upgrade() {
+                if tw.get_cancel_ask() && !receiving_now {
+                    tw.set_cancel_ask(false);
+                    if !hfx_receiver::control::cancel_requested() {
+                        hfx_receiver::control::pause(false);
+                    }
                 }
             }
             // 新的一次传输开始了：上一次的取消提示让位（进度卡回来了，提示就不该再挂着）
@@ -1421,8 +1507,8 @@ fn main() -> Result<(), slint::PlatformError> {
                 }
             }
 
-            // 传输窗口的高度：明细展开 / 取消确认框都会改它，**每帧都要跟**。
-            // 暂停着等用户选的时候上面那三条分支一条都不跑，漏掉这一帧对话框就被裁掉。
+            // 传输窗口的高度：明细展开 / 「接收失败」那行会改它，**每帧都要跟**。
+            // （取消确认框改成独立窗口了，不再影响这个高度。）
             if let Some(tw) = xfer_weak.upgrade() {
                 if tw.window().is_visible() {
                     // 框还开着、传输自己先跑完了：框里的三个选项已经没有意义，
@@ -1435,21 +1521,11 @@ fn main() -> Result<(), slint::PlatformError> {
                         }
                     }
                     let details_now = tw.get_details();
-                    let cancel_now = tw.get_cancel_ask();
                     let failed_now = hfx_receiver::receiver::last_failure().is_some();
-                    if details_now != tw_details_on
-                        || cancel_now != tw_cancel_on
-                        || failed_now != tw_failed_on
-                    {
+                    if details_now != tw_details_on || failed_now != tw_failed_on {
                         tw_details_on = details_now;
-                        tw_cancel_on = cancel_now;
                         tw_failed_on = failed_now;
-                        let h = transfer_window_height(
-                            details_now,
-                            last_row_count,
-                            cancel_now,
-                            failed_now,
-                        );
+                        let h = transfer_window_height(details_now, last_row_count, failed_now);
                         tw.window().set_size(slint::LogicalSize::new(460.0, h));
                         // 长高之后可能探出屏幕下沿（真机：明细一展开，后 6 行跑到屏幕外），
                         // 这里只做「越界才推回来」，不抢用户拖过的位置。

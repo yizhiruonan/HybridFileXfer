@@ -121,86 +121,72 @@ export struct XferSeg {
     filled: float,
 }
 
-// ---------------------------------------------------------------------------
-// 取消接收的确认框（主界面 + 独立传输窗口共用同一个组件）
+// （取消确认框的旧遮罩组件已删除：现在是独立窗口 CancelAskWindow，见下面。）
+// 取消接收的确认框：**独立窗口**（用户要求，不要挤在传输窗口里）。
 //
-// 三个选择的语义只写这一份：
-//   「继续接收」= 只是关掉这个框（传输本来就没停，什么都不用还原）；
-//   「不保留，删掉」= 删掉没传完的文件和 .hfxpart 续传记录，下次从头传；
-//   「保留进度」= 留着半截文件和续传记录，下次同一个文件接着传。
-// 两个窗口都把这个组件盖在自己上面，回调接到同一套 Rust 处理函数
-// （gui_slint.rs 里 ui / xfer_win 两边注册的是同样的代码）。
-// ---------------------------------------------------------------------------
-component CancelAskDialog inherits Rectangle {
-    // 主界面窗口大，卡片 424x188；传输窗口小，卡片也用小的
-    in property <length> card-width: 424px;
-    in property <length> card-height: 188px;
+// 以前它是传输窗口上的一个遮罩层，得靠「给布局加 65px 占位」把窗口物理撑高才露得全
+// （Slint 的窗口高度取根布局需求，set_size 会被夹回去，见 TRANSFER-WINDOW.md §6.2）。
+// 独立窗口不用跟布局较劲：自己的尺寸自己说了算，传输窗口该多高还是多高；
+// 也不会挡住传输窗口上的暂停/取消按钮 —— 用户可以先处理完这个框再说。
+export component CancelAskWindow inherits Window {
+    title: "取消接收";
+    width: 424px;
+    height: 172px;
+    // 标题栏 ✕ 当成「继续接收」（不改主意）：这个回调挂不了在 Window 上，
+    // 由 gui_slint.rs 用 on_close_requested 接（和传输窗口的 ✕ 一个路子）。
 
     callback keep();
     callback discard();
     callback dismiss();
 
-    x: 0;
-    y: 0;
-    // 盖满整个窗口：直接用它被放进窗口时的那一层（组件里够不到 parent）
-    width: 100%;
-    height: 100%;
-    background: #00000059;
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #FFFFFF;
+        border-width: 1px;
+        border-color: #C8C8C8;
 
-    // 吃掉遮罩上的点击，别透到下面的按钮（免得误触「停止接收」/「取消」）
-    TouchArea { }
+        VerticalLayout {
+            padding: 16px;
+            spacing: 8px;
 
-    VerticalLayout {
-        alignment: center;
-        HorizontalLayout {
-            alignment: center;
-            Card {
-                width: root.card-width;
-                height: root.card-height;
-
-                VerticalLayout {
-                    padding: 16px;
-                    spacing: 8px;
-
-                    Text {
-                        text: "取消接收？";
-                        font-size: 15px;
-                        font-weight: 600;
-                        color: #1A1A1A;
-                    }
-                    Text {
-                        text: "已经收到的部分怎么处理？（选好之后就停，这几秒传输先照常跑）";
-                        font-size: 11.5px;
-                        color: #616161;
-                        wrap: word-wrap;
-                    }
-                    Text {
-                        text: "保留进度：留半截文件和续传记录，下次接着传；不保留：删掉。";
-                        font-size: 11.5px;
-                        color: #8A8A8A;
-                        wrap: word-wrap;
-                    }
-                    Rectangle { vertical-stretch: 1; }
-                    HorizontalLayout {
-                        height: 32px;
-                        spacing: 8px;
-                        Rectangle { horizontal-stretch: 1; }
-                        SecondaryButton {
-                            width: 92px;
-                            label: "继续接收";
-                            clicked => { root.dismiss(); }
-                        }
-                        SecondaryButton {
-                            width: 128px;
-                            label: "不保留，删掉";
-                            clicked => { root.discard(); }
-                        }
-                        PrimaryButton {
-                            width: 104px;
-                            label: "保留进度";
-                            clicked => { root.keep(); }
-                        }
-                    }
+            Text {
+                text: "取消接收？";
+                font-size: 15px;
+                font-weight: 600;
+                color: #1A1A1A;
+            }
+            Text {
+                text: "已经收到的部分怎么处理？（选好之后就停，这几秒传输先照常跑）";
+                font-size: 11.5px;
+                color: #616161;
+                wrap: word-wrap;
+            }
+            Text {
+                text: "保留进度：留半截文件和续传记录，下次接着传；不保留：删掉。";
+                font-size: 11.5px;
+                color: #8A8A8A;
+                wrap: word-wrap;
+            }
+            Rectangle { vertical-stretch: 1; }
+            HorizontalLayout {
+                height: 32px;
+                spacing: 8px;
+                Rectangle { horizontal-stretch: 1; }
+                SecondaryButton {
+                    width: 92px;
+                    label: "继续接收";
+                    clicked => { root.dismiss(); }
+                }
+                SecondaryButton {
+                    width: 128px;
+                    label: "不保留，删掉";
+                    clicked => { root.discard(); }
+                }
+                PrimaryButton {
+                    width: 104px;
+                    label: "保留进度";
+                    clicked => { root.keep(); }
                 }
             }
         }
@@ -647,17 +633,8 @@ export component AppWindow inherits Window {
     }
     }
 
-    // ---------------- 取消接收：确认框 ----------------
-    // 和独立传输窗口上的「取消」用的是同一个组件（CancelAskDialog，定义在文件前面），
-    // 「继续接收 / 不保留，删掉 / 保留进度」三选一的语义只有那一份。
-    CancelAskDialog {
-        visible: root.cancel-ask;
-        card-width: 424px;
-        card-height: 188px;
-        keep => { root.cancel-ask = false; root.cancel-keep(); }
-        discard => { root.cancel-ask = false; root.cancel-discard(); }
-        dismiss => { root.cancel-ask = false; root.cancel-dismiss(); }
-    }
+    // 取消接收的确认框不在这儿画了：它是独立窗口 CancelAskWindow（见文件开头），
+    // 主界面和传输窗口共用那一个窗口，「继续 / 不保留 / 保留」的语义只有一份。
 }
 // ---------------------------------------------------------------------------
 // 独立传输窗口：外观照「资源管理器复制文件」那个弹窗做
@@ -693,8 +670,8 @@ export component TransferWindow inherits Window {
     property <length> content-h: 151px
         + (root.failed ? 20px : 0px)
         + (root.details ? 30px + root.rows.length * 22px : 0px);
-    // 取消确认框的卡片是 404x168，窗口比它矮就会裁掉按钮
-    preferred-height: root.cancel-ask && root.content-h < 216px ? 216px : root.content-h;
+    // 确认框现在是独立窗口，不再需要把高度撑到 216 —— 传“细节”让位给它自己的窗口
+    preferred-height: root.content-h;
     background: #FFFFFF;
 
     in-out property <string> action-text: "正在接收文件";
@@ -1018,21 +995,9 @@ export component TransferWindow inherits Window {
 
             Rectangle { height: 10px; }
 
-            // 取消确认框的卡片是 404x168，比收起时的窗口（151）还高。
-            // 窗口高度不是 Rust 调 set_size 说了算：Slint 取的是根布局的需求高度，
-            // set_size 会被夹回去（真机 2026-11-17 实测：要 216，窗口老老实实停在 151，
-            // 确认框底部的「继续接收」只露出半截）。所以这里加一块按需撑开的空白，
-            // 让布局自己要 216 —— 65 = 216 - 151。
-            Rectangle { height: root.cancel-ask ? 65px : 0px; }
+            // 取消确认框不再画在这里：它现在是**独立窗口**（见文件开头的 CancelAskWindow）。
+            // 这里只留 cancel-ask 这个状态位，Rust 每帧读它，翻成 true 就把那个窗口弹出来。
+            // 以前是遮罩层，得靠「加 65px 占位」把窗口物理撑高才露得全（§6.2），独立窗口不用。
         }
-    }
-
-    CancelAskDialog {
-        visible: root.cancel-ask;
-        card-width: 404px;
-        card-height: 168px;
-        keep => { root.cancel-ask = false; root.cancel-keep(); }
-        discard => { root.cancel-ask = false; root.cancel-discard(); }
-        dismiss => { root.cancel-ask = false; root.cancel-dismiss(); }
     }
 }
