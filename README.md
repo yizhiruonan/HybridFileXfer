@@ -60,17 +60,7 @@
 
 ### 应用界面
 
-安卓端基于 Miuix，浅色 / 深色 / Monet 三套主题。
-
-| 主页（浅色） | 设置（浅色） |
-| --- | --- |
-| ![安卓主页浅色](docs/android-home-light.png) | ![安卓设置浅色](docs/android-settings-light.png) |
-
-| 主页（深色） | 设置（深色） |
-| --- | --- |
-| ![安卓主页深色](docs/android-home-dark.png) | ![安卓设置深色](docs/android-settings-dark.png) |
-
-电脑接收器（Rust + Slint，原生 Windows 风格）：
+安卓端基于 Miuix，浅色 / 深色 / Monet 三套主题；电脑接收器是 Rust + Slint 的原生 Windows 风格界面：
 
 ![电脑接收器](docs/windows-receiver.png)
 
