@@ -49,3 +49,15 @@ wgc_capture.obj
 target-verify/
 tools/wgc-capture/shots/
 tools/wgc-capture/wgc_capture.exe
+# ================= 开发记录 / 调试工具（只留本地，不进公开仓库）=================
+# 排查过程、待办清单、交接文档：都在本地 _worklog\，仓库里只留 README
+/BUGS.md
+/NEXT-TODO.md
+/TRANSFER-WINDOW.md
+/HANDOFF*.md
+# 开发期的截图证据：README 只用到 windows-receiver.png 这一张
+/docs/*.md
+/docs/*.png
+!/docs/windows-receiver.png
+# 调试用的 WGC 截屏小工具
+/tools/

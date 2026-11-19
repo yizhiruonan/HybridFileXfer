@@ -16,7 +16,7 @@
 | `HybridFileXfer-Android/` | 安卓客户端（Java + Jetpack Compose / Miuix UI） |
 | `HybridFileXfer-Receiver/` | 电脑接收器（Rust + Slint，原生 Windows 风格界面；GUI 与 CLI 双入口，不需要 Java） |
 | `HybridFileXfer-PC/` | 经典 Java 电脑客户端源码（旧版，可选；不含 jar 与 adb.exe） |
-| `script/` | adb 端口转发、一键编译等辅助脚本 |
+| `script/` | 一键编译 APK、启动 App 的辅助脚本 |
 
 ## 功能
 
