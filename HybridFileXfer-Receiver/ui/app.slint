@@ -732,23 +732,36 @@ export component TransferWindow inherits Window {
     default-font-family: "Segoe UI, Microsoft YaHei UI";
     default-font-size: 13px;
     preferred-width: 460px;
-    // 收起时的高度 = 14 + 20 + 6 + 30 + 13 + 15(条) + 15(条到线) + 1(线) + 10
-    //              + 22(详细信息行) + 10 = 156
-    // （2026-11-19：条到线补了 15px、百分比行到条 12→13、「详细信息」行 20→22，
-    //   所以 151 → 156；gui_slint.rs 的 TW_H_COLLAPSED 同步改了）
-    // 展开「详细信息」后由 Rust 按行数 set_size（和 gui_slint.rs 的 TW_H_COLLAPSED 对得上）
+    // ---- 高度：这里和 gui_slint.rs 的 transfer_window_height() 两处必须一模一样 ----
+    // 收起态（2026-11-19 那一轮逐像素量出来的，这一轮一个字都没改）：
+    //   14(上留白) + 20(主文案) + 6 + 30(百分比行)
+    //   + 13(百分比行到分段条) + 15(分段条) + 15(分段条到分隔线)
+    //   + 1(分隔线) + 10(线到开关行) + 22(「详细信息」行) + 10(下留白) = 156
     //
-    // 但光靠 Rust 的 set_size 不够：窗口高度最终以 Slint 这边的 preferred-height 为准，
-    // 暂停着等用户选「保留 / 不保留」的时候（那时 active 已经是 false）Rust 那边调 set_size
-    // 窗口并不会长 —— 真机 2026-11-17 就是这么撞见的：确认框上的「继续接收」只露出半截。
-    // 所以这里把「内容需要多高」也声明一遍，和 transfer_window_height() 的公式保持一致。
-    // 展开这一段只加「6px 间隔 + 每行 22px」：原来的 30px 里多算了 24px，
-    // 展开后窗口底下会留一条空白（真机截图 476x352 里最后一行下面还有 40 多像素白）。
-    // rows 为空时下面画的是「这一轮还没有分通道数据」那一行，同样占 22px，
-    // 所以这里也用 max(1, …)，和 Rust 的 transfer_window_height() 一个算法。
-    property <length> content-h: 156px
-        + (root.failed ? 20px : 0px)
-        + (root.details ? 6px + Math.max(1, root.rows.length) * 22px : 0px);
+    // 展开态（这一轮重排，用户拍板：展开后顶上那条分段条整块不画，只留详情里那条图表条）：
+    //   14 + 20 + 6 + 30                        = 70  ← 上半原样，只是 13+15(条)+15 这 43px 没了
+    //   + 13(分段条不画了，百分比行到分隔线仍留 13 的呼吸)
+    //   + 1(分隔线)
+    //   + 10(分隔线到「名称：」)
+    //   + 18*3(名称 / 剩余时间 / 剩余项目 —— 原生这三行的行距就是 18，见下面的量测注释)
+    //   + 8(三行到速度图表条)
+    //   + 80(速度图表条 —— 参考图 native-details.png y=92..171 逐行数的，不是 79：
+    //        y=92 外框 / 93 内侧 / 94..141 上层48 / 142 黑基线 / 143..169 下层实心27 /
+    //        170 内侧 / 171 外框，一共 80 行；y=172 起是纯白，所以条子就是 80 高)
+    //   + 8(图表条到各通道速率第一行)
+    //   + 22*max(1,rows)(每条通道一行；rows 为 0 时画「还没有分通道数据」那行，同样 22)
+    //   + 10(行区下留白) + 1(「简略信息」上面那条分隔线，native-details.png y=250)
+    //   + 10 + 22(行) + 10
+    //   合计 = 297 + 22*max(1, rows)
+    //   （拆开验算：70(上半) + 1(分隔线) + 13 + 160(详情固定 10+18*3+8+80+8)
+    //     + 22*rows + 53(尾部 10+1+10+22+10)）
+    // （「接收失败：<原因>」那行红字 +20，收起 / 展开两种状态都加。）
+    //
+    // 光靠 Rust 的 set_size 不够：窗口高度最终以这边的 preferred-height 为准，
+    // 暂停着等用户选「保留 / 不保留」时（active 已经是 false）Rust 调 set_size 窗口不会长
+    // —— 2026-11-17 真机撞见过「继续接收」只露出半截。所以内容高度这里也声明一遍。
+    property <length> content-h: (root.failed ? 20px : 0px)
+        + (root.details ? 297px + Math.max(1, root.rows.length) * 22px : 156px);
     // 确认框现在是独立窗口，不再需要把高度撑到 216 —— 传“细节”让位给它自己的窗口
     preferred-height: root.content-h;
     background: #FFFFFF;
@@ -757,6 +770,22 @@ export component TransferWindow inherits Window {
     in-out property <int> percent: 0;
     // 大号百分比后面那行小字：「210.0 MB / 3.00 GB · 82.9 MB/s」
     in-out property <string> detail-text: "";
+    // ---- 展开「详细信息」里那三行「标签：值」的**值**（标签固定在 Slint 这边，和原生一致）----
+    // 参考图 native-details.png：「名称： vendor_boot_b.img / 剩余时间：正在计算... /
+    // 剩余项目： 1 (17.0 MB)」三行，12px 黑字、行距 18px，左边距和正文同一条线（x=27）。
+    // 名称：当前文件名
+    in-out property <string> file-name: "";
+    // 剩余时间：算得出来是「x 秒 / x 分 x 秒」，算不出来由 Rust 传「正在计算...」
+    in-out property <string> eta-text: "";
+    // 剩余项目：剩余项数 + 剩余大小，例如「1 (17.0 MB)」
+    in-out property <string> remain-text: "";
+    // ---- 展开态那条「速度图表条」里的曲线面积 ----
+    // Rust 每 100ms 往环形缓冲里塞一个 (进度比例, 瞬时速度)，再拼成 Path 的 commands
+    // 推过来。坐标是归一化的：x 0..1000、y 0..48（48 = 上层高度，正好落在黑基线上），
+    // Path 的 viewbox 也是 1000×48，纵向 1:1 对齐黑基线，横向拉伸到条内宽。
+    in-out property <string> curve-path: "";
+    // 图表条里右上那行「速度: 72.9 MB/秒」（叠在浅绿区里、基线之上）
+    in-out property <string> speed-text: "";
     in-out property <bool> paused: false;
     in-out property <bool> done: false;
     // 这一轮失败了（块账本对不上 / 手机端说指纹不一致）：窗口停在「接收失败」上，
@@ -931,84 +960,108 @@ export component TransferWindow inherits Window {
                 }
             }
 
-            // 百分比行到条 13px：参考图大字墨迹底 y=79、条顶 y=92，中间 13 行。原来是 12。
-            Rectangle { height: 13px; }
+            // ---- 失败原因那一行红字 ----
+            // content-h / transfer_window_height() 里一直挂着「failed 时 +20px」，但布局里
+            // 从某一轮精简起就没画过这行了 —— 失败时窗口底下会白白多出 20px。这轮补上，
+            // 让它和那两个公式对得上（红色 #C42B1C = 失败态百分比大字的那个红）。
+            if root.failed : Text {
+                text: root.fail-text;
+                font-size: 12px;
+                color: #C42B1C;
+                height: 20px;
+                width: 100%;
+                vertical-alignment: center;
+                overflow: elide;
+            }
 
-            // 进度条：底是资源管理器那张参考图量出来的 —— 条高 15px、直角、1px #BCBCBC 描边、
-            // 轨道 #E6E6E6、填充原生绿 #0F7B0F。
-            //
-            // 2026-11-19 复核（用户说「进度条配色太鲜艳」）：把参考图和本程序的截图逐点比过，
-            // 三个色**一模一样**，所以这一项不改，只补出处：
-            //   * 描边 #BCBCBC —— 参考图 (27,92) / (200,92) / (200,106)，条子上下各一行；
-            //   * 轨道 #E6E6E6 —— 参考图 (200,93)（条内未填充区域）；
-            //   * 填充 #0F7B0F —— 参考图 (200,97) / (30,93)（左边已填充那段）；
-            //   本程序真机截图 xfer-window-details.png 里同位置取到的也是这三个值。
-            // 最后一段 8% 的绿之所以显得艳，是「窄窄一条高饱和绿」的观感，颜色本身是原生色，
-            // 改浅反而就不像资源管理器了。
-            //
-            // 填充规则：**分段，每段从自己的左边缘往右填**（用户定的）。
-            // 每段就是某条（或某几条合并后的）通道负责的那段文件，段宽 ∝ 块数，
-            // 填到哪儿 = 这段里已经落盘的块占多少。各段同时推进、跨过切分线互不影响；
-            // 全部填满就是一条完整的绿杠。以前之所以看着像「从中间往两边涨」，
-            // 不是这个画法的问题，是切分点算错了（未知归属在中间一分为二，见 §6.1c）。
-            bar := Rectangle {
-                height: 15px;
-                background: #E6E6E6;
-                border-width: 1px;
-                border-color: #BCBCBC;
-                border-radius: 0px;
-                clip: true;
+            // ---- 分段进度条整块：展开「详细信息」时**不画**（用户拍板：「详细信息展开后，
+            // 顶部那条分段进度条就不显示了，整窗只留详情里那条大聚合进度条」）----
+            // 用 if 而不是 visible:false —— visible:false 仍然占着 13+15 的高度，展开后窗口
+            // 顶上会横一条空白，那就是「底部留白」的另一种样子。
+            if !root.details : VerticalLayout {
+                spacing: 0px;
 
-                // 一截一块，各填各的（段宽 ∝ 这段占整条的比例）
-                for seg in root.segs : Rectangle {
-                    x: 1px + (bar.width - 2px) * seg.x;
-                    width: Math.max(0px, (bar.width - 2px) * seg.span);
-                    height: bar.height - 2px;
-                    background: transparent;
+                // 百分比行到条 13px：参考图大字墨迹底 y=79、条顶 y=92，中间 13 行。原来是 12。
+                Rectangle { height: 13px; }
+
+                // 进度条：底是资源管理器那张参考图量出来的 —— 条高 15px、直角、1px #BCBCBC 描边、
+                // 轨道 #E6E6E6、填充原生绿 #0F7B0F。
+                //
+                // 2026-11-19 复核（用户说「进度条配色太鲜艳」）：把参考图和本程序的截图逐点比过，
+                // 三个色**一模一样**，所以这一项不改，只补出处：
+                //   * 描边 #BCBCBC —— 参考图 (27,92) / (200,92) / (200,106)，条子上下各一行；
+                //   * 轨道 #E6E6E6 —— 参考图 (200,93)（条内未填充区域）；
+                //   * 填充 #0F7B0F —— 参考图 (200,97) / (30,93)（左边已填充那段）；
+                //   本程序真机截图 xfer-window-details.png 里同位置取到的也是这三个值。
+                // 最后一段 8% 的绿之所以显得艳，是「窄窄一条高饱和绿」的观感，颜色本身是原生色，
+                // 改浅反而就不像资源管理器了。
+                //
+                // 填充规则：**分段，每段从自己的左边缘往右填**（用户定的）。
+                // 每段就是某条（或某几条合并后的）通道负责的那段文件，段宽 ∝ 块数，
+                // 填到哪儿 = 这段里已经落盘的块占多少。各段同时推进、跨过切分线互不影响；
+                // 全部填满就是一条完整的绿杠。以前之所以看着像「从中间往两边涨」，
+                // 不是这个画法的问题，是切分点算错了（未知归属在中间一分为二，见 §6.1c）。
+                bar := Rectangle {
+                    height: 15px;
+                    background: #E6E6E6;
+                    border-width: 1px;
+                    border-color: #BCBCBC;
+                    border-radius: 0px;
                     clip: true;
 
-                    piece := Rectangle {
-                        // x 必须显式写 0：不给 x 时 Slint 会把这个块**居中**摆进这一段，
-                        // 于是每段的绿都从段中间往两边长 —— 真机上就是「进度条从中间往两边涨」
-                        // （像素实测：段起点 33、段宽 68、绿的起点 64 ≈ 33 + (68-8)/2）。
-                        x: 0px;
-                        width: parent.width * Math.max(0.0, Math.min(1.0, seg.filled));
-                        height: 100%;
-                        background: #0F7B0F;
+                    // 一截一块，各填各的（段宽 ∝ 这段占整条的比例）
+                    for seg in root.segs : Rectangle {
+                        x: 1px + (bar.width - 2px) * seg.x;
+                        width: Math.max(0px, (bar.width - 2px) * seg.span);
+                        height: bar.height - 2px;
+                        background: transparent;
                         clip: true;
 
-                        // 流光：**一道光扫整条**，不是每截各扫各的。
-                        // 亮带位置用整条坐标算，各截只把经过自己的那段露出来（clip），
-                        // 所以光从左边一路走到右边，跨切分线时是连续的。
-                        // 参数照抄 Windows 原生（WPF 默认模板的 PART_GlowRect），不是随手调的：
-                        //   带宽 100px；水平渐变 #00FFFFFF 0% → #60FFFFFF 40% → #60FFFFFF 60% →
-                        //   #00FFFFFF 100%（0x60 = 37.6% 白，中段 40% 实心、两侧各 30% 羽化）；
-                        //   匀速 200 px/s 从左边外面扫到填充区右边外面，扫完停 1 秒再从头来。
-                        // 出处：dotnet/wpf Themes/XAML/ProgressBar.xaml + ProgressBar.cs 的 UpdateAnimation。
-                        band := Rectangle {
-                            visible: root.flow-on && piece.width > 8px;
-                            private property <length> band-w: 100px;
-                            x: (bar.width - 2px) * root.flow - (bar.width - 2px) * seg.x - band.band-w / 2;
-                            y: 0px;
-                            width: band.band-w;
+                        piece := Rectangle {
+                            // x 必须显式写 0：不给 x 时 Slint 会把这个块**居中**摆进这一段，
+                            // 于是每段的绿都从段中间往两边长 —— 真机上就是「进度条从中间往两边涨」
+                            // （像素实测：段起点 33、段宽 68、绿的起点 64 ≈ 33 + (68-8)/2）。
+                            x: 0px;
+                            width: parent.width * Math.max(0.0, Math.min(1.0, seg.filled));
                             height: 100%;
-                            // 注意 Slint 的颜色是 #RRGGBBAA（最后两位是透明度）
-                            background: @linear-gradient(90deg,
-                                #FFFFFF00 0%,
-                                #FFFFFF60 40%,
-                                #FFFFFF60 60%,
-                                #FFFFFF00 100%);
+                            // 暂停 → 深琥珀 #9D5D00（参考图 native-paused.png 整条 (200,97) 都是它；
+                            // 这一轮补上：以前暂停时条子还是绿的，和原生的「暂停色」差着一档）
+                            background: root.paused ? #9D5D00 : #0F7B0F;
+                            clip: true;
+
+                            // 流光：**一道光扫整条**，不是每截各扫各的。
+                            // 亮带位置用整条坐标算，各截只把经过自己的那段露出来（clip），
+                            // 所以光从左边一路走到右边，跨切分线时是连续的。
+                            // 参数照抄 Windows 原生（WPF 默认模板的 PART_GlowRect），不是随手调的：
+                            //   带宽 100px；水平渐变 #00FFFFFF 0% → #60FFFFFF 40% → #60FFFFFF 60% →
+                            //   #00FFFFFF 100%（0x60 = 37.6% 白，中段 40% 实心、两侧各 30% 羽化）；
+                            //   匀速 200 px/s 从左边外面扫到填充区右边外面，扫完停 1 秒再从头来。
+                            // 出处：dotnet/wpf Themes/XAML/ProgressBar.xaml + ProgressBar.cs 的 UpdateAnimation。
+                            band := Rectangle {
+                                visible: root.flow-on && piece.width > 8px;
+                                private property <length> band-w: 100px;
+                                x: (bar.width - 2px) * root.flow - (bar.width - 2px) * seg.x - band.band-w / 2;
+                                y: 0px;
+                                width: band.band-w;
+                                height: 100%;
+                                // 注意 Slint 的颜色是 #RRGGBBAA（最后两位是透明度）
+                                background: @linear-gradient(90deg,
+                                    #FFFFFF00 0%,
+                                    #FFFFFF60 40%,
+                                    #FFFFFF60 60%,
+                                    #FFFFFF00 100%);
+                            }
                         }
                     }
-                }
 
-                // 切分线画在最上面：灰底和绿底上都看得见，一条通道一截全靠它分
-                for seg in root.segs : Rectangle {
-                    visible: seg.x > 0.0001;
-                    x: 1px + (bar.width - 2px) * seg.x;
-                    width: 1px;
-                    height: bar.height - 2px;
-                    background: #F2F2F2;
+                    // 切分线画在最上面：灰底和绿底上都看得见，一条通道一截全靠它分
+                    for seg in root.segs : Rectangle {
+                        visible: seg.x > 0.0001;
+                        x: 1px + (bar.width - 2px) * seg.x;
+                        width: 1px;
+                        height: bar.height - 2px;
+                        background: #F2F2F2;
+                    }
                 }
             }
         }
@@ -1017,69 +1070,189 @@ export component TransferWindow inherits Window {
         // 这一段以前是 **0**：线直接贴着条子画，看着像进度条自己的第二道边，
         // 用户说的「分界线太明显」主要就是这个。加上原生那 15px 之后，线才回到
         // 「段落分隔」的位置上。
-        Rectangle { height: 15px; }
+        // 展开态这一块整段被 if 掉了（见上面），这里换成 13px：条子不画了，但百分比行和
+        // 分隔线之间还得留一口气，否则那条线会贴到 20px 大字的脚上（content-h 里记的就是 13）。
+        if root.details : Rectangle { height: 13px; }
+        if !root.details : Rectangle { height: 15px; }
 
         // ---- 分隔线：贯穿整窗（参考图就是整窗宽，不带内边距）----
         // #E3E3E3 = 参考图 (10,122)/(200,122)/(440,122)，整行 447 个像素全是这个值。
         // 颜色本来就是对的（不是深灰），扎眼是上面那个 0 间距造成的，所以这里只保留原色。
         Rectangle { height: 1px; background: #E3E3E3; }
 
-        // ---- 下半：「详细信息」开关 + 明细 ----
-        // 和上半一样 26px 内边距：参考图里三角的墨迹从 x=31 起、正文从 x=27 起，
-        // 都在同一个 26px 的左边距上（三角字形自己带一点左侧留白）。
+        // ---- 下半：详情（展开时）+「详细信息 / 简略信息」开关行 ----
+        // 顺序照原生 native-details.png：分隔线 → 名称 / 剩余时间 / 剩余项目 → 大聚合条
+        // → 各通道速率 → 分隔线 → 「∧ 简略信息」。所以**开关行在展开时位于最底下**，
+        // 收起时它正好紧跟在分隔线后面（位置和改之前一模一样）。
+        // 和上半一样 26px 内边距：参考图里箭头墨迹从 x=31 起、正文从 x=27 起。
         VerticalLayout {
             padding-left: 26px;
             padding-right: 26px;
             spacing: 0px;
 
-            // 分隔线到行框 10px：参考图线 y=122，22px 的行框落在 y=133..155（框内文字居中，
-            // 墨迹 y=139..149），所以「线到行框 10px」= 「线到文字 15px」，
-            // 后者正是顶部注释块里量的那个 15。原来是 9。
-            Rectangle { height: 10px; }
-
-            // 整行可点（和资源管理器一样，不用非得点到字上）
-            // 行高 22px = Windows 列表的标准行高（原来是 20）；12px 字 = 参考图
-            // 「详细信息」4 个字量出 48px 宽（x=51..98），也就是 12px 一个字。
-            Rectangle {
-                height: 22px;
-                // 悬浮时**不刷底色**（用户 2026-11-19：「鼠标悬浮停留时这个详细信息阴影删除，
-                // 或者 1:1 仿原生」）。原生资源管理器这一行确实有 hover 高亮，但我们把整行 460px
-                // 刷成 #F5F5F5 之后，白底窗口里横着一条灰带，比原生那张图里任何一处都显眼 ——
-                // 用户看到的就是「一道阴影」。宁可没有：可点性靠指针形状和 ▲/▼ 已经够了。
-                background: transparent;
-
-                Text {
-                    // ▼/▲ 是 GB2312 里的字形，YaHei 一定有；▾/▴ 这种小三角会渲染成豆腐块
-                    // 三角色同文字 #000000：参考图三角墨迹 (31..41, 141..147) 最暗 #1F1F1F，
-                    // 是 12px 细笔画的抗锯齿结果，本质还是黑
-                    text: root.details ? "▲ 详细信息" : "▼ 详细信息";
-                    font-size: 12px;
-                    color: #000000;
-                    width: 100%;
-                    height: 100%;
-                    vertical-alignment: center;
-                }
-                // 这一行也是纯文字控件：UIA 里以前只是一颗 Text，自动化点不到。
-                // 加按钮角色 + 跟着展开状态变的名字。
-                details-ta := TouchArea {
-                    accessible-role: button;
-                    accessible-label: root.details ? "收起详细信息" : "展开详细信息";  // 英文：Collapse/Expand details
-                    clicked => { root.toggle-details(); }
-                }
-            }
-
             if root.details : VerticalLayout {
                 spacing: 0px;
 
-                Rectangle { height: 6px; }
+                // 分隔线 → 「名称：」第一行 10px（和收起态「线到开关行」同一个 10）。
+                Rectangle { height: 10px; }
 
-                // 每段（每条通道）一行：序号+通道名 / 已收 · 该段总量 / 速率 / 该段完成度
+                // ---- 三行「标签：值」----
+                // 量测（native-details.png）：三行墨迹 y=185..197 / 202..213 / 221..232，
+                // 行距 17、19（取整 18），字号 12px（「剩余项目：」5 个字 60px 宽 = 12px/字），
+                // 左边距和正文同一条线（ink 从 x=27 起 = 26px 内边距 + 1px 字形左留白）。
+                // 颜色全部 #000000：在 (27..60,185..197) 里取最暗像素是纯黑；图上那些偏橙
+                // /偏蓝的点是 ClearType 的次像素边，不是字色。
+                // 值由 Rust 每帧喂（file-name / eta-text / remain-text），标签固定在这边。
+                Text {
+                    text: "名称：" + root.file-name;
+                    font-size: 12px;
+                    color: #000000;
+                    height: 18px;
+                    width: 100%;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+                Text {
+                    // 算不出来时 Rust 传「正在计算...」（原生的写法就是这个）
+                    text: "剩余时间：" + root.eta-text;
+                    font-size: 12px;
+                    color: #000000;
+                    height: 18px;
+                    width: 100%;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+                Text {
+                    text: "剩余项目：" + root.remain-text;
+                    font-size: 12px;
+                    color: #000000;
+                    height: 18px;
+                    width: 100%;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+
+                // 三行到大条子 8px
+                Rectangle { height: 8px; }
+
+                // ---- 速度图表条（原生「详细信息」里那块 79/80px 的图表）----
+                // 这一块和收起态那条分段条是**互斥的两套**：分段条（IDM 式一段一通道 + 白色流光）
+                // 只在收起时画，展开时整块被 if 掉；这里只有图表条，不再有任何分段竖线、也没有流光。
+                //
+                // 参考图 native-details.png 逐行量出来的结构（坐标都相对条子左上角）：
+                //   y=0        #BCBCBC 外框 1px
+                //   y=1        #E6E6E6 内侧 1px
+                //   y=2..49    #A7E591 上层（48px）：竖网格 #8EDD7B 间距 39（首个在 x=38）、
+                //              横网格 #8EDD7B 在 y=15 / 30 / 46；已完成区间里叠 #06B025 的速度曲线面积
+                //   y=50       #000000 黑基线 1px（横贯整条，不随进度）
+                //   y=51..77   #06B025 下层实心（整条宽度都是，不随进度 —— 原生就是这样）
+                //   y=78       #E6E6E6 内侧 1px
+                //   y=79       #BCBCBC 外框 1px
+                // 合计 80px。参考图里能数出 79 是因为只数到 y=78 那条内侧线；
+                // 但 y=79 那条 #BCBCBC 也是这条子的一部分（下面 y=80 就是纯白），所以这里按 80 做。
+                //
+                // 「速度: 72.9 MB/秒」那行黑字叠在上层里、基线之上、靠右（参考图墨迹 x=319..414、
+                // y=126..137，相对本条 = x 右缩 2px、y 32..43）。
+                chart := Rectangle {
+                    height: 80px;
+                    // 外框用「底色 + 内嵌两块」画，不用 border-width —— 后者对子元素的坐标系
+                    // 是内缩还是原点是 Slint 的实现细节，直接摆坐标最稳。
+                    background: #BCBCBC;
+                    clip: true;
+
+                    // 内侧 1px #E6E6E6（顶和底；左右两边也被这一层盖住）
+                    Rectangle {
+                        x: 1px;
+                        y: 1px;
+                        width: parent.width - 2px;
+                        height: parent.height - 2px;
+                        background: #E6E6E6;
+                    }
+
+                    // 主体 76px = 48(上层) + 1(黑基线) + 27(下层)
+                    body := Rectangle {
+                        x: 2px;
+                        y: 2px;
+                        width: parent.width - 4px;
+                        height: 76px;
+                        background: #A7E591;
+                        clip: true;
+
+                        // 竖网格：间距 39px、首个在 x=38（参考图 x=67、106、146…，条内左边 29 → 38）
+                        for i in 12 : Rectangle {
+                            x: 38px + i * 39px;
+                            y: 0px;
+                            width: 1px;
+                            height: 100%;
+                            background: #8EDD7B;
+                            visible: (38px + i * 39px) < (body.width - 1px);
+                        }
+                        // 横网格：参考图 y=109 / 124 / 140，条内顶 94 → 15 / 30 / 46
+                        Rectangle { x: 0px; y: 15px; width: 100%; height: 1px; background: #8EDD7B; }
+                        Rectangle { x: 0px; y: 30px; width: 100%; height: 1px; background: #8EDD7B; }
+                        Rectangle { x: 0px; y: 46px; width: 100%; height: 1px; background: #8EDD7B; }
+
+                        // ---- 速度曲线面积 ----
+                        // 网格在下、曲线在上（参考图 x=67/106/146 在曲线区内是纯 #06B025，
+                        // 网格被曲线盖住了），所以这一段必须排在上面那几条网格之后。
+                        // viewbox 高度 48 = 元素高度 48px → 纵向 1:1，curve 的 y=48 正好压在黑基线上。
+                        curve := Path {
+                            x: 0px;
+                            y: 0px;
+                            width: 100%;
+                            height: 48px;
+                            // fit 必须写 fill（= 拉伸）：Path 的默认 fit 是 contain，
+                            // 会「等比缩放 + 居中」。viewbox 是 1000x48、元素是 ~403x48，
+                            // 等比缩放取 min(0.403, 1.0) = 0.403，于是纵向只有 48*0.403≈19px
+                            // 还居中 —— 真机截图上整条曲线缩成中间一条 4px 的浮空带子
+                            // （第一版就是踩了这个坑）。fill 之后 y 方向按 48/48 = 1:1，
+                            // x 方向单独拉伸到条内宽，正是要的效果。
+                            fit: ImageFit.fill;
+                            viewbox-x: 0;
+                            viewbox-y: 0;
+                            viewbox-width: 1000;
+                            viewbox-height: 48;
+                            commands: root.curve-path;
+                            // 暂停 → 曲线和下层一起换琥珀 #9D5D00（网格、黑基线不变）
+                            fill: root.paused ? #9D5D00 : #06B025;
+                        }
+
+                        // 黑基线 1px，横贯整条（不分进度）
+                        Rectangle { x: 0px; y: 48px; width: 100%; height: 1px; background: #000000; }
+
+                        // 下层实心：整条宽度都是深绿（不随进度变化 —— 原生就是这样）
+                        Rectangle {
+                            x: 0px;
+                            y: 49px;
+                            width: 100%;
+                            height: 27px;
+                            background: root.paused ? #9D5D00 : #06B025;
+                        }
+
+                        // 「速度: xx MB/秒」：叠在上层、基线之上、靠右，右侧留 6px
+                        Text {
+                            text: root.speed-text;
+                            font-size: 12px;
+                            color: #000000;
+                            x: 0px;
+                            y: 28px;
+                            width: parent.width - 6px;
+                            height: 18px;
+                            horizontal-alignment: right;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                    }
+                }
+
+                // 大条子到各通道速率第一行 8px
+                Rectangle { height: 8px; }
+
+                // ---- 各通道速率：每条通道一行 ----
                 // 通道名和手机端明细那张表同名（USB_ADB / wlan0#4），两边的读法一致。
-                // 列：字号统一 12px（原来是 11.5/11 混着），列距 14px（原来是 8px），
-                // 名字列 110px（原来 96）、速率列 78px（原来 74）、百分比列 44px（原来 40）。
-                // 四列铺满 26px 内边距之间的整条宽度，所以左边缘 / 右边缘和上面那行
-                // 「32.0 MB / 600.0 MB · 9.2 MB/s」是同一条线（用户要的对齐）。
-                // 行高仍是 22px（Windows 列表的标准行高），字放大到 12px 之后行距自然松一档。
+                // 四列：序号+通道名 110 / 已收·该段总量 / 速率 78（右对齐）/ 完成度 44（右对齐）。
+                // 速率列这一轮提到黑字（它是这一块的主角），完成度留在 #616161。
+                // 行高 22px（Windows 列表的标准行高），12px 字。
                 for row in root.rows : HorizontalLayout {
                     height: 22px;
                     spacing: 14px;
@@ -1088,13 +1261,10 @@ export component TransferWindow inherits Window {
                         text: row.name;
                         font-size: 12px;
                         color: #000000;
-                        // 110px：「10. wlan0#4」这种名字要放得下（原来 96px）
                         width: 110px;
                         vertical-alignment: center;
                         overflow: elide;
                     }
-                    // 精简：原来这里还有一列「占整条 xx%」，和最后一列（该段完成度）容易混，
-                    // 而且通道多的时候这一列只是把同一件事说两遍，去掉。
                     Text {
                         text: row.amount;
                         font-size: 12px;
@@ -1104,10 +1274,10 @@ export component TransferWindow inherits Window {
                         overflow: elide;
                     }
                     Text {
+                        // 「9.2 MB/s」/「已完成」/「0 KB/s」（Rust 那边按状态给）
                         text: row.rate;
                         font-size: 12px;
-                        // #616161 = 沿用现值（参考图里没有次级灰字可采，中性灰本来就不艳）
-                        color: #616161;
+                        color: #000000;
                         width: 78px;
                         horizontal-alignment: right;
                         vertical-alignment: center;
@@ -1116,7 +1286,7 @@ export component TransferWindow inherits Window {
                     Text {
                         text: row.percent + "%";
                         font-size: 12px;
-                        // #616161 = 同上，「57%」这类淡一点的字
+                        // #616161 = 次级灰（和收起态 detail-text 同一个灰，中性、不艳）
                         color: #616161;
                         width: 44px;
                         horizontal-alignment: right;
@@ -1131,9 +1301,76 @@ export component TransferWindow inherits Window {
                     height: 22px;
                     vertical-alignment: center;
                 }
+            }
 
-                // 精简（用户选的）：「合计 xx · 剩余约 xx 秒」整行去掉 ——
-                // 速率上面那行已经有了，剩余时间只是估算，明细下面再挂一行是多余的。
+            // 详情最后一行（或收起态的分隔线）到开关行 10px。
+            // 收起态：参考图线 y=122、行框 133..155，所以「线到行框 10px」=「线到文字 15px」。
+            if root.details : Rectangle { height: 10px; }
+            // 展开态在「简略信息」上面**还有一条分隔线**：参考图 native-details.png 的 x=5 一列
+            // 从客户区顶到窗底只有 y=250 这一行是 #E3E3E3，位置正好在「∧ 简略信息」上面
+            // （y=250 线 → 文字墨迹 266..278）。收起态那条线（y=122）在这个位置之外，
+            // 所以这里是展开态独有的 1px。content-h / transfer_window_height() 里记成 +1。
+            if root.details : Rectangle { height: 1px; background: #E3E3E3; }
+            Rectangle { height: 10px; }
+
+            // ---- 开关行（整行可点，和资源管理器一样，不用非得点到字上）----
+            // 行高 22px = Windows 列表的标准行高；12px 字 = 参考图「详细信息」4 个字 48px。
+            Rectangle {
+                height: 22px;
+                // 悬浮时**不刷底色**（用户 2026-11-19：「鼠标悬浮停留时这个详细信息阴影删除，
+                // 或者 1:1 仿原生」）。原生这一行确实有 hover 高亮，但整行 460px 刷成 #F5F5F5
+                // 之后，白底窗口里横着一条灰带，比原生那张图里任何一处都显眼。宁可没有。
+                background: transparent;
+
+                // ---- 箭头：V 形，用 Path 画（不再用 ▼/▲ 字形）----
+                // 量测（native-paused.png）：箭头墨迹 x=31..41（11px 宽）、y=141..147（7px 高），
+                // 最暗 #1F1F1F（12px 细笔画抗锯齿后还是黑），像 1px 圆头的两笔斜线；
+                // 行框是 y=133..155（22px），墨迹上下各留 8px → 7px 高摆在 y=7 正好居中。
+                // 左边：26px 内边距 + 4px = 30，ink 从 31 起（形状自己留 1px）；
+                // 文字 ink 从 51 起 → 文字框 x=24（26+24=50，字形自带 1px 左留白）。
+                chevron := Path {
+                    // 左边距：26px 内边距 + 3px = 29，描边圆头再吃掉 0.5 → 墨迹从 30 起
+                    // （参考图墨迹 31..41，客户区从 1 起 → 相对正文线 3..13）
+                    x: 3px;
+                    // 纵向：参考图箭头墨迹 x=31..41 / y=142..146（11 宽、5 高、1px 圆头细线），
+                    // 行框 133..155 → 墨迹在 +9..+13。这里元素 12x6、笔画 0.5..5，
+                    // 描边圆头再各探出 0.5 → 实墨 +8..+13，和参考图差半像素以内。
+                    y: 8px;
+                    width: 12px;
+                    height: 6px;
+                    // viewbox 和元素尺寸一样大 → 缩放正好 1:1，描边不会被缩放拉粗拉细
+                    viewbox-x: 0;
+                    viewbox-y: 0;
+                    viewbox-width: 12;
+                    viewbox-height: 6;
+                    // 收起 = ∨（尖朝下，笔尖在 y 大的那边）—— 参考图 native-paused.png 就是这个；
+                    // 展开 = ∧（尖朝上）。圆头（stroke-line-cap: round）和参考图的细笔画一致。
+                    commands: root.details
+                        ? "M 1 5 L 6 0.5 L 11 5"
+                        : "M 1 0.5 L 6 5 L 11 0.5";
+                    stroke: #1F1F1F;
+                    stroke-width: 1px;
+                    stroke-line-cap: round;
+                    stroke-line-join: round;
+                }
+
+                Text {
+                    // 文字跟着原生走：收起「详细信息」/ 展开「简略信息」
+                    // （▼/▲/✕ 这类符号会缺字形或宽窄不一，图标一律 Path 画）
+                    x: 24px;
+                    text: root.details ? "简略信息" : "详细信息";
+                    font-size: 12px;
+                    color: #000000;
+                    height: 100%;
+                    vertical-alignment: center;
+                }
+                // 整行一个按钮：UIA 里以前只是一颗 Text，自动化点不到。
+                // 名字跟可见文字同步（收起「详细信息」/ 展开「简略信息」），两个状态下都能点。
+                details-ta := TouchArea {
+                    accessible-role: button;
+                    accessible-label: root.details ? "简略信息" : "详细信息";  // 英文：Hide/Show details
+                    clicked => { root.toggle-details(); }
+                }
             }
 
             Rectangle { height: 10px; }

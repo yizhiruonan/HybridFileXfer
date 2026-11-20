@@ -5,6 +5,7 @@
 
 slint::include_modules!();
 
+use std::collections::VecDeque;
 use std::io;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -337,14 +338,53 @@ fn human_eta(secs: u64) -> String {
 /// 14(上留白) + 20(主文案) + 6 + 30(百分比行) + 13(百分比行到条，原 12)
 /// + 15(条) + 15(条到分隔线，原 0 —— 原来线贴着条子画) + 1(分隔线)
 /// + 10(线到「详细信息」行，原 9) + 22(「详细信息」行，原 20) + 10(下留白)。
-const TW_H_COLLAPSED: f32 = 156.0;
+const TW_H_COLLAPSED: f32 = TW_TOP_PART + TW_BAR_BLOCK + TW_DIVIDER + TW_TOGGLE_TAIL; // = 156.0
+/// 收起态里「分段进度条」那一整块：13(百分比行到条) + 15(条) + 15(条到分隔线) = 43。
+/// 展开态这一块**整块不画**（app.slint 里用 if !root.details 包起来，不是 visible:false
+/// —— 那还占着高度），省下的 43px 换成详情区。
+const TW_BAR_BLOCK: f32 = 43.0;
+/// 顶端那段和进度条无关的部分：14(上留白) + 20(主文案) + 6 + 30(百分比行) = 70。
+/// 收起 / 展开两种状态都一模一样。
+const TW_TOP_PART: f32 = 70.0;
+/// 分隔线 1px（两条状态都有；展开态在它上面还有下面「简略信息」那条，见 TW_DETAIL_TAIL）。
+const TW_DIVIDER: f32 = 1.0;
+/// 展开态尾部：10(行区下留白) + 1(「简略信息」上面那条分隔线) + 10 + 22(开关行) + 10(下留白)。
+const TW_DETAIL_TAIL: f32 = 10.0 + 1.0 + 10.0 + 22.0 + 10.0;
+/// 展开态：分段条不画之后，百分比行到分隔线仍然留的那一口气（app.slint 里 if root.details 的 13px）。
+/// 不这么留，那条分隔线会直接贴到 20px 大字的下沿。
+const TW_DETAIL_GAP: f32 = 13.0;
+/// 展开态详情区的固定高度（和行数无关的部分）：
+///   10(分隔线到「名称：」) + 18*3(名称/剩余时间/剩余项目，原生这三行行距 18)
+///   + 8(三行到速度图表条) + 80(速度图表条) + 8(图表条到第一条通道速率)
+const TW_DETAIL_BODY: f32 = 10.0 + 18.0 * 3.0 + 8.0 + TW_CHART_H + 8.0;
+/// 展开态那条「速度图表条」的高度，80px，和 app.slint 里 chart 的 height 一模一样。
+/// 参考图 native-details.png 逐行数：y=92 外框 / 93 内侧 / 94..141 上层 48 / 142 黑基线 /
+/// 143..169 下层实心 27 / 170 内侧 / 171 外框 = 80 行（y=172 起是纯白）。
+/// 原先这里是 15px 的「大聚合条」，用户拍板要真 1:1 的图表条，换成 80。
+const TW_CHART_H: f32 = 80.0;
+/// 收起态开关行那一串：10(分隔线到行) + 22(「详细信息」行) + 10(下留白) = 42。
+/// 展开态它挪到最底下、中间还多插一条分隔线，见 TW_DETAIL_TAIL。
+const TW_TOGGLE_TAIL: f32 = 10.0 + 22.0 + 10.0;
 /// 明细一行的高度（app.slint 里 for 循环的 height: 22px）
 const TW_ROW_H: f32 = 22.0;
-/// 「详细信息」展开时行区上方的间隔（app.slint 里那个 Rectangle { height: 6px; }）
-const TW_DETAILS_GAP: f32 = 6.0;
 
-/// 传输窗口这一轮该多高：收起 156；展开明细 = 156 + 6(间隔) + 行数*22
+/// 图表条速度曲线的**历史容量**：最多存这么多个原始采样。
+/// timer 每 150ms 一拍 → 2000 个点 ≈ 5 分钟的速率历史，够一次常规传输从头画到尾。
+/// （注意：不是「只留最近 N 个」——那样子弹窗刚展开时曲线只覆盖最近十几秒的进度，
+///   右边一小撮，左边一大片浅绿，和参考图那种「曲线铺满已完成区间」完全不像。
+///   所以这里是**全历史 + 绘制时抽稀**，见 CURVE_DRAW_POINTS。）
+const CURVE_SAMPLES: usize = 2000;
+/// 真正送进 Path 的点数上限（抽稀之后）。参考图那条曲线目视也就是这个量级，
+/// 再密既看不出来，也让 commands 字符串白长。
+const CURVE_DRAW_POINTS: usize = 120;
+/// 相邻两次采样的最小间隔（毫秒）。timer 是 150ms，这里给 100 只是防抖：
+/// 万一日后把 timer 调快，曲线也不会因为采样过密而变成噪声。
+const CURVE_SAMPLE_MS: u128 = 100;
+
+/// 传输窗口这一轮该多高：收起 156；展开 = 297 + 行数*22
 /// （行数为 0 时按 1 行算：那时 app.slint 画的是「这一轮还没有分通道数据」那一行，同样 22px）。
+/// 展开态的 297 = 70(上半) + 1(分隔线) + 13 + 160(详情固定部分，含 80 的图表条) + 53(尾部)，
+/// 逐项见上面的常量。
 /// 弹「取消」确认框时不用再撑高（它是独立窗口）。
 /// 把传输窗口摆到该在的位置再显示。
 ///
@@ -378,12 +418,21 @@ fn show_transfer_window(
 }
 
 fn transfer_window_height(details: bool, rows: usize, failed: bool) -> f32 {
-    let mut h = TW_H_COLLAPSED;
-    if details {
-        // 原来这里是 30.0 + 行数*22：30 里多算了 24，展开后窗口底下会空一条
-        // （真机截图里最后一行下面还有 40 多像素白）。改成和 app.slint 一致的 6 + 行数*22。
-        h += TW_DETAILS_GAP + rows.max(1) as f32 * TW_ROW_H;
-    }
+    // 收起 / 展开两套公式，和 app.slint 的 content-h 一个字一个字对得上：
+    //   收起 = 70 + 1 + 13 + 15 + 15 + 10 + 22 + 10 = 156
+    //   展开 = 70(上半) + 1(分隔线) + 13(分段条不画了留的呼吸) + 160(详情固定，含 80 图表条)
+    //          + 行数*22 + 53(尾部 10+1+10+22+10) = 297 + 行数*22
+    // 每通道一行；rows 为 0 时画的是「这一轮还没有分通道数据」那一行，同样 22px，故 max(1)。
+    let mut h = if details {
+        TW_TOP_PART
+            + TW_DIVIDER
+            + TW_DETAIL_GAP
+            + TW_DETAIL_BODY
+            + rows.max(1) as f32 * TW_ROW_H
+            + TW_DETAIL_TAIL
+    } else {
+        TW_H_COLLAPSED
+    };
     // 「接收失败：<原因>」那一行（app.slint 里 height: 20px）
     if failed {
         h += 20.0;
@@ -909,6 +958,12 @@ fn main() -> Result<(), slint::PlatformError> {
         let mut seg_rate_prev: Vec<u64> = Vec::new();
         let mut seg_rates: Vec<f32> = Vec::new();
         let mut seg_rate_at: Option<std::time::Instant> = None;
+        // 展开态图表条的速度曲线：环形缓冲里每项是「那一刻的进度比例 + 那一刻的速率 B/s」。
+        // 进度比例当横轴 —— 所以曲线只铺在已完成区间里（和原生一致：没传到的部分只有浅绿网格）。
+        let mut curve_samples: VecDeque<(f32, f32)> = VecDeque::new();
+        let mut curve_last_at: Option<std::time::Instant> = None;
+        // 上一次采样时的进度：用来认「新一轮开始了」——进度往回退就清空历史，别把上一轮的波带过来。
+        let mut curve_last_progress = 0f32;
         let mut tw_details_on = false;
         let mut tw_cancel_on = false;
         // 这一轮传完的时刻（用来数「已完成」亮够 3 秒没有）
@@ -1142,8 +1197,14 @@ fn main() -> Result<(), slint::PlatformError> {
             if elapsed >= 0.4 {
                 let delta = received.saturating_sub(last_bytes);
                 let instant = delta as f64 / elapsed;
-                // 轻微平滑，避免数字乱跳
-                speed = if speed <= 0.0 { instant } else { speed * 0.6 + instant * 0.4 };
+                // 暂停时**冻结**速率，不跟着衰减：暂停期间一个字节都不会来，
+                // 照着算 delta=0 会让速率每 0.4 秒掉 40%，几秒后就从 9.6 MB/s 掉成
+                // 一串无意义的数字（真机截图里「暂停」旁边一路跳到 836 KB/s、再往下跳）。
+                // 原生暂停是把图表整块冻住，数字停在最后那个值上；这里照办。
+                if !hfx_receiver::control::paused() {
+                    // 轻微平滑，避免数字乱跳
+                    speed = if speed <= 0.0 { instant } else { speed * 0.6 + instant * 0.4 };
+                }
                 last_bytes = received;
                 last_tick = now;
             }
@@ -1248,15 +1309,22 @@ fn main() -> Result<(), slint::PlatformError> {
                 let mut labels: Vec<String> = Vec::with_capacity(raw.len());
                 let mut row_order: Vec<(u8, f32)> = Vec::with_capacity(raw.len());
                 seg_rate_bytes.clear();
+                // 暂停中：速率列统一写 0 KB/s（这一秒本来就没在传，挂个旧速率是骗人）
+                let paused_now = hfx_receiver::control::paused();
                 for (i, s) in raw.iter().enumerate() {
                     let seg_total = (total_bytes as f64 * s.span as f64) as u64;
                     let seg_done = (seg_total as f64 * s.filled as f64) as u64;
                     seg_rate_bytes.push(seg_done);
                     let rate = seg_rates.get(i).copied().unwrap_or(0.0);
-                    let rate_text = if rate > 0.05 {
-                        human_speed(rate as f64)
+                    // 「各通道速率」这一列的说法（这一轮定的，照原生的意思来）：
+                    //   这一截收满 → 「已完成」；暂停中 / 一秒没动静 → 「0 KB/s」；
+                    //   其余按真实速率（human_speed 自带 KB/s、MB/s 的量级切换）。
+                    let rate_text = if s.filled >= 0.999 {
+                        i18n::tr("已完成", "done").to_string()
+                    } else if paused_now || rate <= 0.05 {
+                        "0 KB/s".to_string()
                     } else {
-                        "—".to_string()
+                        human_speed(rate as f64)
                     };
                     // 段名 = 「谁在负责」，和手机端那条明细（「1 USB_ADB」）同一个读法（序号后加）。
                     // owner 是通道号（mark_sent / mark_received 记下的那个），从这里换成人能看的名字；
@@ -1417,7 +1485,84 @@ fn main() -> Result<(), slint::PlatformError> {
                         format!("{} / {} · {}", human(done), human(total_bytes), speed_text)
                             .into(),
                     );
-                    tw.set_paused(hfx_receiver::control::paused());
+                    // ---- 展开「详细信息」里那三行「标签：值」（标签在 Slint 那边写死）----
+                    // 1) 名称：当前文件名（和 action-text 用的是同一个 short，不带大小）
+                    tw.set_file_name(short.clone().into());
+                    // 2) 剩余时间：算得出来给「x 分 y 秒」，算不出来给「正在计算...」——
+                    //    原生的写法就是这个。刚起步（速率还没稳定）、暂停、已经收满都算「算不出来」。
+                    let remain_bytes = total_bytes.saturating_sub(done);
+                    let eta = if !hfx_receiver::control::paused()
+                        && !finished
+                        && speed > 0.5
+                        && remain_bytes > 0
+                    {
+                        human_eta((remain_bytes as f64 / speed) as u64)
+                    } else {
+                        i18n::tr("正在计算...", "calculating...").to_string()
+                    };
+                    tw.set_eta_text(eta.into());
+                    // 3) 剩余项目：「项目数 (剩余大小)」。这一轮一次只有一个文件在收
+                    //    （PROGRESS 只记「当前文件」），所以项目数是 0 / 1，
+                    //    后面的括号里是**这个文件**还剩多少字节（和参考图的「1 (17.0 MB)」同形）。
+                    tw.set_remain_text(
+                        format!(
+                            "{} ({})",
+                            if remain_bytes > 0 { 1 } else { 0 },
+                            human(remain_bytes)
+                        )
+                        .into(),
+                    );
+                    // ---- 展开态图表条：速度曲线采样 + 拼 Path + 「速度:」那行 ----
+                    // 采样策略：timer 每 150ms 一拍，这里限制最短间隔 CURVE_SAMPLE_MS(100ms)，
+                    // 环形缓冲最多 CURVE_SAMPLES(120) 个点 —— 约 18 秒的速率历史。
+                    // 每个点记 (当时的进度比例, 当时的速率)，横轴就是进度，所以曲线天然只铺在
+                    // 已完成区间里。暂停 / 失败时不采样，波形就冻在那一刻（原生暂停也是这样）。
+                    let paused_now = hfx_receiver::control::paused();
+                    if fill_frac + 0.02 < curve_last_progress {
+                        // 进度往回退了 = 新一轮开始（上一轮传完 / 被取消），历史作废
+                        curve_samples.clear();
+                        curve_last_at = None;
+                    }
+                    curve_last_progress = fill_frac;
+                    let curve_now = std::time::Instant::now();
+                    let curve_due = curve_last_at
+                        .map(|t| curve_now.duration_since(t).as_millis() >= CURVE_SAMPLE_MS)
+                        .unwrap_or(true);
+                    if curve_due && !paused_now && !failed {
+                        curve_last_at = Some(curve_now);
+                        if finished || fill_frac >= 0.999 {
+                            // 收满了补一个 1.0 的点：曲线一直铺到条子最右边（原生完成态就是这样）
+                            curve_samples.push_back((1.0, speed.max(0.0) as f32));
+                        } else if speed > 0.5 {
+                            curve_samples.push_back((fill_frac, speed as f32));
+                        }
+                        while curve_samples.len() > CURVE_SAMPLES {
+                            curve_samples.pop_front();
+                        }
+                    }
+                    let curve_cmds = build_curve_path(&curve_samples);
+                    if std::env::var("HFX_DEBUG_CURVE").is_ok() {
+                        log::debug(&format!(
+                            "curve n={} path={}",
+                            curve_samples.len(),
+                            &curve_cmds[..curve_cmds.len().min(400)]
+                        ));
+                    }
+                    if tw.get_curve_path().as_str() != curve_cmds {
+                        tw.set_curve_path(curve_cmds.into());
+                    }
+                    // 参考图右上那行是「速度: 72.9 MB/秒」——单位沿用 human_speed 的量级切换
+                    // （MB → KB → B），只把 "/s" 写成 "/秒"。
+                    // 暂停时写「已暂停」而不是冻住的那个旧速率：上面那行大字已经是「已暂停」、
+                    // 各通道速率全是 0 KB/s，这里再摆一个 10.0 MB/秒就是自相矛盾。
+                    let chart_speed = if paused_now {
+                        i18n::tr("已暂停", "paused").to_string()
+                    } else {
+                        human_speed(speed).replace("/s", "/秒")
+                    };
+                    tw.set_speed_text(format!("{}: {}", i18n::tr("速度", "Speed"), chart_speed).into());
+
+                    tw.set_paused(paused_now);
                     tw.set_done(finished);
                     tw.set_fill(fill_frac);
                     tw.set_rows(rows_model.clone());
@@ -1816,6 +1961,75 @@ fn human_speed(bps: f64) -> String {
     } else {
         format!("{:.0} B/s", bps)
     }
+}
+
+/// 把速度历史拼成一条 Slint `Path` 的 commands（展开态图表条里那块曲线面积）。
+///
+/// 坐标系是**归一化**的：x 0..1000、y 0..48。
+///   * 纵向 48 = 上层高度（app.slint 里 curve 元素 height: 48px、viewbox-height: 48），
+///     纵向是 1:1 的像素，y=48 正好压在黑基线（y=50 那条 #000000）上沿；
+///   * 横向 1000 由 viewbox 拉成条内宽，所以 Rust 不需要知道条子到底多宽 ——
+///     窗口缩放、DPI 变化都不会错位，也不用把像素宽度在两边各维护一份。
+///
+/// 归一化：分母取**当前窗口内的最大值**（不是全局最大、也不是固定量表），
+/// 于是 9 MB/s 的传输和 100 MB/s 的传输画出来的波形一样清楚 ——
+/// 用固定量表的话，慢速传输的曲线会贴死在基线上看不出起伏。
+/// 0 速度 → y=48（落回基线）；波峰 → y = 48 - 28 = 20。
+/// 幅度：原生那条曲线是**很浅的一条带子**，不是撑满上层的面积图 ——
+/// 参考图 native-details.png 逐列量上沿高度（基线 142 减去上沿 y），柱状分布是
+/// 1px:4列 / 2px:12 / 3px:2 / 4px:3 / 5px:30 / 6px:125 / 7px:101 / 8px:52 / 9px:25 / 10px:3，
+/// 也就是实测范围 1..10px、众数 6~7px。所以这里照抄：0 速度落 1px，波峰落到 10px。
+/// （原先写 28px 是自己想的「撑满好看」，真机截图一看就是一大块深绿疙瘩，和原生完全不像。）
+fn build_curve_path(samples: &VecDeque<(f32, f32)>) -> String {
+    const VW: f32 = 1000.0;
+    const BASE_Y: f32 = 48.0;
+    const AMP_MIN: f32 = 1.0;
+    const AMP: f32 = 9.0;
+    let Some(&(first_p, _)) = samples.front() else {
+        // 还没有采样（刚打开 / 还没开始）：给空串，Slint 那边 Path 什么都不画，
+        // 剩下的浅绿网格就是这个状态该有的样子。
+        return String::new();
+    };
+    // ---- 归一化：分母取「整段历史里的最大速率」，不是全局峰值也不是固定量表 ----
+    // 固定量表在大文件/小文件之间会失衡（9 MB/s 的传输曲线贴成一条线）；
+    // 取历史最大值可以保证波形一直撑满 AMP 的高度，而 0 速度又永远落回基线。
+    let max_v = samples.iter().fold(0.0f32, |m, s| m.max(s.1)).max(1.0);
+    let x_of = |p: f32| (p.clamp(0.0, 1.0) * VW).round();
+
+    // ---- 抽稀：全历史可能有上千个点，这里等间距取至多 CURVE_DRAW_POINTS 个 ----
+    // 首尾一定保留（首点决定起点、尾点决定曲线铺到哪里）。
+    let n = samples.len();
+    let mut picked: Vec<(f32, f32)> = Vec::with_capacity(CURVE_DRAW_POINTS + 2);
+    if n <= CURVE_DRAW_POINTS {
+        picked.extend(samples.iter().copied());
+    } else {
+        let step = (n - 1) as f32 / (CURVE_DRAW_POINTS - 1) as f32;
+        for k in 0..CURVE_DRAW_POINTS {
+            let idx = (k as f32 * step).round() as usize;
+            if let Some(&s) = samples.get(idx.min(n - 1)) {
+                picked.push(s);
+            }
+        }
+        // 尾点补上：浮点取整可能差一格
+        if let Some(&last) = samples.back() {
+            if picked.last().map(|s| s.0) != Some(last.0) {
+                picked.push(last);
+            }
+        }
+    }
+
+    let mut out = String::with_capacity(picked.len() * 22 + 32);
+    let x0 = x_of(first_p);
+    // 从基线起笔 → 抬到第一个点 → 沿曲线走到最后一点 → 落回基线 → 闭合。
+    // 面积的下沿就是黑基线，和原生那张图一样。
+    out.push_str(&format!("M {} {}", x0, BASE_Y));
+    for (p, v) in picked.iter() {
+        let y = (BASE_Y - (AMP_MIN + (v / max_v).clamp(0.0, 1.0) * AMP)).round();
+        out.push_str(&format!(" L {} {}", x_of(*p), y));
+    }
+    let last_x = x_of(picked.last().map(|s| s.0).unwrap_or(0.0));
+    out.push_str(&format!(" L {} {} Z", last_x, BASE_Y));
+    out
 }
 
 fn detect_lang() -> Lang {
