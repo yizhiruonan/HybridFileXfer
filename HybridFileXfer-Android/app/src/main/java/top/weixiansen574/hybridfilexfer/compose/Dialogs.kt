@@ -1088,16 +1088,22 @@ internal fun CancelTransferDialog(
                     modifier = Modifier.padding(top = 10.dp),
                 )
                 // 竖着排三颗：横排两颗中文按钮在窄屏上会被挤成两行
+                // 间距必须用 Spacer 撑出来，不能只给按钮加 padding：
+                // padding 是画在按钮外面的，两颗同色的 TextButton 挨着放时
+                // 圆角底色会连成一块，看着像互相压住了（BUG-3）
+                Spacer(Modifier.height(16.dp))
                 Button(
                     onClick = onKeep,
-                    modifier = Modifier.fillMaxWidth().padding(top = 16.dp),
+                    modifier = Modifier.fillMaxWidth(),
                     colors = ButtonDefaults.buttonColorsPrimary(),
                 ) { Text("保留进度", color = Color.White) }
+                Spacer(Modifier.height(10.dp))
                 TextButton(
                     text = "不保留，删掉未完成文件",
                     onClick = onDiscard,
-                    modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                    modifier = Modifier.fillMaxWidth(),
                 )
+                Spacer(Modifier.height(10.dp))
                 TextButton(
                     text = "继续传输",
                     onClick = onDismiss,

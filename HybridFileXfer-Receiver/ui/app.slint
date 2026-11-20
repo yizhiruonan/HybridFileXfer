@@ -45,7 +45,7 @@ component PrimaryButton inherits Rectangle {
         height: parent.height;
         text: root.label;
         color: enabled ? #FFFFFF : #9AA4AE;
-        font-size: 13.5px;
+        font-size: 13px;
         font-weight: 400;
         horizontal-alignment: center;
         vertical-alignment: center;
@@ -72,7 +72,7 @@ component SecondaryButton inherits Rectangle {
         height: parent.height;
         text: root.label;
         color: #1A1A1A;
-        font-size: 13.5px;
+        font-size: 13px;
         font-weight: 400;
         horizontal-alignment: center;
         vertical-alignment: center;
@@ -207,13 +207,13 @@ export component CancelAskWindow inherits Window {
             }
             Text {
                 text: "已经收到的部分怎么处理？（选好之后就停，这几秒传输先照常跑）";
-                font-size: 11.5px;
+                font-size: 12px;
                 color: #616161;
                 wrap: word-wrap;
             }
             Text {
                 text: "保留进度：留半截文件和续传记录，下次接着传；不保留：删掉。";
-                font-size: 11.5px;
+                font-size: 12px;
                 color: #8A8A8A;
                 wrap: word-wrap;
             }
@@ -249,7 +249,7 @@ export component CancelAskWindow inherits Window {
 export component AppWindow inherits Window {
     title: "多轨快传";
     icon: @image-url("logo-accent.png");
-    default-font-family: "Microsoft YaHei UI";
+    default-font-family: "Segoe UI, Microsoft YaHei UI";
     default-font-size: 13px;
 
     preferred-width: 560px;
@@ -413,7 +413,7 @@ export component AppWindow inherits Window {
                 padding-bottom: 10px;
                 Text {
                     text: root.notice-text;
-                    font-size: 11.5px;
+                    font-size: 12px;
                     color: #0F7B0F;
                     wrap: word-wrap;
                 }
@@ -446,7 +446,7 @@ export component AppWindow inherits Window {
                                     }
                                     Text {
                                         text: p.left.state + "  ·  " + p.left.rate;
-                                        font-size: 10.5px;
+                                        font-size: 11px;
                                         color: #616161;
                                         overflow: elide;
                                     }
@@ -471,7 +471,7 @@ export component AppWindow inherits Window {
                             }
                             Text {
                                 text: p.right.state + "  ·  " + p.right.rate;
-                                font-size: 10.5px;
+                                font-size: 11px;
                                 color: #616161;
                                 overflow: elide;
                             }
@@ -631,7 +631,7 @@ export component AppWindow inherits Window {
                     }
                     Text {
                         text: root.update-text;
-                        font-size: 11.5px;
+                        font-size: 12px;
                         color: #005FB8;
                         vertical-alignment: center;
                         horizontal-stretch: 1;
@@ -644,7 +644,7 @@ export component AppWindow inherits Window {
 
                 if root.update-state == 3 : Text {
                     text: root.update-text;
-                    font-size: 11.5px;
+                    font-size: 12px;
                     color: #005FB8;
                 }
 
@@ -656,7 +656,7 @@ export component AppWindow inherits Window {
 
                 if root.update-state == 5 : Text {
                     text: root.update-text;
-                    font-size: 10.5px;
+                    font-size: 11px;
                     color: #0F7B0F;
                     overflow: elide;
                 }
@@ -729,7 +729,7 @@ export component AppWindow inherits Window {
 export component TransferWindow inherits Window {
     title: root.failed ? "接收失败" : root.done ? "已完成" : "正在传输";
     // 和主窗口同一个字体，别让两个窗口的字长得不一样
-    default-font-family: "Microsoft YaHei UI";
+    default-font-family: "Segoe UI, Microsoft YaHei UI";
     default-font-size: 13px;
     preferred-width: 460px;
     // 收起时的高度 = 14 + 20 + 6 + 30 + 13 + 15(条) + 15(条到线) + 1(线) + 10
@@ -839,7 +839,7 @@ export component TransferWindow inherits Window {
                     text: root.detail-text;
                     // #616161 = 沿用现值：参考图里没有次级灰字（正文全是黑的），
                     // 这已经是中性灰（R=G=B），不存在「太鲜艳」的问题
-                    font-size: 11.5px;
+                    font-size: 12px;
                     color: #616161;
                     vertical-alignment: center;
                     horizontal-stretch: 1;
@@ -875,7 +875,7 @@ export component TransferWindow inherits Window {
                     Text {
                         visible: root.paused;
                         text: "继续";
-                        font-size: 11.5px;
+                        font-size: 12px;
                         color: #000000;
                         width: 100%;
                         height: 100%;
