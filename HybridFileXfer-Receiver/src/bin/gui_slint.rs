@@ -30,6 +30,8 @@ const WINDOW_TITLE: &str = "多轨快传";
 const TRANSFER_TITLE: &str = "正在传输";
 /// 取消确认框的窗口标题（app.slint 里 CancelAskWindow 的 title，两边要一致）
 const ASK_TITLE: &str = "取消接收";
+/// 发送方向的确认框标题（窗口按方向换标题，找 hwnd 时两个都要试）
+const ASK_TITLE_SEND: &str = "取消发送";
 /// 「发送到手机」小窗的窗口标题（app.slint 里 PushWindow 的 title，两边要一致）。
 /// 故意**不随状态变**（「正在发送 / 已发送」都写在窗口内容里）：gui 靠标题找 hwnd 来贴
 /// 右下角 + 置顶，标题一变就有一帧找不到窗口（TransferWindow 那边踩过，见 tray_win.rs）。
@@ -552,9 +554,45 @@ fn cancel_recv_request() -> bool {
     true
 }
 
+/// 发送方向（电脑 -> 手机）的取消被点了一下。返回 false = 忽略这次点击，
+/// 界面据此不弹确认框 —— 和接收方向完全对称。
+fn cancel_send_request() -> bool {
+    if !hfx_receiver::control::sending() {
+        log::warn(i18n::tr(
+            "按钮：取消发送被忽略（当前没有发送在进行）",
+            "cancel sending ignored: nothing is being sent",
+        ));
+        return false;
+    }
+    if hfx_receiver::control::cancel_requested() {
+        log::warn(i18n::tr(
+            "按钮：取消发送被忽略（这次取消已经受理过）",
+            "cancel sending ignored: this cancel was already accepted",
+        ));
+        return false;
+    }
+    log::warn(i18n::tr(
+        "按钮：取消发送（弹确认框；传输先不停，等用户选完再停）",
+        "button: cancel sending (dialog shown; transfer keeps running until the user chooses)",
+    ));
+    true
+}
+
+/// 把「保留 / 不保留」落到当前那个方向上。
+///
+/// 半截文件在哪一头决定了谁来处置：接收方向在电脑本地（finish_with 删），
+/// 发送方向在手机上（收尾时发 CANCEL_DISCARD 让它删）。
+fn apply_cancel_choice(choice: hfx_receiver::control::CancelChoice) -> bool {
+    if hfx_receiver::control::sending() {
+        hfx_receiver::control::cancel_send(choice)
+    } else {
+        hfx_receiver::control::cancel_receive(choice)
+    }
+}
+
 /// 保留：收尾时留着半截文件和 .hfxpart（下次同一个文件接着传）
 fn cancel_keep(st: &Arc<Mutex<State>>) {
-    if !hfx_receiver::control::cancel_receive(hfx_receiver::control::CancelChoice::Keep) {
+    if !apply_cancel_choice(hfx_receiver::control::CancelChoice::Keep) {
         // 幂等：这次取消已经受理过（收尾 / 重建还没做完）时不再做任何事，
         // 上一次的结果原样复用，界面不重复提示、控制通道不插第二帧。
         log::warn(i18n::tr(
@@ -564,8 +602,8 @@ fn cancel_keep(st: &Arc<Mutex<State>>) {
         return;
     }
     log::warn(i18n::tr(
-        "按钮：取消接收 · 保留进度（半截文件和 .hfxpart 留着，可续传）",
-        "button: cancel receiving · keep the partial file (resumable)",
+        "按钮：取消 · 保留进度（半截文件和 .hfxpart 留着，可续传）",
+        "button: cancel · keep the partial file (resumable)",
     ));
     if let Ok(mut s) = st.lock() {
         s.cancel_note = Some(
@@ -578,25 +616,44 @@ fn cancel_keep(st: &Arc<Mutex<State>>) {
     }
 }
 
-/// 不保留：收尾（Receiver::finish_with(false)）会把没传完的文件和续传记录删掉
+/// 不保留：接收方向由 Receiver::finish_with(false) 本地删，
+/// 发送方向由 CANCEL_DISCARD 让手机把它写了一半的文件和续传记录删掉
 fn cancel_discard(st: &Arc<Mutex<State>>) {
-    if !hfx_receiver::control::cancel_receive(hfx_receiver::control::CancelChoice::Discard) {
+    if !apply_cancel_choice(hfx_receiver::control::CancelChoice::Discard) {
         log::warn(i18n::tr(
-            "按钮：取消接收 · 不保留被忽略（这次取消已经受理过）",
+            "按钮：取消 · 不保留被忽略（这次取消已经受理过）",
             "cancel · discard ignored: this cancel was already accepted",
         ));
         return;
     }
+    // 删除是"谁那一头的事"：接收方向电脑自己删（收尾的 finish_with），
+    // 发送方向要等手机收到 CANCEL_DISCARD 之后自己删 —— 提示词得对得上。
+    let sending = hfx_receiver::control::sending();
     log::warn(i18n::tr(
-        "按钮：取消接收 · 不保留（收尾删掉没传完的文件和续传记录）",
-        "button: cancel receiving · discard the incomplete files",
+        if sending {
+            "按钮：取消 · 不保留（已通知手机删掉没传完的文件和续传记录）"
+        } else {
+            "按钮：取消 · 不保留（收尾删掉没传完的文件和续传记录）"
+        },
+        if sending {
+            "button: cancel · discard (the phone was told to remove the incomplete files)"
+        } else {
+            "button: cancel · discard the incomplete files"
+        },
     ));
     if let Ok(mut s) = st.lock() {
         s.cancel_note = Some(
-            i18n::tr(
-                "已取消：已删除未传完的文件和续传记录",
-                "cancelled: the incomplete files and their resume journals were removed",
-            )
+            if sending {
+                i18n::tr(
+                    "已取消：已通知手机删除未传完的文件和续传记录",
+                    "cancelled: the phone was told to remove the incomplete files",
+                )
+            } else {
+                i18n::tr(
+                    "已取消：已删除未传完的文件和续传记录",
+                    "cancelled: the incomplete files and their resume journals were removed",
+                )
+            }
             .to_string(),
         );
     }
@@ -606,8 +663,8 @@ fn cancel_discard(st: &Arc<Mutex<State>>) {
 fn cancel_dismiss() {
     // 弹框时没有暂停，所以这里也不用放暂停 —— 传照常（以前这里负责把"为了弹框而加的暂停"放掉）
     log::info(i18n::tr(
-        "取消接收确认框：选了「继续接收」",
-        "cancel dialog: keep receiving",
+        "取消确认框：选了「继续」（这一轮照常跑）",
+        "cancel dialog: keep going",
     ));
 }
 
@@ -1019,11 +1076,10 @@ fn main() -> Result<(), slint::PlatformError> {
         });
     }
     {
-        // 传输窗口上那颗 × 在「电脑 -> 手机」时走的也是这里（见 app.slint 的
-        // TransferWindow.sending-now）。和主窗口第 2 屏的「取消发送」是同一个动作。
-        xfer_win.on_cancel_send(move || {
-            hfx_receiver::control::cancel();
-        });
+        // 传输窗口上那颗 × 在「电脑 -> 手机」（推送 / 手机来取文件）时走这里。
+        // 和接收方向一个套路：先申请、再弹「保留 / 不保留」，用户选完才真停。
+        // 返回 false = 这次点击该被忽略（没在发送 / 已经在取消中），界面不弹框。
+        xfer_win.on_cancel_send(cancel_send_request);
     }
     // ---- 独立传输窗口上的两颗按钮（和主窗口同一套控制函数）----
     {
@@ -1643,6 +1699,9 @@ fn main() -> Result<(), slint::PlatformError> {
                 let want = tw.get_cancel_ask();
                 let shown = aw.window().is_visible();
                 if want && !shown {
+                    // 标题和正文按方向走（见 app.slint 的 CancelAskWindow.sending）：
+                    // 发送方向的半截文件在手机上，「不保留」是让手机删。
+                    aw.set_sending(hfx_receiver::control::sending());
                     let _ = aw.show();
                     // 弹在传输窗口正中（先 show 再量尺寸：没显示时尺寸还不可信）
                     let tw_pos = tw.window().position();
@@ -1656,7 +1715,9 @@ fn main() -> Result<(), slint::PlatformError> {
                     // 否则用户看着它在前面、鼠标点下去命中的是后面那个置顶窗口 ——
                     // 真机 2026-11-19：点「保留进度」毫无反应，传输一路跑到 100%。
                     #[cfg(windows)]
-                    if let Some(hwnd) = tray_win::find_window_titled(ASK_TITLE) {
+                    if let Some(hwnd) = tray_win::find_window_titled(ASK_TITLE)
+                        .or_else(|| tray_win::find_window_titled(ASK_TITLE_SEND))
+                    {
                         tray_win::bring_to_front(hwnd);
                     }
                 } else if !want && shown {
@@ -2297,8 +2358,12 @@ fn main() -> Result<(), slint::PlatformError> {
             // 什么时候算「收完尾」：进度卡没了（handle_receive 在 finish_with 之后才 reset 进度），
             // 或者 RECEIVING 已经落下去。两个条件谁先满足都行 —— 「已删除」不能比实际删文件
             // 早一句话，而取消之后的重建握手（最长几十秒）不该把这句话一起拖着。
-            let receiving_now = hfx_receiver::control::receiving();
-            let idle_now = !receiving_now || !active;
+            // 两个方向都要算：发送方向 RECEIVING 一直是 false，只按它判的话
+            // 确认框刚弹出来就会被下面那段「传输已经不在收」立刻收掉 ——
+            // 用户看到的就是「按了 ×，什么都没弹」。
+            let busy_now =
+                hfx_receiver::control::receiving() || hfx_receiver::control::sending();
+            let idle_now = !busy_now || !active;
             if let Some(note) = s.cancel_note.clone() {
                 if idle_now {
                     s.cancel_note = None;
@@ -2312,7 +2377,7 @@ fn main() -> Result<(), slint::PlatformError> {
             // 确认框现在是独立窗口、状态位挂在传输窗口上：这里只在「传输已经不在收」时
             // 把那个位清掉（定时器会把窗口收起来）。
             if let Some(tw) = xfer_weak.upgrade() {
-                if tw.get_cancel_ask() && !receiving_now {
+                if tw.get_cancel_ask() && !busy_now {
                     tw.set_cancel_ask(false);
                     if !hfx_receiver::control::cancel_requested() {
                         hfx_receiver::control::pause(false);

@@ -173,7 +173,11 @@ export struct XferSeg {
 // 独立窗口不用跟布局较劲：自己的尺寸自己说了算，传输窗口该多高还是多高；
 // 也不会挡住传输窗口上的暂停/取消按钮 —— 用户可以先处理完这个框再说。
 export component CancelAskWindow inherits Window {
-    title: "取消接收";
+    // 两个方向共用这一张确认框，问的是同一件事：「半截文件怎么处置」。
+    // 差别只在半截文件在哪一头 —— 接收方向在电脑上，发送方向在手机上
+    // （手机上那份由 CANCEL_DISCARD 让它删掉）。
+    in-out property <bool> sending: false;
+    title: root.sending ? "取消发送" : "取消接收";
     width: 424px;
     height: 172px;
     // 标题栏 ✕ 当成「继续接收」（不改主意）：这个回调挂不了在 Window 上，
@@ -199,20 +203,24 @@ export component CancelAskWindow inherits Window {
             spacing: 8px;
 
             Text {
-                text: "取消接收？";
+                text: root.sending ? "取消发送？" : "取消接收？";
                 font-size: 15px;
                 font-weight: 600;
                 // #000000 = 参考图正文文字的最暗像素（(60,141)、(46,50)），原来是 #1A1A1A
                 color: #000000;
             }
             Text {
-                text: "已经收到的部分怎么处理？（选好之后就停，这几秒传输先照常跑）";
+                text: root.sending
+                    ? "手机上已经收到的部分怎么处理？（选好之后就停，这几秒传输先照常跑）"
+                    : "已经收到的部分怎么处理？（选好之后就停，这几秒传输先照常跑）";
                 font-size: 12px;
                 color: #616161;
                 wrap: word-wrap;
             }
             Text {
-                text: "保留进度：留半截文件和续传记录，下次接着传；不保留：删掉。";
+                text: root.sending
+                    ? "保留进度：手机留着已收到的部分，下次接着传；不保留：让手机删掉。"
+                    : "保留进度：留半截文件和续传记录，下次接着传；不保留：删掉。";
                 font-size: 12px;
                 color: #8A8A8A;
                 wrap: word-wrap;
@@ -227,7 +235,7 @@ export component CancelAskWindow inherits Window {
                 // 那颗蓝底就是用户说的「太鲜艳」；现在默认项只用「深一档的灰 + 加粗」表示。
                 AskButton {
                     width: 92px;
-                    label: "继续接收";
+                    label: root.sending ? "继续发送" : "继续接收";
                     clicked => { root.dismiss(); }
                 }
                 AskButton {
@@ -879,8 +887,9 @@ export component TransferWindow inherits Window {
     callback toggle-details();
     // 返回 false = 这次点击被忽略（没在接收 / 已经在取消中），别弹确认框
     callback cancel-recv() -> bool;
-    // 发送方向的取消：没有半截文件要处置，直接中断（对应主窗口第 2 屏的「取消发送」）
-    callback cancel-send();
+    // 发送方向同理：半截文件在手机上，也要问「保留 / 不保留」。
+    // 返回 false = 这次点击被忽略（没在发送 / 已经在取消中），别弹确认框
+    callback cancel-send() -> bool;
     callback cancel-keep();
     callback cancel-discard();
     callback cancel-dismiss();
@@ -1014,9 +1023,12 @@ export component TransferWindow inherits Window {
                             if (root.failed) {
                                 root.close-window();
                             } else if (root.sending-now) {
-                                // 电脑 -> 手机：直接中断。这条链路上没有半截落盘文件
-                                // 需要用户选「保留 / 不保留」，弹那个框只会白等一轮。
-                                root.cancel-send();
+                                // 电脑 -> 手机：半截文件写在手机那头，同样要问
+                                // 「保留 / 不保留」—— 「不保留」由 CANCEL_DISCARD
+                                // 让手机自己删掉（见 session.rs rebuild_transfers）。
+                                if (root.cancel-send()) {
+                                    root.cancel-ask = true;
+                                }
                             } else if (root.cancel-recv()) {
                                 // 手机 -> 电脑：先暂停（手机端跟着停发），再问保留不保留
                                 root.cancel-ask = true;

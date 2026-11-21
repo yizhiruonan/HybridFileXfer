@@ -1321,9 +1321,12 @@ public class ServerService extends Service implements ServiceConnection {
                     }
                     if (opcode == ControllerIdentifiers.PING
                             || opcode == ControllerIdentifiers.CANCEL
+                            || opcode == ControllerIdentifiers.CANCEL_DISCARD
                             || opcode == ControllerIdentifiers.REBUILD_ACK
                             || opcode == ControllerIdentifiers.RESULT) {
-                        // 心跳 / 重复的取消帧：读到就行。
+                        // 心跳 / 重复的取消帧（CANCEL_DISCARD 也当取消帧读掉：要删的文件
+                        // 已经由接收收尾处理过了，这里再删一次既没有 WriteFileCall 可删，
+                        // 也会和重建握手抢帧序）：读到就行。
                         // RESULT 是电脑在取消前一刻已经写出来的收尾结论（载荷已在
                         // readControlOpcode 的锁里读掉丢掉），不能让它打断重建。
                         continue;

@@ -96,6 +96,25 @@ pub fn cancel_receive(choice: CancelChoice) -> bool {
     true
 }
 
+/// 发送方向（电脑 -> 手机：推送，或手机来电脑取文件）点了「取消」并做了选择。
+///
+/// 和 {@link #cancel_receive} 是同一套幂等闸门、同一套语义，区别只有两处：
+///   * 判断的是"正在发送"而不是"正在接收"；
+///   * 半截文件在手机那头，所以「不保留」不能只在本机删 —— 收尾时要把这个选择
+///     变成一帧 {@code CANCEL_DISCARD} 发给手机，让它删掉自己写了一半的文件
+///     （见 session.rs rebuild_transfers）。
+pub fn cancel_send(choice: CancelChoice) -> bool {
+    if !sending() {
+        return false;
+    }
+    if CANCEL_REQUESTED.swap(true, Ordering::Relaxed) {
+        return false;
+    }
+    set_discard_partial(!choice.keep_incomplete());
+    cancel();
+    true
+}
+
 /// 这次「取消接收」是否已经受理过（正在收尾 / 重建中）。
 ///
 /// 界面用它把「取消」按钮灰掉 / 收起确认框：同一轮接收只允许一次取消。

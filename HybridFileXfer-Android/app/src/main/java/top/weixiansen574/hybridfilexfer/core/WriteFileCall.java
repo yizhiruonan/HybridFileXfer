@@ -13,8 +13,14 @@ public abstract class WriteFileCall implements Callable<Void> {
     private final LinkedBlockingDeque<ByteBuffer> buffers;
     private final boolean[] channelFinished;
     private final ArrayList<LinkedList<FileBlock>> dequeArray;
-    /** 303：本次落盘的文件（手机本地绝对路径） */
-    private final java.util.LinkedHashSet<String> writtenPaths = new java.util.LinkedHashSet<>();
+    /**
+     * 303：本次落盘的文件（手机本地绝对路径）。
+     *
+     * <p>同步包装：写盘线程逐个 add，收尾线程要整表复制（「不保留」的删除路径会在写盘
+     * 线程还没退干净时就来取）。
+     */
+    private final java.util.Set<String> writtenPaths =
+            java.util.Collections.synchronizedSet(new java.util.LinkedHashSet<>());
     private boolean canceled = false;
 
     /** 306：目标路径 → 接收端已有的块（续传时电脑只补缺的块） */
@@ -160,6 +166,29 @@ public abstract class WriteFileCall implements Callable<Void> {
                 entry.getValue().save(entry.getKey());
             }
         }
+    }
+
+    /**
+     * 对端取消时明确要求「已收到的那半截也别留」（{@code CANCEL_DISCARD}）的收尾：
+     * 摘掉本轮的续传日志，并把"本轮创建过的文件"交给调用方删。
+     *
+     * <p>为什么日志要在这里删而不是留给 {@link #finish()} / {@link #cancel()}：这两个方法
+     * 的语义都是"没传完就把位图存下来，下次续传"，正好和「不保留」相反。
+     *
+     * <p>为什么只返回路径、不自己删文件：删文件的口径（只删存在的、失败只打日志）在
+     * {@code HFXService.removeIncompleteFiles} 里已经有一份，这里不复制第二份。
+     * 顺序也是先日志后文件——反过来的话，文件没了日志还在，下次同名文件会被当成
+     * "这些块已经有了"。
+     *
+     * <p>只认 {@link #writtenPaths}（真正创建过的文件）：本轮连文件都没建、只建了日志的
+     * 情况极少，不为它加额外的状态。
+     */
+    public synchronized List<String> discardJournalsAndListWritten() {
+        for (String path : journals.keySet()) {
+            ResumeJournal.remove(path);
+        }
+        journals.clear();
+        return writtenPaths();
     }
 
     /**

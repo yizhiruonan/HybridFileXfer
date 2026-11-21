@@ -117,6 +117,23 @@ public abstract class HFXService {
      */
     protected volatile boolean peerCancelled;
     /**
+     * 这一次对端取消还额外要求「把已经收到的那半截也删掉」({@link ControllerIdentifiers#CANCEL_DISCARD})。
+     *
+     * <p>只有<b>发件方</b>会发这一帧：它在取消确认框里选了「不保留」，语义是让收件方把这轮
+     * 写出去的文件连 {@code <文件名>.hfxpart} 续传日志一起删掉，下次同一个文件从头传。
+     * 手机当发件方时是电脑端删（{@code HFXServer.abortTransfer} 读 discard 选 opcode），
+     * 这里是反过来 —— 电脑当发件方，手机当收件方。
+     *
+     * <p>默认（{@link ControllerIdentifiers#CANCEL}，或本机取消、通道出错）<b>仍然保留</b>
+     * 半截文件和续传日志，下次接着传 —— 那是 305 起的既有功能，不能因为收尾走了同一个
+     * 分支就变成默认删除。
+     *
+     * <p>volatile：写它的可能是会话线程（{@code HFXServer.handleUnexpectedControlFrame}
+     * 在暂停同步里读到取消帧），读它的是接收传输线程的收尾。每次 {@link #receiveFiles}
+     * 开头清零，不会串到下一轮。
+     */
+    protected volatile boolean discardOnCancel;
+    /**
      * 304：在别的读循环里顺手读到的、还没处理的控制帧头。
      *
      * <p>取消/重建期间帧序不是我们预期的（电脑可能在飞 PAUSE_STATE 的回报、也可能已经开始
@@ -340,6 +357,20 @@ public abstract class HFXService {
     }
 
     /**
+     * 对端取消，而且明确要求「已经收到的那半截也别留」(CANCEL_DISCARD)。
+     *
+     * <p>取消本身和 {@link #cancelByPeer} 一模一样（置标志 + 放开暂停闸门 + 关传输通道 +
+     * 等重建），只多记一个 {@link #discardOnCancel}：接收方向的收尾据此决定删不删本轮的
+     * 文件和续传日志。两帧都不带载荷，帧流不会因此错位。
+     *
+     * <p>可能被会话线程和传输线程同时碰到（谁先读到这一帧就谁处理），重复调用无害。
+     */
+    protected void cancelByPeerDiscard(String reason) {
+        discardOnCancel = true;
+        cancelByPeer(reason);
+    }
+
+    /**
      * 关掉当前所有传输通道（先打"取消"标，收尾时不弹通道错误）。
      *
      * <p>幂等，任何线程都能调；返回关掉了几条。重建时
@@ -547,6 +578,8 @@ public abstract class HFXService {
         SpeedLimiter.resetWindow();
         pauseGate = new TransferPause();
         lastPcPaused = false;
+        // 新一轮接收开始：上一轮"取消要不要删半截文件"的结论不能带进来
+        discardOnCancel = false;
         WriteFileCall writeFileCall = createWriteFileCall(buffers, connections.size(), resumeBits);
         long startTime = System.currentTimeMillis();
         // 分块进度换成本次传输的新账本（和发送方向同一套口径，见 blockProgress 的注释）
@@ -592,7 +625,8 @@ public abstract class HFXService {
                 writeResultFrame(false, ex, null);
             }
             // 306：写盘线程挂了也保留半截文件，位图落盘，下次同一个文件从这里续上
-            writeFileCall.saveJournals();
+            // （电脑端这次说过「不保留」的话就照它说的删，见 settleCancelledReceive）
+            settleCancelledReceive(writeFileCall, writeFileTask);
             callback.onWriteFileError(ex);
             return true;
         }
@@ -607,8 +641,9 @@ public abstract class HFXService {
                 // 有 CANCEL 就当成"取消"收尾 —— 不写结论帧、不报错，等它重建通道。
                 if (!isTransferCancelled() && probePeerCancel(800)) {
                     top.weixiansen574.hybridfilexfer.core.HFXLog.d("receiveFiles: peer cancelled");
-                    // 306：半截文件 + 续传日志都保留，下次同一个文件只补缺的块
-                    writeFileCall.saveJournals();
+                    // 306：默认是「半截文件 + 续传日志都保留，下次同一个文件只补缺的块」；
+                    // 电脑端发的是 CANCEL_DISCARD（它选了「不保留」）就直接删，见 discardOnCancel
+                    settleCancelledReceive(writeFileCall, writeFileTask);
                     callback.onIncomplete();
                     return false;
                 }
@@ -625,7 +660,10 @@ public abstract class HFXService {
                 }
                 // 306：不再删半截文件 —— 续传日志（<文件名>.hfxpart）记着哪些块已经落盘，
                 // 下次同一个文件（大小/修改时间一致）只补缺的块，不会出现"大小对、内容有洞"的假文件。
-                writeFileCall.saveJournals();
+                // 例外：上面那行 probePeerCancel 没读到帧、但会话线程的暂停同步先把它接走了
+                // （HFXServer.handleUnexpectedControlFrame），本机已被判成取消时走这里 ——
+                // settleCancelledReceive 会按 discardOnCancel 决定删还是留。
+                settleCancelledReceive(writeFileCall, writeFileTask);
                 callback.onIncomplete();
                 return false;
             }
@@ -680,6 +718,50 @@ public abstract class HFXService {
             } catch (Throwable e) {
                 top.weixiansen574.hybridfilexfer.core.HFXLog.d("remove incomplete file failed: " + path, e);
             }
+        }
+    }
+
+    /**
+     * 接收方向「这次传不下去了」的统一收尾：留还是删，只看 {@link #discardOnCancel}。
+     *
+     * <ul>
+     *   <li>false（默认：本机取消 / 通道出错 / 电脑端发的是普通 CANCEL）：<b>一字不变</b>，
+     *       续传日志落盘、半截文件留着，下次同一个文件只补缺的块；</li>
+     *   <li>true（电脑端发的是 CANCEL_DISCARD，它在自己的取消框里选了「不保留」）：
+     *       本轮写出去的文件和它们的 {@code .hfxpart} 一起删掉，下次从头传。
+     *       半截文件在文件管理器里显示的是完整大小、实际是一片空洞，用户既然明确说了
+     *       不要，就别留这种假文件。</li>
+     * </ul>
+     *
+     * <p>为什么先等写盘线程（有界）再删：
+     * <ul>
+     *   <li>它正拿着这些文件的句柄按块随机写，删掉路径后剩下的块会写进已经 unlink 的 inode
+     *       （看不见的垃圾 IO）；</li>
+     *   <li>更实际的是 {@link WriteFileCall#writtenPaths()} 只在它创建文件时才多一条 ——
+     *       不等它退出就取，这一批里排在后面的文件可能还没被记上，就漏删了那份空洞文件。</li>
+     * </ul>
+     * 等不到也照删：删除本身幂等，且此后不会再有人创建这些路径。
+     */
+    private void settleCancelledReceive(WriteFileCall writeFileCall, FutureTask<Void> writeFileTask) {
+        if (!discardOnCancel) {
+            // 305/306 的既有行为：留半截文件 + 续传日志，下次续传
+            writeFileCall.saveJournals();
+            return;
+        }
+        if (writeFileTask != null) {
+            try {
+                writeFileTask.get(1500, TimeUnit.MILLISECONDS);
+            } catch (Throwable ignored) {
+                // 退不完也继续删：此时它要么已退出，要么剩下的写只会落进被删掉的 inode
+            }
+        }
+        top.weixiansen574.hybridfilexfer.core.HFXLog.d(
+                "receiveFiles: peer asked to discard the incomplete files");
+        try {
+            removeIncompleteFiles(writeFileCall.discardJournalsAndListWritten());
+        } catch (Throwable e) {
+            // 删不干净最多留个残骸，不能让这次"取消"被收尾异常改判成"传输失败"
+            top.weixiansen574.hybridfilexfer.core.HFXLog.d("discard incomplete files failed", e);
         }
     }
 
@@ -1178,6 +1260,16 @@ public abstract class HFXService {
                         transferCancelled = true;
                         needsRebuild = true;
                         return;
+                    case ControllerIdentifiers.CANCEL_DISCARD:
+                        // 和 CANCEL 一样是对端取消，另外记下「这轮收到的半截要删掉」。
+                        // 走到这里说明收尾已经过去了（残留帧），没有 WriteFileCall 可删 ——
+                        // 但绝不能当成不认识的帧塞进 pendingOpcode，那样下一个读循环
+                        // （readResultFrameOrNull）会抛 "BAD opcode=31" 把会话打掉。
+                        discardOnCancel = true;
+                        peerCancelled = true;
+                        transferCancelled = true;
+                        needsRebuild = true;
+                        return;
                     default:
                         pendingOpcode = opcode;
                         return;
@@ -1235,6 +1327,14 @@ public abstract class HFXService {
                         break;
                     case ControllerIdentifiers.CANCEL:
                         ctChannel.consumePushback(2);
+                        peerCancelled = true;
+                        transferCancelled = true;
+                        needsRebuild = true;
+                        break;
+                    case ControllerIdentifiers.CANCEL_DISCARD:
+                        // 同 CANCEL，只多一条「这轮收到的半截要删」（提示词见 discardOnCancel）
+                        ctChannel.consumePushback(2);
+                        discardOnCancel = true;
                         peerCancelled = true;
                         transferCancelled = true;
                         needsRebuild = true;
@@ -1373,6 +1473,15 @@ public abstract class HFXService {
                 cancelByPeer("readResultFrame: peer CANCEL");
                 return PeerResult.cancelled();
             }
+            // 同上，另外要求收件方（本端）把已经收到的那半截也删掉。
+            // 接收方向的收尾交换里也可能撞上它（电脑端在最后一块之后才发现校验不过、
+            // 或者用户正好在这一刻点了「取消 → 不保留」），当成 CANCEL 处理，
+            // 否则整条控制通道会因为 "unexpected control frame 31" 报错收场。
+            if (opcode == ControllerIdentifiers.CANCEL_DISCARD) {
+                top.weixiansen574.hybridfilexfer.core.HFXLog.d("readResultFrame: peer CANCEL_DISCARD");
+                cancelByPeerDiscard("readResultFrame: peer CANCEL_DISCARD");
+                return PeerResult.cancelled();
+            }
             // 304：电脑已经开始重建了（理论上 CANCEL 在它前面，这里只是兜底）
             if (opcode == ControllerIdentifiers.REBUILD_REQ) {
                 String name = ctChannel.readUTF();
@@ -1442,6 +1551,13 @@ public abstract class HFXService {
                     switch (opcode) {
                         case ControllerIdentifiers.CANCEL:
                             cancelByPeer("probePeerCancel: CANCEL");
+                            return true;
+                        // 接收方向电脑当发件方、用户选「不保留」时发的就是这一帧：
+                        // 取消的语义和 CANCEL 完全一样，只多记一个「本轮收到的半截要删」，
+                        // 删的动作在 receiveFiles 的收尾里做（见 settleCancelledReceive）。
+                        // 两帧都不带载荷，帧流不会因此错位。
+                        case ControllerIdentifiers.CANCEL_DISCARD:
+                            cancelByPeerDiscard("probePeerCancel: CANCEL_DISCARD");
                             return true;
                         case ControllerIdentifiers.REBUILD_REQ:
                             // 电脑已经开始重建传输通道：这次传输同样作废

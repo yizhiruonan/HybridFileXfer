@@ -495,7 +495,25 @@ impl Session {
         // 等待循环里通常已经抢先把这一帧写出去了（claim_cancel_frame），这里只是兜底
         // （比如线程已经全部正常退出、等待循环没机会发现取消）。
         if crate::control::claim_cancel_frame() {
-            let _ = proto::write_i16(&mut self.writer, controller::CANCEL);
+            // 发哪一帧取决于"半截文件在哪一头"，也就是当前是哪个方向：
+            //   * 发送方向（电脑是发件方，半截文件在手机）：用户选了「不保留」就要
+            //     让手机把它写了一半的文件和续传日志删掉 —— CANCEL_DISCARD；
+            //   * 接收方向（手机是发件方，半截文件在电脑）：绝不发 CANCEL_DISCARD，
+            //     否则手机那头会以为是"让我删东西"，把它自己的源文件删了。
+            let discard_remote =
+                crate::control::sending() && crate::control::discard_partial();
+            let opcode = if discard_remote {
+                controller::CANCEL_DISCARD
+            } else {
+                controller::CANCEL
+            };
+            if discard_remote {
+                log::warn(crate::i18n::tr(
+                    "已通知手机：把没传完的文件和续传记录删掉（CANCEL_DISCARD）",
+                    "the phone was told to remove the incomplete file (CANCEL_DISCARD)",
+                ));
+            }
+            let _ = proto::write_i16(&mut self.writer, opcode);
             let _ = self.writer.flush();
         }
         let names: Vec<String> = self.transfers.iter().map(|(name, _)| name.clone()).collect();

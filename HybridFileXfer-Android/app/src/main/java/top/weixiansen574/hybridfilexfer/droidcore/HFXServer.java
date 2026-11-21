@@ -824,7 +824,8 @@ public class HFXServer extends HFXService {
                 && opcode != ControllerIdentifiers.REBUILD_REQ
                 && opcode != ControllerIdentifiers.REBUILD_ACK
                 && opcode != ControllerIdentifiers.PING
-                && opcode != ControllerIdentifiers.CANCEL) {
+                && opcode != ControllerIdentifiers.CANCEL
+                && opcode != ControllerIdentifiers.CANCEL_DISCARD) {
             // 帧流错位排查用：把原始两字节打出来（正常帧不会走到这里）
             top.weixiansen574.hybridfilexfer.core.HFXLog.d(String.format(
                     "readControlOpcode: unexpected %d bytes=%02x %02x",
@@ -1130,6 +1131,15 @@ public class HFXServer extends HFXService {
                 // （关 socket 才能让阻塞在 write 里的发块线程立刻退出）。
                 // controlLock 在这条路径上是**已经持有**的，cancelByPeer 不碰它。
                 cancelByPeer("exchangePause: peer CANCEL");
+                return true;
+            case ControllerIdentifiers.CANCEL_DISCARD:
+                // 电脑当发件方、取消时选了「不保留」发来的就是这一帧。接收期间本线程
+                // 每 250ms 都会跑一次暂停同步，很容易抢在收尾的 probePeerCancel 前面
+                // 把它读走 —— 不在这里认出来，上面那句 IOException 会把整条会话打掉。
+                // cancelByPeerDiscard 顺手记下「这轮收到的半截要删」，
+                // 删除由 receiveFiles 收尾的 settleCancelledReceive 执行。
+                top.weixiansen574.hybridfilexfer.core.HFXLog.d("exchangePause: peer CANCEL_DISCARD");
+                cancelByPeerDiscard("exchangePause: peer CANCEL_DISCARD");
                 return true;
             case ControllerIdentifiers.REBUILD_REQ: {
                 // 电脑已经开始重建了：通道名先收好，交给 rebuildTransfers 用
