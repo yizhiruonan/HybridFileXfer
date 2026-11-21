@@ -3268,7 +3268,22 @@ fn post_ui(
 const REPO: &str = "yizhiruonan/HybridFileXfer";
 /// Release 里单独放一个接收器版本号文件，避免和整个项目的 tag（v3.1.0）混在一起
 const VERSION_ASSET: &str = "receiver.version";
-const EXE_ASSET: &str = "HybridFileXfer-Receiver.exe";
+/// 本机架构对应的接收器附件名。
+///
+/// x64 沿用老名字 —— 1.5.0 及更早的更新器只认这个字符串，改名会让那些用户
+/// 收到「更新信息不完整」。ARM64 单独一个名字，免得两边互相覆盖。
+const EXE_ASSET: &str = if cfg!(target_arch = "aarch64") {
+    "HybridFileXfer-Receiver-arm64.exe"
+} else {
+    "HybridFileXfer-Receiver.exe"
+};
+/// 兜底：ARM64 版万一没传上去，ARM 机器也还能拿 x64 版（Windows 会自己用
+/// 仿真跑起来，慢一点但能用）。x64 机器这边是空串，等于没有兜底。
+const EXE_ASSET_FALLBACK: &str = if cfg!(target_arch = "aarch64") {
+    "HybridFileXfer-Receiver.exe"
+} else {
+    ""
+};
 
 fn parse_version(text: &str) -> Option<(u32, u32, u32)> {
     let t = text.trim();
@@ -3312,6 +3327,7 @@ fn start_update_check(ui_weak: slint::Weak<AppWindow>) {
 
         let mut version_url = String::new();
         let mut exe_url = String::new();
+        let mut exe_fallback = String::new();
         if let Some(assets) = release["assets"].as_array() {
             for asset in assets {
                 let name = asset["name"].as_str().unwrap_or_default();
@@ -3320,8 +3336,14 @@ fn start_update_check(ui_weak: slint::Weak<AppWindow>) {
                     version_url = url.to_string();
                 } else if name == EXE_ASSET {
                     exe_url = url.to_string();
+                } else if !EXE_ASSET_FALLBACK.is_empty() && name == EXE_ASSET_FALLBACK {
+                    exe_fallback = url.to_string();
                 }
             }
+        }
+        // 本机架构那一份优先；没有才退回 x64 版。
+        if exe_url.is_empty() {
+            exe_url = exe_fallback;
         }
         if version_url.is_empty() || exe_url.is_empty() {
             return fail("更新信息不完整（缺少接收器附件）");
