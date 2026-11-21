@@ -354,6 +354,14 @@ struct PushRound {
     fail_text: String,
     /// 第 3 屏出现的时刻（成功 2 秒后自动关窗）
     done_at: Option<std::time::Instant>,
+    /// 这一轮见过的「已发字节」最大值。
+    ///
+    /// 只能用它来报「发出去了多少」，不能直接读 PROGRESS：取消 / 收尾 / 重新开始
+    /// 都会 reset 全局进度（session.rs 那几处 reset 和 engine 的会话收尾），
+    /// reset 之后 session_bytes 立刻变 0 —— 于是传了 1.94 GB 再点取消，
+    /// 小窗收尾时会写「只发出 0 B / 2.00 GB」（真机 2026-11-21 撞见）。
+    /// 峰值只涨不落，取消也拿得到真实数字。
+    peak_sent: u64,
     /// 速率取样：上一次的「已发字节」和时刻
     last_bytes: u64,
     last_at: std::time::Instant,
@@ -375,6 +383,7 @@ impl Default for PushRound {
             failed: false,
             fail_text: String::new(),
             done_at: None,
+            peak_sent: 0,
             last_bytes: 0,
             last_at: std::time::Instant::now(),
             speed: 0.0,
@@ -1969,6 +1978,8 @@ fn main() -> Result<(), slint::PlatformError> {
                             let (file_path, file_done, file_total, session_all, files_started) =
                                 prog.snapshot();
                             let sent = prog.received_bytes();
+                            // 峰值：取消会 reset 全局进度，收尾那句「发出去了多少」得靠它
+                            r.peak_sent = r.peak_sent.max(session_all);
                             let sending_now = hfx_receiver::control::sending();
                             if sending_now {
                                 r.saw_sending = true;
@@ -2077,7 +2088,10 @@ fn main() -> Result<(), slint::PlatformError> {
                             let bytes_done = if multi {
                                 true
                             } else {
+                                // 同样看峰值：传满之后点取消，session_all 会变 0，
+                                // 拿它判就会把「已经传完」误判成「只发了一部分」。
                                 r.bytes == 0
+                                    || r.peak_sent >= r.bytes
                                     || session_all >= r.bytes
                                     || (file_total > 0 && file_done >= file_total)
                             };
@@ -2098,13 +2112,15 @@ fn main() -> Result<(), slint::PlatformError> {
                                     ));
                                     r.finish(false, String::new());
                                 } else {
+                                    // 用峰值而不是当前的 session_all：取消时它已经被 reset 成 0
+                                    let sent_total = r.peak_sent;
                                     log::warn(&format!(
                                         "推送小窗：只发出一部分 {} / {}",
-                                        human(session_all),
+                                        human(sent_total),
                                         human(r.bytes)
                                     ));
                                     let done_text =
-                                        format!("只发出 {} / {}", human(session_all), human(r.bytes));
+                                        format!("只发出 {} / {}", human(sent_total), human(r.bytes));
                                     r.finish(true, done_text);
                                 }
                                 step_changed = true;
