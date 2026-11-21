@@ -56,6 +56,23 @@ public class ServerService extends Service implements ServiceConnection {
 
     public static final String ACTION_START = "top.weixiansen574.hybridfilexfer.action.START_SERVER";
     public static final String ACTION_STOP = "top.weixiansen574.hybridfilexfer.action.STOP_SERVER";
+    /**
+     * 308：界面改了限速，把新值带给服务。走的是和 {@link #ACTION_START} 同一条路
+     * （startForegroundService + intent extra），不另造一套 IPC —— 限速是 SpeedLimiter
+     * 的静态字段，按进程隔离，界面进程里设的值传不过服务进程。
+     */
+    public static final String ACTION_SPEED_LIMIT = "top.weixiansen574.hybridfilexfer.action.SPEED_LIMIT";
+    /**
+     * 308：共用限速值定下来了（握手定下来的 / 电脑推来的），服务广播给界面。
+     *
+     * <p>为什么要广播：界面进程有它自己的 Config 单例和 SpeedLimiter，服务这边改了
+     * 它看不见，「连接」页的限速一栏会一直显示旧值。只在本应用内发（setPackage），
+     * 不外泄。
+     */
+    public static final String ACTION_SPEED_LIMIT_SYNCED =
+            "top.weixiansen574.hybridfilexfer.SPEED_LIMIT_SYNCED";
+    /** 广播里带的共用限速值（MB/s，0 = 不限速） */
+    public static final String EXTRA_SPEED_LIMIT_SYNCED = "mbps";
 
     // ---- 通知卡片上的任务级按钮 ----
     //
@@ -787,8 +804,11 @@ public class ServerService extends Service implements ServiceConnection {
             }
         }
         intent.putStringArrayListExtra(EXTRA_INTERFACES, serialize(expanded));
-        top.weixiansen574.hybridfilexfer.core.SpeedLimiter.setLimitBytesPerSecond(
-                Config.getInstance(context).getSpeedLimitMbps() * 1024L * 1024L);
+        // 308：这里取的是"两端共用的那个值"（持久化里存的就是共用值），
+        // 按"采纳"语义设 —— 不是用户此刻的改动，不该提代次去推给电脑。
+        top.weixiansen574.hybridfilexfer.core.SpeedLimiter.applySharedBytesPerSecond(
+                top.weixiansen574.hybridfilexfer.core.SpeedLimiter
+                        .mbpsToBytesPerSecond(Config.getInstance(context).getSpeedLimitMbps()));
         intent.putExtra(EXTRA_LOCAL_BUFFER, localBuffer);
         intent.putExtra(EXTRA_REMOTE_BUFFER, remoteBuffer);
         intent.putExtra(EXTRA_SPEED_LIMIT, Config.getInstance(context).getSpeedLimitMbps());
@@ -852,6 +872,76 @@ public class ServerService extends Service implements ServiceConnection {
         restartSession(context);
     }
 
+    /**
+     * 308：界面改了限速 —— 把新值交给服务进程。
+     *
+     * <p>为什么不直接调 SpeedLimiter：那是静态字段，按进程隔离，界面进程里设的值
+     * 服务那边根本看不见（见 {@link #EXTRA_SPEED_LIMIT} 的注释）。走 intent 才是
+     * 唯一能跨进程把值带过去的路，和 {@link #startServer} 用的是同一条。
+     *
+     * <p>服务没在跑就什么也不做：值已经写进 Config 了，下次启动照样读得到，
+     * 没必要为了改个限速把一个前台服务拉起来。
+     */
+    public static void pushSpeedLimit(Context context, int mbps) {
+        if (!isRunning()) {
+            return;
+        }
+        Intent intent = new Intent(context, ServerService.class);
+        intent.setAction(ACTION_SPEED_LIMIT);
+        intent.putExtra(EXTRA_SPEED_LIMIT, Math.max(0, mbps));
+        try {
+            ContextCompat.startForegroundService(context, intent);
+        } catch (Throwable e) {
+            Log.w(TAG, "pushSpeedLimit failed", e);
+        }
+    }
+
+    /**
+     * 308：手机用户自己改了限速（只会由 {@link #ACTION_SPEED_LIMIT} 这条路径调进来）。
+     *
+     * <p>设值 + 提升代次：会话线程发现代次变了就写一帧 SPEED_LIMIT 给电脑，
+     * 两端从此显示同一个数。和采纳电脑的值（{@link #onSyncedSpeedLimit}）必须分开 ——
+     * 采纳也提代次的话，两端会把同一个数来回推个没完。
+     */
+    public static void onLocalSpeedLimitChanged(int mbps) {
+        int value = Math.max(0, mbps);
+        top.weixiansen574.hybridfilexfer.core.SpeedLimiter.applyLocalBytesPerSecond(
+                top.weixiansen574.hybridfilexfer.core.SpeedLimiter.mbpsToBytesPerSecond(value));
+        Context context = appContext;
+        if (context != null) {
+            // 本机这一侧也要落盘：界面写的是界面进程的 Config，这里写的是服务这一侧的
+            Config.getInstance(context).setSpeedLimitMbps(value);
+            HFXServer.setConfiguredLimitFallback(value);
+        }
+    }
+
+    /**
+     * 308：两端共用的限速值定下来了（握手定下来的 / 电脑推来的）——落盘 + 通知界面。
+     *
+     * <p>SpeedLimiter 的采纳（配置值 + 生效值 + reset 计时窗）由调用方在自己那一侧做，
+     * 这里只管"存"和"告诉界面"：界面的「连接」页读的是界面进程的 Config。
+     */
+    public static void onSyncedSpeedLimit(int mbps) {
+        int value = Math.max(0, mbps);
+        Context context = appContext;
+        if (context == null) {
+            // 服务还没 onCreate 完就要落盘：没有 Context 什么也写不了，等下次启动读配置
+            return;
+        }
+        Config.getInstance(context).setSpeedLimitMbps(value);
+        // 握手兜底值也跟着换成共用值：下次握手报出去的就是它（报旧值会把它又改回去）
+        HFXServer.setConfiguredLimitFallback(value);
+        try {
+            Intent intent = new Intent(ACTION_SPEED_LIMIT_SYNCED)
+                    .setPackage(context.getPackageName())
+                    .putExtra(EXTRA_SPEED_LIMIT_SYNCED, value);
+            context.sendBroadcast(intent);
+        } catch (Throwable e) {
+            // 广播发不出去最多是界面晚一帧刷新，不影响限速本身
+            Log.w(TAG, "broadcast speed limit failed", e);
+        }
+    }
+
     public static void stopServer(Context context) {
         Intent intent = new Intent(context, ServerService.class);
         intent.setAction(ACTION_STOP);
@@ -893,11 +983,13 @@ public class ServerService extends Service implements ServiceConnection {
         CrashGuard.install();
         appContext = getApplicationContext();
         config = Config.getInstance(this);
-        // 限速是 SpeedLimiter 的静态字段，按进程隔离：本服务跑在独立进程 `:IOService`，
-        // 界面进程里的 applySpeedLimit()/静态 startServer() 设的值传不过来。
-        // 所以必须在这里（服务自己的进程）按保存的配置再设一次，否则限速永远是 0。
-        top.weixiansen574.hybridfilexfer.core.SpeedLimiter.setLimitBytesPerSecond(
-                config.getSpeedLimitMbps() * 1024L * 1024L);
+        // 限速是 SpeedLimiter 的静态字段，按进程隔离：界面里 applySpeedLimit() 设的值
+        // 靠静态字段是传不过来的（界面改设置时走 ACTION_SPEED_LIMIT 这个 intent，见下）。
+        // 所以必须在这里（服务自己这一侧）按保存的配置再设一次，否则限速永远是 0。
+        // 308：持久化里存的就是"两端共用的那个值"，按采纳语义设（不提代次）。
+        top.weixiansen574.hybridfilexfer.core.SpeedLimiter.applySharedBytesPerSecond(
+                top.weixiansen574.hybridfilexfer.core.SpeedLimiter
+                        .mbpsToBytesPerSecond(config.getSpeedLimitMbps()));
         // 307：同一份值再交给 HFXServer 当兜底。服务刚 rebuilt、SpeedLimiter 还没就绪的
         // 那几百毫秒里如果正好握手，用它代替报 0 —— 报 0 等于告诉电脑「我不限速」，
         // 电脑那边就会把自己那条发送路径放开（协商最怕的就是这种单边放宽）。
@@ -959,6 +1051,13 @@ public class ServerService extends Service implements ServiceConnection {
             updateNotification();
             return START_STICKY;
         }
+        // 308：界面改了限速。新值随 intent 进到服务这一侧，由**本进程**设值 + 提代次，
+        // 会话线程在下一轮轮询里发现代次变了就把新值推给电脑。
+        // 处理完直接返回：这不是"启动服务"，别落到下面的监听逻辑里去。
+        if (ACTION_SPEED_LIMIT.equals(action)) {
+            onLocalSpeedLimitChanged(intent.getIntExtra(EXTRA_SPEED_LIMIT, config.getSpeedLimitMbps()));
+            return START_STICKY;
+        }
         // 电脑上的接收器用 adb 拉起服务时不会带 action，这里也当成"开始监听"
         if (ACTION_START.equals(action) || action == null) {
             if (intent.getBooleanExtra(EXTRA_FRESH, false)) {
@@ -968,10 +1067,13 @@ public class ServerService extends Service implements ServiceConnection {
             int mode = intent.getIntExtra(EXTRA_MODE, config.getMode());
             int local = intent.getIntExtra(EXTRA_LOCAL_BUFFER, config.getLocalBufferCount());
             int remote = intent.getIntExtra(EXTRA_REMOTE_BUFFER, config.getRemoteBufferCount());
-            // 限速值随 intent 进服务进程（静态字段跨进程不共享）；没带就用存好的配置
+            // 限速值随 intent 进服务进程（静态字段跨进程不共享）；没带就用存好的配置。
+            // 308：这一份是"启动时对齐用的共用值"（等同采纳），不是用户刚改的那一版 ——
+            // 用户改设置走的是 ACTION_SPEED_LIMIT 分支（会提代次、会推给电脑）。
             int speedLimitMbps = intent.getIntExtra(EXTRA_SPEED_LIMIT, -1);
-            top.weixiansen574.hybridfilexfer.core.SpeedLimiter.setLimitBytesPerSecond(
-                    (speedLimitMbps >= 0 ? speedLimitMbps : config.getSpeedLimitMbps()) * 1024L * 1024L);
+            top.weixiansen574.hybridfilexfer.core.SpeedLimiter.applySharedBytesPerSecond(
+                    top.weixiansen574.hybridfilexfer.core.SpeedLimiter.mbpsToBytesPerSecond(
+                            speedLimitMbps >= 0 ? speedLimitMbps : config.getSpeedLimitMbps()));
             if (requested.isEmpty()) {
                 // 只带了"重新开始监听"的请求：保持当前网卡配置，若服务未运行则按配置启动
                 if (!active) {
@@ -1349,10 +1451,13 @@ public class ServerService extends Service implements ServiceConnection {
                             || opcode == ControllerIdentifiers.CANCEL
                             || opcode == ControllerIdentifiers.CANCEL_DISCARD
                             || opcode == ControllerIdentifiers.REBUILD_ACK
+                            || opcode == ControllerIdentifiers.SPEED_LIMIT
                             || opcode == ControllerIdentifiers.RESULT) {
                         // 心跳 / 重复的取消帧（CANCEL_DISCARD 也当取消帧读掉：要删的文件
                         // 已经由接收收尾处理过了，这里再删一次既没有 WriteFileCall 可删，
                         // 也会和重建握手抢帧序）：读到就行。
+                        // 308：SPEED_LIMIT 的 i32 载荷也已经在 readControlOpcode 的锁里
+                        // 读掉并采纳了，这里同样只是"读掉不打断重建"。
                         // RESULT 是电脑在取消前一刻已经写出来的收尾结论（载荷已在
                         // readControlOpcode 的锁里读掉丢掉），不能让它打断重建。
                         continue;

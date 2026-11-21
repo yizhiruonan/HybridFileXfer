@@ -57,6 +57,9 @@ pub struct Session {
     port: u16,
     /// adb 转发给这台手机的本地端口（回环通道重连要用）
     local_port: u16,
+    /// 上一次把限速值推给手机时的代次（见 ratelimit::configured_epoch）。
+    /// 轮询里发现代次变了就补发一帧 SPEED_LIMIT。
+    limit_epoch: i64,
     /// 用户点的「停止」标志，run() 时存进来一份。
     ///
     /// 传输循环（等通道 / 重建握手 / 等结论）原来都不读它 —— 只有主循环顶部读，
@@ -133,31 +136,28 @@ impl Session {
         // 位置刻意选在「版本匹配」之后：版本不匹配时这一对帧不交换，
         // 老版本对端看到的仍然是原来那句「版本不一致」，不会卡在一个它没见过的字段上。
         //
-        // 语义：两边各报自己配的上限（MB/s，0 = 不限速），各自算 min(非零)，
-        // 然后对**自己那条发送路径**生效 —— 数据从谁那儿流出，就由谁限速。
-        // 所以这里算出来的值交给 ratelimit，手机那边算出来的值交给 SpeedLimiter。
+        // 308 起语义变了：两端不再各报各的取 min，而是**共用一个值**。
+        //
+        // 定值的规则（两边必须一模一样，见手机端 HFXServer.negotiateLimitMbps）：
+        //   电脑这边非 0 就用电脑的；电脑填 0（= 我这端不限速）才用手机的。
+        // 定下来之后两端都存这个数、都按这个数跑，界面上显示的也是它 ——
+        // 以前是「电脑写 20、手机写 5，实际跑 5，但两边界面各写各的」。
         let local_limit_mb = crate::ratelimit::configured_mb();
         proto::write_i32(&mut w, local_limit_mb)?;
         w.flush()?;
-        let remote_limit_mb = proto::read_i32(&mut reader)?;
-        let negotiated_mb = negotiate_limit_mb(local_limit_mb, remote_limit_mb);
-        // set_limit 内部会 reset_window，这里不用再调一次。
-        crate::ratelimit::set_limit(negotiated_mb as i64 * 1024 * 1024);
+        // 手机读完会把它认下来的共用值写回来（可能等于它自己的值）。
+        let shared_mb = proto::read_i32(&mut reader)?;
+        // adopt 内部含 set_limit（会 reset_window），这里不用再调一次。
+        crate::ratelimit::adopt_configured_mb(shared_mb as i64);
         // limit_text 自己带单位（"5 MB/s" / "不限速"），所以格式串里不要再写 MB/s ——
         // 否则不限速时会拼出「生效 不限速 MB/s」。
-        if local_limit_mb != remote_limit_mb {
-            log::info(&format!(
-                "限速协商：本机 {}，手机 {} → 生效 {}",
-                limit_text(local_limit_mb),
-                limit_text(remote_limit_mb),
-                limit_text(negotiated_mb)
-            ));
-        } else {
-            log::info(&format!(
-                "限速协商：两端都是 {}",
-                limit_text(negotiated_mb)
-            ));
-        }
+        log::info(&format!(
+            "限速（两端共用）：本机 {}，手机 {}",
+            limit_text(local_limit_mb),
+            limit_text(shared_mb)
+        ));
+        // 这一帧已经把值对齐了。代次不用在这里记：Session 结构体就是在握手之后
+        // 构造的，limit_epoch 的初值取的就是此刻的代次，刚连上不会多发一帧。
 
         let count = proto::read_i32(&mut reader)?;
         if count <= 0 {
@@ -366,6 +366,7 @@ impl Session {
             writer,
             transfers,
             pending_opcode: None,
+            limit_epoch: crate::ratelimit::configured_epoch(),
             interfaces,
             port,
             local_port,
@@ -395,6 +396,11 @@ impl Session {
         loop {
             if stop.load(Ordering::Relaxed) {
                 return SessionEnd::Stopped;
+            }
+            // 空闲时也要把「本机改了限速」推过去：这时主循环在 500ms 的读超时里转，
+            // 不推的话用户改完设置要等下一次握手才同步（手机上会一直显示旧值）。
+            if let Err(e) = self.flush_speed_limit() {
+                return SessionEnd::Disconnected(describe_read_error(&e));
             }
             // 传输期间偷看控制通道时会先把指令头取走，这里优先处理暂存的那条
             let id = match self.pending_opcode.take() {
@@ -428,6 +434,7 @@ impl Session {
                 controller::PING => Ok(()),
                 controller::CHECK_PENDING => self.handle_check_pending(),
                 controller::PAUSE_STATE => self.handle_pause_state(),
+                controller::SPEED_LIMIT => self.handle_speed_limit(),
                 controller::LIST_FILES => self.handle_list_files(),
                 controller::DELETE_FILE => self.handle_delete(),
                 controller::MKDIR => self.handle_mkdir(),
@@ -627,6 +634,7 @@ impl Session {
                     | controller::CANCEL
                     | controller::CANCEL_DISCARD
                     | controller::PAUSE_STATE
+                    | controller::SPEED_LIMIT
                     | controller::LIST_FILES
                     | controller::DELETE_FILE
                     | controller::MKDIR
@@ -829,6 +837,17 @@ impl Session {
                     let phone = proto::read_bool(&mut self.reader)?;
                     self.apply_pause_state(phone)?;
                 }
+                // 308：等结论的这段时间也会收到限速同步帧，就地吃掉（不处理的话
+                // 它会被当成「帧序错位」，取消或同步一次就把会话打断）。
+                controller::SPEED_LIMIT => {
+                    let mb = proto::read_i32(&mut self.reader)?;
+                    crate::ratelimit::adopt_configured_mb(mb as i64);
+                    self.limit_epoch = crate::ratelimit::configured_epoch();
+                    log::info(&format!(
+                        "限速已同步到本机（手机上改的）：{}",
+                        limit_text(mb)
+                    ));
+                }
                 controller::PING => {}
                 // 304：手机在这个窗口里点取消是正常的 —— 数据可能已经收全、本端正在
                 // 算 SHA-256 / 等它的结论帧，用户完全可能这时候按取消。以前这里把它当
@@ -897,6 +916,8 @@ impl Session {
     }
 
     fn poll_control_during_transfer(&mut self) -> io::Result<()> {
+        // 传输期间照样把「本机改了限速」推过去（这一步每圈都过，代价是一次原子读）。
+        self.flush_speed_limit()?;
         if self.pending_opcode.is_some() {
             return Ok(());
         }
@@ -909,7 +930,10 @@ impl Session {
         // 记成 pending，控制通道上就留下了一个孤零零的 bool（0x00）。之后下一次读
         // 正好是"残留的 00 + 下一帧的高位 00"，于是读出 opcode 0（SHUTDOWN），
         // 整条控制通道彻底错位。所以这里按帧长判断：不够 3 字节就一个字节都不读。
-        let mut window = [0u8; 3];
+        // 6 = 最大的「定长载荷帧」整帧长度：帧头 2 + 限速帧的 i32 4（308）。
+        // 窗口必须装得下最长的那个，否则帧永远判成「还没到齐」，一个字节都不读，
+        // 它就永远卡在缓冲区里（实测：只开 3 字节时 SPEED_LIMIT 一直不被采纳）。
+        let mut window = [0u8; 6];
         // None = 这一轮没数据（超时）；0 = 对端已关闭（EOF）。两者必须分开：
         // 把 EOF 也当成"没数据"，等待循环就永远转下去 —— 手机取消/断线后
         // handle_receive 收不了尾，界面和日志一起定格在「已暂停」。
@@ -942,6 +966,9 @@ impl Session {
         let id = i16::from_be_bytes([window[0], window[1]]);
         let payload_len = match id {
             controller::PAUSE_STATE => 1,
+            // 308：限速帧带一个 i32，不按 6 字节等就会把 4 字节载荷留在通道里，
+            // 下一次读的「opcode」正好是那个 i32 的高位 —— 帧流当场错位。
+            controller::SPEED_LIMIT => 4,
             _ => 0,
         };
         if available < 2 + payload_len {
@@ -965,10 +992,48 @@ impl Session {
     /// 能当场处理的必须当场处理：手机界面在传输和重建期间照样会发
     /// LIST_FILES / CHECK_PENDING，并且在它自己的锁里等应答 —— 推迟处理就会把
     /// 手机端那个调用堵死，连带把暂停同步和写侧一起堵住（实测卡 100 秒）。
+    /// 本机改了限速就把新值推给手机（308 的「两端共用一个值」）。
+    ///
+    /// 由界面去写 socket 是行不通的：控制通道有且只有一个写者（会话线程），
+    /// 两个线程同时写会把帧切开。所以界面只改配置 + 提升代次，这里在会话
+    /// 自己的轮询里发现代次变了再补发 —— 传输中（poll_control_during_transfer）
+    /// 和空闲（主循环）都会转到这里，最迟 250ms 内发出去。
+    fn flush_speed_limit(&mut self) -> io::Result<()> {
+        let epoch = crate::ratelimit::configured_epoch();
+        if epoch == self.limit_epoch {
+            return Ok(());
+        }
+        self.limit_epoch = epoch;
+        let mb = crate::ratelimit::configured_mb();
+        proto::write_i16(&mut self.writer, controller::SPEED_LIMIT)?;
+        proto::write_i32(&mut self.writer, mb)?;
+        self.writer.flush()?;
+        log::info(&format!(
+            "限速已同步给手机：{}",
+            limit_text(mb)
+        ));
+        Ok(())
+    }
+
+    /// 手机改了限速，推给本机：采纳它的值（不提升代次，否则会互相反弹）。
+    fn handle_speed_limit(&mut self) -> io::Result<()> {
+        let mb = proto::read_i32(&mut self.reader)?;
+        crate::ratelimit::adopt_configured_mb(mb as i64);
+        // 采纳之后本机代次没变，但记一下当前代次，免得下次 flush 时
+        // 把别人给的值又当成"我改的"推回去。
+        self.limit_epoch = crate::ratelimit::configured_epoch();
+        log::info(&format!(
+            "限速已同步到本机（手机上改的）：{}",
+            limit_text(mb)
+        ));
+        Ok(())
+    }
+
     fn handle_control_frame(&mut self, id: i16) -> io::Result<()> {
         match id {
             controller::PING => {}
             controller::CHECK_PENDING => self.handle_check_pending()?,
+            controller::SPEED_LIMIT => self.handle_speed_limit()?,
             controller::PAUSE_STATE => {
                 let phone = proto::read_bool(&mut self.reader)?;
                 log::debug(&format!("control: PAUSE_STATE {} during transfer", phone));
@@ -1269,9 +1334,16 @@ impl Session {
 
         let total = sent.load(Ordering::Relaxed);
         let seconds = started.elapsed().as_secs_f64().max(0.001);
+        // 被取消的那一轮不能报「发送完成」：上一句是「用户点了取消」，
+        // 下一句却是「完成，共 447.0 MB」，日志读起来像自相矛盾
+        // （真机 2026-11-21 取「不保留」时就是这么写的）。
         log::info(&format!(
             "{} {} · {} · {:.1}s",
-            crate::i18n::tr("发送完成，共", "sent"),
+            if crate::control::cancelled() {
+                crate::i18n::tr("已取消发送，已发出共", "cancelled after")
+            } else {
+                crate::i18n::tr("发送完成，共", "sent")
+            },
             crate::receiver::human_bytes(total),
             crate::i18n::tr("结束", "done"),
             seconds
@@ -2497,6 +2569,30 @@ mod tests {
         spawn_mock_phone_expecting(listener, folder, blocks, home_dir, true)
     }
 
+    /// 电脑端主动推给手机的限速值（308）。由 {@link next_opcode} 记录。
+    static PUSHED_LIMITS: Mutex<Vec<i32>> = Mutex::new(Vec::new());
+
+    /// 读下一个控制帧的 opcode，顺手吞掉电脑端主动推来的 SPEED_LIMIT（308）。
+    ///
+    /// 那一帧是电脑端「本机限速被改过」时在轮询里补发的，落在对端哪一次读帧上
+    /// 只取决于线程调度 —— mock 里凡是「等某个特定帧」的地方都走这里，断言
+    /// 才不会因为它的先后顺序随机红。
+    fn next_opcode(cr: &mut &TcpStream) -> i16 {
+        loop {
+            let code = proto::read_i16(cr).unwrap();
+            if code == controller::SPEED_LIMIT {
+                // 载荷是 i32 MB/s，读掉它才算把这一帧消费干净。
+                // 同时记下来，测试末尾断言「电脑改了限速确实推了」。
+                PUSHED_LIMITS
+                    .lock()
+                    .unwrap()
+                    .push(proto::read_i32(cr).unwrap());
+                continue;
+            }
+            return code;
+        }
+    }
+
     /// 同 {@link spawn_mock_phone}，但可以要求电脑最后回一个"失败"的结论帧
     /// （用来断言电脑自己发现了"块账本对不上"，而不是照回 ok 让手机端去喊 SHA 不一致）。
     fn spawn_mock_phone_expecting(
@@ -2516,22 +2612,26 @@ mod tests {
                 .unwrap();
             let mut cr: &TcpStream = &control;
             let mut cw: &TcpStream = &control;
+            // 308 起电脑端改了限速会在轮询里补发一帧 SPEED_LIMIT，它落到对端哪一次
+            // 读帧上取决于线程调度 —— mock 里所有「读下一个 opcode」都走这个助手，
+            // 顺手把这种同步帧吞掉，断言就不会随机红。
             let mut header = [0u8; 4];
             cr.read_exact(&mut header).unwrap();
             assert_eq!(&header, proto::CLIENT_HEADER);
             assert_eq!(proto::read_i32(&mut cr).unwrap(), proto::VERSION_CODE);
             proto::write_bool(&mut cw, true).unwrap();
-            // 307 限速协商：版本一致之后先交换两端的限速（电脑先报，手机再报）。
-            // 这一段是握手的一部分，漏掉它电脑端就会一直等这个 i32 而超时 ——
-            // 加协议字段时忘了同步 mock，测试就是从这儿开始红的。
+            // 限速协商：版本一致之后先交换（电脑先报自己的配置值，手机把两边
+            // 认下来的共用值写回来）。这一段是握手的一部分，漏掉它电脑端就会
+            // 一直等这个 i32 而超时 —— 加协议字段时忘了同步 mock，测试就是从这儿红的。
             let pc_limit = proto::read_i32(&mut cr).unwrap();
-            proto::write_i32(&mut cw, 0).unwrap();
-            // 手机端报「不限速」：协商结果必须是电脑自己的值，不能被 0 抹掉
             assert!(
                 pc_limit >= 0,
                 "电脑端报的限速应该是非负整数（0 = 不限速），实际 {}",
                 pc_limit
             );
+            // mock 手机这一侧：本机值是 0（不限速），共用值 = 电脑非 0 就用电脑的
+            let shared = crate::ratelimit::shared_value(pc_limit as i64, 0) as i32;
+            proto::write_i32(&mut cw, shared).unwrap();
             // Two interfaces on localhost -> two transfer channels.
             proto::write_i32(&mut cw, 2).unwrap();
             for name in ["USB_ADB", "wlan0"] {
@@ -2561,13 +2661,20 @@ mod tests {
 
             // Heartbeat frames must be ignored by the client.
             proto::write_i16(&mut cw, controller::PING).unwrap();
+            // 308：连上之后手机改了限速，推给电脑一帧。电脑必须就地采纳 ——
+            // 认不出来就会被当成「帧序错位」把整条会话断掉。
+            proto::write_i16(&mut cw, controller::SPEED_LIMIT).unwrap();
+            proto::write_i32(&mut cw, 9).unwrap();
             proto::write_i16(&mut cw, controller::REQUEST_RECEIVE).unwrap();
             // 305：REQUEST_RECEIVE 之后紧跟着必须是 RESUME_QUERY（电脑端同步读这一帧），
             // 一个文件都不查也要发，只是 count = 0。
             proto::write_i16(&mut cw, controller::RESUME_QUERY).unwrap();
             proto::write_i32(&mut cw, 0).unwrap();
+            // 本机（电脑）在连上之后把限速改成了 11，会话线程会在轮询里补发一帧
+            // SPEED_LIMIT。它插在哪两次读之间只取决于线程调度，所以不赌顺序：
+            // next_opcode 遇到就记进 PUSHED_LIMITS，测试末尾统一断言。
             assert_eq!(
-                proto::read_i16(&mut cr).unwrap(),
+                next_opcode(&mut cr),
                 controller::RESUME_REPLY,
                 "电脑端应该用 RESUME_REPLY 帧回答续传查询"
             );
@@ -2650,18 +2757,26 @@ mod tests {
             // 以前电脑回的是裸 bool，手机端发送线程的读循环会把它当结论读串。
             proto::write_i16(&mut cw, controller::PAUSE_STATE).unwrap();
             proto::write_bool(&mut cw, false).unwrap();
-            assert_eq!(
-                proto::read_i16(&mut cr).unwrap(),
-                controller::PAUSE_REPLY,
-                "电脑应该用 PAUSE_REPLY 帧回报暂停状态"
-            );
-            assert!(!proto::read_bool(&mut cr).unwrap());
+            // 电脑**可能**在收到这个查询之前就已经把块全收完、把结论帧发出来了 ——
+            // 两个都是合法时序，所以两种都接：拿到 PAUSE_REPLY 就回读那个 bool，
+            // 拿到 RESULT 就当「已经收尾」，下面那段结论帧不再重读 opcode。
+            // （以前这里写死了「下一个帧一定是 PAUSE_REPLY」，偶发红就是撞上另一条路。）
+            let mut result_opcode_consumed = false;
+            match next_opcode(&mut cr) {
+                controller::PAUSE_REPLY => {
+                    assert!(!proto::read_bool(&mut cr).unwrap());
+                }
+                controller::RESULT => result_opcode_consumed = true,
+                other => panic!("暂停查询之后来了一帧没预料到的 {other}"),
+            }
 
             writer_a.join().unwrap();
             writer_b.join().unwrap();
 
             // 302 收尾：电脑先给落盘结论（RESULT），手机再回读文件结论（RESULT）
-            assert_eq!(proto::read_i16(&mut cr).unwrap(), controller::RESULT);
+            if !result_opcode_consumed {
+                assert_eq!(next_opcode(&mut cr), controller::RESULT);
+            }
             let ok = proto::read_bool(&mut cr).unwrap();
             assert_eq!(ok, expect_ok, "落盘结论帧的 ok 和预期不符");
             // 303：成功时结论帧后面跟一张指纹表（这里是空的），失败时跟一段错误信息
@@ -2693,8 +2808,17 @@ mod tests {
         })
     }
 
+    /// 这几个用例都会跑握手，握手会写全局的限速（ratelimit），
+    /// 和 ratelimit 自己的用例抢同一套量 —— 并行跑就会偶发红，所以统一排队。
+    fn rate_serial() -> std::sync::MutexGuard<'static, ()> {
+        crate::ratelimit::TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn receives_files_from_a_mock_phone() {
+        let _serial = rate_serial();
         let dir = temp_dir("receive");
         let home = util::normalize_dir(&dir).to_string_lossy().to_string();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2736,9 +2860,33 @@ mod tests {
             }
         }
 
+        // 308：本机配置 7，mock 手机报 0（不限速）→ 共用值必须是 7，
+        // 而且电脑要真的采纳它（连上就生效，不等第一块数据）。
+        PUSHED_LIMITS.lock().unwrap().clear();
+        crate::ratelimit::set_configured_mb(7);
         let server = spawn_mock_phone(listener, folder_path.clone(), blocks, home.clone());
         let mut session = Session::connect(IpAddr::from([127, 0, 0, 1]), port, &home, 0).unwrap();
         assert_eq!(session.interface_names(), "USB_ADB, wlan0");
+        assert_eq!(
+            crate::ratelimit::configured_mb(),
+            7,
+            "两端共用值应当是电脑配置值（本机非 0 以本机为准）"
+        );
+        let epoch_after_connect = crate::ratelimit::configured_epoch();
+        assert_eq!(
+            crate::ratelimit::limit(),
+            7 * 1024 * 1024,
+            "采纳共用值之后要立即对发送路径生效"
+        );
+        // 连上之后用户在电脑上把限速改成 11：会话线程要主动推给手机
+        // （mock 那边会断言收到 SPEED_LIMIT + 11）。
+        crate::ratelimit::set_configured_mb(11);
+        let epoch_after_local_change = crate::ratelimit::configured_epoch();
+        assert_eq!(
+            epoch_after_local_change,
+            epoch_after_connect + 1,
+            "本机改一次只该提一代"
+        );
         let receiver = Arc::new(Receiver::new(util::normalize_dir(&dir)));
         let stop = Arc::new(AtomicBool::new(false));
         match session.run(&receiver, &stop) {
@@ -2747,6 +2895,27 @@ mod tests {
             SessionEnd::Stopped => panic!("unexpected stop"),
         }
         server.join().unwrap();
+
+        // mock 在握手之后推了一帧 SPEED_LIMIT 9（手机那边改的）：它是在 run() 的
+        // 主循环里被吃掉的，所以断言必须放在 run 之后。
+        assert_eq!(
+            crate::ratelimit::configured_mb(),
+            9,
+            "SPEED_LIMIT 帧应当被就地采纳（而不是当成帧序错位断开）"
+        );
+        assert_eq!(crate::ratelimit::limit(), 9 * 1024 * 1024);
+        assert_eq!(
+            crate::ratelimit::configured_epoch(),
+            epoch_after_local_change,
+            "采纳对端推来的值不得提升代次，否则两端会互相把同一个数推个没完"
+        );
+        // 反方向：本机（电脑）改了限速，会话线程要在轮询里把它推给手机。
+        // 这一帧可能插在任何两次读之间，所以由 next_opcode 一路记下来，这里才断言。
+        assert!(
+            PUSHED_LIMITS.lock().unwrap().contains(&11),
+            "电脑改了限速要把新值推给手机，实际推送：{:?}",
+            PUSHED_LIMITS.lock().unwrap()
+        );
 
         assert_eq!(std::fs::read(&big_path).unwrap(), big);
         assert_eq!(std::fs::read(&small_path).unwrap(), small);
@@ -2762,6 +2931,7 @@ mod tests {
     /// 结论里点名缺哪一块。
     #[test]
     fn a_repeated_block_with_a_hole_fails_the_transfer_locally() {
+        let _serial = rate_serial();
         let dir = temp_dir("receive-hole");
         let home = util::normalize_dir(&dir).to_string_lossy().to_string();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2954,14 +3124,6 @@ fn send_channel(
     proto::write_i16(&mut stream, transfer::EOF)?;
     stream.flush()?;
     Ok(written)
-}
-
-/// 307：两端的限速值（MB/s，0 = 不限速）→ 协商后的值。
-///
-/// 规则和 `ratelimit::effective` 一致，这里只是换个单位再包一层：
-/// 0 表示「我这端不限速」，**不参与 min** —— 一端填 0 不会抹掉另一端的限制。
-fn negotiate_limit_mb(local_mb: i32, remote_mb: i32) -> i32 {
-    crate::ratelimit::effective(local_mb as i64, remote_mb as i64) as i32
 }
 
 /// 限速值的说法（日志用）：0 写「不限速」，别写成「0 MB/s」—— 那读起来像堵死。

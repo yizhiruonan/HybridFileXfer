@@ -262,7 +262,16 @@ export component AppWindow inherits Window {
 
     preferred-width: 560px;
     min-width: 520px;
-    min-height: 260px;
+    // 高度：给的是「最小」而不是「首选」。
+    //
+    // 只给 preferred-width 时窗口按系统默认开（实测 536x439），底部
+    // 「停止接收 / 开始接收」正好被裁在窗口外、右边还挂一条滚动条 —— 用户
+    // 2026-11-21 的截图就是这个。preferred-height 也不行：整块内容包在
+    // ScrollView 里，首选高度由内容算，ScrollView 会把它盖掉。把最小高度定成
+    // 内容实测需要的 464（状态卡 66 + 设置卡 + 分隔线 + 按钮行 32 + 边距）。
+    // 464 是逐个像素试出来的：463 还差一点、右侧挂滚动条，464 刚好放下。
+    // 打开就是完整的，往下拖也不会裁按钮（再矮才出滚动条）。
+    min-height: 435px;
     background: #F3F3F3;
 
     in-out property <string> status-title: "未开始接收";
@@ -285,10 +294,21 @@ export component AppWindow inherits Window {
     in-out property <string> speed-limit-text: "0";
     // 限速输入框现在有没有焦点。LineEdit 的 has-focus 是 out property，
     // 不能直接在上面挂 changed，所以先绑到这个本地属性上，由下面的 changed 监听。
-    private property <bool> limit-focus: limit-edit.has-focus;
+    out property <bool> limit-focus: limit-edit.has-focus;
+    // 用户在这个框里**真的打了字、但还没提交**。公开给 Rust：
+    // 308 起两端共用一个值，手机端改了要写回这个框 —— 用户正在打字时不能抢，
+    // 所以 tick 用这个标志判断「现在能不能改他的输入」。
+    in-out property <bool> limit-typed: false;
     // 失去焦点 = 用户点到别处了 → 提交一次。回车走 limit-edit 自己的 accepted。
+    //
+    // 只在**真的打过字**时才提交：以前这里无条件 speed-limit-changed，于是
+    // 「点一下别处」就会把框里当前的文本重新提交一遍 —— 手机端同步过来的新值
+    // 刚写进框、用户随手点一下别处，就被旧文本原样覆盖回去了。
     changed limit-focus => {
-        if (!limit-focus) { root.speed-limit-changed(root.speed-limit-text); }
+        if (!limit-focus && root.limit-typed) {
+            root.limit-typed = false;
+            root.speed-limit-changed(root.speed-limit-text);
+        }
     }
     in-out property <string> message: "";
     // 状态卡下面的一行结果提示（取消接收后那句「已保留进度」/「已删除未完成文件」）
@@ -338,7 +358,8 @@ export component AppWindow inherits Window {
     callback device-clicked(int);
     callback device-chosen(int);
     callback toggle-pause-send();
-    callback cancel-send();
+    // （发送方向的取消回调不在这里：它挂在 TransferWindow / PushWindow 上，
+    //   要带「保留 / 不保留」的结果，主窗口没有触发点。）
     // 接收方向的取消：点「取消」先暂停并弹确认框，再按用户的选择收尾。
     // 返回 false = 这次点击被忽略（没有在接收 / 已经在取消中），别弹确认框。
     callback cancel-recv() -> bool;
@@ -603,9 +624,10 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                // 指定 IP（仅在指定 IP 模式显示）
-                LineEdit {
-                    visible: root.mode-index == 1;
+                // 指定 IP（仅在指定 IP 模式显示）。
+                // 用 if 而不是 visible：Slint 里 visible:false 的元素**照样在布局里占位**，
+                // 用它隐藏这个输入框会白留 32px 空档（窗口因此被撑高，中间一大片空白）。
+                if root.mode-index == 1 : LineEdit {
                     text <=> root.ip-text;
                     placeholder-text: "192.168.1.5";
                 }
@@ -656,10 +678,24 @@ export component AppWindow inherits Window {
                         width: 64px;
                         text <=> root.speed-limit-text;
                         placeholder-text: "0";
-                        accepted => { root.speed-limit-changed(root.speed-limit-text); }
+                        // edited 只在用户敲键时发（程序里改 text 不会触发），
+                        // 正好用来记「用户现在手里有没提交的输入」。
+                        edited => { root.limit-typed = true; }
+                        accepted => {
+                            root.limit-typed = false;
+                            root.speed-limit-changed(root.speed-limit-text);
+                            // 回车 = 提交**并结束编辑**：焦点得撤走。
+                            //
+                            // 以前只提交不撤焦点，框里那条蓝色下划线一直亮着
+                            // （用户原话「输入完按回车不能退出输入框焦点」），
+                            // 看起来像还在编辑、光标停在那儿，再点别处还得再来一次。
+                            // 撤焦点会让 has-focus 变假、触发下面那段 changed ——
+                            // 那时 limit-typed 已经置 false，不会再提交一遍。
+                            limit-edit.clear-focus();
+                        }
                     }
                     Text {
-                        text: "MB/s（0 = 不限速，与手机端取较小值）";
+                        text: "MB/s（0 = 不限速；这里改了，手机端也跟着改）";
                         font-size: 11px;
                         color: #8A8A8A;
                         vertical-alignment: center;
@@ -667,9 +703,9 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                Text {
+                // 同上：用 if 而不是 visible，否则没消息时也占着一行字的高度。
+                if root.message != "" : Text {
                     text: root.message;
-                    visible: root.message != "";
                     font-size: 11px;
                     color: #9D5D00;
                 }
@@ -724,9 +760,10 @@ export component AppWindow inherits Window {
                     vertical-stretch: 0;
                     spacing: 8px;
                     Rectangle { horizontal-stretch: 1; }
-                    SecondaryButton {
+                    // 用 if 而不是 visible：不接收时这颗按钮不该占位（占位会把
+                    // 「开始接收」往左挤，右边留一道和按钮等宽的空白）。
+                    if root.running : SecondaryButton {
                         label: "停止接收";
-                        visible: root.running;
                         clicked => { root.stop-clicked(); }
                     }
                     PrimaryButton {
@@ -738,7 +775,10 @@ export component AppWindow inherits Window {
             }
         }
 
-        Rectangle { vertical-stretch: 1; }
+        // 这里原来有一个 vertical-stretch:1 的占位矩形，用来把内容顶到窗口顶部。
+        // 去掉它：它在 ScrollView 里会把「滚动内容高度」撑成视口高度，于是内容明明
+        // 放得下、ScrollView 还是判定要滚，右侧就一直挂一条滚动条（373 行那次老
+        // 截图里的那条）。没有它，内容按自然高度排，视口够大就不滚。
     }
     }
 
@@ -1641,6 +1681,10 @@ export component PushWindow inherits Window {
     // 拿不到总进度（队列里量不出字节数 / 手机还没报）→ 不确定态：整条绿 + 跑光带
     in-out property <bool> indeterminate: false;
     in-out property <bool> failed: false;
+    // 用户自己点了「取消发送」：结果既不是「已发送」也不是「发送失败」。
+    // 单独一个状态位，是因为「发出去了多少字节」判不出用户意图 ——
+    // 取消时字节数必然小于总量，混进 failed 就会弹出红字「发送失败」+「只发出 215.0 MB」。
+    in-out property <bool> cancelled: false;
     in-out property <string> fail-text: "";
 
     // 多选：打了几台（0 的时候「发送到选中的 N 台」是灰的）
@@ -1666,10 +1710,12 @@ export component PushWindow inherits Window {
     //         列表 = 设备数*56；一台都没有时 76（两行说明 + 「重试」）
     // step 1: 16 + 40 + 12 + 1 + 14 + 20(文件名) + 8 + 15(进度条) + 10 + 20(百分比行) + 14 + 32 + 12 = 214
     // step 2: 16 + 40 + 12 + 1 + 14 + 12 = 95；失败再 +20(红字) +8 +32(关闭按钮) = 155
+    //         取消同样多三行（+20 灰字已发出 / +8 / +32 关闭按钮）= 155 ——
+    //         以前只认 failed，取消时窗口只有 95 高，那三行和「关闭」被裁在窗外。
     private property <length> list-h: root.devices.length == 0 ? 76px : root.devices.length * 56px;
     private property <length> content-h: root.step == 0
         ? 125px + root.list-h
-        : (root.step == 1 ? 214px : (95px + (root.failed ? 60px : 0px)));
+        : (root.step == 1 ? 214px : (95px + ((root.failed || root.cancelled) ? 60px : 0px)));
     preferred-height: root.content-h;
 
     Rectangle {
@@ -2074,18 +2120,20 @@ export component PushWindow inherits Window {
                     height: 40px;
                     background: transparent;
 
-                    // 成功画勾（20 高，居中 y=10）；失败画个红色的手机
+                    // 成功画勾（20 高，居中 y=10）；失败画个红色的手机；
+                    // 取消画个灰色的手机（是"停下来了"，不是"出错了"）
                     if root.failed : PhoneGlyph { x: 0px; y: 7px; tint: #C42B1C; }
-                    if !root.failed : CheckGlyph { x: 0px; y: 10px; }
+                    if root.cancelled : PhoneGlyph { x: 0px; y: 7px; tint: #8A8A8A; }
+                    if !root.failed && !root.cancelled : CheckGlyph { x: 0px; y: 10px; }
                     Text {
                         x: 32px;
                         y: 0px;
                         width: parent.width - 32px;
                         height: 22px;
-                        text: root.failed ? "发送失败" : ("已发送到 " + root.target-name);
+                        text: root.failed ? "发送失败" : root.cancelled ? "已取消发送" : ("已发送到 " + root.target-name);
                         font-size: 15px;
                         font-weight: 600;
-                        color: root.failed ? #C42B1C : #000000;
+                        color: root.failed ? #C42B1C : root.cancelled ? #616161 : #000000;
                         vertical-alignment: center;
                         overflow: elide;
                     }
@@ -2105,6 +2153,35 @@ export component PushWindow inherits Window {
                 Rectangle { height: 12px; }
                 Rectangle { height: 1px; background: #E3E3E3; }
                 Rectangle { height: 14px; }
+
+                // 取消：说明已经发出去了多少（灰字，不是错误原因）
+                if root.cancelled : Rectangle {
+                    height: 20px;
+                    background: transparent;
+
+                    Text {
+                        width: 100%;
+                        height: 20px;
+                        text: root.fail-text;
+                        font-size: 12px;
+                        color: #616161;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                }
+                if root.cancelled : Rectangle { height: 8px; }
+                if root.cancelled : Rectangle {
+                    height: 32px;
+                    background: transparent;
+
+                    PushTextButton {
+                        x: parent.width - 60px;
+                        y: 0px;
+                        width: 60px;
+                        label: "关闭";
+                        clicked => { root.cancel(); }
+                    }
+                }
 
                 // 失败原因（红字，只有失败才有；失败不自动关窗，等用户看完点「关闭」）
                 if root.failed : Rectangle {

@@ -354,6 +354,16 @@ struct PushRound {
     started_at: Option<std::time::Instant>,
     failed: bool,
     fail_text: String,
+    /// 这一轮是用户自己点了「取消发送」结束的（不是失败）。
+    ///
+    /// 必须和 failed 分开：取消时「已发字节」必然小于总量，用「发没发完」判结果
+    /// 就会把用户主动取消说成「发送失败」（真机 2026-11-21 用户截图报的就是这个）。
+    cancelled: bool,
+    /// 这一轮里见过「取消已经受理」（control::cancel_requested）。
+    ///
+    /// 不直接在这两处各读一次全局量：收尾那一帧可能已经跨到下一轮握手，而
+    /// CANCEL_REQUESTED 是会被复位的一次性闸门。见过就一直记着。
+    cancel_seen: bool,
     /// 第 3 屏出现的时刻（成功 2 秒后自动关窗）
     done_at: Option<std::time::Instant>,
     /// 这一轮见过的「已发字节」最大值。
@@ -384,6 +394,8 @@ impl Default for PushRound {
             started_at: None,
             failed: false,
             fail_text: String::new(),
+            cancelled: false,
+            cancel_seen: false,
             done_at: None,
             peak_sent: 0,
             last_bytes: 0,
@@ -423,6 +435,13 @@ impl PushRound {
         self.fail_text = text;
         self.done_at = Some(std::time::Instant::now());
         self.speed = 0.0;
+    }
+
+    /// 用户自己取消的那一轮：进第 3 屏，但**不**算失败 —— 不弹红字、不挂窗，
+    /// 和「已发送」一样 2 秒后自己收掉（半截文件和「已取消」由传输小窗去说）。
+    fn finish_cancelled(&mut self, text: String) {
+        self.cancelled = true;
+        self.finish(false, text);
     }
 
     fn reset(&mut self) {
@@ -1070,11 +1089,8 @@ fn main() -> Result<(), slint::PlatformError> {
             }
         });
     }
-    {
-        ui.on_cancel_send(move || {
-            hfx_receiver::control::cancel();
-        });
-    }
+    // 主窗口上那个 `cancel-send` 回调没有任何地方 invoke（发送方向的取消都在
+    // 传输窗口 / 推送小窗上），所以这里不再注册——留着只会让人以为还有第三条路。
     {
         // 传输窗口上那颗 × 在「电脑 -> 手机」（推送 / 手机来取文件）时走这里。
         // 和接收方向一个套路：先申请、再弹「保留 / 不保留」，用户选完才真停。
@@ -1405,13 +1421,22 @@ fn main() -> Result<(), slint::PlatformError> {
     }
     {
         // 第 2 屏「取消发送」：中断这次发送（传输线程每领一块都会看一眼这个开关）
+        //
+        // 结果是「已取消」，不是「失败」：以前这里写 finish(true, ...)，于是用户
+        // 点了取消，小窗却变成红字「发送失败 / 已取消发送」（真机截图报的）。
         let round = Arc::clone(&push_round);
         push_win.on_cancel_send(move || {
             log::info("推送小窗：取消发送");
             hfx_receiver::control::cancel();
             if let Ok(mut r) = round.lock() {
                 if r.step == PUSH_SENDING {
-                    r.finish(true, "已取消发送".to_string());
+                    let sent = r.peak_sent;
+                    let text = if r.bytes > 0 {
+                        format!("已发出 {} / {}", human(sent), human(r.bytes))
+                    } else {
+                        String::new()
+                    };
+                    r.finish_cancelled(text);
                 }
             }
         });
@@ -1503,8 +1528,9 @@ fn main() -> Result<(), slint::PlatformError> {
                     log::warn(&format!("保存限速设置失败: {e}"));
                 }
             }
-            // 本机立即生效。已经连着的手机不受影响 —— 协商值在握手时定下来，
-            // 下一轮连接才按新值走（改运行中的速度会让当前传输忽快忽慢，反而更难用）。
+            // 立即生效，并且**连着的手机也跟着变**（308 起两端共用一个值）：
+            // set_configured_mb 会提升代次，会话线程发现后发一帧 SPEED_LIMIT，
+            // 手机那边改自己的 SpeedLimiter 并把它的设置页也刷成这个数。
             hfx_receiver::ratelimit::set_configured_mb(mb as i64);
             if let Some(ui) = weak.upgrade() {
                 ui.set_speed_limit_text(mb.to_string().into());
@@ -1668,6 +1694,9 @@ fn main() -> Result<(), slint::PlatformError> {
 
         let mut last_want_h = 0f32;
         let mut boot_hidden = false;
+        // 上一次刷进输入框的限速值，用来判断「需要不要再刷一次」。
+        // 手机推来新值时（含握手定下来的共用值）就把它写进配置和输入框。
+        let mut limit_shown = hfx_receiver::ratelimit::configured_mb();
 
         // ---- 「发送到手机」小窗 ----
         let push_weak = push_win.as_weak();
@@ -2045,6 +2074,12 @@ fn main() -> Result<(), slint::PlatformError> {
                             if sending_now {
                                 r.saw_sending = true;
                             }
+                            // 用户点过「取消发送」：这一轮的结果是「已取消」，不是失败。
+                            // 见过就记着 —— 收尾比 cancel_requested 的复位早不了多少，
+                            // 但整整一轮的 150ms tick 里总能撞上。
+                            if hfx_receiver::control::cancel_requested() {
+                                r.cancel_seen = true;
+                            }
                             // 速率：0.4 秒取一次样（和主界面同一套平滑）；
                             // 手机那边一 reset 进度（received 变小）就重新起算，
                             // 别把上一轮的字节当成本轮的速率基准。
@@ -2164,8 +2199,27 @@ fn main() -> Result<(), slint::PlatformError> {
                                 queue_drained && bytes_done
                             };
                             if finished_now && !r.failed {
-                                let ok = bytes_done;
-                                if ok {
+                                // 取消优先：用户自己停的不叫「失败」，也不能把
+                                // 「只发出 215.0 MB / 2.00 GB」当成错误原因摆在红字里。
+                                if r.cancel_seen {
+                                    let sent_total = r.peak_sent;
+                                    log::warn(&format!(
+                                        "推送小窗：已取消（已发出 {} / {}）",
+                                        human(sent_total),
+                                        human(r.bytes)
+                                    ));
+                                    let text = if r.bytes > 0 {
+                                        format!(
+                                            "已发出 {} / {}",
+                                            human(sent_total),
+                                            human(r.bytes)
+                                        )
+                                    } else {
+                                        String::new()
+                                    };
+                                    r.finish_cancelled(text);
+                                    step_changed = true;
+                                } else if bytes_done {
                                     log::info(&format!(
                                         "推送小窗：已发送 {} · {} 个文件",
                                         human(r.bytes),
@@ -2173,7 +2227,7 @@ fn main() -> Result<(), slint::PlatformError> {
                                     ));
                                     r.finish(false, String::new());
                                 } else {
-                                    // 用峰值而不是当前的 session_all：取消时它已经被 reset 成 0
+                                    // 用峰值而不是当前的 session_all：收尾时它已经被 reset 成 0
                                     let sent_total = r.peak_sent;
                                     log::warn(&format!(
                                         "推送小窗：只发出一部分 {} / {}",
@@ -2184,10 +2238,9 @@ fn main() -> Result<(), slint::PlatformError> {
                                         format!("只发出 {} / {}", human(sent_total), human(r.bytes));
                                     r.finish(true, done_text);
                                 }
-                                step_changed = true;
                             }
                             // ---- 一直没开始的超时说法 ----
-                            if !r.saw_sending && !r.failed {
+                            if !r.saw_sending && !r.failed && !r.cancelled {
                                 if let Some(t0) = r.started_at {
                                     // 多选时只要有一台连上了就算「在等它来取」；
                                     // 一台都连不上才走 8 秒那条（再等也没用）
@@ -2230,18 +2283,24 @@ fn main() -> Result<(), slint::PlatformError> {
                         PUSH_DONE => {
                             // 成功不打扰：小窗整个收着（选完就关掉了），完成由传输小窗说。
                             // 失败才把小窗重新弹出来 —— 「哪台没收到 / 为什么」必须让人看见。
-                            if !r.failed {
+                            // 成功：窗口直接收起来（完成由传输小窗说）。
+                            // 取消：留着说一句「已取消发送」，2 秒后自己收 —— 用户刚点了
+                            // 取消，界面总得应一声；以前这里因为「没发完」被判成失败，
+                            // 弹的是红字「发送失败 / 只发出 215.0 MB」（真机截图报的）。
+                            if !r.failed && !r.cancelled {
                                 if pw.window().is_visible() {
                                     let _ = pw.hide();
                                 }
-                                if let Some(t) = r.done_at {
-                                    if t.elapsed() >= Duration::from_secs(2) {
-                                        log::info("推送小窗：这一轮收尾，退出小窗状态");
-                                        r.reset();
-                                    }
+                            }
+                            if let Some(t) = r.done_at {
+                                if !r.failed && t.elapsed() >= Duration::from_secs(2) {
+                                    log::info("推送小窗：这一轮收尾，退出小窗状态");
+                                    r.reset();
                                 }
                             }
-                            if r.failed && !pw.window().is_visible() {
+                            // 失败 / 取消：窗口必须在 —— 失败挂着等用户看，
+                            // 取消显示 2 秒再收。
+                            if (r.failed || r.cancelled) && !pw.window().is_visible() {
                                 #[cfg(windows)]
                                 {
                                     if let Ok(mut g) = push_state_tick.lock() {
@@ -2262,6 +2321,7 @@ fn main() -> Result<(), slint::PlatformError> {
                             pw.set_target_name(r.target_name.clone().into());
                             pw.set_summary_text(push_summary(r.files, r.bytes).into());
                             pw.set_failed(r.failed);
+                            pw.set_cancelled(r.cancelled);
                             pw.set_fail_text(r.fail_text.clone().into());
                         }
                         _ => {
@@ -2298,6 +2358,39 @@ fn main() -> Result<(), slint::PlatformError> {
             if launch_at_boot && !boot_hidden && ui.get_tray() {
                 boot_hidden = true;
                 tray_win::hide_main_window(WINDOW_TITLE);
+            }
+
+            // ---- 限速：手机那边改了要反映到本机 ----------------
+            //
+            // 308 起两端共用一个值，谁改都推给对方。手机推来的值由会话线程写进
+            // ratelimit（adopt_configured_mb），这里发现和界面上显示的不一样就更新
+            // 配置 + 输入框，并落盘 —— 否则用户下次开程序，框里又是旧数。
+            // 配置文件无论如何都要跟着写 —— 那是真正生效的值，和光标在哪无关。
+            //
+            // 注意：这里**不能**再 st.lock() 一次 —— tick 开头（1756 行）已经拿到那把锁
+            // 并一直持有到最后，同线程重复 lock 就是自己把自己锁死（界面直接定住，
+            // 配置也一直存不下去）。所以直接改手里这份 s。
+            let limit_now = hfx_receiver::ratelimit::configured_mb();
+            if limit_now != limit_shown {
+                limit_shown = limit_now;
+                if s.config.speed_limit_mb != limit_now as u32 {
+                    s.config.speed_limit_mb = limit_now as u32;
+                    let path = s.config_path.clone();
+                    let config = s.config.clone();
+                    if let Err(e) = config.save(&path) {
+                        log::warn(&format!("保存同步来的限速值失败: {e}"));
+                    }
+                }
+                // 共用值就是真值：**每次都写进框**，不看用户有没有在打字。
+                //
+                // 之前这里加了个「用户手上有没提交的字就跳过刷新」的闸门，本意是别抢
+                // 他的光标。但那个闸门两头坏事：手机刚改完、电脑这边框里还留着半截旧
+                // 字，界面就一直显示旧值（用户说的「没有及时刷新出来」）；等他一点别处
+                // 失焦，那行旧字又会被当成「用户改的」推回手机，把手机刚设的值顶回去。
+                // 共用值只有一份，对端改了就以对端为准，框跟着变。
+                // 顺手把「手里有未提交输入」的标志清掉，失焦时就不会再提交一遍。
+                ui.set_speed_limit_text(limit_now.to_string().into());
+                ui.set_limit_typed(false);
             }
 
             // ---- 传输进度 ----

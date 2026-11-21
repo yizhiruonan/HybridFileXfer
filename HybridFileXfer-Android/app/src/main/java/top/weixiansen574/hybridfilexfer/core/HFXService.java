@@ -54,8 +54,13 @@ public abstract class HFXService {
      * </ul>
      */
     // 306 → 307：双端限速协商（握手阶段交换两端的上限，各自算 min(非零)）。
-    // 0 = 「我这端不限速」，不参与 min。详见 SpeedLimiter / HFXServer 的注释。
-    public static final int VERSION_CODE = 307;
+    // 307 → 308：限速改成**两端共用一个值**（谁改了都推给对方，两端永远同一个数）。
+    //   307 那套「各报各的取 min」两端算出的生效值虽然一样，但界面上各写各的数
+    //   （电脑写 20、手机写 5、实际跑 5，两边都还显示自己的），用户看到的和实际跑的对不上。
+    //   共用值怎么定见 HFXServer.negotiateLimitMbps（和电脑端 session.rs 严格一致）；
+    //   连上之后再改走 ControllerIdentifiers.SPEED_LIMIT 帧。
+    //   0 仍然只是「不限速」，不是「限到 0 字节」。
+    public static final int VERSION_CODE = 308;
     protected final LinkedBlockingDeque<ByteBuffer> buffers = new LinkedBlockingDeque<>();
     protected DataByteChannel ctChannel;
     /**
@@ -788,6 +793,32 @@ public abstract class HFXService {
         }
     }
 
+    /**
+     * 308：电脑推来了共用限速值（{@code {i16 SPEED_LIMIT}{i32 MB/s}}）：就地采纳。
+     *
+     * <p>用 {@link SpeedLimiter#applySharedBytesPerSecond(long)} 而<b>不是</b>
+     * applyLocalBytesPerSecond：这个数是电脑定的，提代次就意味着本机也「改了一次」，
+     * 会话线程下一轮又会把它推回给电脑 —— 两端就此把同一个数对推一辈子。
+     *
+     * <p>载荷是固定 4 字节，所以每个读循环都必须把 i32 读干净再往下走：
+     * 只吞掉 2 字节帧头的话，这 4 个字节会和下一帧的帧头拼成假 opcode，
+     * 整条控制通道当场错位（本仓库踩过多次的坑）。
+     */
+    protected void onPeerSpeedLimit(int mbps) {
+        int value = Math.max(0, mbps);
+        SpeedLimiter.applySharedBytesPerSecond(SpeedLimiter.mbpsToBytesPerSecond(value));
+        onSharedSpeedLimitAdopted(value);
+    }
+
+    /**
+     * 308：共用限速值变了之后要做的「落地」动作。
+     *
+     * <p>默认什么也不做：纯客户端会话（HFXClient）没有持久化配置，也没有第二个进程要通知。
+     * {@code HFXServer} 覆盖它去写配置 + 广播界面，并更新「已经推给电脑的代次」。
+     */
+    protected void onSharedSpeedLimitAdopted(int mbps) {
+    }
+
     // ------------------------------------------------------------------
     // 303：完整性校验（块 CRC32 + 收尾整文件 SHA-256）
     // ------------------------------------------------------------------
@@ -1054,6 +1085,10 @@ public abstract class HFXService {
                         || opcode == ControllerIdentifiers.PAUSE_STATE) {
                     // 302 之前电脑回的是裸 bool，302 起两边都是带 opcode 的帧
                     applyPcPause(ctChannel.readBoolean());
+                } else if (opcode == ControllerIdentifiers.SPEED_LIMIT) {
+                    // 308：电脑改了限速推过来的 {i32 MB/s}。载荷必须在这里读干净，
+                    // 漏在这里会让这条读线程直接 break（整条控制通道的读者就没了）。
+                    onPeerSpeedLimit(ctChannel.readInt());
                 } else if (opcode == ControllerIdentifiers.PING) {
                     // 心跳，读到就行
                 } else if (opcode == ControllerIdentifiers.RESULT) {
@@ -1243,6 +1278,12 @@ public abstract class HFXService {
                     case ControllerIdentifiers.PAUSE_REPLY:
                         applyPcPause(ctChannel.readBoolean());
                         break;
+                    case ControllerIdentifiers.SPEED_LIMIT:
+                        // 308：残留的限速帧（电脑在我们收尾时改的设置）。整帧 6 字节，
+                        // 这里必须把 i32 读掉：只丢帧头会把 4 字节载荷留在通道里，
+                        // 下一次读就成了假 opcode。
+                        onPeerSpeedLimit(ctChannel.readInt());
+                        break;
                     case ControllerIdentifiers.PING:
                         break;
                     case ControllerIdentifiers.RESULT:
@@ -1311,6 +1352,13 @@ public abstract class HFXService {
                     case ControllerIdentifiers.PAUSE_REPLY:
                         ctChannel.consumePushback(2);
                         applyPcPause(ctChannel.readBoolean());
+                        break;
+                    case ControllerIdentifiers.SPEED_LIMIT:
+                        // 308：整帧 6 字节（opcode 2 + i32 4）。这里和 PAUSE_REPLY /
+                        // REBUILD_REQ 一样，先吃掉帧头再读载荷 —— 读载荷走 DataByteChannel
+                        // 的读锁，退字缓冲里剩下的字节会先被喂出来，不会把帧读串。
+                        ctChannel.consumePushback(2);
+                        onPeerSpeedLimit(ctChannel.readInt());
                         break;
                     case ControllerIdentifiers.PING:
                         ctChannel.consumePushback(2);
@@ -1463,6 +1511,12 @@ public abstract class HFXService {
                 applyPcPause(ctChannel.readBoolean());
                 continue;
             }
+            // 308：收尾期间电脑也可能改限速（它会推一帧过来）。就地采纳、继续等结论 ——
+            // 不当成"意外的帧"抛出去，否则一次擦肩而过就把会话打掉了。
+            if (opcode == ControllerIdentifiers.SPEED_LIMIT) {
+                onPeerSpeedLimit(ctChannel.readInt());
+                continue;
+            }
             // 304：电脑端点「中断发送」= 先来一帧 CANCEL。
             // 这次传输就地作废：置取消标志（界面显示"已取消传输"），并且等它重建通道。
             if (opcode == ControllerIdentifiers.CANCEL) {
@@ -1566,6 +1620,11 @@ public abstract class HFXService {
                             return true;
                         case ControllerIdentifiers.PAUSE_REPLY:
                             applyPcPause(channel.readBoolean());
+                            return false;
+                        case ControllerIdentifiers.SPEED_LIMIT:
+                            // 308：电脑推来的限速值。整帧 6 字节，必须在这里用同一把锁
+                            // 把 i32 读完（只读帧头会让载荷和下一帧拼成假 opcode）。
+                            onPeerSpeedLimit(channel.readInt());
                             return false;
                         case ControllerIdentifiers.RESULT:
                             // 电脑端的收尾结论：这次传输已经作废，读干净丢掉

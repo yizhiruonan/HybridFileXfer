@@ -418,6 +418,37 @@ fun HfxApp(
         onDispose { activity.lifecycle.removeObserver(observer) }
     }
 
+    // 308：限速是两端共用的 —— 握手或电脑端改了这个值，服务那一侧会广播过来。
+    // 收到就写进本进程的 Config 并刷新界面，免得「连接」页那一栏还显示旧数字
+    // （界面和服务各有自己的 Config 单例，服务改了这边看不见）。
+    androidx.compose.runtime.DisposableEffect(activity) {
+        val ctx = activity.applicationContext
+        val receiver = object : android.content.BroadcastReceiver() {
+            override fun onReceive(context: Context, intent: Intent) {
+                val mbps = intent.getIntExtra(ServerService.EXTRA_SPEED_LIMIT_SYNCED, -1)
+                if (mbps < 0) return
+                Config.getInstance(ctx).speedLimitMbps = mbps
+                // readState 里有 root / 网卡等 shell 查询，别在主线程上做
+                scope.launch {
+                    state = withContext(Dispatchers.IO) { readState(ctx) }
+                }
+            }
+        }
+        // 只收本应用自己的广播（服务也是本应用，所以 NOT_EXPORTED 够用，也不怕外泄）
+        androidx.core.content.ContextCompat.registerReceiver(
+            ctx,
+            receiver,
+            android.content.IntentFilter(ServerService.ACTION_SPEED_LIMIT_SYNCED),
+            androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED,
+        )
+        onDispose {
+            try {
+                ctx.unregisterReceiver(receiver)
+            } catch (_: Exception) {
+            }
+        }
+    }
+
     LaunchedEffect(Unit) {
         if (!hasStoragePermission(activity)) {
             try {
@@ -617,7 +648,13 @@ fun HfxApp(
 
     fun applySpeedLimit(value: Int) {
         Config.getInstance(activity).speedLimitMbps = value
-        top.weixiansen574.hybridfilexfer.core.SpeedLimiter.setLimitBytesPerSecond(value * 1024L * 1024L)
+        // 308：限速是两端共用的 —— 本机这一侧的 SpeedLimiter 也要设（客户端模式的传输
+        // 就跑在这个进程里），但真正要同步给电脑的那一版必须交给服务那一侧：
+        // SpeedLimiter 是静态字段、按进程隔离，这里设的值服务那边看不见。
+        top.weixiansen574.hybridfilexfer.core.SpeedLimiter.applyLocalBytesPerSecond(
+            top.weixiansen574.hybridfilexfer.core.SpeedLimiter.mbpsToBytesPerSecond(value),
+        )
+        ServerService.pushSpeedLimit(activity, value)
         state = readState(activity)
     }
 
@@ -937,7 +974,8 @@ private fun ConnectionsPage(
             Card {
                 ArrowPreference(
                     title = "限速",
-                    summary = "0 表示不限速",
+                    // 308 起这个值是两端共用的，电脑端改了这边也会跟着变
+                    summary = "0 表示不限速；电脑端改了这里也会跟着变",
                     endActions = {
                         ActionText(if (state.speedLimit == 0) "不限速" else state.speedLimit.toString() + " MB/s")
                     },
@@ -945,7 +983,7 @@ private fun ConnectionsPage(
                         onOpenNumber(
                             NumberDialogSpec(
                                 title = "限速",
-                                subtitle = "MB/s，0 表示不限速",
+                                subtitle = "MB/s，两端共用；0 表示不限速",
                                 initial = state.speedLimit,
                                 min = 0,
                                 max = 1000,

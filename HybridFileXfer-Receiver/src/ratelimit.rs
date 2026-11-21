@@ -44,27 +44,56 @@ static LIMIT_BPS: AtomicI64 = AtomicI64::new(0);
 /// `None` = 还没开始记，第一块到达时惰性建立。
 static WINDOW: Mutex<Option<(Instant, u64)>> = Mutex::new(None);
 
-/// 协商：两端各报一个上限，取「非零里最小的那个」；都为 0 就是都不限速。
+/// 308：两端共用一个限速值 —— 谁说了算。
 ///
-/// 0 在这套协议里的语义是「我这端不限速」，**不是**「限速到 0」，
-/// 所以它不能参与 min —— 否则一端填 0 就会把另一端的限制抹掉。
-pub fn effective(local: i64, remote: i64) -> i64 {
-    match (local > 0, remote > 0) {
-        (true, true) => local.min(remote),
-        (true, false) => local,
-        (false, true) => remote,
-        (false, false) => 0,
+/// `local` 是本机配置值，`remote` 是握手时对端报上来的值（MB/s）：
+///   * 本机非 0：用本机的（用户就在这台机器上改的，最直观）；
+///   * 本机为 0（「我这端不限速」）：才用对端的。
+///
+/// 307 那套是取「非零里最小的」—— 两端算出来的生效值一样，但界面上各写各的数，
+/// 用户看到的和实际跑的对不上（电脑写 20、手机写 5、实际 5，两边都还显示自己的），
+/// 所以 308 改成这一个值：定下来之后两端都存它、都显示它、都按它跑。
+///
+/// 0 仍然只是「不限速」，不是「限速到 0」。
+pub fn shared_value(local: i64, remote: i64) -> i64 {
+    if local > 0 { local } else { remote.max(0) }
+}
+
+/// 配置值的代次：本机用户每改一次 +1，没变不加。
+///
+/// 308 起限速是**两端共用一个值**：谁改了，谁就把新值推给对方。会话线程不直接
+/// 由界面去写 socket（那是跨线程抢同一根控制通道），而是每转一圈比对一次代次，
+/// 发现变了就发一帧 SPEED_LIMIT。代次只在「本机用户改」时增长 —— 采纳对端发来的值
+/// 不动它，否则两端会互相把同一个值推来推去。
+static CONFIGURED_EPOCH: AtomicI64 = AtomicI64::new(0);
+
+/// 本机用户改了限速（配置文件 + 界面）。
+///
+/// 立即对这条发送路径生效**并且**提升代次 —— 连着的会话会在下一次轮询里把新值
+/// 推给手机，两端从此显示同一个数（307 那套是各报各的、跑 min，两边数字可以不一样）。
+pub fn set_configured_mb(mb: i64) {
+    let mb = mb.max(0);
+    let old = CONFIGURED_MB.swap(mb, Ordering::Relaxed);
+    if old != mb {
+        CONFIGURED_EPOCH.fetch_add(1, Ordering::Relaxed);
+        set_limit(mb * 1024 * 1024);
     }
 }
 
-/// 把配置文件里的 `speed_limit_mb` 灌进来（握手要用它去报数）。
+/// 采纳对端同步过来的值（握手或 SPEED_LIMIT 帧）：改配置 + 立即生效，**不**提升代次。
 ///
-/// **只记配置值，不动生效值**。生效值一律由握手协商写入 ——
-/// 否则用户在传输中途改了本机设置，会把「手机那边更小的限制」直接掀掉，
-/// 那一轮就变成了单边限速（本来协商的是 5，改完立刻按 20 跑）。
-/// 本协议里所有发送都发生在握手之后，所以「等握手」不会漏掉任何一次发送。
-pub fn set_configured_mb(mb: i64) {
-    CONFIGURED_MB.store(mb.max(0), Ordering::Relaxed);
+/// 不提升是有意的：这个值本来就是对方定的，再推回去只会让两端把同一个数
+/// 来回发一辈子（每 250ms 一帧，控制通道上全是废话）。
+pub fn adopt_configured_mb(mb: i64) {
+    let mb = mb.max(0);
+    if CONFIGURED_MB.swap(mb, Ordering::Relaxed) != mb {
+        set_limit(mb * 1024 * 1024);
+    }
+}
+
+/// 本机配置值的代次（会话线程用它判断「该不该把新值推给手机」）。
+pub fn configured_epoch() -> i64 {
+    CONFIGURED_EPOCH.load(Ordering::Relaxed)
 }
 
 /// 本机配置的上限（MB/s），握手时报给对方。
@@ -133,24 +162,64 @@ pub fn throttle(bytes: usize) {
     }
 }
 
+/// 测试用的全局量互斥锁：LIMIT_BPS / CONFIGURED_MB / 代次都是进程级的，
+/// 而 cargo test 并行跑 —— 不排队的话，一个用例刚设好的上限会被另一个用例的
+/// set_configured_mb 顺手改掉，于是偶发失败（真出现过）。
+/// session.rs 里的握手用例也在动这套量，所以它是 pub(crate) 的。
+#[cfg(test)]
+pub(crate) static TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::MutexGuard;
+
+    fn serial() -> MutexGuard<'static, ()> {
+        TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     #[test]
-    fn effective_takes_smaller_nonzero() {
-        // 都填了：取小的
-        assert_eq!(effective(10, 5), 5);
-        assert_eq!(effective(5, 10), 5);
-        // 一端填 0（不限速）：听另一端的
-        assert_eq!(effective(0, 7), 7);
-        assert_eq!(effective(7, 0), 7);
+    fn shared_value_prefers_the_machine_that_set_it() {
+        // 本机填了就以本机为准（不再是 307 的「取小的」：那样两端显示的数对不上）
+        assert_eq!(shared_value(10, 5), 10);
+        assert_eq!(shared_value(5, 10), 5);
+        // 本机是 0（不限速）才听对端的
+        assert_eq!(shared_value(0, 7), 7);
+        assert_eq!(shared_value(7, 0), 7);
         // 两端都不限：不限速
-        assert_eq!(effective(0, 0), 0);
+        assert_eq!(shared_value(0, 0), 0);
+        // 负数一律当 0，不能把负值当限速值传下去
+        assert_eq!(shared_value(-3, 9), 9);
+    }
+
+    #[test]
+    fn local_change_bumps_epoch_but_adopting_does_not() {
+        let _serial = serial();
+        // 308：本机用户改值要提升代次（会话线程据此推给手机），
+        // 采纳对端同步来的值不能提升（否则两端把同一个数来回推一辈子）。
+        let before = configured_epoch();
+        set_configured_mb(12);
+        let after_local = configured_epoch();
+        assert_eq!(after_local, before + 1, "本机改值必须提升代次");
+        assert_eq!(configured_mb(), 12);
+        assert_eq!(limit(), 12 * 1024 * 1024, "本机改值要立即对发送路径生效");
+
+        adopt_configured_mb(30);
+        assert_eq!(configured_epoch(), after_local, "采纳对端不得提升代次");
+        assert_eq!(configured_mb(), 30);
+        assert_eq!(limit(), 30 * 1024 * 1024);
+
+        // 同一个值再设一次：代次不动（否则每帧都在发重复的同步帧）
+        set_configured_mb(30);
+        assert_eq!(configured_epoch(), after_local);
+
+        // 收尾：别把测试值留给后面的用例
+        set_configured_mb(0);
     }
 
     #[test]
     fn zero_limit_never_sleeps() {
+        let _serial = serial();
         set_limit(0);
         let started = Instant::now();
         for _ in 0..100 {
@@ -161,6 +230,7 @@ mod tests {
 
     #[test]
     fn heavy_limit_actually_sleeps() {
+        let _serial = serial();
         // 1MB/s 理论上 2MB 要睡约 1000ms（第一块是即时额度，第二块要补）
         set_limit(1024 * 1024);
         let started = Instant::now();

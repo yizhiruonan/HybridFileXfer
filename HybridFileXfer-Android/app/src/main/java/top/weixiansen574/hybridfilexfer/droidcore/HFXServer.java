@@ -19,6 +19,7 @@ import java.util.concurrent.LinkedBlockingDeque;
 
 import top.weixiansen574.async.BackstageTask;
 import top.weixiansen574.hybridfilexfer.NativeMemory;
+import top.weixiansen574.hybridfilexfer.ServerService;
 import top.weixiansen574.hybridfilexfer.aidl.IIOService;
 import top.weixiansen574.hybridfilexfer.core.ControllerIdentifiers;
 import top.weixiansen574.hybridfilexfer.core.FileBlock;
@@ -27,6 +28,7 @@ import top.weixiansen574.hybridfilexfer.core.ReadFileCall;
 import top.weixiansen574.hybridfilexfer.core.ResumeJournal;
 import top.weixiansen574.hybridfilexfer.core.ReceiveFileCall;
 import top.weixiansen574.hybridfilexfer.core.SendFileCall;
+import top.weixiansen574.hybridfilexfer.core.SpeedLimiter;
 import top.weixiansen574.hybridfilexfer.core.SpeedMonitorThread;
 import top.weixiansen574.hybridfilexfer.core.TransferConnection;
 import top.weixiansen574.hybridfilexfer.core.WriteFileCall;
@@ -84,6 +86,14 @@ public class HFXServer extends HFXService {
 
     private final int id = NEXT_ID.getAndIncrement();
     private volatile String displayName = "";
+    /**
+     * 308：上一次把「本机改过的限速」推给这台电脑时，{@link SpeedLimiter#sharedEpoch()} 是多少。
+     *
+     * <p>每个会话一份而不是静态的：一台手机可能同时连着几台电脑，推给了 A 不代表
+     * B 也收到了。握手时把它记成当时的代次 —— 握手里那个值已经对齐过了，
+     * 刚连上不该再补发一帧。
+     */
+    private int lastSentEpoch;
 
     public HFXServer(IIOService ioService) {
         this.ioService = ioService;
@@ -244,32 +254,28 @@ public class HFXServer extends HFXService {
                 return false;
             }
             ctChannel.writeBoolean(true);//版本正确匹配
-            // ---- 307：双端限速协商 ----
+            // ---- 308：限速值两端共用 ----
             //
-            // 位置和电脑端（session.rs）严格对应：电脑在「版本匹配」之后先写它的上限、
-            // 再读手机的上限；所以这里读完之后必须马上写自己的，两边才咬得住。
+            // 线序和电脑端（session.rs 的 connect）严格对应，位置一字不差：
+            //   电脑写 {i32 它那边的值} → 手机读
+            //   手机算出共用值 → 手机写 {i32 共用值} → 电脑读并采纳
+            // 所以这里读完必须马上写回去，错开一步两边就咬不住。
             //
-            // 语义：0 = 「我这端不限速」，**不参与 min**。两端各自算 min(非零)，
-            // 对**自己那条发送路径**生效：手机发文件用 SpeedLimiter，电脑推文件用它的
-            // ratelimit —— 数据从谁那儿流出就由谁限速，上限是同一个协商值。
+            // 定值规则和电脑端 ratelimit::shared_value 一模一样：电脑非 0 以电脑为准，
+            // 电脑填 0（= 它那端不限速）才用手机的。0 依然只是「不限速」，不是「限到 0」。
             int pcLimitMbps = ctChannel.readInt();
-            // SpeedLimiter 的配置值只有服务进程从配置文件读出来之后才算数。
-            // 读之前 configuredBytesPerSecond 是 0，照报就会把用户设的上限**静默抹掉**
-            // （电脑那边看到的是「这台手机不限速」，于是它也不再限制自己）。
-            // 实测里服务刚重启的那几秒握手确实报过「不限速」，就是这条路径。
-            // 所以配置没就绪时改用持久化配置兜底（ServerService 带 Context 提前灌进来）。
-            int phoneLimitMbps = top.weixiansen574.hybridfilexfer.core.SpeedLimiter.isConfiguredKnown()
-                    ? (int) (top.weixiansen574.hybridfilexfer.core.SpeedLimiter
-                            .getConfiguredBytesPerSecond() / (1024L * 1024L))
-                    : configuredLimitFallbackMbps;
-            ctChannel.writeInt(phoneLimitMbps);
-            int negotiatedMbps = negotiateLimitMbps(phoneLimitMbps, pcLimitMbps);
-            top.weixiansen574.hybridfilexfer.core.SpeedLimiter
-                    .applyNegotiatedBytesPerSecond(negotiatedMbps * 1024L * 1024L);
+            int phoneLimitMbps = localLimitMbps();
+            int sharedMbps = negotiateLimitMbps(phoneLimitMbps, pcLimitMbps);
+            // 采纳：配置值 + 生效值都设成这个数（并 reset 计时窗）→ 持久化 + 广播给界面
+            // → 记下代次，别在第一次轮询里又把它推回去（见 onSharedSpeedLimitAdopted）。
+            onPeerSpeedLimit(sharedMbps);
+            // 手机认下来的共用值写回电脑，电脑读完就采纳它：两端从此同一个数。
+            ctChannel.writeInt(sharedMbps);
             // HFXLog 只有 d()（且只在 DEBUG 包生效），没有 i()。
-            // 文案和电脑端 session.rs 里那句对齐，两边日志一拼就能看出协商结果。
-            top.weixiansen574.hybridfilexfer.core.HFXLog.d("限速协商：本机 " + limitText(phoneLimitMbps)
-                    + "，电脑 " + limitText(pcLimitMbps) + " → 生效 " + limitText(negotiatedMbps));
+            // 文案和电脑端 session.rs 里那句对齐，两边日志一拼就能看出共用值是怎么定的。
+            top.weixiansen574.hybridfilexfer.core.HFXLog.d("限速（两端共用）：电脑 "
+                    + limitText(pcLimitMbps) + "，手机 " + limitText(phoneLimitMbps)
+                    + " → 共用 " + limitText(sharedMbps));
             ctChannel.writeInt(interfaceList.size());//网卡IP数量
             for (ServerNetInterface netInterface : interfaceList) {
                 byte[] address = netInterface.address.getAddress();
@@ -812,6 +818,10 @@ public class HFXServer extends HFXService {
             stashRebuildName(channel.readUTF());
         } else if (opcode == ControllerIdentifiers.PAUSE_REPLY) {
             applyPcPause(channel.readBoolean());
+        } else if (opcode == ControllerIdentifiers.SPEED_LIMIT) {
+            // 308：重建握手期间电脑也可能推限速。和 RESULT 同理，载荷必须在这把锁里
+            // 读掉 —— 只取 2 字节帧头、把 4 字节载荷留在通道里，下一次读就成了假 opcode。
+            onPeerSpeedLimit(channel.readInt());
         } else if (opcode == ControllerIdentifiers.RESULT) {
             // 电脑端的收尾结论帧可能在我们取消之前一刻已经写出来了（它那时正在算
             // SHA-256 / 等我们的结论，用户随时可能按取消）。重建握手收到它不能当成
@@ -825,7 +835,8 @@ public class HFXServer extends HFXService {
                 && opcode != ControllerIdentifiers.REBUILD_ACK
                 && opcode != ControllerIdentifiers.PING
                 && opcode != ControllerIdentifiers.CANCEL
-                && opcode != ControllerIdentifiers.CANCEL_DISCARD) {
+                && opcode != ControllerIdentifiers.CANCEL_DISCARD
+                && opcode != ControllerIdentifiers.SPEED_LIMIT) {
             // 帧流错位排查用：把原始两字节打出来（正常帧不会走到这里）
             top.weixiansen574.hybridfilexfer.core.HFXLog.d(String.format(
                     "readControlOpcode: unexpected %d bytes=%02x %02x",
@@ -1081,6 +1092,8 @@ public class HFXServer extends HFXService {
                 writePauseStateLocked(phonePaused);
                 return lastPcPaused;
             }
+            // 308：本机改了限速就在这里补发（空闲 250ms 一轮，最迟一轮就同步过去）
+            flushSpeedLimitLocked();
             ctChannel.writeShort(ControllerIdentifiers.PAUSE_STATE);
             ctChannel.writeBoolean(phonePaused);
             // 302：回报带 opcode（以前是裸 bool，传输期间会被结论帧读串）
@@ -1149,6 +1162,12 @@ public class HFXServer extends HFXService {
                 cancelByPeer("exchangePause: REBUILD_REQ");
                 return true;
             }
+            case ControllerIdentifiers.SPEED_LIMIT:
+                // 308：电脑改了限速推过来 {i32 MB/s}。空闲时这条每 250ms 的暂停同步
+                // 就是控制通道唯一的读者，不在这里认出来，上面那句 IOException
+                // 会把整条会话打掉（载荷是固定 4 字节，必须在这里读干净）。
+                onPeerSpeedLimit(ctChannel.readInt());
+                return true;
             default:
                 return false;
         }
@@ -1156,11 +1175,58 @@ public class HFXServer extends HFXService {
 
     /** 只写一帧 PAUSE_STATE（调用方必须已持有 controlLock） */
     private void writePauseStateLocked(boolean phonePaused) throws IOException {
+        // 308：传输期间会话线程只写不读，但「本机改了限速要推给电脑」照样得走这里 ——
+        // 否则传输中改的设置要等这一轮传完才同步。
+        flushSpeedLimitLocked();
         byte[] frame = new byte[3];
         frame[0] = (byte) (ControllerIdentifiers.PAUSE_STATE >> 8);
         frame[1] = (byte) ControllerIdentifiers.PAUSE_STATE;
         frame[2] = (byte) (phonePaused ? 1 : 0);
         ctChannel.writeFully(frame);
+    }
+
+    /**
+     * 308：本机改过限速就把新值推给电脑（调用方必须已持有 {@link #controlLock}）。
+     *
+     * <p>为什么不由界面线程直接写控制通道：控制通道有且只有一个写者（会话线程），
+     * 两个线程同时写会把帧切开。所以界面只改值 + 提升代次，这里在每 250ms 的轮询里
+     * 比对一次代次，变了就补发一帧 {@code {i16 SPEED_LIMIT}{i32 MB/s}} ——
+     * 和电脑端 session.rs 的 flush_speed_limit 是同一套做法。
+     *
+     * <p>整帧固定 6 字节，用 writeFully 一次写完：分两次写会有半个帧被别人插进来的空隙。
+     */
+    private void flushSpeedLimitLocked() throws IOException {
+        int epoch = SpeedLimiter.sharedEpoch();
+        if (epoch == lastSentEpoch) {
+            return;
+        }
+        // 先记代次再写：写失败会抛上去把会话拆掉，不需要"下次重试"这种状态
+        lastSentEpoch = epoch;
+        int mbps = localLimitMbps();
+        byte[] frame = new byte[6];
+        frame[0] = (byte) (ControllerIdentifiers.SPEED_LIMIT >> 8);
+        frame[1] = (byte) ControllerIdentifiers.SPEED_LIMIT;
+        frame[2] = (byte) (mbps >>> 24);
+        frame[3] = (byte) (mbps >>> 16);
+        frame[4] = (byte) (mbps >>> 8);
+        frame[5] = (byte) mbps;
+        ctChannel.writeFully(frame);
+        top.weixiansen574.hybridfilexfer.core.HFXLog.d("限速已同步给电脑：" + limitText(mbps));
+    }
+
+    /**
+     * 308：共用限速值变了（握手定下来的 / 电脑推来的）——落盘 + 通知界面，并记下代次。
+     *
+     * <p>写持久化配置是为了下次启动时还用这个数（SpeedLimiter 是进程内的静态字段，
+     * 服务重启就没了）；广播给界面则是让「连接」页那一栏显示同一个数 ——
+     * 界面进程有它自己的 Config 单例，服务这边改了它看不见。
+     *
+     * <p>记代次的理由：这个值是电脑定的，本机没有"改过"，下一轮轮询不该再推回去。
+     */
+    @Override
+    protected void onSharedSpeedLimitAdopted(int mbps) {
+        ServerService.onSyncedSpeedLimit(mbps);
+        lastSentEpoch = SpeedLimiter.sharedEpoch();
     }
 
     public List<RemoteFile> listLocalFiles(String path) throws RemoteException {
@@ -1329,26 +1395,36 @@ public class HFXServer extends HFXService {
     }
 
     /**
-     * 307：两端的限速值（MB/s，0 = 不限速）→ 协商后的值。
-     * <p>
-     * 0 表示「我这端不限速」，<b>不参与 min</b> —— 一端填 0 不会把另一端的限制抹掉。
-     * 电脑端 session.rs 的 negotiate_limit_mb 是同一套规则，两边必须一致，
-     * 否则两端算出的生效值不同，就会出现「一边限一边不限」的怪象。
+     * 本机这一端该报出去的限速（MB/s）。
+     *
+     * <p>SpeedLimiter 的值只有服务进程从配置文件读出来之后才算数。读之前
+     * configuredBytesPerSecond 是 0，照报就会把用户设的值**静默抹掉**
+     * （电脑那边看到的是「这台手机不限速」，于是它也不再限制自己）。
+     * 实测里服务刚重启的那几秒握手确实报过「不限速」，就是这条路径。
+     * 所以配置没就绪时改用持久化配置兜底（ServerService 带 Context 提前灌进来）。
      */
+    private static int localLimitMbps() {
+        return SpeedLimiter.isConfiguredKnown()
+                ? SpeedLimiter.bytesPerSecondToMbps(SpeedLimiter.getConfiguredBytesPerSecond())
+                : configuredLimitFallbackMbps;
+    }
+
     /** 限速值的说法（日志用）：0 写「不限速」，别写成「0 MB/s」—— 那读起来像堵死。 */
     private static String limitText(int mbps) {
         return mbps <= 0 ? "不限速" : mbps + " MB/s";
     }
 
+    /**
+     * 308：电脑的值 + 手机的值 → 两端共用的那个值（MB/s）。
+     *
+     * <p>规则：<b>电脑填了非 0 就以电脑为准；电脑填 0（= 它那端不限速）才用手机的。</b>
+     * 电脑端 ratelimit::shared_value（session.rs 握手时用的就是它）是同一套规则，
+     * 两边必须一模一样，否则同一个握手会算出两个不同的"共用值"。
+     *
+     * <p>0 仍然只是「不限速」，不是「限到 0 字节」；这里也永远不会做除法，
+     * 所以不存在除零。
+     */
     private static int negotiateLimitMbps(int phoneMbps, int pcMbps) {
-        boolean phoneOn = phoneMbps > 0;
-        boolean pcOn = pcMbps > 0;
-        if (phoneOn && pcOn) {
-            return Math.min(phoneMbps, pcMbps);
-        }
-        if (phoneOn) {
-            return phoneMbps;
-        }
-        return pcOn ? pcMbps : 0;
+        return pcMbps > 0 ? pcMbps : Math.max(0, phoneMbps);
     }
 }
