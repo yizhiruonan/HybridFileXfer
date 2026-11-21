@@ -175,9 +175,48 @@ impl Adb {
         Ok((ok, text))
     }
 
+    /// 手机的名字：优先「市场名」（`ro.product.marketname`，例如「Xiaomi Pad 7 Pro」），
+    /// 其次 `ro.product.model`（「24091RPADC」这种型号代码）。
+    ///
+    /// 界面上原来拿序列号前 8 位当名字（`a6eb08a5`），用户认不出是谁 —— 换成手机自己的名字。
+    /// 全是只读 getprop，几百毫秒；调用方在后台线程里解析一次、缓存起来，别拖慢界面。
+    /// 拿不到（老系统没有 marketname、或者 adb 没授权）就返回 None，界面退回序列号。
+    pub fn device_name(&self, serial: &str) -> Option<String> {
+        for prop in ["ro.product.marketname", "ro.product.model"] {
+            let mut cmd = self.command();
+            cmd.arg("-s")
+                .arg(serial)
+                .arg("shell")
+                .arg("getprop")
+                .arg(prop);
+            let Ok(out) = run(&mut cmd, Duration::from_secs(8)) else {
+                continue;
+            };
+            if !out.success {
+                continue;
+            }
+            if let Some(name) = clean_device_name(&out.stdout) {
+                return Some(name);
+            }
+        }
+        None
+    }
+
     fn command(&self) -> Command {
         Command::new(&self.path)
     }
+}
+
+/// getprop 的输出收拾成能直接上界面的样子：去掉首尾空白/回车，
+/// 空串和 "unknown" 都算没拿到（很多 ROM 的 marketname 是空串）。
+fn clean_device_name(raw: &str) -> Option<String> {
+    let text = raw.trim().trim_matches('\r').trim();
+    if text.is_empty() || text.eq_ignore_ascii_case("unknown") {
+        return None;
+    }
+    // 太长的截断（有些 ROM 会把整串型号描述塞进来），界面上就一行
+    let text: String = text.chars().take(40).collect();
+    Some(text)
 }
 
 #[cfg(windows)]

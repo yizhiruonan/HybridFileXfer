@@ -244,6 +244,32 @@ public class HFXServer extends HFXService {
                 return false;
             }
             ctChannel.writeBoolean(true);//版本正确匹配
+            // ---- 307：双端限速协商 ----
+            //
+            // 位置和电脑端（session.rs）严格对应：电脑在「版本匹配」之后先写它的上限、
+            // 再读手机的上限；所以这里读完之后必须马上写自己的，两边才咬得住。
+            //
+            // 语义：0 = 「我这端不限速」，**不参与 min**。两端各自算 min(非零)，
+            // 对**自己那条发送路径**生效：手机发文件用 SpeedLimiter，电脑推文件用它的
+            // ratelimit —— 数据从谁那儿流出就由谁限速，上限是同一个协商值。
+            int pcLimitMbps = ctChannel.readInt();
+            // SpeedLimiter 的配置值只有服务进程从配置文件读出来之后才算数。
+            // 读之前 configuredBytesPerSecond 是 0，照报就会把用户设的上限**静默抹掉**
+            // （电脑那边看到的是「这台手机不限速」，于是它也不再限制自己）。
+            // 实测里服务刚重启的那几秒握手确实报过「不限速」，就是这条路径。
+            // 所以配置没就绪时改用持久化配置兜底（ServerService 带 Context 提前灌进来）。
+            int phoneLimitMbps = top.weixiansen574.hybridfilexfer.core.SpeedLimiter.isConfiguredKnown()
+                    ? (int) (top.weixiansen574.hybridfilexfer.core.SpeedLimiter
+                            .getConfiguredBytesPerSecond() / (1024L * 1024L))
+                    : configuredLimitFallbackMbps;
+            ctChannel.writeInt(phoneLimitMbps);
+            int negotiatedMbps = negotiateLimitMbps(phoneLimitMbps, pcLimitMbps);
+            top.weixiansen574.hybridfilexfer.core.SpeedLimiter
+                    .applyNegotiatedBytesPerSecond(negotiatedMbps * 1024L * 1024L);
+            // HFXLog 只有 d()（且只在 DEBUG 包生效），没有 i()。
+            // 文案和电脑端 session.rs 里那句对齐，两边日志一拼就能看出协商结果。
+            top.weixiansen574.hybridfilexfer.core.HFXLog.d("限速协商：本机 " + limitText(phoneLimitMbps)
+                    + "，电脑 " + limitText(pcLimitMbps) + " → 生效 " + limitText(negotiatedMbps));
             ctChannel.writeInt(interfaceList.size());//网卡IP数量
             for (ServerNetInterface netInterface : interfaceList) {
                 byte[] address = netInterface.address.getAddress();
@@ -1265,6 +1291,18 @@ public class HFXServer extends HFXService {
         connections = null;
     }
 
+    /**
+     * 307：持久化配置里的限速（MB/s），用于 SpeedLimiter 还没初始化的那几秒。
+     * <p>
+     * 由 ServerService 在 onCreate 里带 Context 读出来写一次 —— 那时离握手还早。
+     * 0 是合法值（不限速），所以不需要额外的「已知」标志：这里永远反映配置文件。
+     */
+    private static volatile int configuredLimitFallbackMbps;
+
+    public static void setConfiguredLimitFallback(int mbps) {
+        configuredLimitFallbackMbps = Math.max(0, mbps);
+    }
+
     /** 旧接口：等价于断开本连接（监听套接字由 ServerService 统一管理）。 */
     public void close() {
         disconnect();
@@ -1278,5 +1316,29 @@ public class HFXServer extends HFXService {
     @Override
     protected ReadFileCall createReadFileCall(LinkedBlockingDeque<ByteBuffer> buffers, List<RemoteFile> files, Directory localDir, Directory remoteDir, int operateThreadCount, String[] channelNames, java.util.Map<String, java.util.BitSet> resumeBits) {
         return new DroidReadFileCall(ioService,buffers,files,localDir,remoteDir,operateThreadCount, channelNames, resumeBits);
+    }
+
+    /**
+     * 307：两端的限速值（MB/s，0 = 不限速）→ 协商后的值。
+     * <p>
+     * 0 表示「我这端不限速」，<b>不参与 min</b> —— 一端填 0 不会把另一端的限制抹掉。
+     * 电脑端 session.rs 的 negotiate_limit_mb 是同一套规则，两边必须一致，
+     * 否则两端算出的生效值不同，就会出现「一边限一边不限」的怪象。
+     */
+    /** 限速值的说法（日志用）：0 写「不限速」，别写成「0 MB/s」—— 那读起来像堵死。 */
+    private static String limitText(int mbps) {
+        return mbps <= 0 ? "不限速" : mbps + " MB/s";
+    }
+
+    private static int negotiateLimitMbps(int phoneMbps, int pcMbps) {
+        boolean phoneOn = phoneMbps > 0;
+        boolean pcOn = pcMbps > 0;
+        if (phoneOn && pcOn) {
+            return Math.min(phoneMbps, pcMbps);
+        }
+        if (phoneOn) {
+            return phoneMbps;
+        }
+        return pcOn ? pcMbps : 0;
     }
 }

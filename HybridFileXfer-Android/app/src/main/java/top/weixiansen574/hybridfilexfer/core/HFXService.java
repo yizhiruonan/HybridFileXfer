@@ -53,7 +53,9 @@ public abstract class HFXService {
      *   <li>取消/中断时半截文件不再删除，留着下次续传。</li>
      * </ul>
      */
-    public static final int VERSION_CODE = 306;
+    // 306 → 307：双端限速协商（握手阶段交换两端的上限，各自算 min(非零)）。
+    // 0 = 「我这端不限速」，不参与 min。详见 SpeedLimiter / HFXServer 的注释。
+    public static final int VERSION_CODE = 307;
     protected final LinkedBlockingDeque<ByteBuffer> buffers = new LinkedBlockingDeque<>();
     protected DataByteChannel ctChannel;
     /**

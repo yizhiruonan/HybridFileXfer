@@ -57,6 +57,12 @@ pub struct Session {
     port: u16,
     /// adb 转发给这台手机的本地端口（回环通道重连要用）
     local_port: u16,
+    /// 用户点的「停止」标志，run() 时存进来一份。
+    ///
+    /// 传输循环（等通道 / 重建握手 / 等结论）原来都不读它 —— 只有主循环顶部读，
+    /// 而主循环在传输期间根本不转。于是「传输中途点停止」要等这一轮传完才有反应，
+    /// 期间用户再点一次「开始接收」，就又建了一条会话（手机上凑成两台电脑）。
+    stop: Option<Arc<AtomicBool>>,
 }
 
 pub enum SessionEnd {
@@ -69,6 +75,14 @@ pub enum SessionEnd {
 }
 
 impl Session {
+    /// 用户点了「停止」没有。传输循环里每转一圈都问一次。
+    fn stop_requested(&self) -> bool {
+        self.stop
+            .as_ref()
+            .map(|s| s.load(Ordering::Relaxed))
+            .unwrap_or(false)
+    }
+
     pub fn connect(
         address: IpAddr,
         port: u16,
@@ -112,6 +126,36 @@ impl Session {
                     "protocol version mismatch: local {} remote {}",
                     proto::VERSION_CODE, remote
                 ),
+            ));
+        }
+        // ---- 307：双端限速协商 ----
+        //
+        // 位置刻意选在「版本匹配」之后：版本不匹配时这一对帧不交换，
+        // 老版本对端看到的仍然是原来那句「版本不一致」，不会卡在一个它没见过的字段上。
+        //
+        // 语义：两边各报自己配的上限（MB/s，0 = 不限速），各自算 min(非零)，
+        // 然后对**自己那条发送路径**生效 —— 数据从谁那儿流出，就由谁限速。
+        // 所以这里算出来的值交给 ratelimit，手机那边算出来的值交给 SpeedLimiter。
+        let local_limit_mb = crate::ratelimit::configured_mb();
+        proto::write_i32(&mut w, local_limit_mb)?;
+        w.flush()?;
+        let remote_limit_mb = proto::read_i32(&mut reader)?;
+        let negotiated_mb = negotiate_limit_mb(local_limit_mb, remote_limit_mb);
+        // set_limit 内部会 reset_window，这里不用再调一次。
+        crate::ratelimit::set_limit(negotiated_mb as i64 * 1024 * 1024);
+        // limit_text 自己带单位（"5 MB/s" / "不限速"），所以格式串里不要再写 MB/s ——
+        // 否则不限速时会拼出「生效 不限速 MB/s」。
+        if local_limit_mb != remote_limit_mb {
+            log::info(&format!(
+                "限速协商：本机 {}，手机 {} → 生效 {}",
+                limit_text(local_limit_mb),
+                limit_text(remote_limit_mb),
+                limit_text(negotiated_mb)
+            ));
+        } else {
+            log::info(&format!(
+                "限速协商：两端都是 {}",
+                limit_text(negotiated_mb)
             ));
         }
 
@@ -325,6 +369,7 @@ impl Session {
             interfaces,
             port,
             local_port,
+            stop: None,
         })
     }
 
@@ -339,6 +384,9 @@ impl Session {
     /// Serve the control channel until the phone hangs up, asks to stop, or the
     /// local stop flag is raised.
     pub fn run(&mut self, receiver: &Arc<Receiver>, stop: &Arc<AtomicBool>) -> SessionEnd {
+        // 存一份给传输循环看：那几个循环跑起来之后主循环是不转的，
+        // 不存的话「停止」要等传完才生效（手机上会因此凑出两台电脑）。
+        self.stop = Some(Arc::clone(stop));
         let mut last_activity = Instant::now();
         // 用较短的读超时轮询 stop 标志；手机端每隔几秒会发心跳
         let _ = self
@@ -402,6 +450,15 @@ impl Session {
             let _ = self
                 .reader
                 .set_read_timeout(Some(Duration::from_millis(500)));
+            // 这条指令可能执行了很久（传输 / 取消后的重建，实测重建要 13 秒）。
+            // 期间手机端的心跳是**在这条指令内部**被就地处理掉的，没有更新
+            // last_activity；回到循环里若正好赶上一次读超时，就会拿十几秒前的
+            // 时间戳去比 12 秒的心跳上限 —— 明明刚重建成功 9 条通道，
+            // 下一秒却报「连接超时」把会话拆掉（真机 2026-11-21 撞见）。
+            // 指令正常返回就说明对端一直活着，直接把计时器归零。
+            if result.is_ok() {
+                last_activity = Instant::now();
+            }
             if let Err(e) = result {
                 return SessionEnd::Disconnected(format!("{}", e));
             }
@@ -448,9 +505,18 @@ impl Session {
         // 等手机端 ACK 的总窗口。手机那边要"等传输线程退出（最长 15s）+ 每条新通道
         // 400ms 分类 + takeTransferChannel"，6 条要 2~12 秒；以前只给 20 秒，
         // 实测（PC 端「中断发送」）会超时把整条会话拆掉。给到 45 秒，超时仍然按失败处理。
+        //
+        // 读超时本身用短的（500ms）轮询，不是一次等 45 秒：45 秒里点了「停止」
+        // 会一直卡在 read 上，stop_engine 的 join 就得陪着等 —— 界面按停止要卡 45 秒。
+        // 真正的总窗口由下面的 deadline 控制，超时才按失败处理。
+        let rebuild_deadline = Instant::now() + Duration::from_secs(45);
+        // 轮询用短超时只是为了让 stop 能被及时看到，但**不能直接拿短超时去读 i16**：
+        // 帧头两个字节若分在两个 TCP 片段里到达，第一个字节读到、第二个超时，
+        // 这条控制通道从此错位一拍。所以照 poll_control_during_transfer 的写法，
+        // 先用 peek 确认整帧到了再正式读。
         let _ = self
             .reader
-            .set_read_timeout(Some(Duration::from_secs(45)));
+            .set_read_timeout(Some(Duration::from_millis(200)));
         let mut rebuilt: Vec<(String, TcpStream)> = Vec::with_capacity(names.len());
         for name in names {
             let interface = match self.interfaces.iter().find(|iface| iface.name == name) {
@@ -487,9 +553,39 @@ impl Session {
             proto::write_utf(&mut self.writer, &name)?;
             self.writer.flush()?;
             loop {
+                // 重建要等 REBUILD_ACK（读超时 45 秒）。这里点了「停止」也得能走开，
+                // 否则 stop_engine 的 join 会把界面卡住这么久。
+                if self.stop_requested() {
+                    return Err(io::Error::new(io::ErrorKind::Interrupted, "stopped"));
+                }
+                if Instant::now() > rebuild_deadline {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "rebuild timed out"));
+                }
                 let id = match self.pending_opcode.take() {
                     Some(id) => id,
-                    None => proto::read_i16(&mut self.reader)?,
+                    None => {
+                        let mut window = [0u8; 2];
+                        match self.reader.peek(&mut window) {
+                            // 对端把控制通道关了
+                            Ok(0) => {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::UnexpectedEof,
+                                    "control channel closed by peer",
+                                ))
+                            }
+                            // 半个帧头：下一轮再看（此时一个字节都还没读走）
+                            Ok(n) if n < 2 => continue,
+                            Ok(_) => {
+                                let _ = self
+                                    .reader
+                                    .set_read_timeout(Some(Duration::from_secs(45)));
+                                proto::read_i16(&mut self.reader)?
+                            }
+                            // 200ms 没数据：回去再看一眼 stop / deadline
+                            Err(e) if is_timeout(&e) => continue,
+                            Err(e) => return Err(e),
+                        }
+                    }
                 };
                 match id {
                     controller::REBUILD_ACK => {
@@ -1005,8 +1101,25 @@ impl Session {
         ));
         // 这次发送期间允许界面暂停 / 中断；离开作用域自动清标志
         let _sending = crate::control::SendingGuard::begin();
+        // 307：限速计时窗随本次传输重新开始，避免上次设完之后积累的空闲时间
+        // 变成等额的免费流量额度（限 10MB/s、隔 90 秒再传，前 900MB 完全不睡）。
+        crate::ratelimit::reset_window();
         // 每次"手机来取文件"都重置会话计数，避免"已接收 10.41 GB"把上几次的也算进来
         crate::receiver::PROGRESS.reset();
+        // 发送方向同样要登记通道名，否则明细里全是「通道 1 / 通道 2 …」。
+        //
+        // set_channels 原来**只在接收路径**调用（handle_receive），发送路径漏了。
+        // 而明细那张表是 mark_sent / mark_received **共用**的同一套行：owner 存的是
+        // 通道号，画的时候用 channel_name(owner) 换成名字。接收方向登记过所以正常，
+        // 发送方向 names 一直是空的 → channel_name() 全返回 None → 整张表掉进
+        // 「通道 N」的兜底文案（真机截图：推送 mp4 时 10 行全是「通道 1..通道 10」）。
+        // 下标必须和下面 spawn 时的 index 一致（同一个 iter().enumerate() 顺序）。
+        crate::receiver::PROGRESS.set_channels(
+            self.transfers
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect(),
+        );
 
         let base = PathBuf::from(&phone_dir);
         let mut tasks: Vec<SendTask> = Vec::new();
@@ -1075,6 +1188,16 @@ impl Session {
         let mut finished = vec![false; handles.len()];
         let mut remaining = handles.len();
         while remaining > 0 {
+            // 点「停止」也要能打断传输：主循环这时候不转，只有这里看一眼
+            if self.stop_requested() {
+                log::warn(crate::i18n::tr(
+                    "发送中途被停止（关掉传输通道）",
+                    "sending stopped midway (closing the transfer channels)",
+                ));
+                self.shutdown_transfers();
+                hard_error = Some(crate::i18n::tr("已停止", "stopped").to_string());
+                break;
+            }
             if let Err(e) = self.poll_control_during_transfer() {
                 log::warn(&format!(
                     "{}: {}",
@@ -1328,19 +1451,31 @@ impl Session {
         // 排在后面就把这些标记一起清掉了，进度条又变回「大片空白 + 一串碎段」。
         crate::receiver::PROGRESS.reset();
         receiver.progress.reset();
-        // 305：手机发完 REQUEST_RECEIVE 会立刻来一帧 RESUME_QUERY（这次要传的文件清单），
-        // 这里读它、回每个文件"已经收到哪些块"的位图，发送端据此跳过已收到的块；
-        // 同时把这些块直接标进进度（手机端也是把它们当完成的）。
-        self.handle_resume_query(receiver)?;
-        // 接收方向没有发送计划：清掉上一次的发送分段，界面改按"谁写了第几块"还原
-        reset_send_segments();
-        // 明细里要写出通道名（USB_ADB / wlan1#2 …），下标必须和下面 spawn 时的 channel 一致
+        // 通道名必须**在** handle_resume_query 之前登记。
+        //
+        // reset() 会连 channels 一起清空（它是「清干净再来一轮」）。
+        // 原来 set_channels 排在 handle_resume_query **之后** —— 而续传查询会立刻
+        // 把「磁盘上已经有的块」标成完成（mark_received → owner = OWNER_RESUMED）
+        // 并建出文件条目。于是那一段时间的明细行算通道名时 channels 还是空的，
+        // channel_name() 全返回 None，整张表掉进「通道 1 / 通道 2 …」的兜底文案；
+        // 而续传一轮里未分配 / 续传的段特别多，正好把整张表占满 —— 真机上看到的
+        // 「通道名称没有显示」就是这个（截图里 12 条通道 + 一堆「续传」行）。
+        //
+        // 顺序要求：reset → set_channels → handle_resume_query。
         crate::receiver::PROGRESS.set_channels(
             self.transfers
                 .iter()
                 .map(|(name, _)| name.clone())
                 .collect(),
         );
+        // 305：手机发完 REQUEST_RECEIVE 会立刻来一帧 RESUME_QUERY（这次要传的文件清单），
+        // 这里读它、回每个文件"已经收到哪些块"的位图，发送端据此跳过已收到的块；
+        // 同时把这些块直接标进进度（手机端也是把它们当完成的）。
+        self.handle_resume_query(receiver)?;
+        // 接收方向没有发送计划：清掉上一次的发送分段，界面改按"谁写了第几块"还原
+        reset_send_segments();
+        // 通道名已在上面（reset 之后、续传查询之前）登记 —— 那时下标就和下面
+        // spawn 时的 channel 一致，早登记才不会让续传自查那一段掉进兜底文案。
         // 接收期间界面显示「暂停 / 已暂停」，暂停时通知手机端停发
         let _receiving = crate::control::ReceivingGuard::begin();
         let started = Instant::now();
@@ -1371,6 +1506,21 @@ impl Session {
         // 取消时"关掉所有传输通道"只做一次（关 socket 是幂等的，但没必要每 10ms 打一遍）
         let mut abort_shutdown = false;
         while remaining > 0 {
+            // 点「停止」也要能打断传输（主循环这时候不转，只有这里看一眼）。
+            // 和取消同一条路：先关传输通道，手机端那次阻塞的 write 才会立刻失败。
+            if self.stop_requested() {
+                abort_shutdown = true;
+                log::warn(crate::i18n::tr(
+                    "接收中途被停止（关掉传输通道）",
+                    "receiving stopped midway (closing the transfer channels)",
+                ));
+                self.shutdown_transfers();
+                if crate::control::claim_cancel_frame() {
+                    let _ = proto::write_i16(&mut self.writer, controller::CANCEL);
+                    let _ = self.writer.flush();
+                }
+                break;
+            }
             if let Err(e) = self.poll_control_during_transfer() {
                 log::warn(&format!(
                     "{}: {}",
@@ -2353,6 +2503,17 @@ mod tests {
             assert_eq!(&header, proto::CLIENT_HEADER);
             assert_eq!(proto::read_i32(&mut cr).unwrap(), proto::VERSION_CODE);
             proto::write_bool(&mut cw, true).unwrap();
+            // 307 限速协商：版本一致之后先交换两端的限速（电脑先报，手机再报）。
+            // 这一段是握手的一部分，漏掉它电脑端就会一直等这个 i32 而超时 ——
+            // 加协议字段时忘了同步 mock，测试就是从这儿开始红的。
+            let pc_limit = proto::read_i32(&mut cr).unwrap();
+            proto::write_i32(&mut cw, 0).unwrap();
+            // 手机端报「不限速」：协商结果必须是电脑自己的值，不能被 0 抹掉
+            assert!(
+                pc_limit >= 0,
+                "电脑端报的限速应该是非负整数（0 = 不限速），实际 {}",
+                pc_limit
+            );
             // Two interfaces on localhost -> two transfer channels.
             proto::write_i32(&mut cw, 2).unwrap();
             for name in ["USB_ADB", "wlan0"] {
@@ -2777,6 +2938,23 @@ fn send_channel(
     Ok(written)
 }
 
+/// 307：两端的限速值（MB/s，0 = 不限速）→ 协商后的值。
+///
+/// 规则和 `ratelimit::effective` 一致，这里只是换个单位再包一层：
+/// 0 表示「我这端不限速」，**不参与 min** —— 一端填 0 不会抹掉另一端的限制。
+fn negotiate_limit_mb(local_mb: i32, remote_mb: i32) -> i32 {
+    crate::ratelimit::effective(local_mb as i64, remote_mb as i64) as i32
+}
+
+/// 限速值的说法（日志用）：0 写「不限速」，别写成「0 MB/s」—— 那读起来像堵死。
+fn limit_text(mb: i32) -> String {
+    if mb <= 0 {
+        crate::i18n::tr("不限速", "unlimited").to_string()
+    } else {
+        format!("{mb} MB/s")
+    }
+}
+
 /// 306：位图第 index 位是否为 1（那块已经在接收端了）
 fn resume_has_block(bits: &[u8], index: u32) -> bool {
     let byte = index as usize / 8;
@@ -2850,6 +3028,14 @@ fn send_task(
                 *total_size,
                 *length as u64,
             );
+            // 307：限速。每一块写完之后才睡（和手机端 SendFileCall 里那次调用对称）。
+            //
+            // 放在 mark_sent **之后**：这一块确实已经出去了，进度就该认它；
+            // 放到前面会让「进度」比实际发送慢一拍，限速时那点延迟肉眼可见。
+            //
+            // 多通道共享同一个全局账本，所以 N 条通道并发跑出来的是**总**速率 = 上限，
+            // 不是每条各一份（后者实测限 1MB/s 能跑到 ~60MB/s）。
+            crate::ratelimit::throttle(*length as usize);
             Ok(*length as u64)
         }
     }

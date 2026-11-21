@@ -8,7 +8,7 @@
 
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -515,7 +515,16 @@ fn report_connected(session: &Session, on_state: &StateSink) {
     on_state(EngineState::Connected(names));
 }
 
+/// 正在进行中的会话线程数。
+///
+/// PROGRESS 是全局单例（界面上只有一份进度），所以「会话结束要不要把进度清掉」
+/// 不能只看自己这一条：多设备（run_multi）时任何一台断开都会走到 run_session
+/// 的收尾，无条件 reset 会把**另一台正在传**的进度抹掉 —— 于是明细表整张退回
+/// 「通道 1 / 通道 2 …」，进度条也归零。只在最后一个会话退出时才清。
+static ACTIVE_SESSIONS: AtomicUsize = AtomicUsize::new(0);
+
 fn run_session(session: &mut Session, options: &EngineOptions, stop: &Arc<AtomicBool>) -> SessionEnd {
+    ACTIVE_SESSIONS.fetch_add(1, Ordering::SeqCst);
     let receiver = Arc::new(Receiver::with_shared(crate::webserve::current_dir()));
     let end = session.run(&receiver, stop);
     // 会话结束（断开/被停止/出错）：把还开着的文件句柄放掉、续传日志落盘，
@@ -537,7 +546,10 @@ fn run_session(session: &mut Session, options: &EngineOptions, stop: &Arc<Atomic
             ));
         }
     }
-    crate::receiver::PROGRESS.reset();
+    // 最后一个会话退出才清（见 ACTIVE_SESSIONS 的注释）。
+    if ACTIVE_SESSIONS.fetch_sub(1, Ordering::SeqCst) == 1 {
+        crate::receiver::PROGRESS.reset();
+    }
     crate::session::reset_send_segments();
     match end {
         SessionEnd::Shutdown => {

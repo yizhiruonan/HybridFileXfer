@@ -25,6 +25,8 @@ struct Args {
     ip: Option<IpAddr>,
     discover: bool,
     lang: Option<Lang>,
+    /// 307：本机限速（MB/s），0 = 不限速。和手机端互相协商，取非零里较小的一个。
+    speed_limit_mb: Option<u32>,
 }
 
 fn main() {
@@ -52,6 +54,11 @@ fn run() -> i32 {
 
     let config_path = config::config_path(&exe_dir);
     let mut cfg = Config::load(&config_path);
+    // 307：命令行版本同样要参与限速协商 —— 握手时把自己的上限报给手机。
+    // 不灌的话 configured_mb() 永远是 0，CLI 跑起来就变成「本机不限速」，
+    // 会把手机那边配的限制在协商里压掉一半语义（手机报 5、电脑报 0 → 仍是 5，
+    // 但电脑自己那条发送路径完全不限 —— 和图形版行为不一致）。
+    hfx_receiver::ratelimit::set_configured_mb(cfg.speed_limit_mb as i64);
     let lang = args.lang.or(cfg.lang).unwrap_or_else(detect_lang);
     i18n::set_lang(lang);
 
@@ -78,6 +85,10 @@ fn run() -> i32 {
     }
     if let Some(lang) = args.lang {
         cfg.lang = Some(lang);
+        must_save = true;
+    }
+    if let Some(mb) = args.speed_limit_mb {
+        cfg.speed_limit_mb = mb.min(1000);
         must_save = true;
     }
 
@@ -230,6 +241,16 @@ fn parse_args<I: Iterator<Item = String>>(mut it: I) -> Result<Args, String> {
                     _ => return Err(format!("invalid language: {}", value)),
                 });
             }
+            "--speed-limit" | "--limit" | "--speed" => {
+                let value = next_value(&mut it, &arg)?;
+                // 0 是合法值（= 不限速），所以不能用 next_value 里那套「空串 = 缺值」的判断。
+                args.speed_limit_mb = Some(
+                    value
+                        .parse::<u32>()
+                        .map_err(|_| format!("invalid speed limit: {}", value))?
+                        .min(1000),
+                );
+            }
             other => return Err(format!("unknown argument: {}", other)),
         }
     }
@@ -260,6 +281,7 @@ fn print_usage() {
             "  -c, --ip <ip|adb|discover>  直接连接 IP / adb（默认自动）/ 只用局域网发现\n",
             "      --component <name>    手机上要启动的组件\n",
             "      --lang <zh|en>        日志语言\n",
+            "      --speed-limit <mbps>  限速（MB/s，0 = 不限速），与手机端取较小值\n",
             "      --print-config        打印配置后退出\n",
             "  -v, --verbose             输出调试信息\n",
             "  -h, --help                显示帮助\n",

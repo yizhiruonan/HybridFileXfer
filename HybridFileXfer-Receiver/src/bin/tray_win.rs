@@ -178,6 +178,8 @@ pub fn transfer_window_origin(win_w: i32, win_h: i32, saved: Option<(i32, i32)>)
 struct FindWindow {
     pid: u32,
     main_title: String,
+    /// 另外几个「不是传输窗口」的标题（推送小窗、取消确认框都排在传输窗口前面被枚举到）
+    skip: Vec<String>,
     found: HWND,
 }
 
@@ -201,8 +203,8 @@ unsafe extern "system" fn find_window_proc(hwnd: HWND, lparam: LPARAM) -> i32 {
         return 1;
     }
     let title = String::from_utf16_lossy(&buffer[..n as usize]);
-    // 主窗口和托盘窗口（无标题）都不是我们要的
-    if title == state.main_title {
+    // 主窗口、托盘窗口（无标题）、推送小窗都不是我们要的
+    if title == state.main_title || state.skip.iter().any(|t| *t == title) {
         return 1;
     }
     state.found = hwnd;
@@ -210,10 +212,15 @@ unsafe extern "system" fn find_window_proc(hwnd: HWND, lparam: LPARAM) -> i32 {
 }
 
 /// 本进程里那个独立的传输窗口；还没建出来（窗口刚 show）时返回 None
-pub fn find_transfer_window(main_title: &str) -> Option<HwndVal> {
+///
+/// `skip_titles` 是「别当成传输窗口」的标题。进程里现在不止三个窗口了
+/// （主界面 / 传输窗口 / 取消确认框 / 推送小窗），谁先被 EnumWindows 枚举到不一定，
+/// 不把推送小窗排掉，传输窗口的落位 / 置顶就会作用到小窗身上。
+pub fn find_transfer_window(main_title: &str, skip_titles: &[&str]) -> Option<HwndVal> {
     let mut state = FindWindow {
         pid: std::process::id(),
         main_title: main_title.to_string(),
+        skip: skip_titles.iter().map(|t| t.to_string()).collect(),
         found: std::ptr::null_mut(),
     };
     unsafe {

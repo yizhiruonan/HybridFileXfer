@@ -872,6 +872,11 @@ public class ServerService extends Service implements ServiceConnection {
         // 所以必须在这里（服务自己的进程）按保存的配置再设一次，否则限速永远是 0。
         top.weixiansen574.hybridfilexfer.core.SpeedLimiter.setLimitBytesPerSecond(
                 config.getSpeedLimitMbps() * 1024L * 1024L);
+        // 307：同一份值再交给 HFXServer 当兜底。服务刚 rebuilt、SpeedLimiter 还没就绪的
+        // 那几百毫秒里如果正好握手，用它代替报 0 —— 报 0 等于告诉电脑「我不限速」，
+        // 电脑那边就会把自己那条发送路径放开（协商最怕的就是这种单边放宽）。
+        top.weixiansen574.hybridfilexfer.droidcore.HFXServer.setConfiguredLimitFallback(
+                config.getSpeedLimitMbps());
         createNotificationChannel();
         goForeground();
         // 局域网广播：让电脑不用 adb、不用手动输 IP 也能发现手机

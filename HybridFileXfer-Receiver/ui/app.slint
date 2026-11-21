@@ -271,6 +271,17 @@ export component AppWindow inherits Window {
     in-out property <bool> tray: true;
     // 右键「发送到」里显示「发送到手机」
     in-out property <bool> sendto: false;
+    // 本机限速（MB/s，0 = 不限速）。和手机端的设置互相协商，取非零里较小的一个。
+    // 存成字符串而不是 int：输入框里允许「还没输完」的空串 / 半截数字，
+    // 边输边转 int 会把中间态吞掉（用户输 10 时先清空，那一瞬会被当成 0 存下来）。
+    in-out property <string> speed-limit-text: "0";
+    // 限速输入框现在有没有焦点。LineEdit 的 has-focus 是 out property，
+    // 不能直接在上面挂 changed，所以先绑到这个本地属性上，由下面的 changed 监听。
+    private property <bool> limit-focus: limit-edit.has-focus;
+    // 失去焦点 = 用户点到别处了 → 提交一次。回车走 limit-edit 自己的 accepted。
+    changed limit-focus => {
+        if (!limit-focus) { root.speed-limit-changed(root.speed-limit-text); }
+    }
     in-out property <string> message: "";
     // 状态卡下面的一行结果提示（取消接收后那句「已保留进度」/「已删除未完成文件」）
     in-out property <string> notice-text: "";
@@ -315,6 +326,7 @@ export component AppWindow inherits Window {
     callback autostart-toggled(bool);
     callback tray-toggled(bool);
     callback sendto-toggled(bool);
+    callback speed-limit-changed(string);
     callback device-clicked(int);
     callback device-chosen(int);
     callback toggle-pause-send();
@@ -611,6 +623,42 @@ export component AppWindow inherits Window {
                     toggled => { root.sendto-toggled(root.sendto); }
                 }
 
+                // 限速：和手机端的同一个设置互相协商，取非零里较小的一个。
+                // 「0 = 不限速」必须写在标签上：填 0 不等于限到 0，
+                // 这是本协议里唯一一个「0 有特殊含义」的字段，不写清楚会被理解反。
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text {
+                        text: "限速";
+                        font-size: 12px;
+                        color: #444444;
+                        vertical-alignment: center;
+                    }
+                    // 提交时机：**回车** 或 **点到框外失焦**，不是边打边存。
+                    //
+                    // 原来接的是 edited —— LineEdit 的 edited 每敲一个键就发一次
+                    // （i-slint-core/items/text.rs 里每次文本改动都 TriggerCallbacks），
+                    // 于是输入「25」会先按「2」存一遍配置再按「25」存一遍：配置被写两次、
+                    // 界面上的值在打字途中来回跳，而且中途那个「2」如果正好赶上一轮握手，
+                    // 就会用 2 MB/s 去跟手机协商。
+                    //
+                    // accepted 对应回车（Enter），limit-focus 由真变假对应「点了别处」，
+                    // 两者各存一次，语义和原生 Windows 的输入框一致。
+                    limit-edit := LineEdit {
+                        width: 64px;
+                        text <=> root.speed-limit-text;
+                        placeholder-text: "0";
+                        accepted => { root.speed-limit-changed(root.speed-limit-text); }
+                    }
+                    Text {
+                        text: "MB/s（0 = 不限速，与手机端取较小值）";
+                        font-size: 11px;
+                        color: #8A8A8A;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                    }
+                }
+
                 Text {
                     text: root.message;
                     visible: root.message != "";
@@ -781,10 +829,15 @@ export component TransferWindow inherits Window {
     in-out property <string> remain-text: "";
     // ---- 展开态那条「速度图表条」里的曲线面积 ----
     // Rust 每 100ms 往环形缓冲里塞一个 (进度比例, 瞬时速度)，再拼成 Path 的 commands
-    // 推过来。坐标是归一化的：x 0..1000、y 0..48（48 = 上层高度，正好落在黑基线上），
-    // Path 的 viewbox 也是 1000×48，纵向 1:1 对齐黑基线，横向拉伸到条内宽。
+    // 推过来。坐标是归一化的：x 0..1000、y 0..76（76 = 图表主体高度，面积下沿压在主体现底沿），
+    // Path 的 viewbox 也是 1000×76，纵向 1:1，横向拉伸到条内宽。
+    // 面积的右边界 = 最后一个采样点（= 当时进度），所以**未完成区间里没有面积**。
     in-out property <string> curve-path: "";
-    // 图表条里右上那行「速度: 72.9 MB/秒」（叠在浅绿区里、基线之上）
+    // 黑线（速度基准线）在主体里的 y：0 = 顶、76 = 底。由 Rust 按「当前速度 / 量程」算，
+    // 原生实测这条线每帧都在动（速度越快线越高），不是画死在中间的一条装饰线。
+    in-out property <float> guide-y: 75.0;
+    // 图表条里那行「速度: 72.9 MB/秒」：**底边恒在黑线上方 6px**（原生实测 4 帧都是 6px），
+    // 所以它会跟着黑线上下走，不是一个固定位置的标签。
     in-out property <string> speed-text: "";
     in-out property <bool> paused: false;
     in-out property <bool> done: false;
@@ -808,6 +861,13 @@ export component TransferWindow inherits Window {
     in-out property <float> flow: 0.0;
     // 速率掉到 0 / 暂停 / 传完了 → 流光停住（一边 0 MB/s 一边还在流，看着像卡死）
     in-out property <bool> flow-on: true;
+    // 这一轮是「电脑 -> 手机」（手机从电脑取文件）还是「手机 -> 电脑」。
+    // × 的含义两个方向不一样：接收方向要弹「保留 / 不保留」再收尾，
+    // 发送方向没有半截落盘文件可留，直接中断这一轮就行。
+    // 不分方向的话，推送过程中点 × 会走到 cancel-recv，而 control::receiving()
+    // 在发送时是 false，于是被当成「当前没有接收在进行」直接忽略 ——
+    // 真机 2026-11-21 日志连打 20 行「取消接收被忽略」，用户看到的就是「按了不管用」。
+    in-out property <bool> sending-now: false;
     // 取消的确认框（和主界面那套是同一个组件、同一套 Rust 处理函数）
     in-out property <bool> cancel-ask: false;
     // 这一轮已经受理过取消：把「取消」按钮收起来（同一轮只让取消一次）
@@ -819,6 +879,8 @@ export component TransferWindow inherits Window {
     callback toggle-details();
     // 返回 false = 这次点击被忽略（没在接收 / 已经在取消中），别弹确认框
     callback cancel-recv() -> bool;
+    // 发送方向的取消：没有半截文件要处置，直接中断（对应主窗口第 2 屏的「取消发送」）
+    callback cancel-send();
     callback cancel-keep();
     callback cancel-discard();
     callback cancel-dismiss();
@@ -951,8 +1013,12 @@ export component TransferWindow inherits Window {
                             // （已经没有传输在跑了，走取消流程只会被忽略，按钮就成死的了）
                             if (root.failed) {
                                 root.close-window();
+                            } else if (root.sending-now) {
+                                // 电脑 -> 手机：直接中断。这条链路上没有半截落盘文件
+                                // 需要用户选「保留 / 不保留」，弹那个框只会白等一轮。
+                                root.cancel-send();
                             } else if (root.cancel-recv()) {
-                                // 和主界面一样：先暂停（手机端跟着停发），再问保留不保留
+                                // 手机 -> 电脑：先暂停（手机端跟着停发），再问保留不保留
                                 root.cancel-ask = true;
                             }
                         }
@@ -1169,73 +1235,119 @@ export component TransferWindow inherits Window {
                         background: #E6E6E6;
                     }
 
-                    // 主体 76px = 48(上层) + 1(黑基线) + 27(下层)
+                    // ---- 图表主体 76px（贴完原生实测的 463x302 复制对话框）----
+                    //
+                    // 原生的图表是**两个区域**，不是一整块浅绿：
+                    //   已完成区（0 .. 进度）：底 #A7E591、网格 #8EDD7B
+                    //   未完成区（进度 .. 右）：底 #FFFFFF、网格 #CDEFD3（= #06B025 20% 叠白）
+                    // 深绿面积 #06B025 **只出现在已完成区**，上沿是速度曲线、下沿是主体底沿。
+                    // 「黑线以下一开始就填满」就是因为以前把面积画成整条宽度了。
+                    //
+                    // 网格是 10 列 × 5 行：竖线 i×W/10（i=1..9），横线 i×76/5 = 15/30/46/61。
+                    // 这个 10×5 和开源实现 rhengles/transfer-speed-graph 的 gridCols/gridRows 一致，
+                    // 也和我们逐像素量的竖线位置（38,77,117,157…）完全对得上。
                     body := Rectangle {
                         x: 2px;
                         y: 2px;
                         width: parent.width - 4px;
                         height: 76px;
-                        background: #A7E591;
+                        background: #FFFFFF;
                         clip: true;
 
-                        // 竖网格：间距 39px、首个在 x=38（参考图 x=67、106、146…，条内左边 29 → 38）
-                        for i in 12 : Rectangle {
-                            x: 38px + i * 39px;
-                            y: 0px;
-                            width: 1px;
-                            height: 100%;
-                            background: #8EDD7B;
-                            visible: (38px + i * 39px) < (body.width - 1px);
-                        }
-                        // 横网格：参考图 y=109 / 124 / 140，条内顶 94 → 15 / 30 / 46
-                        Rectangle { x: 0px; y: 15px; width: 100%; height: 1px; background: #8EDD7B; }
-                        Rectangle { x: 0px; y: 30px; width: 100%; height: 1px; background: #8EDD7B; }
-                        Rectangle { x: 0px; y: 46px; width: 100%; height: 1px; background: #8EDD7B; }
-
-                        // ---- 速度曲线面积 ----
-                        // 网格在下、曲线在上（参考图 x=67/106/146 在曲线区内是纯 #06B025，
-                        // 网格被曲线盖住了），所以这一段必须排在上面那几条网格之后。
-                        // viewbox 高度 48 = 元素高度 48px → 纵向 1:1，curve 的 y=48 正好压在黑基线上。
-                        curve := Path {
-                            x: 0px;
-                            y: 0px;
-                            width: 100%;
-                            height: 48px;
-                            // fit 必须写 fill（= 拉伸）：Path 的默认 fit 是 contain，
-                            // 会「等比缩放 + 居中」。viewbox 是 1000x48、元素是 ~403x48，
-                            // 等比缩放取 min(0.403, 1.0) = 0.403，于是纵向只有 48*0.403≈19px
-                            // 还居中 —— 真机截图上整条曲线缩成中间一条 4px 的浮空带子
-                            // （第一版就是踩了这个坑）。fill 之后 y 方向按 48/48 = 1:1，
-                            // x 方向单独拉伸到条内宽，正是要的效果。
-                            fit: ImageFit.fill;
-                            viewbox-x: 0;
-                            viewbox-y: 0;
-                            viewbox-width: 1000;
-                            viewbox-height: 48;
-                            commands: root.curve-path;
-                            // 暂停 → 曲线和下层一起换琥珀 #9D5D00（网格、黑基线不变）
-                            fill: root.paused ? #9D5D00 : #06B025;
-                        }
-
-                        // 黑基线 1px，横贯整条（不分进度）
-                        Rectangle { x: 0px; y: 48px; width: 100%; height: 1px; background: #000000; }
-
-                        // 下层实心：整条宽度都是深绿（不随进度变化 —— 原生就是这样）
+                        // ---- 已完成区：浅绿底 ----
                         Rectangle {
                             x: 0px;
-                            y: 49px;
-                            width: 100%;
-                            height: 27px;
-                            background: root.paused ? #9D5D00 : #06B025;
+                            y: 0px;
+                            width: body.width * root.fill;
+                            height: 100%;
+                            background: #A7E591;
                         }
 
-                        // 「速度: xx MB/秒」：叠在上层、基线之上、靠右，右侧留 6px
+                        // ---- 已完成区：网格 + 速度面积（整块裁到已完成区间）----
+                        done-zone := Rectangle {
+                            x: 0px;
+                            y: 0px;
+                            width: body.width * root.fill;
+                            height: 76px;
+                            clip: true;
+
+                            for i in 9 : Rectangle {
+                                x: body.width * (i + 1) / 10;
+                                y: 0px;
+                                width: 1px;
+                                height: 100%;
+                                background: #8EDD7B;
+                            }
+                            Rectangle { x: 0px; y: 15px; width: 100%; height: 1px; background: #8EDD7B; }
+                            Rectangle { x: 0px; y: 30px; width: 100%; height: 1px; background: #8EDD7B; }
+                            Rectangle { x: 0px; y: 46px; width: 100%; height: 1px; background: #8EDD7B; }
+                            Rectangle { x: 0px; y: 61px; width: 100%; height: 1px; background: #8EDD7B; }
+
+                            // 面积画在网格之上（原生曲线区内网格是被盖住的）
+                            // fit 必须写 fill（= 拉伸）：Path 默认的 contain 会「等比缩放 + 居中」，
+                            // viewbox 1000x76 塞进 403x76 时纵向只剩 76*0.403≈31px 还居中。
+                            curve := Path {
+                                x: 0px;
+                                y: 0px;
+                                width: body.width;
+                                height: 76px;
+                                fit: ImageFit.fill;
+                                viewbox-x: 0;
+                                viewbox-y: 0;
+                                viewbox-width: 1000;
+                                viewbox-height: 76;
+                                commands: root.curve-path;
+                                // 暂停 → 面积换琥珀 #9D5D00（网格、黑线不变）
+                                fill: root.paused ? #9D5D00 : #06B025;
+                            }
+                        }
+
+                        // ---- 未完成区：只有浅网格，没有面积 ----
+                        undone-zone := Rectangle {
+                            x: body.width * root.fill;
+                            y: 0px;
+                            width: body.width - body.width * root.fill;
+                            height: 76px;
+                            clip: true;
+
+                            // 网格坐标还是按整条算，只是被这个容器裁掉左半截 ——
+                            // 所以这里减去已完成宽度，线才能落在和已完成区同一条 x 上。
+                            for i in 9 : Rectangle {
+                                x: body.width * (i + 1) / 10 - body.width * root.fill;
+                                y: 0px;
+                                width: 1px;
+                                height: 100%;
+                                background: #CDEFD3;
+                                visible: (body.width * (i + 1) / 10) > (body.width * root.fill);
+                            }
+                            Rectangle { x: 0px; y: 15px; width: 100%; height: 1px; background: #CDEFD3; }
+                            Rectangle { x: 0px; y: 30px; width: 100%; height: 1px; background: #CDEFD3; }
+                            Rectangle { x: 0px; y: 46px; width: 100%; height: 1px; background: #CDEFD3; }
+                            Rectangle { x: 0px; y: 61px; width: 100%; height: 1px; background: #CDEFD3; }
+                        }
+
+                        // ---- 黑线：整条横贯（未完成区里也有），压在其它所有东西之上 ----
+                        // y 由 Rust 按「当前速度 / 量程」算出来，每帧都可能不同 ——
+                        // 原生实测 25 帧 y 在 7..40（相对主体）之间来回跳，速度越快线越高。
+                        Rectangle {
+                            x: 0px;
+                            y: root.guide-y * 1px;
+                            width: 100%;
+                            height: 1px;
+                            background: #000000;
+                        }
+
+                        // ---- 「速度: xx MB/秒」：底边恒在黑线上方 6px，靠右留 6px ----
+                        // 它跟着黑线走（原生 4 帧实测都是 6px 间距），所以不是固定标签。
                         Text {
                             text: root.speed-text;
                             font-size: 12px;
                             color: #000000;
                             x: 0px;
-                            y: 28px;
+                            // 字底 = 黑线上方 6px（原生 4 帧实测都是 6px）：
+                            // 12px 字在 18px 高的盒子里垂直居中，盒子底 = y + 18，
+                            // 要让盒子底落在 guide-6，就是 y = guide - 24。
+                            y: (root.guide-y * 1px) - 24px;
                             width: parent.width - 6px;
                             height: 18px;
                             horizontal-alignment: right;
@@ -1378,6 +1490,641 @@ export component TransferWindow inherits Window {
             // 取消确认框不再画在这里：它现在是**独立窗口**（见文件开头的 CancelAskWindow）。
             // 这里只留 cancel-ask 这个状态位，Rust 每帧读它，翻成 true 就把那个窗口弹出来。
             // 以前是遮罩层，得靠「加 65px 占位」把窗口物理撑高才露得全（§6.2），独立窗口不用。
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 「发送到手机」小窗（PushWindow）
+//
+// 右键「发送到 → 手机」推过来文件时，以前会把整套接收器主界面弹出来，
+// 再靠里面那张「选择接收设备」卡片等你去点 —— 用户的要求：**推送不要跳转到接收器界面**。
+// 所以这里是**独立窗口**，只有三屏，不碰主界面（gui_slint.rs 的推送路径里
+// ui.show() / show_main_window 一律不调用；主界面那张卡片保留给「从主界面里主动发」）。
+//
+// 同一个窗口换内容 = 三步走状态机（Rust 那边 PushRound 驱动）：
+//   step 0  发送到哪台：设备列表，每台一行（整行可点，右边一颗「发送」）+ 取消
+//   step 1  正在发送：目标 / 文件名 / 进度条 + 百分比 + 速率 + 取消发送
+//   step 2  已发送（failed=true 时是失败：红字写原因，不自动关）
+// 单台设备时 Rust 直接把 step 置成 1（不用用户点）；多台必须让用户点。
+//
+// 尺寸：宽 420 给死；高度按屏算（content-h → preferred-height，逐项在下面注明）。
+// 落位（工作区右下角）/ 置顶 / 抢前台都在 gui_slint.rs（和传输窗口同一套做法）。
+//
+// 窗口标题故意**固定**成「发送到手机」：gui 靠标题找 hwnd 来贴右下角 + 置顶，
+// 标题跟着状态变就会有一帧找不到窗口（TransferWindow 那边踩过这个坑，见 tray_win.rs），
+// 所以状态全部表达在窗口内容里。
+//
+// 配色沿用传输窗口那套：底 #FFFFFF、分隔线 #E3E3E3、正文 #000000、次级 #616161、
+// 进度条 轨道 #E6E6E6 / 填充 #0F7B0F / 描边 #BCBCBC。字号一律整数 px；
+// 图标（手机 / 勾）一律 Path 画 —— ✕ ✓ 这类字形在 YaHei 里不一定有。
+// ---------------------------------------------------------------------------
+export struct PushDevice {
+    // 设备真名（Xiaomi Pad 7 Pro）；名字还没解析出来时是序列号前 8 位
+    name: string,
+    // 圆形头像里那个字（名字首字母）
+    avatar: string,
+    // 「已连接 · 10 条通道」/「正在连接…」/「连不上 · 重试中」
+    status: string,
+    // 多选：这一行打没打勾（点整行切换）
+    selected: bool,
+}
+
+// 小窗里的「文字按钮」：无底无边，hover 才出浅灰 #F0F0F0（Win11 内容对话框里的链接按钮）
+component PushTextButton inherits Rectangle {
+    in property <string> label;
+    callback clicked;
+
+    width: 60px;
+    height: 32px;
+    border-radius: 4px;
+    background: ta.has-hover ? #F0F0F0 : transparent;
+
+    Text {
+        width: 100%;
+        height: 100%;
+        text: root.label;
+        color: #000000;
+        font-size: 13px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    // 纯文字按钮也必须能被 UIA 找到（测试脚本按名字点）
+    ta := TouchArea {
+        accessible-role: button;
+        accessible-label: root.label;
+        clicked => { root.clicked(); }
+    }
+}
+
+// 手机图标：竖长圆角框 + 底部一条听筒线，Path 画（不用 emoji / 字体符号）
+component PhoneGlyph inherits Rectangle {
+    in property <color> tint: #1F1F1F;
+
+    width: 20px;
+    height: 26px;
+    background: transparent;
+
+    Path {
+        width: 100%;
+        height: 100%;
+        viewbox-x: 0;
+        viewbox-y: 0;
+        viewbox-width: 20;
+        viewbox-height: 26;
+        commands: "M 5 1 C 3.3 1 2 2.3 2 4 L 2 22 C 2 23.7 3.3 25 5 25 L 15 25 C 16.7 25 18 23.7 18 22 L 18 4 C 18 2.3 16.7 1 15 1 Z M 8 21 L 12 21";
+        fill: transparent;
+        stroke: root.tint;
+        stroke-width: 1.6px;
+        stroke-line-cap: round;
+    }
+}
+
+// 成功那个勾：Path 画（✓ U+2713 在 YaHei 里没有，会变豆腐块）
+component CheckGlyph inherits Rectangle {
+    in property <color> tint: #0F7B0F;
+
+    width: 20px;
+    height: 20px;
+    background: transparent;
+
+    Path {
+        width: 100%;
+        height: 100%;
+        viewbox-x: 0;
+        viewbox-y: 0;
+        viewbox-width: 20;
+        viewbox-height: 20;
+        commands: "M 3 10 L 8 15 L 17 5";
+        fill: transparent;
+        stroke: root.tint;
+        stroke-width: 2px;
+        stroke-line-cap: round;
+        stroke-line-join: round;
+    }
+}
+
+export component PushWindow inherits Window {
+    title: "发送到手机";
+    default-font-family: "Segoe UI, Microsoft YaHei UI";
+    default-font-size: 13px;
+    preferred-width: 420px;
+    background: #FFFFFF;
+
+    // 0 = 选设备 / 1 = 发送中 / 2 = 已发送（failed 时为失败）
+    in-out property <int> step: 0;
+    // 标题下那行「3 个文件 · 128.4 MB」
+    in-out property <string> summary-text: "";
+    in-out property <[PushDevice]> devices: [];
+    in-out property <string> target-name: "";
+    in-out property <string> file-name: "";
+    // 「42%」
+    in-out property <string> percent-text: "";
+    // 「12.3 MB / 128.4 MB · 9.6 MB/s」
+    in-out property <string> progress-text: "";
+    in-out property <float> fill: 0.0;
+    // 流光位置（0..1），Rust 那边 16ms 一拍推着走（和传输窗口同一条公式）
+    in-out property <float> flow: 0.0;
+    // 拿不到总进度（队列里量不出字节数 / 手机还没报）→ 不确定态：整条绿 + 跑光带
+    in-out property <bool> indeterminate: false;
+    in-out property <bool> failed: false;
+    in-out property <string> fail-text: "";
+
+    // 多选：打了几台（0 的时候「发送到选中的 N 台」是灰的）
+    in-out property <int> chosen-count: 0;
+    // 那颗主按钮上的字（0 台 = 「选择要发送的手机」，否则「发送到选中的 N 台」）
+    in-out property <string> send-label: "选择要发送的手机";
+
+    // 第 1 屏：用户点了第 i 台右侧那颗「发送」（只发这一台）
+    callback choose(int);
+    // 第 1 屏：点了第 i 行的勾 / 整行（切换这一行的勾选）
+    callback toggle(int);
+    // 第 1 屏：点「发送到选中的 N 台」
+    callback send-selected();
+    // 第 1 屏「取消」/ 第 3 屏「关闭」：收窗口，队列不动
+    callback cancel();
+    // 设备列表为空时那颗「重试」
+    callback retry();
+    // 第 2 屏「取消发送」：中断这次发送
+    callback cancel-send();
+
+    // ---- 高度：每块都是写死的高度，所以这里能把总量算准 ----
+    // step 0: 14(上留白) + 40(标题行) + 12 + 1(分隔线) + 6 + 列表 + 8 + 32(按钮行) + 12 = 125 + 列表
+    //         列表 = 设备数*56；一台都没有时 76（两行说明 + 「重试」）
+    // step 1: 16 + 40 + 12 + 1 + 14 + 20(文件名) + 8 + 15(进度条) + 10 + 20(百分比行) + 14 + 32 + 12 = 214
+    // step 2: 16 + 40 + 12 + 1 + 14 + 12 = 95；失败再 +20(红字) +8 +32(关闭按钮) = 155
+    private property <length> list-h: root.devices.length == 0 ? 76px : root.devices.length * 56px;
+    private property <length> content-h: root.step == 0
+        ? 125px + root.list-h
+        : (root.step == 1 ? 214px : (95px + (root.failed ? 60px : 0px)));
+    preferred-height: root.content-h;
+
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #FFFFFF;
+
+        VerticalLayout {
+            spacing: 0px;
+            padding-left: 16px;
+            padding-right: 16px;
+
+            // ================= 第 1 屏：发送到哪台 =================
+            if root.step == 0 : VerticalLayout {
+                spacing: 0px;
+
+                Rectangle { height: 14px; }
+
+                // 标题行 40px：手机图标（26 高，居中 y=7）+ 主文案 + 副文案
+                Rectangle {
+                    height: 40px;
+                    background: transparent;
+
+                    PhoneGlyph { x: 0px; y: 7px; }
+                    Text {
+                        x: 32px;
+                        y: 0px;
+                        width: parent.width - 32px;
+                        height: 22px;
+                        text: "发送到手机";
+                        font-size: 15px;
+                        font-weight: 600;
+                        color: #000000;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                    Text {
+                        x: 32px;
+                        y: 20px;
+                        width: parent.width - 32px;
+                        height: 18px;
+                        text: root.summary-text;
+                        font-size: 12px;
+                        color: #616161;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                }
+
+                Rectangle { height: 12px; }
+                Rectangle { height: 1px; background: #E3E3E3; }
+                Rectangle { height: 6px; }
+
+                // ---- 设备列表：每台一行 56px ----
+                for d[i] in root.devices : Rectangle {
+                    height: 56px;
+                    // hover 时整行浅灰；点「发送」那颗也算在整行里（同一块高亮）
+                    background: (row-ta.has-hover || send-ta.has-hover) ? #F5F5F5 : transparent;
+
+                    // 勾选框（18x18，圆角 3）：Path 画勾，不用 ✓ 字形
+                    Rectangle {
+                        x: 0px;
+                        y: 19px;
+                        width: 18px;
+                        height: 18px;
+                        border-radius: 3px;
+                        border-width: 1px;
+                        border-color: d.selected ? #0F7B0F : #C6C6C6;
+                        background: d.selected ? #0F7B0F : #FFFFFF;
+
+                        if d.selected : CheckGlyph {
+                            x: 3px;
+                            y: 3px;
+                            width: 12px;
+                            height: 12px;
+                            tint: #FFFFFF;
+                        }
+                    }
+
+                    // 圆形头像：名字首字母
+                    Rectangle {
+                        x: 30px;
+                        y: 12px;
+                        width: 32px;
+                        height: 32px;
+                        border-radius: 16px;
+                        background: #EFEFEF;
+
+                        Text {
+                            width: 100%;
+                            height: 100%;
+                            text: d.avatar;
+                            font-size: 14px;
+                            font-weight: 600;
+                            color: #4A4A4A;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    // 上行 = 设备真名
+                    Text {
+                        x: 74px;
+                        y: 10px;
+                        width: parent.width - 162px;
+                        height: 20px;
+                        text: d.name;
+                        font-size: 14px;
+                        color: #000000;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                    // 下行 = 状态（灰 12px）
+                    Text {
+                        x: 74px;
+                        y: 30px;
+                        width: parent.width - 162px;
+                        height: 16px;
+                        text: d.status;
+                        font-size: 12px;
+                        color: #616161;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+
+                    // 右侧那颗「发送」小按钮（画出来的样子）
+                    Rectangle {
+                        x: parent.width - 76px;
+                        y: 13px;
+                        width: 76px;
+                        height: 30px;
+                        border-radius: 4px;
+                        border-width: 1px;
+                        border-color: #D7D7D7;
+                        background: send-ta.has-hover ? #F0F0F0 : #FFFFFF;
+
+                        Text {
+                            width: 100%;
+                            height: 100%;
+                            text: "发送";
+                            font-size: 12px;
+                            color: #000000;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    // 整行可点 = 切换勾选（读屏/自动化按设备名找得到）；「发送」那颗叠在它上面
+                    row-ta := TouchArea {
+                        accessible-role: button;
+                        accessible-label: d.name;
+                        clicked => { root.toggle(i); }
+                    }
+                    send-ta := TouchArea {
+                        x: parent.width - 76px;
+                        width: 76px;
+                        accessible-role: button;
+                        accessible-label: "发送";
+                        clicked => { root.choose(i); }
+                    }
+                }
+
+                // ---- 一台设备都没有：说清楚该怎么办，给一颗「重试」----
+                if root.devices.length == 0 : Rectangle {
+                    height: 76px;
+                    background: transparent;
+
+                    Text {
+                        x: 0px;
+                        y: 0px;
+                        width: 100%;
+                        height: 44px;
+                        text: "还没有手机连接，插上数据线或连同一个 Wi-Fi 就自动出现";
+                        font-size: 12px;
+                        color: #616161;
+                        wrap: word-wrap;
+                        vertical-alignment: center;
+                    }
+                    PushTextButton {
+                        x: 0px;
+                        y: 44px;
+                        width: 56px;
+                        label: "重试";
+                        clicked => { root.retry(); }
+                    }
+                }
+
+                Rectangle { height: 8px; }
+
+                // 底部：左「发送到选中的 N 台」（一台都没勾时是灰的）+ 右「取消」
+                Rectangle {
+                    height: 32px;
+                    background: transparent;
+
+                    Rectangle {
+                        x: 0px;
+                        y: 0px;
+                        width: 148px;
+                        height: 32px;
+                        border-radius: 4px;
+                        background: root.chosen-count > 0
+                            ? (send-all-ta.has-hover ? #0E6E0E : #0F7B0F)
+                            : #EDEDED;
+
+                        Text {
+                            width: 100%;
+                            height: 100%;
+                            text: root.send-label;
+                            font-size: 12px;
+                            color: root.chosen-count > 0 ? #FFFFFF : #9A9A9A;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+
+                        send-all-ta := TouchArea {
+                            accessible-role: button;
+                            accessible-label: root.send-label;
+                            clicked => {
+                                if (root.chosen-count > 0) {
+                                    root.send-selected();
+                                }
+                            }
+                        }
+                    }
+
+                    PushTextButton {
+                        x: parent.width - 60px;
+                        y: 0px;
+                        width: 60px;
+                        label: "取消";
+                        clicked => { root.cancel(); }
+                    }
+                }
+
+                Rectangle { height: 12px; }
+            }
+
+            // ================= 第 2 屏：正在发送 =================
+            if root.step == 1 : VerticalLayout {
+                spacing: 0px;
+
+                Rectangle { height: 16px; }
+
+                Rectangle {
+                    height: 40px;
+                    background: transparent;
+
+                    PhoneGlyph { x: 0px; y: 7px; }
+                    Text {
+                        x: 32px;
+                        y: 0px;
+                        width: parent.width - 32px;
+                        height: 22px;
+                        text: "正在发送到 " + root.target-name;
+                        font-size: 15px;
+                        font-weight: 600;
+                        color: #000000;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                    Text {
+                        x: 32px;
+                        y: 20px;
+                        width: parent.width - 32px;
+                        height: 18px;
+                        text: root.summary-text;
+                        font-size: 12px;
+                        color: #616161;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                }
+
+                Rectangle { height: 12px; }
+                Rectangle { height: 1px; background: #E3E3E3; }
+                Rectangle { height: 14px; }
+
+                // 当前文件名（多文件时 Rust 那边拼「xxx（第 1 / 3 个文件）」）
+                Text {
+                    height: 20px;
+                    text: root.file-name;
+                    font-size: 13px;
+                    color: #000000;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+
+                Rectangle { height: 8px; }
+
+                // 进度条：和传输窗口那条一样 —— 15 高、直角、1px #BCBCBC 描边、
+                // 轨道 #E6E6E6、填充 #0F7B0F、流光 100px 宽的光带（WPF 的 GlowRect 就是 100px）
+                bar := Rectangle {
+                    height: 15px;
+                    background: #E6E6E6;
+                    border-width: 1px;
+                    border-color: #BCBCBC;
+                    border-radius: 0px;
+                    clip: true;
+
+                    piece := Rectangle {
+                        x: 1px;
+                        y: 1px;
+                        // 有 x 必须显式给：不给 x 时 Slint 会把填充块**居中**摆（真机上就是
+                        // 「进度从中间往两边涨」，传输窗口那边已经踩过一次）
+                        width: Math.max(0px, (bar.width - 2px) * Math.max(0.0, Math.min(1.0, root.fill)));
+                        height: bar.height - 2px;
+                        background: #0F7B0F;
+                        clip: true;
+
+                        // 流光：亮带位置用整条坐标算，被这一段 clip 住
+                        Rectangle {
+                            x: (bar.width - 2px) * root.flow - 50px;
+                            y: 0px;
+                            width: 100px;
+                            height: 100%;
+                            background: @linear-gradient(90deg,
+                                #FFFFFF00 0%,
+                                #FFFFFF60 40%,
+                                #FFFFFF60 60%,
+                                #FFFFFF00 100%);
+                        }
+                    }
+
+                    // 不确定态：整条填满绿 + 光带整条跑（没有总进度时用）
+                    if root.indeterminate : Rectangle {
+                        x: 1px;
+                        y: 1px;
+                        width: bar.width - 2px;
+                        height: bar.height - 2px;
+                        background: #0F7B0F;
+                        clip: true;
+
+                        Rectangle {
+                            x: (bar.width - 2px) * root.flow - 50px;
+                            y: 0px;
+                            width: 100px;
+                            height: 100%;
+                            background: @linear-gradient(90deg,
+                                #FFFFFF00 0%,
+                                #FFFFFF60 40%,
+                                #FFFFFF60 60%,
+                                #FFFFFF00 100%);
+                        }
+                    }
+                }
+
+                Rectangle { height: 10px; }
+
+                // 百分比 + 「已发 / 总量 · 速率」
+                Rectangle {
+                    height: 20px;
+                    background: transparent;
+
+                    Text {
+                        x: 0px;
+                        y: 0px;
+                        height: 20px;
+                        text: root.percent-text;
+                        font-size: 15px;
+                        font-weight: 600;
+                        color: #000000;
+                        vertical-alignment: center;
+                    }
+                    Text {
+                        x: 52px;
+                        y: 0px;
+                        width: parent.width - 52px;
+                        height: 20px;
+                        text: root.progress-text;
+                        font-size: 12px;
+                        color: #616161;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                }
+
+                Rectangle { height: 14px; }
+
+                Rectangle {
+                    height: 32px;
+                    background: transparent;
+
+                    PushTextButton {
+                        x: parent.width - 76px;
+                        y: 0px;
+                        width: 76px;
+                        label: "取消发送";
+                        clicked => { root.cancel-send(); }
+                    }
+                }
+
+                Rectangle { height: 12px; }
+            }
+
+            // ================= 第 3 屏：已发送 / 发送失败 =================
+            if root.step == 2 : VerticalLayout {
+                spacing: 0px;
+
+                Rectangle { height: 16px; }
+
+                Rectangle {
+                    height: 40px;
+                    background: transparent;
+
+                    // 成功画勾（20 高，居中 y=10）；失败画个红色的手机
+                    if root.failed : PhoneGlyph { x: 0px; y: 7px; tint: #C42B1C; }
+                    if !root.failed : CheckGlyph { x: 0px; y: 10px; }
+                    Text {
+                        x: 32px;
+                        y: 0px;
+                        width: parent.width - 32px;
+                        height: 22px;
+                        text: root.failed ? "发送失败" : ("已发送到 " + root.target-name);
+                        font-size: 15px;
+                        font-weight: 600;
+                        color: root.failed ? #C42B1C : #000000;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                    Text {
+                        x: 32px;
+                        y: 20px;
+                        width: parent.width - 32px;
+                        height: 18px;
+                        text: root.summary-text;
+                        font-size: 12px;
+                        color: #616161;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                }
+
+                Rectangle { height: 12px; }
+                Rectangle { height: 1px; background: #E3E3E3; }
+                Rectangle { height: 14px; }
+
+                // 失败原因（红字，只有失败才有；失败不自动关窗，等用户看完点「关闭」）
+                if root.failed : Rectangle {
+                    height: 20px;
+                    background: transparent;
+
+                    Text {
+                        width: 100%;
+                        height: 20px;
+                        text: root.fail-text;
+                        font-size: 12px;
+                        color: #C42B1C;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                }
+                if root.failed : Rectangle { height: 8px; }
+                if root.failed : Rectangle {
+                    height: 32px;
+                    background: transparent;
+
+                    PushTextButton {
+                        x: parent.width - 60px;
+                        y: 0px;
+                        width: 60px;
+                        label: "关闭";
+                        clicked => { root.cancel(); }
+                    }
+                }
+
+                Rectangle { height: 12px; }
+            }
         }
     }
 }

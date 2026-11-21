@@ -522,9 +522,15 @@ impl ProgressState {
         self.session_bytes.store(0, Ordering::Relaxed);
         self.resumed_bytes.store(0, Ordering::Relaxed);
         self.files_started.store(0, Ordering::Relaxed);
-        if let Ok(mut channels) = self.channels.lock() {
-            channels.clear();
-        }
+        // channels（通道名表）**故意不在这里清**。
+        //
+        // 它是「本次连接的通道拓扑」，不是单轮传输的计数：set_channels 本来就是全量覆盖，
+        // 根本不需要靠 reset 来清。反过来，一清就出事 —— reset 是全局的，
+        // 会话线程结束（engine.rs run_session）、取消收尾（session.rs 好几处）、
+        // 点「开始接收」（gui_slint 里那次）都会调它。旧会话/另一台设备那一条
+        // 一退出就把新一轮刚登记好的名字抹掉，且没有任何代码会重新登记，
+        // 于是 channel_name() 全返回 None，明细整张表退成「通道 1 / 通道 2 …」。
+        // 真机 2026-11-21 复现：取消 → 停止 → 重连后名字又没了，就是这个。
         if let Ok(mut files) = self.files.lock() {
             files.clear();
         }
@@ -611,6 +617,11 @@ impl ProgressState {
         if let Ok(mut guard) = self.channels.lock() {
             *guard = names;
         }
+    }
+
+    /// 已登记的通道名条数（诊断用：能看出「名字没登记」还是「下标越界」）
+    pub fn channel_count(&self) -> usize {
+        self.channels.lock().map(|c| c.len()).unwrap_or(0)
     }
 
     /// 通道号 -> 通道名（未登记 / 未分配时返回 None，界面自己决定显示什么）

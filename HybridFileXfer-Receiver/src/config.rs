@@ -29,6 +29,11 @@ pub struct Config {
     pub max_devices: usize,
     /// 是否在右键「发送到」菜单里放一个「发送到手机」快捷方式
     pub sendto: bool,
+    /// 本机限速（MB/s），0 = 不限速。
+    ///
+    /// 双端各有这样一个设置，握手时互换，取「非零里最小的」生效（见 proto 的 307 说明）。
+    /// 语义要点：0 是「我这端不限速」，**不会**把对方填的限制抹掉。
+    pub speed_limit_mb: u32,
     /// 独立传输窗口上次被用户拖到的位置（物理像素，窗口左上角）。
     /// None = 还没摆过 / 用户没拖过，第一次出现时自己贴到工作区右下角。
     /// 两个坐标都必须有：文件被手改坏、只剩半行时当作没存过。
@@ -47,6 +52,7 @@ impl Default for Config {
             minimize_to_tray: true,
             max_devices: 3,
             sendto: false,
+            speed_limit_mb: 0,
             xfer_win_pos: None,
         }
     }
@@ -134,6 +140,13 @@ impl Config {
                 "sendto" | "send_to" => {
                     cfg.sendto = !(value == "0" || value.eq_ignore_ascii_case("false"));
                 }
+                // 上限给到 1000：和手机端 Config.setSpeedLimit 的钳制范围一致。
+                // 0 = 不限速；解析不了就保持默认（不限速），不要让一个手滑的字符堵死传输。
+                "speed_limit" | "speed_limit_mb" | "limit" => {
+                    if let Ok(mb) = value.parse::<u32>() {
+                        cfg.speed_limit_mb = mb.min(1000);
+                    }
+                }
                 "xfer_win_x" => {
                     win_x = value.parse::<i32>().ok();
                 }
@@ -171,6 +184,9 @@ impl Config {
              max_devices = {}\n\
              # 右键「发送到」菜单里显示「发送到手机」（1 显示 / 0 不显示）\n\
              sendto = {}\n\
+             # 限速（MB/s，0 = 不限速）。与手机端的限速设置互相协商，取非零里较小的一个。\n\
+             # 电脑推文件给手机时由本机限速；手机发文件时由手机限速，上限是同一个值。\n\
+             speed_limit = {}\n\
              # 独立传输窗口上次的位置（物理像素，窗口左上角；留空 = 自动贴工作区右下角）\n\
              # 用户拖过就记住；拔掉副屏 / 改分辨率后位置落到屏幕外会自动回落右下角\n\
              xfer_win_x = {}\n\
@@ -191,6 +207,7 @@ impl Config {
             if self.minimize_to_tray { "1" } else { "0" },
             self.max_devices,
             if self.sendto { "1" } else { "0" },
+            self.speed_limit_mb,
             self.xfer_win_pos
                 .map(|(x, _)| x.to_string())
                 .unwrap_or_default(),
