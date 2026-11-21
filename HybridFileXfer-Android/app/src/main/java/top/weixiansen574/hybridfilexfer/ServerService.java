@@ -617,6 +617,15 @@ public class ServerService extends Service implements ServiceConnection {
                             live.active = false;
                             if (live.userCancelled) {
                                 collectPartials(dir, files);
+                            } else if (server.isPeerCancelled()) {
+                                // 电脑端取消：留还是删，receiveFiles 的收尾
+                                // (settleCancelledReceive) 已经按电脑上用户选的
+                                // 「保留 / 不保留」处理完了 —— 这里再 deletePartial
+                                // 会把「保留」也删成残骸：文件没了、<文件名>.hfxpart
+                                // 还在，日志说"这些块已有"、文件却不存在，
+                                // 下次同名文件续传会跳过这些块，落盘是带空洞的假文件。
+                                // （真机 2026-11-21 实测：选「保留进度」后只剩 288 字节的日志）
+                                debugFile("peer cancelled: partials already settled by receiveFiles");
                             } else {
                                 deletePartial(dir, files);
                             }
@@ -629,8 +638,14 @@ public class ServerService extends Service implements ServiceConnection {
             if (live.userCancelled) {
                 // 用户主动取消：先别删，等界面问"保留还是删除"
                 collectPartials(dir, files);
+            } else if (server.isPeerCancelled()) {
+                // 电脑端取消：和 onIncomplete 里同一个道理 —— 留还是删已经由
+                // receiveFiles 的收尾决定了（而且取消时到这里是预期内的异常：
+                // 传输通道被对方关掉，本端的读写会以异常收场）
+                debugFile("peer cancelled: partials already settled by receiveFiles");
             } else {
-                // 掉线/出错：预分配到完整大小的半成品没有用，删掉
+                // 掉线/出错：预分配到完整大小的半成品没有用，删掉（连续传日志一起，
+                // 见 deletePartial 里的说明：留孤儿日志会让下次续传出空洞）
                 deletePartial(dir, files);
             }
         }
@@ -704,6 +719,17 @@ public class ServerService extends Service implements ServiceConnection {
                     debugFile("cannot delete partial " + target);
                 } else {
                     debugFile("deleted partial " + target);
+                }
+            }
+            // 续传日志必须跟着一起删。只删文件会留下一个"说这些块已经有了"的孤儿日志，
+            // 下次同名文件续传时按它跳过这些块 —— 文件是预分配到完整长度的，
+            // 那些位置就成了空洞（大小对、内容是 0），比一份没传完的文件更害人。
+            java.io.File journal = new java.io.File(target.getPath() + ".hfxpart");
+            if (journal.isFile()) {
+                if (!journal.delete()) {
+                    debugFile("cannot delete journal " + journal);
+                } else {
+                    debugFile("deleted journal " + journal);
                 }
             }
         }
