@@ -60,7 +60,12 @@ public abstract class HFXService {
     //   共用值怎么定见 HFXServer.negotiateLimitMbps（和电脑端 session.rs 严格一致）；
     //   连上之后再改走 ControllerIdentifiers.SPEED_LIMIT 帧。
     //   0 仍然只是「不限速」，不是「限到 0 字节」。
-    public static final int VERSION_CODE = 308;
+    // 308 → 309：新增 QUEUE_STATE（手机 → 电脑，只发不答）：手机上「分享发送」的队列快照。
+    //   为什么要它：电脑那边只看得见"正在传的那一个文件"，看不见手机队列里还排着谁、
+    //   前一个传完是成功还是失败。加上这一帧之后，握手后先推一次，队列一变就推一次，
+    //   传输期间每秒兜底一次，电脑界面和手机队列说的是同一件事。
+    //   它是纯增量指令：只多一帧，已有帧的载荷和顺序一个字节都不动。
+    public static final int VERSION_CODE = 309;
     protected final LinkedBlockingDeque<ByteBuffer> buffers = new LinkedBlockingDeque<>();
     protected DataByteChannel ctChannel;
     /**

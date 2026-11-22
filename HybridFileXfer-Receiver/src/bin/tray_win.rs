@@ -148,6 +148,28 @@ fn monitor_work_area(point: POINT, nearest: bool) -> Option<WorkArea> {
     }
 }
 
+/// 鼠标所在那块屏的「可用高度」（工作区，物理像素，已扣掉任务栏）。
+///
+/// 给传输窗口做高度封顶用：块一多，窗口就跟着长，真机上直接长出屏幕顶。
+/// 为什么按鼠标所在的那块屏算：窗口第一次出现就是贴鼠标所在屏的右下角
+/// （见 transfer_window_origin），而且这里调用时窗口的 hwnd 还没建出来、
+/// 量不到它自己在哪块屏上。
+///
+/// 只读几何，不碰任何摆位 / 吸附逻辑。
+pub fn cursor_work_area_height() -> Option<i32> {
+    let mut cursor = POINT { x: 0, y: 0 };
+    if unsafe { GetCursorPos(&mut cursor) } == 0 {
+        return None;
+    }
+    let (_, top, _, bottom) = monitor_work_area(cursor, true)?;
+    let h = bottom - top;
+    if h > 0 {
+        Some(h)
+    } else {
+        None
+    }
+}
+
 /// 窗口该出现在哪（物理像素，左上角）
 ///
 /// saved = 用户上次拖到的位置。它必须整块还在某块屏幕上（中心点落在屏幕内就行，
@@ -175,6 +197,10 @@ pub fn transfer_window_origin(win_w: i32, win_h: i32, saved: Option<(i32, i32)>)
     (x, y)
 }
 
+// 下面这一组（FindWindow / find_window_proc / find_transfer_window）是「本进程第一个带标题的
+// 窗口」那套找法，一台设备一个传输窗口之后**不能再用**：EnumWindows 永远先命中最早建出来的
+// 那个，第二台设备的窗口永远摆不上位置。留着是为了排查时对照，标记 dead_code 免得报警。
+#[allow(dead_code)]
 struct FindWindow {
     pid: u32,
     main_title: String,
@@ -183,6 +209,7 @@ struct FindWindow {
     found: HWND,
 }
 
+#[allow(dead_code)]
 unsafe extern "system" fn find_window_proc(hwnd: HWND, lparam: LPARAM) -> i32 {
     let state = &mut *(lparam as *mut FindWindow);
     let mut pid = 0u32;
@@ -216,6 +243,7 @@ unsafe extern "system" fn find_window_proc(hwnd: HWND, lparam: LPARAM) -> i32 {
 /// `skip_titles` 是「别当成传输窗口」的标题。进程里现在不止三个窗口了
 /// （主界面 / 传输窗口 / 取消确认框 / 推送小窗），谁先被 EnumWindows 枚举到不一定，
 /// 不把推送小窗排掉，传输窗口的落位 / 置顶就会作用到小窗身上。
+#[allow(dead_code)]
 pub fn find_transfer_window(main_title: &str, skip_titles: &[&str]) -> Option<HwndVal> {
     let mut state = FindWindow {
         pid: std::process::id(),
@@ -225,6 +253,64 @@ pub fn find_transfer_window(main_title: &str, skip_titles: &[&str]) -> Option<Hw
     };
     unsafe {
         EnumWindows(Some(find_window_proc), &mut state as *mut FindWindow as LPARAM);
+    }
+    if state.found.is_null() {
+        None
+    } else {
+        Some(state.found as isize)
+    }
+}
+
+/// 枚举用的状态：按「标题后缀」认窗口。
+///
+/// 每台设备一个传输窗口之后，按标题找就不能再用「本进程第一个带标题的窗口」那套了 ——
+/// EnumWindows 永远先命中最早建出来的那个，第二台设备的窗口永远摆不上位置。
+/// 于是让每个传输窗口的标题带上设备名（"正在传输 · 小米 15"），这里按后缀认。
+struct FindWindowFor {
+    pid: u32,
+    suffix: String,
+    found: HWND,
+}
+
+unsafe extern "system" fn find_window_for_proc(hwnd: HWND, lparam: LPARAM) -> i32 {
+    let state = &mut *(lparam as *mut FindWindowFor);
+    let mut pid = 0u32;
+    GetWindowThreadProcessId(hwnd, &mut pid);
+    if pid != state.pid {
+        return 1;
+    }
+    if IsWindowVisible(hwnd) == 0 {
+        return 1;
+    }
+    let len = GetWindowTextLengthW(hwnd);
+    if len <= 0 {
+        return 1;
+    }
+    let mut buffer = vec![0u16; len as usize + 1];
+    let n = GetWindowTextW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32);
+    if n <= 0 {
+        return 1;
+    }
+    let title = String::from_utf16_lossy(&buffer[..n as usize]);
+    if !title.ends_with(&state.suffix) {
+        return 1;
+    }
+    state.found = hwnd;
+    0
+}
+
+/// 某一台设备的传输窗口（标题以 `suffix` 结尾，例如 " · 小米 15"）。
+///
+/// 标题里的状态前缀是会变的（正在传输 / 已完成 / 接收失败），所以只认后缀，
+/// 调用方在窗口刚 show 出来那几帧反复调它，哪个状态第一次命中就是它。
+pub fn find_transfer_window_of(suffix: &str) -> Option<HwndVal> {
+    let mut state = FindWindowFor {
+        pid: std::process::id(),
+        suffix: suffix.to_string(),
+        found: std::ptr::null_mut(),
+    };
+    unsafe {
+        EnumWindows(Some(find_window_for_proc), &mut state as *mut FindWindowFor as LPARAM);
     }
     if state.found.is_null() {
         None
@@ -362,6 +448,44 @@ pub fn keep_on_screen(hwnd: HwndVal, margin: i32) -> bool {
 /// 用的是「量一下现在还差多少、再挪多少」的写法，不去猜标题栏和边框有多高：
 /// 多显示器时按窗口自己所在那块屏的工作区算（不是主屏），所以副屏也摆得对。
 /// 返回 true = 已经量到并处理过。
+/// 同 `nudge_to_bottom_right`，但往上再错开 `up` 像素。
+///
+/// 多设备时会有好几个传输窗口，都贴右下角就会叠在一起、只看得见最上面那个。
+/// 第 i 个窗口 `up = i * (窗口高 + 间距)`，就从下往上排开，像资源管理器那样一列。
+pub fn nudge_to_bottom_right_up(hwnd: HwndVal, margin: i32, up: i32) -> bool {
+    let Some((left, top, right, bottom)) = window_visible_rect(hwnd) else {
+        return false;
+    };
+    let center = POINT {
+        x: (left + right) / 2,
+        y: (top + bottom) / 2,
+    };
+    let Some((_, _, work_right, work_bottom)) = monitor_work_area(center, true) else {
+        return false;
+    };
+    let dx = (work_right - margin) - right;
+    let dy = (work_bottom - margin - up) - bottom;
+    if dx == 0 && dy == 0 {
+        return true;
+    }
+    unsafe {
+        let mut outer: windows_sys::Win32::Foundation::RECT = std::mem::zeroed();
+        if GetWindowRect(hwnd as HWND, &mut outer) == 0 {
+            return false;
+        }
+        SetWindowPos(
+            hwnd as HWND,
+            std::ptr::null_mut(),
+            outer.left + dx,
+            outer.top + dy,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+    true
+}
+
 pub fn nudge_to_bottom_right(hwnd: HwndVal, margin: i32) -> bool {
     let Some((left, top, right, bottom)) = window_visible_rect(hwnd) else {
         return false;

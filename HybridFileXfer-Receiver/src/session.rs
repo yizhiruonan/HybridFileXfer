@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use crate::log;
 use crate::proto::{self, controller, current_file_system, transfer, BLOCK_SIZE};
+use crate::queue;
 use crate::receiver::Receiver;
 use crate::util;
 
@@ -52,6 +53,23 @@ pub struct Session {
     /// 传输期间"偷看"控制通道时读到的、暂不处理的指令：
     /// 传输结束后由主循环按原顺序继续处理
     pending_opcode: Option<i16>,
+    /// 重建传输通道期间，手机端要求「开下一单」（REQUEST_RECEIVE）的记号。
+    ///
+    /// 手机端有了「多选排队」之后，电脑取消当前这一单，手机立刻取下一个开始：
+    /// 它往控制通道写一帧 REQUEST_RECEIVE，紧跟一帧 RESUME_QUERY（整份文件清单）。
+    /// 这两帧落在「电脑正等 REBUILD_ACK」的窗口里是必然的（真机 06:54:45 那三条
+    /// 「意外的控制帧」就是这么来的），而处理它要 receiver 参数（主循环里是
+    /// handle_receive(receiver)），rebuild_transfers 拿不到。
+    ///
+    /// 所以只能连帧带载荷一起读下来存进这里，重建结束回到主循环后立刻补办 ——
+    /// 以前是「打个警告就地 break」：帧头读走了、载荷留在流里，下一次读 opcode
+    /// 读到的就是文件清单里的字节，整条控制通道当场错位，重建和会话一起报废。
+    pending_receive: bool,
+    /// 已经替主循环读好的「下一单文件清单」（RESUME_QUERY 的载荷）。
+    ///
+    /// 主循环补办 handle_receive 时直接用这一份，别再去流里读一遍 ——
+    /// 那一帧已经消费掉了，再读会一直等到读超时。
+    pending_resume: Option<Vec<(String, u64, i64)>>,
     pub interfaces: Vec<PeerInterface>,
     /// 手机监听的端口（非回环网卡上的传输通道重连要用）
     port: u16,
@@ -366,6 +384,8 @@ impl Session {
             writer,
             transfers,
             pending_opcode: None,
+            pending_receive: false,
+            pending_resume: None,
             limit_epoch: crate::ratelimit::configured_epoch(),
             interfaces,
             port,
@@ -402,6 +422,27 @@ impl Session {
             if let Err(e) = self.flush_speed_limit() {
                 return SessionEnd::Disconnected(describe_read_error(&e));
             }
+            // 取消之后重建通道时，手机端可能已经把下一单排上了（REQUEST_RECEIVE，
+            // 见 rebuild_transfers）：那一帧和它的文件清单都已经读好存在 pending 里，
+            // 处理它要 receiver，只能回到这里办。
+            //
+            // 必须排在「读下一帧」之前：手机端此刻正卡在等 RESUME_REPLY 上，
+            // 我们晚回它就一直停在那儿（队列里剩下的那几个文件也就一直不开始）。
+            if self.pending_receive {
+                self.pending_receive = false;
+                let _ = self
+                    .reader
+                    .set_read_timeout(Some(Duration::from_secs(120)));
+                let result = self.handle_receive(receiver);
+                let _ = self
+                    .reader
+                    .set_read_timeout(Some(Duration::from_millis(500)));
+                if let Err(e) = result {
+                    return SessionEnd::Disconnected(format!("{}", e));
+                }
+                last_activity = Instant::now();
+                continue;
+            }
             // 传输期间偷看控制通道时会先把指令头取走，这里优先处理暂存的那条
             let id = match self.pending_opcode.take() {
                 Some(id) => {
@@ -435,11 +476,22 @@ impl Session {
                 controller::CHECK_PENDING => self.handle_check_pending(),
                 controller::PAUSE_STATE => self.handle_pause_state(),
                 controller::SPEED_LIMIT => self.handle_speed_limit(),
+                // 309：手机的队列快照。正常只在空闲时来（用户又勾了 / 删了排队项），
+                // 整表覆盖进登记表，界面下一帧就能看见「等待中」那几块。
+                controller::QUEUE_STATE => self.handle_queue_state(),
                 controller::LIST_FILES => self.handle_list_files(),
                 controller::DELETE_FILE => self.handle_delete(),
                 controller::MKDIR => self.handle_mkdir(),
                 controller::REQUEST_RECEIVE => self.handle_receive(receiver),
                 controller::REQUEST_SEND => self.handle_send(),
+                // 305：续传查询本该紧跟 REQUEST_RECEIVE、由 handle_receive 同步读掉。
+                // 万一那帧 REQUEST_RECEIVE 落在了重建窗口里（见 rebuild_transfers），
+                // 只剩这一帧漏到主循环：先把载荷（整份文件清单）读干净存起来，
+                // 下一圈的开头按「下一单」补办 —— 只读帧头就走，文件名就成了下一个帧头。
+                controller::RESUME_QUERY => self.stash_resume_query(),
+                // 306：这个方向的续传状态帧只该由 handle_send 里的 read_resume_state 读。
+                // 出现在别处就把载荷读干净再丢（留着它同样是帧序错位）。
+                controller::RESUME_STATE => self.discard_resume_state(),
                 // 302：结论帧正常只在传输收尾读，漏到这里说明时序错位，读干净别留半帧
                 controller::RESULT => self.discard_result(),
                 other => {
@@ -480,6 +532,24 @@ impl Session {
     ///
     /// 一条都没恢复就返回错误：留着一条都传不了的会话，界面会一直显示"已连接"、
     /// 一传就失败，还不如老老实实断线重连。
+    ///
+    /// 帧流上的硬规矩（上一轮错位的根因）：**每一条退出路径上都不许留下没读走的变长载荷**。
+    /// 也就是说帧头读下来之后，要么当场把载荷读完，要么把「还没读完」这件事记下来
+    /// 交给能读完的人 —— 绝不允许"读了 opcode 就 break/return"。
+    ///
+    /// 「手机端要开下一单」（REQUEST_RECEIVE + RESUME_QUERY）的策略：读下来、存进
+    /// pending_receive / pending_resume，等重建彻底结束回主循环再办（那里才有 receiver）。
+    /// 为什么这样延迟是安全的 —— 时序的闸门在电脑手里：
+    ///   * 手机端发完 RESUME_QUERY 就停在那里等 RESUME_REPLY，位图没拿到之前它不会往
+    ///     任何传输通道写一个字节（对端 handle_resume_query 的那段逻辑就是这么写的）；
+    ///   * RESUME_REPLY 是主循环重新进入 handle_receive 之后才发的，而那时重建已经结束了
+    ///     —— 不存在"重建还没收全通道、手机已经开始发块"的窗口；
+    ///   * 重建只成功一部分也没关系：这一单的通道集合就是 self.transfers 里剩下的那些，
+    ///     handle_receive 按它们 spawn 读线程，手机端也只往它 ACK 过的那几条上写，
+    ///     少几条通道只是慢一点，不会写丢；
+    ///   * 一条都没重建回来的话，rebuild_transfers 照旧返回错误（下面那支），会话断掉、
+    ///     pending 里的那一单一起作废：没有能收的通道，硬留着会话只会让手机端卡在等
+    ///     RESUME_REPLY 上直到超时，还不如老实断线重连。
     fn rebuild_transfers(&mut self) -> io::Result<usize> {
         // 先告诉手机"这是取消，不是断线" —— 本机点「中断发送」时它还不知道；
         // 手机自己点的取消，这一帧重复一次也无害（它是幂等的）。
@@ -635,20 +705,43 @@ impl Session {
                     | controller::CANCEL_DISCARD
                     | controller::PAUSE_STATE
                     | controller::SPEED_LIMIT
+                    // 309：队列快照也是「走到哪儿都能吞」的那种 —— 它载荷变长，
+                    // 当 pending 留给主循环会把后面的帧读错位
+                    | controller::QUEUE_STATE
                     | controller::LIST_FILES
                     | controller::DELETE_FILE
                     | controller::MKDIR
-                    | controller::CHECK_PENDING => self.handle_control_frame(id)?,
+                    | controller::CHECK_PENDING
+                    // 手机端正常断开前会发这一帧：当成断线报上去（不是"意外帧"），
+                    // 否则要干等到 45 秒的 deadline 才失败，界面卡在那儿不动
+                    | controller::SHUTDOWN => self.handle_control_frame(id)?,
+                    // 手机端要开「下一单」（多选排队）。REQUEST_RECEIVE 自己不载荷，
+                    // 真正带载荷的是紧跟其后的一帧 RESUME_QUERY（整份文件清单）。
+                    // 这里只做记号、把帧头吃掉是安全的；清单那一帧由下面那支读干净。
+                    controller::REQUEST_RECEIVE => self.note_pending_receive(),
+                    // 清单来了：载荷当场读完存进 pending_resume（回主循环再回位图）。
+                    // 也可能 REQUEST_RECEIVE 已经落在重建窗口之前，这里补上记号。
+                    controller::RESUME_QUERY => self.stash_resume_query()?,
+                    // 306：反方向的续传状态帧。重建期间没有 handle_send 在读它，
+                    // 也没有能接手它的人 —— 载荷读干净丢掉，绝不能留在流里。
+                    controller::RESUME_STATE => self.discard_resume_state()?,
+                    // 手机来电脑取文件（发送方向的「下一单」）：它的载荷变长，
+                    // 而重建窗口里跑不了 handle_send —— 同样读干净丢掉。
+                    controller::REQUEST_SEND => self.discard_send_request()?,
                     other => {
+                        // 认不出来的帧：协议里没有"帧长"字段，它有没有载荷、
+                        // 载荷多长都无从得知。但**不能**因此放弃重建 —— 那等于因为
+                        // 手机上多传了一帧就把整条会话拆掉（就是这一轮报的那个 bug）。
+                        // 只吃掉它的 opcode（和主循环遇到不认识指令时一模一样：
+                        // 警告 + 忽略），重建继续等 ACK。
                         log::warn(&format!(
-                            "{} {}",
+                            "{} {}（已忽略，重建继续）",
                             crate::i18n::tr(
-                                "重建通道时收到意外的控制帧（已放弃重建）",
-                                "unexpected frame while waiting for REBUILD_ACK",
+                                "重建通道时收到不认识的控制帧",
+                                "unknown control frame while waiting for REBUILD_ACK",
                             ),
                             other
                         ));
-                        break;
                     }
                 }
             }
@@ -802,10 +895,9 @@ impl Session {
     /// PING 就地处理 —— 收尾时手机端的暂停同步还在飞，不处理就会把结论读串。
     fn read_result(&mut self) -> io::Result<PeerResult> {
         loop {
-            let id = match self.pending_opcode.take() {
-                Some(id) => id,
-                None => proto::read_i16(&mut self.reader)?,
-            };
+            // 这里在等结论帧，但手机可能先插一帧队列快照进来（用户随时能改队列）。
+            // 由辅助函数就地吞掉，别的帧照原样返回。
+            let id = self.read_control_frame_skipping_queue()?;
             log::debug(&format!("waiting phone RESULT: frame {}", id));
             match id {
                 controller::RESULT => {
@@ -916,6 +1008,15 @@ impl Session {
     }
 
     fn poll_control_during_transfer(&mut self) -> io::Result<()> {
+        // 本地点了「取消」就先回主循环去办正事（关传输通道 + 发 CANCEL），
+        // 别把这一轮控制帧的应答先做完 —— 那些应答是**阻塞写**，手机那边一时
+        // 读得慢就会顶住几百毫秒到几秒，用户看到的就是「按下取消，进度还在涨」。
+        //
+        // 说清楚它的边界：这只是「取消之后不再多干一份活」，打断不了已经在飞的
+        // read/write（见 handle_receive 等待循环里那段注释）。
+        if crate::control::cancelled() {
+            return Ok(());
+        }
         // 传输期间照样把「本机改了限速」推过去（这一步每圈都过，代价是一次原子读）。
         self.flush_speed_limit()?;
         if self.pending_opcode.is_some() {
@@ -969,6 +1070,9 @@ impl Session {
             // 308：限速帧带一个 i32，不按 6 字节等就会把 4 字节载荷留在通道里，
             // 下一次读的「opcode」正好是那个 i32 的高位 —— 帧流当场错位。
             controller::SPEED_LIMIT => 4,
+            // 309 的 QUEUE_STATE 载荷是变长的（条数 + 每条变长文件名），peek 这两个字节
+            // 算不出整帧要多少，所以落到下面这个 0：帧头读完由 handle_control_frame
+            // 顺着载荷读下去。手机是把整帧一次 write 出来的，中间那几毫秒的等待可以接受。
             _ => 0,
         };
         if available < 2 + payload_len {
@@ -978,6 +1082,14 @@ impl Session {
                 .set_read_timeout(Some(Duration::from_secs(120)));
             return Ok(());
         }
+        // 读帧体前必须把超时恢复成正常值：QUEUE_STATE 是变长帧，payload_len 落在 0，
+        // 也就是「peek 到 2 字节就动手读帧头」。手机虽然整帧一次 writeFully，TCP 仍可能
+        // 把几百字节的文件名载荷切成两段 —— 还顶着 2ms 超时去读，读到一半就超时，
+        // 帧体读残缺，下一个「opcode」成了文件名的半截字节，整条控制通道当场错位。
+        // 定长帧（PAUSE_STATE / SPEED_LIMIT）在上面已经确认到齐，这一步对它们没有代价。
+        let _ = self
+            .reader
+            .set_read_timeout(Some(Duration::from_secs(120)));
         let id = proto::read_i16(&mut self.reader)?;
         let result = self.handle_control_frame(id);
         let _ = self
@@ -1029,6 +1141,60 @@ impl Session {
         Ok(())
     }
 
+    /// 33（309）：手机推来「排队中」任务的快照。
+    ///
+    /// 载荷 `{i32 count}{ (UTF 文件名, i64 字节数, u8 状态) * count }`，整表覆盖。
+    /// 只发不答：手机不等电脑确认，电脑端把这张表存进登记表就够了 ——
+    /// 界面每 16ms 读一次登记表，读不到就当队列是空的，不需要一次控制通道往返。
+    fn handle_queue_state(&mut self) -> io::Result<()> {
+        let items = queue::read_items(&mut self.reader)?;
+        let previous = queue::get_for(&self.device);
+        let waiting = items
+            .iter()
+            .filter(|item| item.state == queue::state::WAITING)
+            .count();
+        // 手机在传输期间每秒还会补发一帧兜底（那边 ServerService 的 1 秒节拍），
+        // 内容通常和上一帧一模一样 —— 每帧都按 info 记，日志就成了每秒一行。
+        // 只有「这一帧和登记表里那张不一样」才值得写进日志。
+        let line = format!(
+            "{} {} {} {}",
+            crate::i18n::tr("手机队列更新：共", "queue update from the phone:"),
+            items.len(),
+            crate::i18n::tr("条，其中等待中", "item(s), waiting:"),
+            waiting
+        );
+        if previous == items {
+            log::debug(&line);
+        } else {
+            log::info(&line);
+        }
+        // 整表覆盖（含空表）：手机每报一次就以这一次为准，见 queue::set_for
+        queue::set_for(&self.device, items);
+        Ok(())
+    }
+
+    /// 读下一个控制帧的 opcode；路上撞见 QUEUE_STATE 就地吃掉（解析存表）再继续读。
+    ///
+    /// 控制通道的读点都是「上下文特定」的：这里在等 RESULT（收尾时），那里在等
+    /// RESUME_QUERY / RESUME_STATE（开传之前）。手机随时可能推队列快照（用户在手机上
+    /// 又勾了几个文件、或者删掉排队里的某一条），它插在哪两次读之间只取决于线程调度。
+    ///
+    /// 所以不在每个等待点各写一个 switch 分支 —— 漏一处就是帧序错位（那一帧的载荷
+    /// 会被当成下一个帧头读走，整条会话当场报废）。统一走这个入口：QUEUE_STATE 是
+    /// 唯一「出现在哪儿都能吞掉」的帧，其它帧原样交回给调用方自己判。
+    fn read_control_frame_skipping_queue(&mut self) -> io::Result<i16> {
+        loop {
+            let id = match self.pending_opcode.take() {
+                Some(id) => id,
+                None => proto::read_i16(&mut self.reader)?,
+            };
+            if id != controller::QUEUE_STATE {
+                return Ok(id);
+            }
+            self.handle_queue_state()?;
+        }
+    }
+
     fn handle_control_frame(&mut self, id: i16) -> io::Result<()> {
         match id {
             controller::PING => {}
@@ -1059,6 +1225,10 @@ impl Session {
                 crate::control::set_discard_partial(true);
                 crate::control::cancel();
             }
+            // 309：队列快照在传输 / 重建期间也可能来（手机那头随时能改队列）。
+            // 载荷是变长的，必须就地读完存表 —— 当 pending 留给主循环，
+            // 「只读了帧头没读载荷」的通道立刻错位一拍。
+            controller::QUEUE_STATE => self.handle_queue_state()?,
             controller::RESULT => {
                 // 手机端的落盘结论可能在本机发送线程收尾那一瞬间到：先记下指令头，
                 // 载荷由收尾时的 read_result() 接着读，不能当成不相干的指令丢掉
@@ -1131,7 +1301,8 @@ impl Session {
 
     /// 306：读手机作为接收端上报的"已经收到哪些块"（电脑→手机方向的续传）
     fn read_resume_state(&mut self) -> io::Result<HashMap<String, Vec<u8>>> {
-        let id = proto::read_i16(&mut self.reader)?;
+        // 同上：等 RESUME_STATE 时也要能跳过路上插进来的队列快照
+        let id = self.read_control_frame_skipping_queue()?;
         if id != controller::RESUME_STATE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -1450,13 +1621,31 @@ impl Session {
     /// 帧格式见 {@link proto::controller::RESUME_QUERY} / {@link proto::controller::RESUME_REPLY}。
     /// 手机端在 `REQUEST_RECEIVE` 之后立刻发这一帧，所以这里可以同步读。
     fn handle_resume_query(&mut self, receiver: &Arc<Receiver>) -> io::Result<()> {
-        let id = proto::read_i16(&mut self.reader)?;
+        let entries = self.read_resume_query_entries()?;
+        self.reply_resume_entries(receiver, entries)
+    }
+
+    /// 读一帧 RESUME_QUERY（帧头 + 载荷）。
+    fn read_resume_query_entries(&mut self) -> io::Result<Vec<(String, u64, i64)>> {
+        // 手机在 REQUEST_RECEIVE 之后立刻发这一帧，但队列快照有可能正好插在中间
+        // （用户在手机上点了「发送」又顺手改了队列）：照常跳过它，别把帧序读歪。
+        let id = self.read_control_frame_skipping_queue()?;
         if id != controller::RESUME_QUERY {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("expected RESUME_QUERY, got {}", id),
             ));
         }
+        self.read_resume_query_payload()
+    }
+
+    /// 读 RESUME_QUERY 的载荷：{i32 count}{ (UTF 路径, i64 大小, i64 修改时间) * count }
+    /// —— 帧头已经读掉了。
+    ///
+    /// 和帧头拆开是给 rebuild_transfers / 主循环用的：那两处的 opcode 是自己按
+    /// 帧序读到的（不能重读），而载荷必须当场读干净 —— 留在流里就是帧序错位；
+    /// 但"回位图"那一步要 receiver，只能回主循环做。
+    fn read_resume_query_payload(&mut self) -> io::Result<Vec<(String, u64, i64)>> {
         let count = proto::read_i32(&mut self.reader)?.max(0) as usize;
         let mut entries: Vec<(String, u64, i64)> = Vec::with_capacity(count.min(4096));
         for _ in 0..count {
@@ -1465,6 +1654,15 @@ impl Session {
             let mtime = proto::read_i64(&mut self.reader)?;
             entries.push((path, size, mtime));
         }
+        Ok(entries)
+    }
+
+    /// 回一帧 RESUME_REPLY：每个文件"已经收到哪些块"的位图，并把这些块标进进度。
+    fn reply_resume_entries(
+        &mut self,
+        receiver: &Arc<Receiver>,
+        entries: Vec<(String, u64, i64)>,
+    ) -> io::Result<()> {
         proto::write_i16(&mut self.writer, controller::RESUME_REPLY)?;
         proto::write_i32(&mut self.writer, entries.len() as i32)?;
         let mut resumed = 0usize;
@@ -1518,6 +1716,101 @@ impl Session {
         Ok(())
     }
 
+    /// 记下「手机端要开下一单」这件事（REQUEST_RECEIVE）。
+    ///
+    /// 这一帧自己不带载荷（只有两字节 opcode），真正带载荷的是紧跟其后的
+    /// RESUME_QUERY —— 见 stash_resume_query。这里只置记号：
+    /// 处理这一单要 receiver，而当前线程（重建 / 传输收尾）拿不到它。
+    fn note_pending_receive(&mut self) {
+        self.pending_receive = true;
+        log::info(crate::i18n::tr(
+            "手机端要开始下一单（等通道就绪后接着接收）",
+            "the phone queued the next transfer (it starts once the channels are back)",
+        ));
+    }
+
+    /// 读掉一帧 RESUME_QUERY 的载荷（整份文件清单）并暂存，回主循环再回位图。
+    ///
+    /// 必须当场读完：这一帧是变长的，只读帧头就走，下一次「读 opcode」读到的是
+    /// 清单里的字节 —— 真机日志上那一串 0 / 75 / -20960 / 418 就是这么来的。
+    fn stash_resume_query(&mut self) -> io::Result<()> {
+        // 走到这儿的调用方都已经把帧头（RESUME_QUERY 那两个字节）读掉了
+        let entries = self.read_resume_query_payload()?;
+        log::info(&format!(
+            "{} {} {}",
+            crate::i18n::tr(
+                "手机端已经排好下一单（清单已读好，等通道重建完就开传）",
+                "the phone queued the next transfer; its file list is buffered",
+            ),
+            entries.len(),
+            crate::i18n::tr("个文件", "file(s)")
+        ));
+        // 清掉上一份：同一时刻只可能有一单在开头，旧的只可能是没来得及办就作废的那种
+        self.pending_resume = Some(entries);
+        // 记号在这儿置上就够了（上面那行日志已经说明"要做下一单"）：
+        // 万一 10 那帧没走到 note_pending_receive（比如它落在重建窗口之前），
+        // 光凭这一帧也得让主循环去把这一单办了。
+        self.pending_receive = true;
+        Ok(())
+    }
+
+    /// 读掉一帧 REQUEST_SEND（手机来电脑取文件）连同它后面的续传状态帧。
+    ///
+    /// 重建窗口里没有发送计划可跑（传输通道正在重建），但这一帧的载荷是变长的
+    /// —— 只吃 opcode 就会把后面每一帧读歪。所以整段读干净再丢，日志里说清楚
+    /// 这一次取文件请求没有被满足（用户再点一次就行）。
+    fn discard_send_request(&mut self) -> io::Result<()> {
+        // 字段顺序和 handle_send 读的那一段完全一致（协议里两者是一份）
+        let count = proto::read_i32(&mut self.reader)?.max(0).min(4096);
+        for _ in 0..count {
+            let _source = proto::read_utf(&mut self.reader)?;
+        }
+        let _phone_dir = proto::read_utf(&mut self.reader)?;
+        let _phone_fs = proto::read_i32(&mut self.reader)?;
+        let _pc_dir = proto::read_utf(&mut self.reader)?;
+        // 手机在这之后紧接着还会发一帧 RESUME_STATE（它已经有哪些块）：
+        // handle_send 里是用 read_resume_state 同步读的，这里照同一个顺序读掉。
+        let id = self.read_control_frame_skipping_queue()?;
+        if id == controller::RESUME_STATE {
+            self.discard_resume_state()?;
+        } else {
+            // 正常不会有别的帧；真出现了也不能丢 —— opcode 已经读走，放回 pending_opcode，
+            // 由调用方的循环按原顺序接手（它会接着把这一帧的载荷读干净）。
+            self.pending_opcode = Some(id);
+        }
+        log::warn(crate::i18n::tr(
+            "重建通道时收到手机端取文件请求（已读干净丢弃，请让手机再点一次）",
+            "a file pull request arrived while the channels were being rebuilt; it was dropped",
+        ));
+        Ok(())
+    }
+
+    /// 读掉一帧 RESUME_STATE 的载荷并丢掉。
+    ///
+    /// 306 的这帧只属于「电脑 → 手机」那个方向，正常由 handle_send 里的
+    /// read_resume_state 同步读掉。它要是出现在别的地方（手机那边时序被取消 /
+    /// 排队打乱），也必须把载荷读干净再丢 —— 留着它，下一条帧的头就是位图里的字节。
+    fn discard_resume_state(&mut self) -> io::Result<()> {
+        // count 是变长载荷的总开关：真错位时它可能是任意垃圾值，别照着它转几百万圈
+        let count = proto::read_i32(&mut self.reader)?.max(0).min(65536) as usize;
+        for _ in 0..count {
+            let _dest = proto::read_utf(&mut self.reader)?;
+            let _size = proto::read_i64(&mut self.reader)?;
+            let _mtime = proto::read_i64(&mut self.reader)?;
+            let len = proto::read_i32(&mut self.reader)?.max(0) as usize;
+            let len = len.min(4 * 1024 * 1024);
+            let mut bits = vec![0u8; len];
+            if len > 0 {
+                self.reader.read_exact(&mut bits)?;
+            }
+        }
+        log::warn(crate::i18n::tr(
+            "当前不该收到续传状态帧（已读干净丢弃）",
+            "a RESUME_STATE frame arrived out of place; read and dropped",
+        ));
+        Ok(())
+    }
+
     fn handle_receive(&mut self, receiver: &Arc<Receiver>) -> io::Result<()> {
         if self.transfers.is_empty() {
             return Err(io::Error::new(
@@ -1526,6 +1819,8 @@ impl Session {
             ));
         }
         log::info(crate::i18n::tr("手机开始发送文件", "the phone is sending files"));
+        // 「下一单」这一单就在这里办了，记号清掉（清单接着从 pending_resume 取）
+        self.pending_receive = false;
         // 新一轮开始了：把上一轮的「接收失败」清掉。
         // 不点「开始接收」、直接由手机发起的那一轮（手机主动发文件）也是从这里进的，
         // 不清的话上一轮的失败红字会挂在窗口上，看着像这一轮也失败了（真机 2026-11-17 撞见）。
@@ -1552,16 +1847,27 @@ impl Session {
         // 「通道名称没有显示」就是这个（截图里 12 条通道 + 一堆「续传」行）。
         //
         // 顺序要求：reset → set_channels → handle_resume_query。
-        crate::receiver::PROGRESS.set_channels(
-            self.transfers
-                .iter()
-                .map(|(name, _)| name.clone())
-                .collect(),
-        );
+        //
+        // 两份都要登记：全局那份给主窗口的大卡片，receiver.progress 那份是"本设备"的，
+        // 多设备时每台设备一个操作块，各读各的（见 receiver::progress_for）。
+        let channel_names: Vec<String> = self
+            .transfers
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect();
+        receiver.progress.set_channels(channel_names.clone());
+        crate::receiver::PROGRESS.set_channels(channel_names);
         // 305：手机发完 REQUEST_RECEIVE 会立刻来一帧 RESUME_QUERY（这次要传的文件清单），
         // 这里读它、回每个文件"已经收到哪些块"的位图，发送端据此跳过已收到的块；
         // 同时把这些块直接标进进度（手机端也是把它们当完成的）。
-        self.handle_resume_query(receiver)?;
+        //
+        // 清单也可能已经替我们读好了（取消后重建通道时收到的那一单，
+        // 见 rebuild_transfers / stash_resume_query）：那种情况下去流里再读一次
+        // 会一直等到读超时 —— 那一帧早就消费掉了。
+        match self.pending_resume.take() {
+            Some(entries) => self.reply_resume_entries(receiver, entries)?,
+            None => self.handle_resume_query(receiver)?,
+        }
         // 接收方向没有发送计划：清掉上一次的发送分段，界面改按"谁写了第几块"还原
         reset_send_segments();
         // 通道名已在上面（reset 之后、续传查询之前）登记 —— 那时下标就和下面
@@ -1825,6 +2131,7 @@ impl Session {
                 "接收已取消（数据已收齐，文件保留）",
                 "receiving cancelled after all data arrived; the files stay",
             ));
+            receiver.progress.reset();
             crate::receiver::PROGRESS.reset();
             reset_send_segments();
             return self.finish_cancelled();
@@ -1853,6 +2160,7 @@ impl Session {
                 "接收已取消",
                 "the transfer was cancelled",
             ));
+            receiver.progress.reset();
             crate::receiver::PROGRESS.reset();
             reset_send_segments();
             return self.finish_cancelled();
@@ -1894,6 +2202,7 @@ impl Session {
                 "接收已取消",
                 "the transfer was cancelled",
             ));
+            receiver.progress.reset();
             crate::receiver::PROGRESS.reset();
             reset_send_segments();
             return self.finish_cancelled();
@@ -2666,6 +2975,27 @@ mod tests {
             proto::write_i16(&mut cw, controller::SPEED_LIMIT).unwrap();
             proto::write_i32(&mut cw, 9).unwrap();
             proto::write_i16(&mut cw, controller::REQUEST_RECEIVE).unwrap();
+            // 309：手机可能在这一帧之后、RESUME_QUERY 之前插一帧队列快照
+            // （用户在手机上点了「发送」又顺手改了队列，就是这个时序）。
+            // 电脑端必须顺着载荷把它读完、存进登记表 —— 认成「等错了帧」直接断开，
+            // 或只读帧头不读载荷，都会让帧流错位。
+            proto::write_i16(&mut cw, controller::QUEUE_STATE).unwrap();
+            crate::queue::write_items(
+                &mut cw,
+                &[
+                    crate::queue::QueueItem {
+                        name: "排队一.mp4".to_string(),
+                        size: 4096,
+                        state: crate::queue::state::WAITING,
+                    },
+                    crate::queue::QueueItem {
+                        name: "排队二.mp4".to_string(),
+                        size: 8192,
+                        state: crate::queue::state::RUNNING,
+                    },
+                ],
+            )
+            .unwrap();
             // 305：REQUEST_RECEIVE 之后紧跟着必须是 RESUME_QUERY（电脑端同步读这一帧），
             // 一个文件都不查也要发，只是 count = 0。
             proto::write_i16(&mut cw, controller::RESUME_QUERY).unwrap();
@@ -2863,9 +3193,13 @@ mod tests {
         // 308：本机配置 7，mock 手机报 0（不限速）→ 共用值必须是 7，
         // 而且电脑要真的采纳它（连上就生效，不等第一块数据）。
         PUSHED_LIMITS.lock().unwrap().clear();
+        // 309：队列登记表是进程级的，先清干净再断言 mock 推来的那一帧
+        crate::queue::clear("MOCK-QUEUE-PHONE");
         crate::ratelimit::set_configured_mb(7);
         let server = spawn_mock_phone(listener, folder_path.clone(), blocks, home.clone());
         let mut session = Session::connect(IpAddr::from([127, 0, 0, 1]), port, &home, 0).unwrap();
+        // 串号是队列登记表的键（会话里用 self.device 入库，界面用设备串号查）
+        session.device = "MOCK-QUEUE-PHONE".to_string();
         assert_eq!(session.interface_names(), "USB_ADB, wlan0");
         assert_eq!(
             crate::ratelimit::configured_mb(),
@@ -2916,6 +3250,18 @@ mod tests {
             "电脑改了限速要把新值推给手机，实际推送：{:?}",
             PUSHED_LIMITS.lock().unwrap()
         );
+
+        // 309：mock 在 REQUEST_RECEIVE 之后插的那一帧 QUEUE_STATE 必须落在登记表里，
+        // 而且只有「等待中」的那一条会被界面画成等待块（state == 1 就是正在传的那个块）。
+        let queued = crate::queue::get_for("MOCK-QUEUE-PHONE");
+        assert_eq!(queued.len(), 2, "整表覆盖要存下手机报来的全部条目");
+        assert_eq!(queued[0].name, "排队一.mp4");
+        assert_eq!(queued[0].size, 4096);
+        assert_eq!(queued[0].state, crate::queue::state::WAITING);
+        let waiting = crate::queue::waiting_for("MOCK-QUEUE-PHONE");
+        assert_eq!(waiting.len(), 1, "只有 state == 0 的那条才是等待块");
+        assert_eq!(waiting[0].name, "排队一.mp4");
+        crate::queue::clear("MOCK-QUEUE-PHONE");
 
         assert_eq!(std::fs::read(&big_path).unwrap(), big);
         assert_eq!(std::fs::read(&small_path).unwrap(), small);
@@ -2982,6 +3328,208 @@ mod tests {
         let bitmap = &raw[32..];
         assert_eq!(bitmap[0] & 0b0000_0001, 1, "第 0 块是收到的");
         assert_eq!(bitmap[0] & 0b0000_0010, 0, "第 1 块必须留着让重传补");
+    }
+
+    /// 这一轮的核心验收：取消之后手机立刻开「下一单」，不许把重建和会话搞死。
+    ///
+    /// 复现真机 06:54:45 的时序（逐字对应日志里那三条「意外的控制帧」）：
+    ///   1. 电脑点了「取消」→ rebuild_transfers 发出 CANCEL，等 REBUILD_ACK；
+    ///   2. 手机端（多选排队）不发 ACK，先发 REQUEST_RECEIVE(10)，
+    ///      紧跟一帧 RESUME_QUERY(28)，载荷是下一单的整份文件清单；
+    ///   3. 再回 REBUILD_ACK。
+    ///
+    /// 以前第 2 步那支 other => break 会把 10 的帧头读走、把 28 整帧留在流里，
+    /// 之后读到的「opcode」就是清单里的字节（日志上的 0 / 75 / -20960 / 418），
+    /// 重建失败 → 会话被判成断线 → 进度窗口整个消失。
+    ///
+    /// 现在断言：这两帧的载荷都被读走（清单进了 pending_resume）、REBUILD_ACK 照常
+    /// 收到、重建成功、下一单在主循环里被补办（回 RESUME_REPLY）、整条帧流一帧不差
+    /// （REBUILD_ACK / RESUME_REPLY / EOF / RESULT / SHUTDOWN 全按顺序对上），
+    /// 会话以 Shutdown 正常收场 —— 不是 Disconnected。
+    #[test]
+    fn a_queued_next_task_does_not_break_the_cancel_rebuild() {
+        let _serial = rate_serial();
+        let dir = temp_dir("rebuild-next-task");
+        let home = util::normalize_dir(&dir).to_string_lossy().to_string();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let next_path = dir.join("下一单.bin").to_string_lossy().to_string();
+        let next_size = 2 * BLOCK_SIZE;
+        let next_mtime = 1_700_000_000_000i64;
+
+        let next_path_for_mock = next_path.clone();
+        let home_for_mock = home.clone();
+        let server = thread::spawn(move || {
+            let (control, _) = listener.accept().unwrap();
+            control
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            control
+                .set_write_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut cr: &TcpStream = &control;
+            let mut cw: &TcpStream = &control;
+            // ---- 握手：和 spawn_mock_phone 那一套完全一致 ----
+            let mut header = [0u8; 4];
+            cr.read_exact(&mut header).unwrap();
+            assert_eq!(&header, proto::CLIENT_HEADER);
+            assert_eq!(proto::read_i32(&mut cr).unwrap(), proto::VERSION_CODE);
+            proto::write_bool(&mut cw, true).unwrap();
+            let pc_limit = proto::read_i32(&mut cr).unwrap();
+            let shared = crate::ratelimit::shared_value(pc_limit as i64, 0) as i32;
+            proto::write_i32(&mut cw, shared).unwrap();
+            proto::write_i32(&mut cw, 2).unwrap();
+            for name in ["USB_ADB", "wlan0"] {
+                proto::write_utf(&mut cw, name).unwrap();
+                proto::write_u8(&mut cw, 4).unwrap();
+                cw.write_all(&[127, 0, 0, 1]).unwrap();
+                proto::write_u8(&mut cw, 0).unwrap();
+            }
+            let mut old = Vec::new();
+            for _ in 0..2 {
+                let (transfer, _) = listener.accept().unwrap();
+                assert!(proto::read_bool(&mut cr).unwrap());
+                assert!(!proto::read_utf(&mut cr).unwrap().is_empty());
+                proto::write_bool(&mut cw, true).unwrap();
+                old.push(transfer);
+            }
+            proto::write_i32(&mut cw, 512).unwrap();
+            assert!(proto::read_bool(&mut cr).unwrap());
+            proto::write_bool(&mut cw, true).unwrap();
+            assert_eq!(
+                proto::read_i32(&mut cr).unwrap(),
+                proto::current_file_system()
+            );
+            assert_eq!(proto::read_utf(&mut cr).unwrap(), home_for_mock);
+
+            // ---- 电脑点了「取消」：重建的敲门砖是 CANCEL ----
+            assert_eq!(
+                next_opcode(&mut cr),
+                controller::CANCEL,
+                "重建开始时应先发出一帧 CANCEL"
+            );
+
+            // ---- 手机端立刻开下一单，全部插在 REBUILD_ACK 之前 ----
+            // 10 自己不带载荷，带载荷的是紧跟其后的 28（整份文件清单）
+            proto::write_i16(&mut cw, controller::REQUEST_RECEIVE).unwrap();
+            proto::write_i16(&mut cw, controller::RESUME_QUERY).unwrap();
+            proto::write_i32(&mut cw, 1).unwrap();
+            proto::write_utf(&mut cw, &next_path_for_mock).unwrap();
+            proto::write_i64(&mut cw, next_size as i64).unwrap();
+            proto::write_i64(&mut cw, next_mtime).unwrap();
+            // 306 的反方向续传状态帧：重建窗口里没人处理它，但载荷是变长的，
+            // 必须被读干净丢掉（留下来同样是帧序错位）
+            proto::write_i16(&mut cw, controller::RESUME_STATE).unwrap();
+            proto::write_i32(&mut cw, 1).unwrap();
+            proto::write_utf(&mut cw, "back.bin").unwrap();
+            proto::write_i64(&mut cw, BLOCK_SIZE as i64).unwrap();
+            proto::write_i64(&mut cw, next_mtime).unwrap();
+            proto::write_i32(&mut cw, 1).unwrap();
+            cw.write_all(&[0xFF]).unwrap();
+            // 发送方向的「下一单」（手机来电脑取文件）：重建窗口里跑不了 handle_send，
+            // 但它同样是一整段变长载荷，必须读干净丢掉，不能留在流里
+            proto::write_i16(&mut cw, controller::REQUEST_SEND).unwrap();
+            proto::write_i32(&mut cw, 1).unwrap();
+            proto::write_utf(&mut cw, "/sdcard/取这个.mp4").unwrap();
+            proto::write_utf(&mut cw, "/sdcard/DCIM").unwrap();
+            proto::write_i32(&mut cw, proto::current_file_system()).unwrap();
+            proto::write_utf(&mut cw, &home_for_mock).unwrap();
+            // 这一帧后面紧跟的续传状态帧（这一单没有已收到的块）
+            proto::write_i16(&mut cw, controller::RESUME_STATE).unwrap();
+            proto::write_i32(&mut cw, 0).unwrap();
+
+            // ---- 现在才回两条 REBUILD_ACK ----
+            let mut rebuilt = Vec::new();
+            for _ in 0..2 {
+                let (transfer, _) = listener.accept().unwrap();
+                assert_eq!(
+                    next_opcode(&mut cr),
+                    controller::REBUILD_REQ,
+                    "手机端开下一单不能影响重建握手的第一帧"
+                );
+                assert!(!proto::read_utf(&mut cr).unwrap().is_empty());
+                proto::write_i16(&mut cw, controller::REBUILD_ACK).unwrap();
+                proto::write_bool(&mut cw, true).unwrap();
+                rebuilt.push(transfer);
+            }
+            drop(old);
+
+            // ---- 主循环把被推迟的那一单办了：回 RESUME_REPLY ----
+            assert_eq!(
+                next_opcode(&mut cr),
+                controller::RESUME_REPLY,
+                "重建之后必须补办下一单：回 RESUME_REPLY"
+            );
+            assert_eq!(
+                proto::read_i32(&mut cr).unwrap(),
+                1,
+                "RESUME_REPLY 的文件数要和手机发来的清单一致（帧没错位才读得对）"
+            );
+            assert!(
+                !proto::read_bool(&mut cr).unwrap(),
+                "文件不在盘上，不该报可续传"
+            );
+            assert_eq!(proto::read_i32(&mut cr).unwrap(), 0);
+
+            // ---- 两条重建回来的通道各来一帧 EOF：这一单没有数据块 ----
+            for transfer in &rebuilt {
+                let mut w: &TcpStream = transfer;
+                proto::write_i16(&mut w, transfer::EOF).unwrap();
+            }
+
+            // ---- 收尾：电脑先给落盘结论，手机回读文件结论，然后断开 ----
+            assert_eq!(
+                next_opcode(&mut cr),
+                controller::RESULT,
+                "帧流错了才会在这儿读到别的"
+            );
+            assert!(proto::read_bool(&mut cr).unwrap());
+            assert_eq!(proto::read_i32(&mut cr).unwrap(), 0);
+            proto::write_i16(&mut cw, controller::RESULT).unwrap();
+            proto::write_bool(&mut cw, true).unwrap();
+            proto::write_i32(&mut cw, 0).unwrap();
+            proto::write_i16(&mut cw, controller::SHUTDOWN).unwrap();
+            thread::sleep(Duration::from_millis(150));
+        });
+
+        crate::control::reset();
+        let mut session = Session::connect(IpAddr::from([127, 0, 0, 1]), port, &home, 0).unwrap();
+        session.device = "MOCK-NEXT-TASK-PHONE".to_string();
+        // 界面上点「取消 · 不保留」= 先记选择，再置取消标志（见 control::cancel_receive）
+        crate::control::set_discard_partial(true);
+        crate::control::cancel();
+
+        let rebuilt = match session.rebuild_transfers() {
+            Ok(count) => count,
+            Err(e) => panic!("手机端开下一单不该让重建失败（真机就是这儿断的）：{}", e),
+        };
+        assert_eq!(rebuilt, 2, "两条通道都该重建回来");
+
+        // 这两帧必须已经读走并记下来 —— 留在流里就是下一条帧的头被读歪
+        assert!(session.pending_receive, "REQUEST_RECEIVE 要记下来交给主循环");
+        let pending = match session.pending_resume.as_ref() {
+            Some(entries) => entries.clone(),
+            None => panic!("RESUME_QUERY 的载荷必须已经被读进来"),
+        };
+        assert_eq!(pending.len(), 1, "清单里就那一个文件");
+        assert_eq!(pending[0].0, next_path);
+        assert_eq!(pending[0].1, next_size);
+        assert_eq!(pending[0].2, next_mtime);
+
+        let receiver = Arc::new(Receiver::new(util::normalize_dir(&dir)));
+        let stop = Arc::new(AtomicBool::new(false));
+        match session.run(&receiver, &stop) {
+            SessionEnd::Shutdown => {}
+            SessionEnd::Disconnected(reason) => panic!("会话不该断（真机就是这个症状）：{}", reason),
+            SessionEnd::Stopped => panic!("unexpected stop"),
+        }
+        server.join().unwrap();
+        assert!(!session.pending_receive, "下一单办完就该把记号清掉");
+        assert!(
+            session.pending_resume.is_none(),
+            "清单用完就该清掉，别带到再下一单"
+        );
+        crate::control::reset();
     }
 }
 // ---------------- 发送方向（电脑 -> 手机） ----------------

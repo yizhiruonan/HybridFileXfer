@@ -58,11 +58,15 @@ import top.weixiansen574.hybridfilexfer.droidcore.HFXServer;
  *   <li>暂停 / 继续 / 取消都按任务作用在本对象上，不会误伤别的任务。</li>
  * </ul>
  *
- * <p><b>并发</b>：{@code core/} 的发送调度不能动，一条连接上同一时刻只能有一次传输。
+ * <p><b>并发</b>：{@code core/} 的发送控制不能动，一条连接上同一时刻只能有一次传输。
  * 所以打到<b>同一台电脑</b>上的多个任务靠 {@link SendTasks#acquire} 排队；
- * 打到不同电脑上的任务是真正并发的。被用户暂停着的任务占着通道不放的话，
- * 排队者会请它让出（{@link #requestHandover()}：保留进度的取消），
- * 所以「暂停任务1 → 发任务2 → 回头继续任务1」这条路走得通。
+ * 打到不同电脑上的任务是真正并发的。
+ *
+ * <p><b>暂停管住整个队列</b>（3.7.0）：连接上有任务被暂停着，队列里的下一个任务就<b>不开跑</b>
+ * （{@link SendTasks#acquire} 里那个暂停判断）。以前这里是"请暂停着的任务让出通道"
+ * （{@link #requestHandover()}：保留进度的取消），于是暂停了正在传的那个，
+ * 下一个文件立刻顶上来 —— 用户看到的就是"暂停了还在一个接一个地传"。
+ * 让出通道那条路还在，但只剩 {@code SUSPENDED} 这个状态在用。
  *
  * <p><b>状态机</b>：
  * <pre>
@@ -229,6 +233,9 @@ public final class SendTask {
         }
         statusText = appContext.getString(R.string.share_preparing);
         startRun();
+        // 309：队列里多了一个（还没连上电脑的话这一帧暂时落不到任何一条连接上，
+        // 等它占上发送通道时再推一次，见 transferGroup 里那处）
+        SendTasks.notifyQueueChanged();
     }
 
     private void startRun() {
@@ -329,6 +336,8 @@ public final class SendTask {
                 HFXLog.d("task " + taskId + ": cancelTransfer 失败", e);
             }
         }
+        // 309：用户取消了（队列上这一行要变成「已取消」）
+        SendTasks.notifyQueueChanged();
         SendTasks.onSettled(this);
     }
 
@@ -655,6 +664,8 @@ public final class SendTask {
             state = STATE_SENDING;
             statusText = "";
         }
+        // 309：开始传了（队列上这一行从「等待中」变成「进行中」）
+        SendTasks.notifyQueueChanged();
         Outcome outcome = new Outcome();
         try {
             Directory localDir = new Directory(group.dir, Directory.getCurrentFileSystem());
@@ -775,6 +786,7 @@ public final class SendTask {
 
     private void complete() {
         long displayPeak;
+        boolean wasPaused;
         synchronized (stateLock) {
             if (terminal) {
                 return;
@@ -782,9 +794,11 @@ public final class SendTask {
             terminal = true;
             state = STATE_DONE;
             statusText = "";
+            wasPaused = pausedByUser;
             pausedByUser = false;
             displayPeak = peakSpeedBytes;
         }
+        releasePauseOnFinish(wasPaused);
         String summary = buildFileSummary();
         if (displayPeak <= 0 && totalBytes > 0 && startTime > 0) {
             long elapsedMs = Math.max(1L, System.currentTimeMillis() - startTime);
@@ -818,6 +832,8 @@ public final class SendTask {
             } catch (Throwable ignored) {
             }
         });
+        // 309：完成了（队列上这一行要变成「已完成」）
+        SendTasks.notifyQueueChanged();
         SendTasks.onSettled(this);
     }
 
@@ -852,10 +868,33 @@ public final class SendTask {
             });
         } catch (Throwable ignored) {
         }
+        // 309：电脑端取消也是一次队列变化（这一行结束了）
+        SendTasks.notifyQueueChanged();
         SendTasks.onSettled(this);
     }
 
+    /**
+     * 这个任务收尾了：它按下的暂停必须跟着收掉（3.7.0）。
+     *
+     * <p>暂停闸门是<b>连接级</b>的（{@code HFXServer#pauseGate}），队列里的下一个任务就是看它
+     * 判断"现在能不能开跑"（见 {@code SendTasks#acquire} 里的暂停判断）。任务已经结束了、
+     * 闸门却还关着的话，那条连接上的队列会永远等下去 —— 而能放开它的那颗"继续"按钮
+     * 已经跟着这个任务一起没了。所以正常收尾 / 失败这两种结局顺手兜一下。
+     *
+     * <p>用户主动取消不用管：{@code cancel()} 里的 {@code abortTransfer} 已经把闸门放开了。
+     */
+    private void releasePauseOnFinish(boolean wasPaused) {
+        if (!wasPaused) {
+            return;
+        }
+        HFXServer srv = server;
+        if (srv != null) {
+            srv.resumeTransfer();
+        }
+    }
+
     private void fail(String message) {
+        boolean wasPaused;
         synchronized (stateLock) {
             if (terminal) {
                 return;
@@ -863,11 +902,15 @@ public final class SendTask {
             terminal = true;
             state = STATE_FAILED;
             statusText = "";
+            wasPaused = pausedByUser;
             pausedByUser = false;
         }
+        releasePauseOnFinish(wasPaused);
         Log.w(TAG, "task " + taskId + " 失败: " + message);
         HFXLog.d("task " + taskId + ": 失败 " + message);
         resultText = appContext.getString(R.string.share_failed, message);
+        // 309：失败了（队列上这一行要变成「失败」）
+        SendTasks.notifyQueueChanged();
         SendTasks.onSettled(this);
     }
 

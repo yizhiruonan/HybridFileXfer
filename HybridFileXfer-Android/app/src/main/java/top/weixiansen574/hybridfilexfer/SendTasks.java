@@ -461,6 +461,120 @@ public final class SendTasks {
     }
 
     // ------------------------------------------------------------------
+    // 309：QUEUE_STATE —— 发给电脑的那份队列快照
+    // ------------------------------------------------------------------
+
+    /**
+     * QUEUE_STATE 的状态码（线格式上定死的数值，和 {@code ControllerIdentifiers.QUEUE_STATE} 的注释一致）。
+     *
+     * <p>手机内部有 8 个状态（准备中 / 排队 / 在传 / 暂停 / 让出 / 完成 / 失败 / 取消），
+     * 线上只有 4 个格子。折叠规则见 {@link #queueStateFor(int)}。
+     */
+    public static final int QUEUE_STATE_WAITING = 0;
+    public static final int QUEUE_STATE_RUNNING = 1;
+    public static final int QUEUE_STATE_DONE = 2;
+    public static final int QUEUE_STATE_FAILED = 3;
+
+    /**
+     * 队列里的一行，<b>协议用</b>：只有线上要的那三个字段，字段全是 final。
+     *
+     * <p>为什么不直接把 {@link TaskInfo} 那种富对象递出去：协议帧的字段越少越不容易
+     * 跟着界面需求变，电脑那边按这个结构读就行。
+     */
+    public static final class QueueStateEntry {
+        /** 文件名（还没解析出文件时是空串） */
+        public final String fileName;
+        /** 这个任务的文件总字节数（不是已传字节，见 {@code ControllerIdentifiers.QUEUE_STATE}） */
+        public final long bytes;
+        /** {@link #QUEUE_STATE_WAITING} / RUNNING / DONE / FAILED */
+        public final int state;
+
+        QueueStateEntry(String fileName, long bytes, int state) {
+            this.fileName = fileName == null ? "" : fileName;
+            this.bytes = bytes;
+            this.state = state;
+        }
+    }
+
+    /**
+     * 某台电脑那一侧的队列快照，给 {@code HFXServer#writeQueueState()} 用。
+     *
+     * <p><b>按连接过滤</b>：这张表是全进程一份的，一台手机可能同时连着几台电脑，
+     * 发给 A 的那一帧只能有 A 要收的那几行（不然 A 的界面上会出现别人的文件）。
+     * 还没落到某条连接上的任务（准备中、还没握手）不在这条连接里，等它连上再出现。
+     *
+     * <p>顺序和面板 / 通知一致（正在传的在最前，排队的跟上，收尾的垫底），
+     * 电脑画出来的列表就和手机上一个样。
+     *
+     * <p>折叠规则：
+     * <ul>
+     *   <li>SENDING / PAUSED → 进行中：暂停着的那一行还占着传输通道，它对队列来说是"当前这个"；</li>
+     *   <li>PREPARING / WAITING / SUSPENDED → 等待中：准备和排队本来就没开跑，
+     *       SUSPENDED（把通道让给别人、保留进度）等的是"再轮到我"，也归这一格；</li>
+     *   <li>DONE → 已完成；</li>
+     *   <li>FAILED <b>和</b> CANCELLED → 失败：线上没有"取消"这一格，而取消和失败对电脑
+     *       来说都是"这个文件没传成"，宁可少一格，也不自己发明第 4 个状态码之外的值。</li>
+     * </ul>
+     */
+    public static List<QueueStateEntry> queueStateFor(int connectionId) {
+        List<SendTask> tasks = new ArrayList<>();
+        for (SendTask task : snapshot()) {
+            if (connectionKey(task) == connectionId) {
+                tasks.add(task);
+            }
+        }
+        Collections.sort(tasks, (a, b) -> {
+            int rankA = rank(a.getState());
+            int rankB = rank(b.getState());
+            if (rankA != rankB) {
+                return Integer.compare(rankA, rankB);
+            }
+            return Integer.compare(a.getTaskId(), b.getTaskId());
+        });
+        List<QueueStateEntry> out = new ArrayList<>(tasks.size());
+        for (SendTask task : tasks) {
+            out.add(new QueueStateEntry(
+                    task.getDisplayFileName(),
+                    task.getTotalBytes(),
+                    queueStateOf(task.getState())));
+        }
+        return out;
+    }
+
+    /** 手机内部状态 → QUEUE_STATE 的 4 个状态码（规则见 {@link #queueStateFor(int)}） */
+    private static int queueStateOf(int state) {
+        switch (state) {
+            case SendTask.STATE_SENDING:
+            case SendTask.STATE_PAUSED:
+                return QUEUE_STATE_RUNNING;
+            case SendTask.STATE_DONE:
+                return QUEUE_STATE_DONE;
+            case SendTask.STATE_FAILED:
+            case SendTask.STATE_CANCELLED:
+                return QUEUE_STATE_FAILED;
+            default:
+                // PREPARING / WAITING / SUSPENDED
+                return QUEUE_STATE_WAITING;
+        }
+    }
+
+    /**
+     * 队列变了（加入 / 开始 / 完成 / 失败 / 取消）：立刻把新快照推给每台在线的电脑。
+     *
+     * <p>推到哪几台是各推各的：每台电脑只拿 {@link #queueStateFor(int)} 里属于自己那几行，
+     * 所以这里直接广播给所有会话，不需要"这个任务是发给谁的"这种判断。
+     *
+     * <p>这里<b>不等</b>写完才返回：真正的写由
+     * {@code HFXServer#postQueueState()} 丢给后台那条线程，传输出错时也不会把
+     * 发送线程堵在网络写上。
+     */
+    static void notifyQueueChanged() {
+        for (HFXServer server : HFXServer.snapshot()) {
+            server.postQueueState();
+        }
+    }
+
+    // ------------------------------------------------------------------
     // 连接闸门：同一台电脑上同一时刻只放一个发送任务
     // ------------------------------------------------------------------
 
@@ -469,9 +583,15 @@ public final class SendTasks {
      *
      * <p>排队期间任务的状态是 WAITING（面板上写着「排队中（前面还有 N 个任务）」），不是失败。
      *
-     * <p><b>让出</b>：如果此刻占着通道的那个任务正被用户暂停着（闸门关着、传输线程阻塞在读块上），
-     * 它不主动退出就谁也进不来。这里发现这种情况就请它让出（{@link SendTask#requestHandover()}：
-     * 保留进度的取消），它退出后本方法拿到通道。
+     * <p><b>暂停优先于排队</b>（3.7.0）：这条连接被暂停着的时候，队列里的下一个任务就地等着 ——
+     * 既不进去，也不像以前那样请暂停着的持锁者让出通道。用户报的现象是「暂停了还在一个接一个地传」：
+     * 多选分享是<b>一个文件一个任务</b>（见 ShareActivity#createTaskPerFile），暂停正在传的那个之后，
+     * 原来那句 {@code requestHandover()} 会请它让出通道、下一个文件立刻顶上来 ——
+     * 于是"暂停"只停住了这一个文件，后面的照样一个接一个往外发。
+     *
+     * <p>代价（有意为之）：暂停着的任务占着通道，新分享的任务也要等它继续 / 取消才开跑。
+     * 以前这条路径是"暂停 A → 发 B → B 立刻跑、A 让出进度"，现在改成"暂停 A → B 排队等"，
+     * 因为用户要的是"暂停就真的都停下来"。
      */
     static boolean acquire(SendTask task, HFXServer server) {
         Gate gate = gateFor(server.getId());
@@ -481,6 +601,17 @@ public final class SendTasks {
                     return false;
                 }
                 SendTask holder = gate.holder;
+                if (queuePaused(task, holder, server)) {
+                    // 暂停期间不启动新任务：就地等，用户点继续 / 取消后下一轮(≤300ms)自己就过去了
+                    task.onSlotWaiting();
+                    try {
+                        gate.wait(300L);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        return false;
+                    }
+                    continue;
+                }
                 if (holder == null || holder == task) {
                     gate.holder = task;
                     task.onSlotAcquired(server.getId());
@@ -491,8 +622,8 @@ public final class SendTasks {
                     gate.holder = null;
                     continue;
                 }
-                if (holder.isPausedByUser() || holder.isSuspended()) {
-                    // 「暂停 A 再发 B」：请 A 让出通道（保留进度），A 退出后这里就能进去
+                if (holder.isSuspended()) {
+                    // 让出通道的那个任务正在退出（进度已经交回电脑），等它 release 就能进去
                     holder.requestHandover();
                 }
                 task.onSlotWaiting();
@@ -504,6 +635,33 @@ public final class SendTasks {
                 }
             }
         }
+    }
+
+    /**
+     * 现在能不能把队列里的下一个任务放进去（3.7.0）。
+     *
+     * <p>看的是<b>已有的暂停标志</b>，没有新造开关：
+     * <ul>
+     *   <li>{@link HFXServer#isTransferPaused()}：会话级的暂停闸门。手机上点暂停
+     *       （{@code SendTask#pause()} → {@code HFXServer#pauseTransfer()}）、电脑上点暂停
+     *       （PAUSE_REPLY → {@code applyPcPause}）都作用在它上面，界面显示的"已暂停"也是它 ——
+     *       一个连接只有一个暂停状态，队列要认的就是这一个；</li>
+     *   <li>任务自己的 {@link SendTask#isPausedByUser()}：任务在<b>排队时</b>就被暂停了，
+     *       那一刻闸门还没关（{@code pause()} 只在"正在传"时才关闸门），不看它就会把
+     *       一个用户已经暂停的任务放进去开跑。</li>
+     * </ul>
+     *
+     * <p>持锁者是不是暂停着也要看：闸门是会话级的，理论上三者一致；但任务在排队时被暂停
+     * 这种先后顺序会让闸门晚一步关上，多看一眼不会有副作用，却少一条"暂停了还在传"的路。
+     */
+    private static boolean queuePaused(SendTask task, SendTask holder, HFXServer server) {
+        if (task.isPausedByUser()) {
+            return true;
+        }
+        if (holder != null && holder != task && holder.isPausedByUser()) {
+            return true;
+        }
+        return server != null && server.isTransferPaused();
     }
 
     /** 让出 / 结束：唤醒所有排队者 */

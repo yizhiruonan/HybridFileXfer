@@ -1285,6 +1285,39 @@ mod tests {
     }
 
     #[test]
+    fn 每台设备的进度互不干扰() {
+        // 主界面每台设备那一行读 progress_for(串号)，传窗口读全局 PROGRESS。
+        // 这里只验「按设备的那一份确实是隔开的」—— 多设备并行时不能互相串数。
+        let dir_a = temp_dir("dev-progress-a");
+        let dir_b = temp_dir("dev-progress-b");
+        let a = Receiver::with_device(SharedDir::new(util::normalize_dir(&dir_a)), "test-dev-a");
+        let b = Receiver::with_device(SharedDir::new(util::normalize_dir(&dir_b)), "test-dev-b");
+        let pa = progress_for("test-dev-a");
+        let pb = progress_for("test-dev-b");
+        pa.reset();
+        pb.reset();
+
+        let file_a = dir_a.join("a.bin").to_string_lossy().to_string();
+        a.write_block(0, &file_a, 2_097_152, 0, 1_700_000_000_000, &[1u8; 1024])
+            .unwrap();
+
+        let (name_a, done_a, total_a, sess_a, files_a) = pa.snapshot();
+        let (name_b, done_b, total_b, sess_b, files_b) = pb.snapshot();
+        assert!(sess_a >= 1024, "A 的会话字节应该涨：{sess_a}");
+        assert_eq!(files_a, 1, "A 应该记到一个文件");
+        assert_eq!(total_a, 2_097_152);
+        assert!(done_a > 0);
+        assert_eq!(name_a, file_a);
+
+        assert_eq!(sess_b, 0, "B 不该被 A 的写入影响");
+        assert_eq!(files_b, 0);
+        assert_eq!(done_b, 0);
+        assert_eq!(total_b, 0);
+        assert!(name_b.is_empty());
+        let _ = b;
+    }
+
+    #[test]
     fn incomplete_files_are_removed_when_discarding() {
         let dir = temp_dir("incomplete");
         let receiver = Receiver::new(util::normalize_dir(&dir));

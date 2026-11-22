@@ -19,6 +19,7 @@ import java.util.concurrent.LinkedBlockingDeque;
 
 import top.weixiansen574.async.BackstageTask;
 import top.weixiansen574.hybridfilexfer.NativeMemory;
+import top.weixiansen574.hybridfilexfer.SendTasks;
 import top.weixiansen574.hybridfilexfer.ServerService;
 import top.weixiansen574.hybridfilexfer.aidl.IIOService;
 import top.weixiansen574.hybridfilexfer.core.ControllerIdentifiers;
@@ -46,6 +47,23 @@ public class HFXServer extends HFXService {
     private static final java.util.Map<Integer, HFXServer> INSTANCES = new java.util.concurrent.ConcurrentHashMap<>();
     private static final java.util.concurrent.atomic.AtomicInteger NEXT_ID = new java.util.concurrent.atomic.AtomicInteger(1);
     private static final String LABELS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    /**
+     * 309：QUEUE_STATE 的推送线程，全进程一条。
+     *
+     * <p>为什么单独一条线程：队列变化的通知来自很多地方（任务线程、界面线程、通知栏），
+     * 而控制通道的写必须是"一帧一帧"的 —— 两个线程各写半帧，对端读出来的就是假 opcode。
+     * 全丢给这一条线程，顺序天然是串的；它只写不读，不会和传输线程抢帧。
+     *
+     * <p>为什么不让调用方当场写：写 socket 是阻塞的，电脑那边一时读慢了（界面卡一下、
+     * 暂停着不读），调用方（很可能是发送线程）就会被堵在这里，整次传输跟着停。
+     * 守护线程：进程退出时不用等它。
+     */
+    private static final java.util.concurrent.ExecutorService QUEUE_STATE_WRITER =
+            java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+                Thread thread = new Thread(r, "hfx-queue-state");
+                thread.setDaemon(true);
+                return thread;
+            });
     /**
      * 等一条传输通道的超时。
      *
@@ -94,6 +112,9 @@ public class HFXServer extends HFXService {
      * 刚连上不该再补发一帧。
      */
     private int lastSentEpoch;
+    /** 309：这台电脑已经有一帧 QUEUE_STATE 在排队了（队列连着变几次时只留一帧最新的） */
+    private final java.util.concurrent.atomic.AtomicBoolean queueStatePending =
+            new java.util.concurrent.atomic.AtomicBoolean();
 
     public HFXServer(IIOService ioService) {
         this.ioService = ioService;
@@ -372,6 +393,15 @@ public class HFXServer extends HFXService {
             this.connections = connections;
             register(this);
             success = true;
+            // 309：握手成功后先推一帧队列快照 —— 电脑那边一连上就能显示「手机上还有几个文件等着」，
+            // 不用等到第一次传输开始。
+            // 推不动不算握手失败：会话本身已经建立（这一帧只是界面用的），
+            // 队列一变化还会再推，别因为一个界面帧把刚连好的会话拆掉。
+            try {
+                writeQueueState();
+            } catch (Throwable e) {
+                top.weixiansen574.hybridfilexfer.core.HFXLog.d("握手后推 QUEUE_STATE 失败", e);
+            }
             callback.onConnectSuccess();
             return true;
         } finally {
@@ -1128,6 +1158,77 @@ public class HFXServer extends HFXService {
             }
             writePauseStateLocked(phonePaused);
         }
+    }
+
+    /**
+     * 309：把本机「分享发送」队列的快照推给电脑（{@link ControllerIdentifiers#QUEUE_STATE}）。
+     *
+     * <p><b>只写不读</b>：传输期间控制通道的读权在传输线程手里（见 {@link #writePauseStateOnly}
+     * 上面那段注释），这条推送不论从哪条线程进来都只往通道里写，绝不读 —— 去读就会把
+     * 传输线程的结论帧（RESULT）或暂停回报（PAUSE_REPLY）吃掉，两边一起卡死。
+     *
+     * <p>整帧<b>先在内存里拼好再一次性写出去</b>：这条通道的写者有会话线程（暂停同步、心跳）、
+     * 传输线程（结论帧）和本线程三方，虽然都握着 {@link #controlLock}，但一帧要是分成
+     * 十几次 writeShort/writeUTF 写，中间的等待窗口越多越容易出事。整帧一次 writeFully，
+     * 对端要么收到整帧，要么连接已经断了。
+     *
+     * <p>快照在锁<b>外</b>取：{@code SendTasks} 那边有自己的锁，且它要遍历整张任务表；
+     * 在控制通道的锁里做这件事，会让传输收尾时的结论帧多等一会儿 —— 而收尾那一刻
+     * 电脑端正在等这帧结论，谁也不该被队列统计拖住。
+     */
+    public void writeQueueState() throws IOException {
+        List<SendTasks.QueueStateEntry> entries = SendTasks.queueStateFor(id);
+        java.io.ByteArrayOutputStream buffer = new java.io.ByteArrayOutputStream(16 + entries.size() * 32);
+        java.io.DataOutputStream out = new java.io.DataOutputStream(buffer);
+        // 线格式（和电脑端约定死的，顺序与类型都不能动）：
+        //   {i16 opcode}{i32 count}{ (UTF 文件名, i64 字节数, u8 状态) * count }
+        // UTF 走 DataOutputStream.writeUTF（u16 长度 + 修改版 UTF-8），和 RESUME_QUERY / REBUILD_REQ 同一种写法：
+        // 电脑端 queue::read_items 用的 proto::read_utf 认的就是这一套（代理对按两个三字节段）
+        out.writeShort(ControllerIdentifiers.QUEUE_STATE);
+        out.writeInt(entries.size());
+        for (SendTasks.QueueStateEntry entry : entries) {
+            out.writeUTF(entry.fileName);
+            out.writeLong(entry.bytes);
+            out.writeByte(entry.state);
+        }
+        out.flush();
+        byte[] frame = buffer.toByteArray();
+        synchronized (controlLock) {
+            if (ctChannel == null) {
+                throw new IOException("control channel is not connected");
+            }
+            ctChannel.writeFully(frame);
+        }
+        top.weixiansen574.hybridfilexfer.core.HFXLog.d("QUEUE_STATE → " + getDisplayName()
+                + "：" + entries.size() + " 个任务，" + frame.length + " 字节");
+    }
+
+    /**
+     * 309：队列变了，把新快照推给这台电脑（丢给后台那条写线程，不当场写）。
+     *
+     * <p>为什么不在调用方线程里直接写：调用方多半是发送线程 / 界面线程，
+     * 而控制通道的写是阻塞的。电脑那边一时读得慢，写就会卡住调用方几百毫秒甚至更久，
+     * 用户看到的就是"点了暂停/取消，界面僵一下"。
+     *
+     * <p><b>合并</b>：多选分享一次建好几个任务，队列会连着变好几次。这里只保留一帧 ——
+     * 后一帧读到的是那时的最新快照，前面那些中间态没有必要挨个发。
+     * 先清标志再写，是为了让"写的过程中又变了"也能排上下一帧（宁可多发，不可漏发）。
+     */
+    public void postQueueState() {
+        if (!queueStatePending.compareAndSet(false, true)) {
+            return;
+        }
+        QUEUE_STATE_WRITER.execute(() -> {
+            queueStatePending.set(false);
+            try {
+                writeQueueState();
+            } catch (Throwable e) {
+                // 推不出去不算错误：会话真断了的话心跳 / 暂停同步会先发现并断开这条连接，
+                // 队列下一次变化还会再推一帧
+                top.weixiansen574.hybridfilexfer.core.HFXLog.d("QUEUE_STATE 推送失败（"
+                        + getDisplayName() + "）", e);
+            }
+        });
     }
 
     /**

@@ -5,9 +5,11 @@
 
 slint::include_modules!();
 
+use std::cell::RefCell;
 use std::io;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -19,6 +21,8 @@ use hfx_receiver::engine::{self, ConnectMode, EngineOptions, EngineState};
 use hfx_receiver::i18n::{self, Lang};
 use hfx_receiver::log;
 use slint::ComponentHandle;
+// VecModel / ModelRc 的 row_count / set_row_data 是 Model trait 的方法，得引进来才有
+use slint::Model as _;
 
 #[cfg(windows)]
 mod tray_win;
@@ -143,9 +147,10 @@ impl State {
     }
 }
 
-/// 独立传输窗口的「落位 / 置顶」状态。
+/// 一个传输窗口的「落位 / 置顶」状态。
 ///
-/// 窗口只有一个实例，跨轮次复用，所以这份状态也只有一个：
+/// 一台设备一个窗口之后，这份状态也**每窗口一份**（挂在 DevXferWin 里），
+/// 不再是整进程一个单例：
 ///   placed_at = 这一轮把它摆在的坐标（物理像素）；和用户拖到的位置比一下就知道他拖过没有；
 ///   settle    = 还要补几次「摆位置 + 置顶」—— 窗口刚 show 出来时 hwnd 还没建好、
 ///               位置也可能还没生效，补几帧就稳了；补完就再也不动它，免得把用户拖到的位置抢回去。
@@ -177,27 +182,44 @@ impl TwWindow {
 
     /// 每帧调一次：把窗口摆到位 + 置顶。hwnd 要等窗口真建出来才拿得到。
     ///
+    /// `suffix` = 这个窗口标题的后缀（" · 小米 15"）。一台设备一个窗口之后**只能按后缀
+    /// 认窗口**：以前那套「本进程第一个带标题的窗口」在多窗口下永远只命中最早建出来的
+    /// 那个，第二台设备的窗口就永远摆不上位置（见 tray_win::find_transfer_window_of）。
+    /// `slot` = 这个窗口在创建顺序里的位置（0 = 最下面那个）：第 i 个窗口往上错开
+    /// i*(可见高+12)，单窗口时 slot=0 —— 和改之前「贴右下角」一个像素都不差。
+    ///
     /// 摆位置分两种：
-    ///   * 用户拖过（config 里有坐标）→ 照那个坐标（show 之前已经 set_position 过一次）；
-    ///   * 没拖过 → 贴着工作区右下角。这一步用「量一下现在的可见右下角离工作区还差多少、
-    ///     再挪多少」的写法（tray_win::nudge_to_bottom_right），不去猜标题栏和边框多高，
-    ///     多显示器也是按窗口自己所在那块屏算。
-    fn tick(&mut self, tw: &TransferWindow, saved: Option<(i32, i32)>) {
+    ///   * 用户拖过（config 里有坐标，只有恰好一个窗口时才会传进来）→ 照那个坐标
+    ///     （show 之前已经 set_position 过一次）；
+    ///   * 没拖过 → 贴着工作区右下角（+ 往上错开）。这一步用「量一下现在的可见右下角
+    ///     离工作区还差多少、再挪多少」的写法（tray_win::nudge_to_bottom_right_up），
+    ///     不去猜标题栏和边框多高，多显示器也是按窗口自己所在那块屏算。
+    fn tick(&mut self, tw: &TransferWindow, suffix: &str, saved: Option<(i32, i32)>, slot: usize) {
         if self.settle == 0 {
             return;
         }
         self.settle -= 1;
         if self.hwnd.is_none() {
-            // 推送小窗也是「本进程里带标题的窗口」，不排掉会被当成传输窗口摆位置/置顶
-            self.hwnd = tray_win::find_transfer_window(WINDOW_TITLE, &[PUSH_TITLE]);
+            self.hwnd = tray_win::find_transfer_window_of(suffix);
         }
         let Some(hwnd) = self.hwnd else { return };
+        // 往上错开的距离按**量出来的可见高**算（量不到就用 .slint 里的偏好尺寸估）：
+        // 用可见高而不是外框高，因为外框里还带着 DWM 那圈看不见的缩放边框。
+        let up = if slot == 0 {
+            0
+        } else {
+            let h = tray_win::window_visible_rect(hwnd)
+                .map(|(_, t, _, b)| b - t)
+                .filter(|h| *h > 0)
+                .unwrap_or_else(|| transfer_window_px(tw).1);
+            slot as i32 * (h + TW_STACK_GAP)
+        };
         if !self.anchored {
-            if saved.is_some() {
+            if let Some((x, y)) = saved {
                 // 记住的位置：show 之前已经放好了，这里只是再确认一次
-                tw.window().set_position(slint::PhysicalPosition::new(saved.unwrap().0, saved.unwrap().1));
+                tw.window().set_position(slint::PhysicalPosition::new(x, y));
                 self.anchored = true;
-            } else if tray_win::nudge_to_bottom_right(hwnd, TW_MARGIN) {
+            } else if tray_win::nudge_to_bottom_right_up(hwnd, TW_MARGIN, up) {
                 self.anchored = true;
             }
         }
@@ -209,6 +231,388 @@ impl TwWindow {
         if let Some(pos) = tray_win::window_position(hwnd) {
             self.placed_at = Some(pos);
         }
+    }
+}
+
+/// 多窗口时上下两个窗口之间留的空隙（可见边之间）。
+///
+/// 12 和标题栏是一个量级：贴太近看着像一整块，离太远又要吃掉半块屏幕。
+#[cfg(windows)]
+const TW_STACK_GAP: i32 = 12;
+
+/// 一台设备的独立传输窗口（每台设备一个 OS 窗口，键 = 设备串号）。
+///
+/// 以前只有一个单例 `TransferWindow` + 一堆裸变量（tracks / ops_model / tw_shown /
+/// last_tw_h / xfer_dismissed）。现在窗口、模型、滚动状态、落位状态、收起标志全按设备
+/// 各存一份，键和设备串号对齐（= OpTrack.serial = receiver::progress_for 那把键）。
+///
+/// **Slint 对象不能跨线程**：这个结构只活在 UI 线程的那个 16ms Timer 里，
+/// 被 `Rc<RefCell<XferWins>>` 包着（不 Send），建窗口 / 刷模型 / 摆位置全在那一条线程上。
+struct DevXferWin {
+    /// 设备串号（map 的键；也是这个窗口里的块读哪一份进度的依据）
+    serial: String,
+    /// 设备显示名（窗口标题里 " · " 后面那一段的来源）
+    label: String,
+    /// 标题后缀 " · <label>"：标题靠它唯一，找 HWND 也靠它（tray_win::find_transfer_window_of）
+    suffix: String,
+    /// 窗口本体。Slint 组件不 Send，所以它只出现在这里、整条链都在 UI 线程上
+    win: TransferWindow,
+    /// 这个窗口自己的列表 model：**全程只建这一个**。块数变了才 set_vec，否则只写内容
+    /// 变了的那几行 —— 每建一个新的 VecModel 就等于告诉 Slint「整个列表全变了」，
+    /// 它会把所有块连同里头上百个元素全拆了重建。
+    model: Rc<slint::VecModel<XferOp>>,
+    /// 这个窗口里的块：一条任务一个 OpTrack。现在一台设备一条任务；将来同一台设备并行
+    /// 几条时这里会变成 N 个，窗口内的多块堆叠逻辑一个字都不用改。
+    tracks: Vec<OpTrack>,
+    /// 上次写进模型的那几块「等待中」（手机队列里 state == 0 的那些）。
+    ///
+    /// 它们接在 tracks 后面，所以模型里第 i 行不再一定对应 tracks[i] —— 这部分单独记一份，
+    /// 「内容没变就不写回模型」那套比较才能照样做（Slint 收到一样的值也会重绘整窗）。
+    waiting_sent: Vec<XferOp>,
+    /// 这个窗口自己的落位 / 置顶状态（以前整进程只有一个实例）
+    #[cfg(windows)]
+    tw: TwWindow,
+    /// 用户在**这个窗口**上点过收起：这一轮别再弹它（别的设备的窗口不受影响）
+    dismissed: bool,
+    /// 「详细信息」展开了没有（窗口最底下那行开关，一次性切换这个窗口里所有块）
+    details: bool,
+    /// 上一帧设过的窗口高度：变了才 set_size（set_size 会触发一次重排 + 落位）
+    last_h: f32,
+    /// 上次摆位用的槽位（往上错开的档位）。窗口数一变槽位就变，这时要按新槽位重排一遍；
+    /// 槽位没变就一个像素都不动 —— 用户拖过的位置得保住。
+    slot_seen: usize,
+    /// 上次摆位时的窗口总数。1 个窗口和多个窗口的摆位规则不一样（单窗口优先用户拖过的
+    /// 坐标，多窗口一律从右下角往上排），所以总数一变就得重排。
+    stack_seen: usize,
+    /// 这一轮弹过没有（对应以前单例上的 tw_shown）
+    shown: bool,
+    /// 这个窗口里所有块都收尾的时刻：用来数「已完成」亮够 3 秒没有（以前整进程一个）
+    finish_at: Option<std::time::Instant>,
+}
+
+impl DevXferWin {
+    /// 这个窗口在我们摆的位置（用户拖走之后和它比，就知道该不该记进 config）
+    fn placed_at(&self) -> Option<(i32, i32)> {
+        #[cfg(windows)]
+        {
+            self.tw.placed_at
+        }
+        #[cfg(not(windows))]
+        {
+            None
+        }
+    }
+
+    /// 按新槽位重排一遍（窗口数变了才调）。重置之后 settle() 会重新量、重新吸到位。
+    fn re_anchor(&mut self) {
+        #[cfg(windows)]
+        self.tw.begin();
+    }
+
+    /// 补一帧「摆位置 + 置顶」（只有窗口刚 show 出来那几帧真的做事，见 TwWindow::tick）
+    fn settle(&mut self, saved: Option<(i32, i32)>, slot: usize) {
+        #[cfg(windows)]
+        self.tw.tick(&self.win, &self.suffix, saved, slot);
+        #[cfg(not(windows))]
+        let _ = (saved, slot);
+    }
+
+    /// 把窗口摆到该在的位置再显示，然后补一帧落位。
+    ///
+    /// 先按估算尺寸摆个大概位置（省得在系统默认位置闪一下），真实边框和尺寸由 settle()
+    /// 量出来再吸过去 —— 和改之前那个 show_transfer_window 同一个套路。
+    fn show_at(&mut self, saved: Option<(i32, i32)>, slot: usize) {
+        #[cfg(windows)]
+        {
+            let (pw, ph) = transfer_window_px(&self.win);
+            // +16 / +40 是边框和标题栏的估算值，只影响这一两帧
+            let origin = tray_win::transfer_window_origin(pw + 16, ph + 40, saved);
+            // 第 slot 个窗口往上先错开一段：否则 show 出来那一瞬所有窗口都叠在右下角
+            let up = slot as i32 * (ph + TW_STACK_GAP);
+            let origin = (origin.0, origin.1 - up);
+            self.tw.begin();
+            self.tw.placed_at = Some(origin);
+            self.win
+                .window()
+                .set_position(slint::PhysicalPosition::new(origin.0, origin.1));
+        }
+        #[cfg(not(windows))]
+        let _ = (saved, slot);
+        let _ = self.win.show();
+        self.settle(saved, slot);
+    }
+}
+
+/// 所有设备的传输窗口（UI 线程私有，理由见 DevXferWin）。
+#[derive(Default)]
+struct XferWins {
+    map: std::collections::HashMap<String, DevXferWin>,
+    /// **创建顺序**：第 i 个窗口摆位时往上错开 i*(窗口高+12)，所以顺序必须稳定 ——
+    /// 照 map 的遍历顺序排的话，每帧每个窗口的位次都可能变，窗口会互相跳。
+    order: Vec<String>,
+    /// 最近出现过的设备串号：传输收尾、设备表也空了的失败帧还得有个窗口把红字亮出来，
+    /// 窗口被移除之后照这个串号重建一个（见 tick 里的失败分支）。
+    last: Option<String>,
+}
+
+impl XferWins {
+    /// 登记一个新窗口（创建顺序追加在末尾 = 摆位时排在上一个上面）
+    fn insert(&mut self, serial: String, d: DevXferWin) {
+        if !self.order.iter().any(|k| k == &serial) {
+            self.order.push(serial.clone());
+        }
+        self.map.insert(serial, d);
+    }
+
+    /// 这个窗口的槽位（创建顺序里的位置，0 = 最下面那个）
+    fn slot_of(&self, serial: &str) -> usize {
+        self.order.iter().position(|k| k == serial).unwrap_or(0)
+    }
+}
+
+/// 收起一台设备的窗口并从表里移除（这台设备这一轮没有块了 / 整轮结束了）。
+///
+/// 顺序是「先从表里摘下来，再记坐标，再藏」：窗口的显示状态挂在 Slint 自己那个 Rc 上，
+/// 表里那一条一删、强引用一断，系统窗口就没了 —— 不藏的话屏幕上会留着最后一帧。
+/// 顺手把用户拖过的坐标记进 config，但**只有恰好一个窗口时**才记：多窗口是自动从右下角
+/// 往上排的，一份 xfer_win_pos 说不清是哪台设备的窗口（config 格式不为多窗口改）。
+fn drop_dev_xfer_win(wins: &Rc<RefCell<XferWins>>, s: &mut State, serial: &str) {
+    let removed = {
+        let mut g = wins.borrow_mut();
+        let single = g.map.len() == 1;
+        let placed = if single {
+            g.map.get(serial).and_then(|d| d.placed_at())
+        } else {
+            None
+        };
+        g.order.retain(|k| k != serial);
+        g.last = Some(serial.to_string());
+        g.map.remove(serial).map(|d| (d, single, placed))
+    };
+    if let Some((d, single, placed)) = removed {
+        // 只有「这一轮真弹出来过」的窗口才记坐标：从没 show 过的窗口报告的坐标是假的
+        // （以前那个单例走的是同一个判断 —— 只在 tw_shown 时保存）
+        if single && d.shown {
+            save_transfer_pos(&d.win, s, placed);
+        }
+        // 先藏再丢：表里那一条已经删了，这里的最后一个强引用一落，系统窗口就跟着没了
+        let _ = d.win.hide();
+    }
+}
+
+/// 用户在某个传输窗口上点「收起」/ 标题栏 ✕：把**这一台**的窗口藏起来。
+///
+/// 传输继续（要真停下得点窗口里的「取消」）。窗口本身不删：这台设备的下一条任务还会
+/// 用它 —— 删窗口是 tick 里「这块设备这一轮没块了」那件事。
+fn hide_dev_xfer_win(
+    wins: &std::rc::Weak<RefCell<XferWins>>,
+    state: &Arc<Mutex<State>>,
+    serial: &str,
+    weak: &slint::Weak<TransferWindow>,
+) {
+    // 窗口的回调里只拿 Weak 回指 XferWins：强引用的话「XferWins ↔ 窗口」就互相抓住了
+    // （回调存在窗口自己身上），两边谁也放不掉。
+    if let Some(wins) = wins.upgrade() {
+        if let Ok(mut g) = wins.try_borrow_mut() {
+            let single = g.map.len() == 1;
+            if let Some(d) = g.map.get_mut(serial) {
+                d.dismissed = true;
+                // 用户可能把窗口拖到别处了：收起时顺手记住（只有单窗口才记，理由见
+                // drop_dev_xfer_win）
+                if single {
+                    let placed = d.placed_at();
+                    if let Ok(mut st) = state.lock() {
+                        save_transfer_pos(&d.win, &mut st, placed);
+                    }
+                }
+            }
+        }
+    }
+    if let Some(w) = weak.upgrade() {
+        let _ = w.hide();
+    }
+}
+
+/// 把**所有**传输窗口的「取消确认」状态位清零。
+///
+/// 确认框上那三个按钮（保留 / 不保留 / 继续接收）是共用的：取消是进程级的一件事，
+/// 用户只回答一次，所以不用管是哪台设备点的 ×，一律全清。
+fn clear_cancel_ask(wins: &Rc<RefCell<XferWins>>) {
+    if let Ok(g) = wins.try_borrow() {
+        for d in g.map.values() {
+            if d.win.get_cancel_ask() {
+                d.win.set_cancel_ask(false);
+            }
+        }
+    }
+}
+
+/// 给一台设备挑一个**不重名**的标签：默认用设备显示名，重名就依次加 " 2"、" 3"。
+///
+/// 为什么必须唯一：窗口标题 = 状态文案 + " · " + label，而找 HWND 是靠标题后缀匹配的
+/// （tray_win::find_transfer_window_of）—— 两台手机同名就会互相抢到对方的窗口。
+fn unique_label(taken: &[String], base: &str) -> String {
+    let base = if base.trim().is_empty() {
+        i18n::tr("手机", "phone").to_string()
+    } else {
+        base.to_string()
+    };
+    if !taken.iter().any(|t| t == &base) {
+        return base;
+    }
+    let mut n = 2;
+    loop {
+        let cand = format!("{} {}", base, n);
+        if !taken.iter().any(|t| t == &cand) {
+            return cand;
+        }
+        n += 1;
+    }
+}
+
+/// 屏幕可用高度（逻辑像素，0 = 没量到）。工作区高是物理像素，除以缩放才是 Slint 的
+/// 逻辑像素 —— 传输窗口的高度、块高（114 / 244）都是逻辑像素，混着用会在 150% 缩放的
+/// 屏幕上封错值（1920x1080@150% 会把 1032 当成 1032 逻辑像素，等于多封进去 500）。
+#[cfg(windows)]
+fn screen_height_logical(win: &TransferWindow) -> i32 {
+    let scale = win.window().scale_factor().max(0.1);
+    match tray_win::cursor_work_area_height() {
+        Some(px) if px > 0 => (px as f32 / scale).round() as i32,
+        _ => 0,
+    }
+}
+
+/// 建一台设备的独立传输窗口，并把它的回调挂上。
+///
+/// 只能在 UI 线程调（Slint 对象不 Send），所以只从那个 16ms Timer 里进来。
+fn make_dev_xfer_win(
+    wins: &Rc<RefCell<XferWins>>,
+    state: &Arc<Mutex<State>>,
+    serial: &str,
+    label: &str,
+) -> Option<DevXferWin> {
+    let win = match TransferWindow::new() {
+        Ok(w) => w,
+        Err(e) => {
+            log::warn(&format!("建传输窗口失败（{}）：{}", label, e));
+            return None;
+        }
+    };
+    // 标题后缀要在 show 之前设好：settle() 是拿它去找 hwnd 的
+    let suffix = format!(" · {}", label);
+    win.set_title_suffix(suffix.as_str().into());
+    // 高度封顶要用的屏幕可用高度（逻辑像素）：Slint 自己问不到屏幕尺寸，只能这边量了喂进去。
+    // 量的是「鼠标所在那块屏」的工作区 —— 窗口第一次出现就贴那块屏的右下角
+    // （tray_win::transfer_window_origin 用的是同一个点），而这时候 hwnd 还没建出来、
+    // 量不到窗口自己在哪块屏上。量不到就给 0，Slint 那边退化到固定 720。
+    #[cfg(windows)]
+    win.set_screen_h(screen_height_logical(&win));
+    let model = Rc::new(slint::VecModel::from(Vec::<XferOp>::new()));
+    win.set_ops(slint::ModelRc::new(model.clone()));
+    wire_dev_xfer_win(&win, serial, wins, state);
+    Some(DevXferWin {
+        serial: serial.to_string(),
+        label: label.to_string(),
+        suffix,
+        win,
+        model,
+        tracks: Vec::new(),
+        waiting_sent: Vec::new(),
+        #[cfg(windows)]
+        tw: TwWindow::default(),
+        dismissed: false,
+        details: false,
+        last_h: 0.0,
+        slot_seen: 0,
+        // 1 = 「刚建出来时默认是单窗口摆法」：真多窗口时下面的判断会立刻重排一次
+        stack_seen: 1,
+        shown: false,
+        finish_at: None,
+    })
+}
+
+/// 给一个新传输窗口挂上它那一套回调。
+///
+/// 以前这些回调挂在唯一那个窗口上；现在每台设备一个窗口，所以建窗口时挂一遍。
+/// 回调分两类：
+///   * 「这台设备自己的事」（收起 / 明细展开）→ 按串号回查 map，只改这一条；
+///   * 「进程级的事」（暂停 / 取消 / 失败提示）→ 和改之前调的是同一套全局函数。
+fn wire_dev_xfer_win(
+    win: &TransferWindow,
+    serial: &str,
+    wins: &Rc<RefCell<XferWins>>,
+    state: &Arc<Mutex<State>>,
+) {
+    // 窗口回调里一律用 Weak 回指（理由见 hide_dev_xfer_win）
+    let wins_weak: std::rc::Weak<RefCell<XferWins>> = Rc::downgrade(wins);
+
+    // × 的语义按方向分（接收 = 弹「保留 / 不保留」，发送 = 直接中断），方向由引擎的
+    // control 标志给出，不靠界面自己猜 —— 所有窗口共用同一套判断。
+    win.on_cancel_send(cancel_send_request);
+    // 暂停位是**进程级**的（control.rs 里那个 static AtomicBool）：一个窗口按暂停，
+    // 所有块都该停，所以这里没有「按窗口」的记录。
+    win.on_toggle_pause(|| {
+        let paused = !hfx_receiver::control::paused();
+        hfx_receiver::control::pause(paused);
+    });
+    win.on_cancel_recv(cancel_recv_request);
+    win.on_cancel_dismiss(cancel_dismiss);
+    {
+        let st = Arc::clone(state);
+        win.on_cancel_keep(move || cancel_keep(&st));
+    }
+    {
+        let st = Arc::clone(state);
+        win.on_cancel_discard(move || cancel_discard(&st));
+    }
+    // 收起（窗口里那颗按钮）：藏起来，传输继续。失败那一轮点它 = 「我知道了」——
+    // 把失败提示消费掉，下一轮正常弹回来。
+    {
+        let key = serial.to_string();
+        let wins = wins_weak.clone();
+        let st = Arc::clone(state);
+        let weak = win.as_weak();
+        win.on_close_window(move || {
+            hfx_receiver::receiver::clear_failure();
+            hide_dev_xfer_win(&wins, &st, &key, &weak);
+        });
+    }
+    // 标题栏的 ✕ 和窗口里的「收起」是同一件事：藏起来，传输继续。
+    // （不接管的话 Slint 会当成「关窗」，窗口状态和这边的 shown 就对不上了）
+    {
+        let key = serial.to_string();
+        let wins = wins_weak.clone();
+        let st = Arc::clone(state);
+        let weak = win.as_weak();
+        win.window().on_close_requested(move || {
+            hfx_receiver::receiver::clear_failure();
+            hide_dev_xfer_win(&wins, &st, &key, &weak);
+            slint::CloseRequestResponse::KeepWindowShown
+        });
+    }
+    // 「▾ 详细信息」：只翻这个窗口的 bool，窗口高度由主循环那边跟着算
+    //（收起/展开都不动窗口位置：set_size 只改大小）
+    {
+        let key = serial.to_string();
+        let wins = wins_weak;
+        let weak = win.as_weak();
+        win.on_toggle_details(move || {
+            let Some(w) = weak.upgrade() else { return };
+            // 传完之后明细没意义（窗口正准备收起来），别让它把窗口撑大
+            if w.get_done() {
+                return;
+            }
+            let next = !w.get_details();
+            w.set_details(next);
+            // 高度公式读的是 map 里那一份：同一个 bool 的两面必须一起改
+            if let Some(wins) = wins.upgrade() {
+                if let Ok(mut g) = wins.try_borrow_mut() {
+                    if let Some(d) = g.map.get_mut(&key) {
+                        d.details = next;
+                    }
+                }
+            }
+        });
     }
 }
 
@@ -226,7 +630,9 @@ fn transfer_window_px(tw: &TransferWindow) -> (i32, i32) {
 }
 
 /// 收起 / 关掉窗口时，如果用户把它拖到别处了，就把坐标记进 config.ini。
-#[cfg(windows)]
+///
+/// 不碰任何 Windows API（只读窗口坐标 + 写 config），所以不加 cfg —— 多窗口改造之后
+/// 它是从「跟平台无关」的那几段代码里调的，加 cfg 反而要在调用处再套一层。
 fn save_transfer_pos(tw: &TransferWindow, state: &mut State, placed: Option<(i32, i32)>) {
     let pos = tw.window().position();
     // (0,0) 一般是「拿不到位置」而不是真的拖到了左上角
@@ -306,7 +712,7 @@ impl PushWinState {
 
 /// 把推送小窗摆到工作区右下角 → 显示 → 立刻补一帧落位。
 ///
-/// 和 show_transfer_window 一个套路：先按估算尺寸摆个大概位置（省得在系统默认位置
+/// 和 DevXferWin::show_at 一个套路：先按估算尺寸摆个大概位置（省得在系统默认位置
 /// 闪一下），真实边框和尺寸由 PushWinState::tick 的 nudge_to_bottom_right 量出来再吸过去。
 #[cfg(windows)]
 fn show_push_window(pw: &PushWindow, state: &mut PushWinState) {
@@ -698,13 +1104,16 @@ fn human_eta(secs: u64) -> String {
     }
 }
 
-/// 传输窗口收起时的高度（逻辑像素），和 app.slint 的 preferred-height 对得上。
+/// 传输窗口里「一个操作块」收起时的高度（逻辑像素），和 app.slint 的 XferOperation 对得上。
 ///
-/// 2026-11-19「对齐资源管理器」那一轮从 151 改成 156，逐项是：
+/// 2026-11-19「对齐资源管理器」那一轮整窗只有一块、收起是 156，逐项是：
 /// 14(上留白) + 20(主文案) + 6 + 30(百分比行) + 13(百分比行到条，原 12)
 /// + 15(条) + 15(条到分隔线，原 0 —— 原来线贴着条子画) + 1(分隔线)
 /// + 10(线到「详细信息」行，原 9) + 22(「详细信息」行，原 20) + 10(下留白)。
-const TW_H_COLLAPSED: f32 = TW_TOP_PART + TW_BAR_BLOCK + TW_DIVIDER + TW_TOGGLE_TAIL; // = 156.0
+///
+/// 现在一个窗口能堆 N 块，156 这个数就拆成了「块自己 114 + 尾部开关行 42」：
+/// 单块时 114 + 42 还是 156，一个像素都没变；多块时每块各自 +114。
+const TW_OP_COLLAPSED: f32 = TW_TOP_PART + TW_BAR_BLOCK + TW_DIVIDER; // = 114.0
 /// 收起态里「分段进度条」那一整块：13(百分比行到条) + 15(条) + 15(条到分隔线) = 43。
 /// 展开态这一块**整块不画**（app.slint 里用 if !root.details 包起来，不是 visible:false
 /// —— 那还占着高度），省下的 43px 换成详情区。
@@ -712,9 +1121,12 @@ const TW_BAR_BLOCK: f32 = 43.0;
 /// 顶端那段和进度条无关的部分：14(上留白) + 20(主文案) + 6 + 30(百分比行) = 70。
 /// 收起 / 展开两种状态都一模一样。
 const TW_TOP_PART: f32 = 70.0;
-/// 分隔线 1px（两条状态都有；展开态在它上面还有下面「简略信息」那条，见 TW_DETAIL_TAIL）。
+/// 块末尾那条分隔线 1px。它在 app.slint 里是 XferOperation 的最后一行，兼职
+/// 「块与块之间的分隔线」，所以**每块**都算 1px —— 单块时它正好是原来那条
+/// 「进度区 ↔ 详细信息行」的线（展开态也一样在「名称：」上面那条）。
 const TW_DIVIDER: f32 = 1.0;
-/// 展开态尾部：10(行区下留白) + 1(「简略信息」上面那条分隔线) + 10 + 22(开关行) + 10(下留白)。
+/// 展开态尾部（所有块共用）：10(行区下留白) + 1(「简略信息」上面那条分隔线) + 10
+/// + 22(开关行) + 10(下留白) = 53。
 const TW_DETAIL_TAIL: f32 = 10.0 + 1.0 + 10.0 + 22.0 + 10.0;
 /// 展开态：分段条不画之后，百分比行到分隔线仍然留的那一口气（app.slint 里 if root.details 的 13px）。
 /// 不这么留，那条分隔线会直接贴到 20px 大字的下沿。
@@ -723,16 +1135,38 @@ const TW_DETAIL_GAP: f32 = 13.0;
 ///   10(分隔线到「名称：」) + 18*3(名称/剩余时间/剩余项目，原生这三行行距 18)
 ///   + 8(三行到速度图表条) + 80(速度图表条) + 8(图表条到第一条通道速率)
 const TW_DETAIL_BODY: f32 = 10.0 + 18.0 * 3.0 + 8.0 + TW_CHART_H + 8.0;
+/// 展开态一块的高度（不含明细行）：70(上半) + 13(分段条不画了留的呼吸) + 1(分隔线)
+/// + 160(详情固定部分，含 80 的图表条) = 244。明细行 22*rows 在
+/// transfer_window_height() 里按**非等待块**汇总后另算（等待块永远不展开）。
+const TW_OP_EXPANDED: f32 = TW_TOP_PART + TW_DETAIL_GAP + TW_DIVIDER + TW_DETAIL_BODY; // = 244.0
 /// 展开态那条「速度图表条」的高度，80px，和 app.slint 里 chart 的 height 一模一样。
 /// 参考图 native-details.png 逐行数：y=92 外框 / 93 内侧 / 94..141 上层 48 / 142 黑基线 /
 /// 143..169 下层实心 27 / 170 内侧 / 171 外框 = 80 行（y=172 起是纯白）。
 /// 原先这里是 15px 的「大聚合条」，用户拍板要真 1:1 的图表条，换成 80。
 const TW_CHART_H: f32 = 80.0;
-/// 收起态开关行那一串：10(分隔线到行) + 22(「详细信息」行) + 10(下留白) = 42。
+/// 收起态尾部（所有块共用一条开关行）：10(分隔线到行) + 22(「详细信息」行) + 10(下留白) = 42。
 /// 展开态它挪到最底下、中间还多插一条分隔线，见 TW_DETAIL_TAIL。
 const TW_TOGGLE_TAIL: f32 = 10.0 + 22.0 + 10.0;
 /// 明细一行的高度（app.slint 里 for 循环的 height: 22px）
 const TW_ROW_H: f32 = 22.0;
+/// 等待块（手机队列里还没开始传的那一条）的高度。
+///
+/// 和精简块**同值** 114：等待块只画精简态（一行「文件名（大小）」+ 小号灰字「等待中」+
+/// 空的进度条），窗口的「详细信息」展开它也不跟着展开 —— 所以它没有 244 那一档，
+/// 也不会占任何明细行。app.slint 的 raw-content-h 里同样是 waiting-ops * 114。
+const TW_WAITING_OP: f32 = 114.0;
+/// 传输窗口高度封顶要扣掉的上下留白：封顶值 = 屏幕可用高度 - 这个数。
+///
+/// 160 是「标题栏 + 边框 + 上下各留一口气」的量级：窗口是贴工作区右下角的，
+/// 封顶之后再靠 keep_on_screen 收一下尾，上下都还看得见窗口边缘。
+/// app.slint 的 cap-h 里是同一个数（两处必须一致）。
+const TW_HEIGHT_CAP_SLACK: f32 = 160.0;
+/// 拿不到屏幕高度时的封顶值（退化值）。720 能装下 1366x768 笔记本的工作区（768-48=720），
+/// 又不至于把一块 244 高的展开块裁掉。
+const TW_HEIGHT_CAP_FALLBACK: f32 = 720.0;
+/// 「接收失败：<原因>」那一行红字的高度（app.slint 里 height: 20px）。
+/// 每个失败块各加一次（多块时可能只失败其中一块）。
+const TW_FAIL_LINE_H: f32 = 20.0;
 
 /// 图表速度曲线的**进度分桶数**：把 0..100% 切成这么多格，每格记那一刻的速率。
 ///
@@ -761,64 +1195,707 @@ const CURVE_SAMPLE_MS: u128 = 40;
 /// 这正是「画过的曲线不会乱动」的关键（以前按当前点数算步长，每帧都在挪）。
 const CURVE_DRAW_POINTS: usize = 200;
 
-/// 传输窗口这一轮该多高：收起 156；展开 = 297 + 行数*22
-/// （行数为 0 时按 1 行算：那时 app.slint 画的是「这一轮还没有分通道数据」那一行，同样 22px）。
-/// 展开态的 297 = 70(上半) + 1(分隔线) + 13 + 160(详情固定部分，含 80 的图表条) + 53(尾部)，
-/// 逐项见上面的常量。
-/// 弹「取消」确认框时不用再撑高（它是独立窗口）。
-/// 把传输窗口摆到该在的位置再显示。
+/// 流光那条亮带的几何参数（照抄 Windows 原生 WPF 默认模板，参见 app.slint 里 band 的注释）。
 ///
-/// 三处「要弹出来了」都走它（正常开始 / 失败 / 失败后重新弹）：先摆个大概位置（省得在系统默认
-/// 位置闪一下），再让 `TwWindow::tick` 量出真实边框贴到工作区右下角 + 置顶。
-/// 少走一处就是一次真机 bug —— 失败那一轮当初只 `show()` 过，窗口停在 (130,130)。
-fn show_transfer_window(
-    tw: &TransferWindow,
-    s: &mut State,
-    tw_state: &Arc<Mutex<TwWindow>>,
-) {
-    #[cfg(windows)]
-    {
-        // +16 / +40 是边框和标题栏的估算值，只影响这一两帧
-        let (pw, ph) = transfer_window_px(tw);
-        let origin = tray_win::transfer_window_origin(pw + 16, ph + 40, s.config.xfer_win_pos);
-        if let Ok(mut g) = tw_state.lock() {
-            g.begin();
-            g.placed_at = Some(origin);
+/// 以前这四样是 tick 闭包里的局部 const —— 流光跑在一个独立的 16ms Timer 上，整窗只有一块，
+/// 亮带位置一个数就够了。现在一个窗口能堆 N 块，每块的亮带位置由自己那份填充比例算出来，
+/// 所以搬到模块级给 OpTrack 用（数值一个都没动，BAR_PX 是「按已填充比例换算成像素」用的
+/// 换算基准，改了亮带速度和位置就变）。
+const FLOW_BAND_PX: f32 = 100.0; // 高光带宽（WPF 就是 100px）
+const FLOW_SPEED_PX_S: f32 = 200.0; // 200 px/s（WPF 注释里的原值）
+const FLOW_PAUSE_S: f32 = 1.0; // 扫完停 1 秒
+const FLOW_BAR_PX: f32 = 428.0; // 条的实际像素宽：窗口 476 - 左右各 24 的内边距
+
+/// 传输窗口里「一个操作块」的滚动状态（一条传输任务一份）。
+///
+/// 为什么要有这一份：速度、分段速率、曲线分桶、量程、流光相位在「窗外只有一块」的时候
+/// 都是 tick 闭包里的局部变量，天然只有一份。现在一个窗口能堆 N 块，这些东西必须各算各的
+/// —— 共用一份的话两块会画同一条曲线、共用同一个量程，读数互相污染（一块在跑、一块停着，
+/// 量程会被跑得快的那个顶死，停着那块也照样长出新曲线）。
+struct OpTrack {
+    /// 这条任务读哪一份进度。目前一条任务就是「一台设备的一次传输」，所以这里就是设备串号
+    /// （进度按串号分开记，见 receiver::progress_for）。
+    serial: String,
+    /// 速度（B/s）：0.2 秒窗口 + EMA 平滑（和主窗口那张卡同一套算法）
+    speed: f64,
+    last_bytes: u64,
+    last_tick: std::time::Instant,
+    /// 每截速率：拿「这一秒」和「上一秒」各截的已收字节做差（PROGRESS 没有速率数据源）
+    seg_rate_bytes: Vec<u64>,
+    seg_rate_prev: Vec<u64>,
+    seg_rates: Vec<f32>,
+    seg_rate_at: Option<std::time::Instant>,
+    /// 展开态曲线的进度分桶（分桶的理由见 CURVE_BINS 的说明）
+    curve_bins: Vec<f32>,
+    curve_bin_cnt: Vec<u16>,
+    curve_cur_progress: f32,
+    curve_last_at: Option<std::time::Instant>,
+    curve_last_progress: f32,
+    curve_max_speed: f32,
+    curve_peak_win: Vec<f32>,
+    curve_win: Vec<(std::time::Instant, u64)>,
+    curve_path_progress: f32,
+    curve_path_at: Option<std::time::Instant>,
+    /// 上次拼出来的 Path commands：这帧不用重建时原样写回去（字符串就不用动）
+    curve_cmds: String,
+    /// 黑线的显示位置：每帧朝目标值追 22%，不在 5Hz 的速率刷新上跳格子
+    guide_y_disp: Option<f32>,
+    /// 流光相位（秒，0..一个周期）。以前是一个独立的 16ms Timer + 一个 Cell，
+    /// 现在跟着 tick 走（同一个节拍，省掉一条定时器）
+    flow_phase: f32,
+    /// 明细行 / 分段条的 model：内容不变就沿用旧对象（换一次 = Slint 重建全部行）
+    rows_model: slint::ModelRc<XferRow>,
+    rows_prev: Option<Vec<XferRow>>,
+    segs_model: slint::ModelRc<XferSeg>,
+    segs_prev: Option<Vec<XferSeg>>,
+    /// 上次写进模型的那份数据：和这帧一样就不写（Slint 收到一样的值也会标脏、重绘整窗）
+    sent: Option<XferOp>,
+    /// 这一块的明细行数（0 = 块里画「这一轮还没有分通道数据」那一行，仍占 22px）
+    rows_count: usize,
+}
+
+/// tick 每帧给所有块准备的公共上下文。
+///
+/// 这几样都是**进程级**的东西（control.rs 里的 static AtomicBool、全局的失败快照），
+/// 不分设备也不分任务 —— 每块拿到的都是同一个值，不需要按块各读一次。
+struct OpCtx<'a> {
+    paused: bool,
+    failed: bool,
+    failure_text: &'a str,
+    /// 窗口里有几块：只有一块时文案和改之前一模一样，多块时第 1 行前面带上设备名
+    op_count: usize,
+    /// 「详细信息」展开着没有：展开态分段条整条不画，流光也不用走
+    details: bool,
+    /// 窗口现在可见吗：不可见就别推进流光相位（改了看不见，却让整窗重绘）
+    visible: bool,
+}
+
+impl OpTrack {
+    fn new(serial: &str) -> OpTrack {
+        OpTrack {
+            serial: serial.to_string(),
+            speed: 0.0,
+            last_bytes: 0,
+            last_tick: std::time::Instant::now(),
+            seg_rate_bytes: Vec::new(),
+            seg_rate_prev: Vec::new(),
+            seg_rates: Vec::new(),
+            seg_rate_at: None,
+            curve_bins: vec![0.0; CURVE_BINS],
+            curve_bin_cnt: vec![0; CURVE_BINS],
+            curve_cur_progress: 0.0,
+            curve_last_at: None,
+            curve_last_progress: 0.0,
+            curve_max_speed: 0.0,
+            curve_peak_win: Vec::new(),
+            curve_win: Vec::new(),
+            curve_path_progress: -1.0,
+            curve_path_at: None,
+            curve_cmds: String::new(),
+            guide_y_disp: None,
+            flow_phase: 0.0,
+            rows_model: slint::ModelRc::new(slint::VecModel::from(Vec::<XferRow>::new())),
+            rows_prev: None,
+            segs_model: slint::ModelRc::new(slint::VecModel::from(Vec::<XferSeg>::new())),
+            segs_prev: None,
+            sent: None,
+            rows_count: 0,
         }
-        tw.window()
-            .set_position(slint::PhysicalPosition::new(origin.0, origin.1));
     }
-    #[cfg(not(windows))]
-    let _ = (s, tw_state);
-    let _ = tw.show();
-    #[cfg(windows)]
-    if let Ok(mut g) = tw_state.lock() {
-        g.tick(tw, s.config.xfer_win_pos);
+
+    /// 算出这一帧这个块该显示什么（顺手把 model / Path 换掉）。
+    ///
+    /// 这里整段是原来「窗外只有一块」时那套逻辑的搬运：除了把 tw.set_xxx 换成写进 XferOp、
+    /// 把闭包里的局部变量换成 self 的字段，算法和数值一个都没动 —— 单块时的界面数字
+    /// 必须和改之前完全一样。
+    fn frame(&mut self, ctx: &OpCtx, device_name: &str) -> XferOp {
+        // 读哪一份进度：接收方向是按设备分开记的（receiver::progress_for，收块时
+        // 「本设备」和「全局」两份都写，见 receiver.rs 的进度上报）。
+        // 发送方向（电脑 -> 手机：手机来取文件 / 用户推送）目前只有全局那份在更新 ——
+        // session.rs 的发送循环只写 PROGRESS，要改成按设备写属于会话层，这一轮不动它。
+        // 所以推文件时退回全局那份：单块时显示的数字和改之前完全一样；两台设备同时推
+        // 会看到同一组数字（那个方向本来也只有一个计数）。
+        let dev_prog;
+        let prog: &hfx_receiver::receiver::ProgressState = if hfx_receiver::control::sending() {
+            &hfx_receiver::receiver::PROGRESS
+        } else {
+            dev_prog = hfx_receiver::receiver::progress_for(&self.serial);
+            &dev_prog
+        };
+        let (path, done, total_bytes, _session_bytes, _files) = prog.snapshot();
+
+        // 速率只按「这次真收到的字节」算：续传基线（磁盘上本来就有的一块）不算进去，
+        // 否则续传一开始会跳出一个几 GB/s 的假峰值。
+        let received = prog.received_bytes();
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(self.last_tick).as_secs_f64();
+        // 0.2 秒一个窗口 = 每秒更新 5 次。以前是 0.4 秒（2.5 次/秒），
+        // 黑线和「速度:」那行字看着就像一秒跳两下的电子钟。
+        if elapsed >= 0.2 {
+            let delta = received.saturating_sub(self.last_bytes);
+            let instant = delta as f64 / elapsed;
+            // 暂停时**冻结**速率，不跟着衰减：暂停期间一个字节都不会来，
+            // 照着算 delta=0 会让速率每 0.4 秒掉 40%，几秒后就从 9.6 MB/s 掉成
+            // 一串无意义的数字。原生暂停是把图表整块冻住，数字停在最后那个值上。
+            if !ctx.paused {
+                // 0.55 的惯性 + 0.45 的新值：窗口短了噪声会变大，靠这个压住。
+                self.speed = if self.speed <= 0.0 {
+                    instant
+                } else {
+                    self.speed * 0.55 + instant * 0.45
+                };
+            }
+            self.last_bytes = received;
+            self.last_tick = now;
+        }
+        let speed = self.speed;
+
+        // 传完了没有：真机第一次跑出来的是「已完成 100%」+ 0 B/s 一直挂着不消失 ——
+        // 因为 PROGRESS 不清零，所以「结束」得单独认：字节满了就算完；另外真机第二次
+        // 撞见过 done 停在 599.0/600.0 MB（块计数尾巴对不上），再认一个信号：
+        // control 那边 receiving()/sending() 都落下去，就是这一轮结束了。
+        let in_flight = hfx_receiver::control::receiving() || hfx_receiver::control::sending();
+        let finished = (total_bytes > 0 && done >= total_bytes) || !in_flight;
+
+        let short = path
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(&path)
+            .to_string();
+        let size_text = human(total_bytes);
+
+        // ---- 第 1 行 ----
+        // 单块时就是改之前那句「文件名（大小）」；多块时前面加设备名 —— 否则两块内容
+        // 长得一样，用户分不出哪一块是哪台手机 / 哪条任务。
+        let action_now = if ctx.failed {
+            i18n::tr("接收失败", "receiving failed").to_string()
+        } else if ctx.op_count > 1 {
+            format!("{}：{}（{}）", device_name, short, size_text)
+        } else {
+            format!("{}（{}）", short, size_text)
+        };
+
+        // 百分比往下取整：向上四舍五入会在「1.99 / 2.00 GB」就跳成 100%，
+        // 而这时其实还在传。没传完最多显示 99%，满字节了才给 100%。
+        let pct = if total_bytes > 0 {
+            ((done.min(total_bytes) as f64 / total_bytes as f64) * 100.0).floor() as i32
+        } else {
+            0
+        };
+        // 失败的时候按块算：真机那次字节数明明满了、却缺 2 块，报「未完成 100%」是
+        // 自相矛盾的，按块算出来是 99%。用 set_failure 那一刻拍下来的百分比。
+        let shown_pct = if ctx.failed {
+            hfx_receiver::receiver::failure_percent().unwrap_or(99)
+        } else if finished {
+            100
+        } else {
+            pct.min(99)
+        };
+
+        // 暂停时速率位置显示「已暂停」（和手机端弹窗一致）
+        let speed_text = if ctx.paused {
+            "已暂停".to_string()
+        } else {
+            human_speed(speed)
+        };
+        let detail_now = format!("{} / {} · {}", human(done), human(total_bytes), speed_text);
+
+        // ---- 展开「详细信息」里那三行「标签：值」的值（标签在 Slint 那边写死）----
+        // 剩余时间：算得出来给「x 分 y 秒」，算不出来给「正在计算...」（原生的写法就是这个）。
+        // 刚起步（速率还没稳定）、暂停、已经收满都算「算不出来」。
+        let remain_bytes = total_bytes.saturating_sub(done);
+        let eta = if !ctx.paused && !finished && speed > 0.5 && remain_bytes > 0 {
+            human_eta((remain_bytes as f64 / speed) as u64)
+        } else {
+            i18n::tr("正在计算...", "calculating...").to_string()
+        };
+        // 剩余项目：「项目数 (剩余大小)」。这一轮一次只有一个文件在收（PROGRESS 只记
+        // 「当前文件」），所以项目数是 0 / 1，括号里是**这个文件**还剩多少字节。
+        let remain_now = format!(
+            "{} ({})",
+            if remain_bytes > 0 { 1 } else { 0 },
+            human(remain_bytes)
+        );
+
+        // IDM 式分块：按「哪条通道负责哪一段」画。段边界 = 相邻块通道归属的变化处。
+        let mut raw: Vec<hfx_receiver::receiver::XferSeg> = prog.segments();
+        let seg_total: f32 = raw.iter().map(|s| s.span).sum::<f32>().max(1.0);
+        for s in raw.iter_mut() {
+            s.span = (s.span / seg_total).clamp(0.0, 1.0);
+            s.filled = s.filled.clamp(0.0, 1.0);
+        }
+        // 已填充比例（按块算）：进度条画到哪、流光在哪儿扫都看它
+        let fill_frac: f32 = raw.iter().map(|s| s.span * s.filled).sum::<f32>().clamp(0.0, 1.0);
+
+        // ---- 「详细信息」里的明细行：一截一行 ----
+        let mut rows: Vec<XferRow> = Vec::with_capacity(raw.len());
+        // 行名先不带序号、行的排序键先攒着：手机端那张表是**按通道号**排的
+        // （1 USB_ADB、2 USB_ADB#2、3 wlan1 …），电脑这边段是按文件位置来的，
+        // 直接照段序排行两边就对不上。排完再统一编号。
+        let mut labels: Vec<String> = Vec::with_capacity(raw.len());
+        let mut row_order: Vec<(u8, f32)> = Vec::with_capacity(raw.len());
+        self.seg_rate_bytes.clear();
+        // 暂停中：速率列统一写 0 KB/s（这一秒本来就没在传，挂个旧速率是骗人）
+        for (i, s) in raw.iter().enumerate() {
+            let seg_total_b = (total_bytes as f64 * s.span as f64) as u64;
+            let seg_done = (seg_total_b as f64 * s.filled as f64) as u64;
+            self.seg_rate_bytes.push(seg_done);
+            let rate = self.seg_rates.get(i).copied().unwrap_or(0.0);
+            // 「各通道速率」这一列的说法（照原生的意思来）：
+            //   这一截收满 → 「已完成」；暂停中 / 一秒没动静 → 「0 KB/s」；
+            //   其余按真实速率（human_speed 自带 KB/s、MB/s 的量级切换）。
+            let rate_text = if s.filled >= 0.999 {
+                i18n::tr("已完成", "done").to_string()
+            } else if ctx.paused || rate <= 0.05 {
+                "0 KB/s".to_string()
+            } else {
+                human_speed(rate as f64)
+            };
+            // 段名 = 「谁在负责」，和手机端那条明细（「1 USB_ADB」）同一个读法（序号后加）。
+            let label = if s.owner == u8::MAX {
+                "未分配".to_string()
+            } else if s.owner == hfx_receiver::receiver::OWNER_RESUMED {
+                "续传".to_string()
+            } else {
+                match prog.channel_name(s.owner) {
+                    Some(n) => n,
+                    None => {
+                        if std::env::var("HFX_DEBUG_NAME").is_ok() {
+                            log::info(&format!(
+                                "通道名缺失 owner={} 已登记={}",
+                                s.owner,
+                                prog.channel_count()
+                            ));
+                        }
+                        format!("通道 {}", s.owner as u32 + 1)
+                    }
+                }
+            };
+            labels.push(label);
+            row_order.push((s.owner, i as f32));
+            rows.push(XferRow {
+                name: "".into(),
+                span_text: format!("{:.0}%", s.span * 100.0).into(),
+                amount: format!("{} / {}", human(seg_done), human(seg_total_b)).into(),
+                rate: rate_text.into(),
+                percent: (s.filled * 100.0).round() as i32,
+            });
+        }
+        // 按通道号重排（和手机端那张表同序），再统一编号；「未分配 / 多通道合并」的段排最后。
+        {
+            let mut order: Vec<usize> = (0..rows.len()).collect();
+            order.sort_by(|&a, &b| {
+                let (oa, xa) = row_order[a];
+                let (ob, xb) = row_order[b];
+                let ka = if oa == u8::MAX { (1u8, u8::MAX) } else { (0u8, oa) };
+                let kb = if ob == u8::MAX { (1u8, u8::MAX) } else { (0u8, ob) };
+                ka.cmp(&kb)
+                    .then(xa.partial_cmp(&xb).unwrap_or(std::cmp::Ordering::Equal))
+            });
+            let mut sorted: Vec<XferRow> = Vec::with_capacity(rows.len());
+            for (new_i, &old_i) in order.iter().enumerate() {
+                let mut r = rows[old_i].clone();
+                r.name = format!("{}. {}", new_i + 1, labels[old_i]).into();
+                sorted.push(r);
+            }
+            rows = sorted;
+        }
+        // 每截速率的取样：约一秒一次。逐帧做差会把块到达的抖动放大成满屏跳动的数字。
+        {
+            let now_at = std::time::Instant::now();
+            let due = match self.seg_rate_at {
+                Some(t) => now_at.duration_since(t).as_secs_f32() >= 0.9,
+                None => true,
+            };
+            if due {
+                if let Some(t) = self.seg_rate_at {
+                    let dt = now_at.duration_since(t).as_secs_f32().max(0.2);
+                    let new_rates: Vec<f32> = self
+                        .seg_rate_bytes
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &b)| {
+                            let prev = self.seg_rate_prev.get(i).copied().unwrap_or(b);
+                            if b >= prev {
+                                (b - prev) as f32 / dt
+                            } else {
+                                0.0
+                            }
+                        })
+                        .collect();
+                    self.seg_rates = new_rates;
+                }
+                self.seg_rate_prev = self.seg_rate_bytes.clone();
+                self.seg_rate_at = Some(now_at);
+            }
+        }
+        // 进度条上的切分线：段是「相邻块换了通道」留下的痕迹，位置就是它占整条的比例。
+        let mut segs: Vec<XferSeg> = Vec::with_capacity(raw.len());
+        let mut seg_at = 0.0f32;
+        for s in raw.iter() {
+            segs.push(XferSeg {
+                x: seg_at,
+                span: s.span,
+                filled: s.filled,
+            });
+            seg_at += s.span;
+        }
+        // 诊断：设了 HFX_DEBUG_SEGS=1 就把这一帧的段表写进日志（排查「条子画得不像」用）。
+        if std::env::var("HFX_DEBUG_SEGS").is_ok() {
+            let mut acc = 0.0f32;
+            let mut line = format!("段表 done={} n={}", done, raw.len());
+            for s in raw.iter() {
+                line.push_str(&format!(
+                    " [{:.3}+{:.3} f{:.2} o{}]",
+                    acc, s.span, s.filled, s.owner
+                ));
+                acc += s.span;
+            }
+            log::debug(&line);
+        }
+        // ---- 关键：model 不能每拍都换 ----
+        // 每拍新建一个 VecModel 塞给 Slint，等于告诉它「整个列表全变了」：它会把这 10 行
+        // 全部拆掉重建（每行里还有 10 来个 Text/Rectangle），光这一步就吃掉整帧预算的大头。
+        // 所以先和自己的上一帧比，内容一样就沿用旧 model，Slint 那边什么都不会动。
+        if self.segs_prev.as_ref().map(|p| p.as_slice()) != Some(segs.as_slice()) {
+            self.segs_prev = Some(segs.clone());
+            self.segs_model = slint::ModelRc::new(slint::VecModel::from(segs));
+        }
+        if self.rows_prev.as_ref().map(|p| p.as_slice()) != Some(rows.as_slice()) {
+            self.rows_prev = Some(rows.clone());
+            self.rows_model = slint::ModelRc::new(slint::VecModel::from(rows));
+        }
+        self.rows_count = self.rows_prev.as_ref().map(|r| r.len()).unwrap_or(0);
+
+        // ---- 展开态图表条：速度曲线采样 + 拼 Path + 「速度:」那行 ----
+        // 横轴是**进度**：把 0..1 切成 CURVE_BINS 格，每格记那一刻的速率。写进格子的值
+        // 就不再改 —— 曲线只向右长，画过的部分一个像素都不动。暂停 / 失败时不写。
+        //
+        // 回退检测要**狠一点**：进度是从 PROGRESS 里几千个块的计数算出来的，
+        // 个别块先完成后重置，会让 fill_frac 瞬间回弹几个百分点。真正的新一轮必然是
+        // 「回到接近 0」，所以要求回退超过 25% 且新进度 < 10%。
+        if self.curve_last_progress - fill_frac > 0.25 && fill_frac < 0.10 {
+            self.curve_bins.iter_mut().for_each(|b| *b = 0.0);
+            self.curve_bin_cnt.iter_mut().for_each(|c| *c = 0);
+            self.curve_cur_progress = 0.0;
+            self.curve_last_at = None;
+            self.curve_max_speed = 0.0;
+            self.curve_peak_win.clear();
+            self.curve_win.clear();
+        }
+        self.curve_last_progress = fill_frac;
+        // ---- 曲线专用速率：300ms 滑窗 ----
+        // 不能拿上面那个 speed 画曲线：那个值（0.2 秒窗口 + EMA）被压得几乎不动，
+        // 画出来就是一条平线。曲线单独按 40ms 采样间隔算一次瞬时值，两套互不干扰。
+        // 也不用「相邻两次采样之差」：PROGRESS 的字节数按块累加，一块收完才跳一次，
+        // 40ms 窗口里会读到「0、0、42761232、21MB」这种突发序列，尖峰能把量程顶飞。
+        let curve_now = std::time::Instant::now();
+        self.curve_win.push((curve_now, received));
+        while self
+            .curve_win
+            .first()
+            .map(|(t, _)| curve_now.duration_since(*t).as_secs_f32() > 2.0)
+            .unwrap_or(false)
+        {
+            self.curve_win.remove(0);
+        }
+        // 取「至少 300ms 前」的那个点当锚：窗口还不够长时用最老的点，
+        // 这样刚起步时也有一个（偏小的）速率可用，而不是一路 0。
+        let anchor = self
+            .curve_win
+            .iter()
+            .rev()
+            .find(|(t, _)| curve_now.duration_since(*t).as_millis() >= 300)
+            .copied()
+            .unwrap_or_else(|| *self.curve_win.first().unwrap_or(&(curve_now, received)));
+        let curve_elapsed = curve_now.duration_since(anchor.0).as_secs_f64();
+        let curve_instant = if curve_elapsed > 0.05 {
+            (received.saturating_sub(anchor.1) as f64 / curve_elapsed) as f32
+        } else {
+            0.0
+        };
+        // ---- 量程：最近 5 秒的 90 分位 × 1.1 ----
+        // 用**分位数**而不是最大值：偶发的突发（实测 66.8 MB/s，正常 21）会把「最大值」
+        // 顶到天上，量程跟着涨 3 倍，整条曲线被压成贴底。
+        self.curve_peak_win.push(curve_instant);
+        if self.curve_peak_win.len() > 125 {
+            self.curve_peak_win.remove(0);
+        }
+        let peak_now = {
+            let mut v: Vec<f32> = self.curve_peak_win.iter().copied().collect();
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let idx = ((v.len() as f32) * 0.9) as usize;
+            v.get(idx.min(v.len().saturating_sub(1))).copied().unwrap_or(0.0)
+        };
+        let want_max = chart_max_speed(peak_now);
+        if want_max > self.curve_max_speed {
+            // 涨：立刻跟上（不然曲线会冲出量程被削平）
+            self.curve_max_speed = want_max;
+        } else if self.curve_max_speed > want_max * 1.15 {
+            // 跌：只在水花明显偏大时收敛，每拍 0.2%
+            self.curve_max_speed = (self.curve_max_speed
+                - (self.curve_max_speed - want_max) * 0.002)
+                .max(want_max);
+        }
+        let curve_due = self
+            .curve_last_at
+            .map(|t| curve_now.duration_since(t).as_millis() >= CURVE_SAMPLE_MS)
+            .unwrap_or(true);
+        if curve_due && !ctx.paused && !ctx.failed {
+            self.curve_last_at = Some(curve_now);
+            // 从上次写到的位置一直填到当前进度：中间的格子沿用这一拍的速率。
+            // （不填的话进度一快，格子之间会留下 0 值，曲线变成一排向下的尖刺。）
+            let upto = if finished || fill_frac >= 0.999 {
+                1.0f32
+            } else {
+                fill_frac.clamp(0.0, 1.0)
+            };
+            let v = curve_instant.max(0.0);
+            let from = self.curve_cur_progress;
+            // 首帧（from==0）如果速率还没算出来，**先别填**：传输窗口是在进度非零时
+            // 才出现的，首帧要从 0 一口气补几百格，可那一拍的速率还是 0，于是整段被 0
+            // 填死，曲线左边贴底。速率一上来（>1KB/s）再补，那一次才是有意义的波形。
+            let ready_to_fill = from > 0.0 || v >= 1024.0;
+            if std::env::var("HFX_DEBUG_CURVE").is_ok() {
+                log::info(&format!(
+                    "采样 fill={:.4} v={:.0} 量程={:.0} 峰值={:.0} from={:.4} upto={:.4}",
+                    fill_frac, v, self.curve_max_speed, peak_now, from, upto
+                ));
+            }
+            if upto > from && ready_to_fill {
+                // 首次填桶必须从 0 开始：那一刻 fill_frac 可能已经 15%，
+                // 直接按 floor(0.15*400)=58 当起点时 bins[0..57] 就永远是 0。
+                let i0 = if from <= 0.0 {
+                    0usize
+                } else {
+                    (from * CURVE_BINS as f32).floor() as usize
+                };
+                let i1 = ((upto * CURVE_BINS as f32).ceil() as usize).min(CURVE_BINS);
+                for i in i0..i1 {
+                    if let Some(b) = self.curve_bins.get_mut(i) {
+                        // 加权平均：同一个桶被多次采样时取均值（覆盖会让相邻桶跳成锯齿）
+                        let c = self.curve_bin_cnt.get(i).copied().unwrap_or(0) as f32;
+                        *b = (*b * c + v) / (c + 1.0);
+                        if let Some(cnt) = self.curve_bin_cnt.get_mut(i) {
+                            *cnt = cnt.saturating_add(1);
+                        }
+                    }
+                }
+                self.curve_cur_progress = upto;
+            }
+        }
+        // ---- 曲线 Path 降频重建 ----
+        // Path 每次换 commands 字符串，Slint 都要把 200 个点重新三角化 + 重绘，
+        // 这是整帧里最贵的一步。曲线右边界每涨 0.2%（600MB 文件约 1.2MB）才需要重画一次，
+        // 且最少间隔 150ms —— 视觉上完全看不出延迟，帧率却能提上去。
+        let path_due = self
+            .curve_path_at
+            .map(|t| t.elapsed().as_millis() >= 150)
+            .unwrap_or(true)
+            && (self.curve_cur_progress - self.curve_path_progress).abs() >= 0.002;
+        if path_due {
+            self.curve_path_at = Some(std::time::Instant::now());
+            self.curve_path_progress = self.curve_cur_progress;
+            self.curve_cmds =
+                build_curve_path(&self.curve_bins, self.curve_cur_progress, self.curve_max_speed);
+        }
+        // 黑线：当前速度在刻度上的位置。暂停时钉在速度 0（贴底），
+        // 和「速度: 已暂停」那行字一致。
+        let guide_y = chart_guide_y(
+            if ctx.paused { 0.0 } else { speed as f32 },
+            self.curve_max_speed,
+        );
+        // 黑线：目标值是 0.1px 精度，但**每帧插值**逼近，所以线是连续滑动的。
+        let disp = match self.guide_y_disp {
+            // 第一帧 / 新一轮：直接落位，别从屏外滑进来
+            None => guide_y,
+            Some(prev) => prev + (guide_y - prev) * 0.22,
+        };
+        self.guide_y_disp = Some(disp);
+        // 量化到整数像素再写属性：黑线是 1px 高的横线，亚像素位置没有意义（原生就是整数
+        // 像素）。而「速度: xx MB/秒」那行字的 y 绑在 guide-y 上，属性一变它就重排一次，
+        // 中文重排很贵 —— 60Hz 下每帧都重排，实测展开态吃 74% 单核。
+        let quantized = disp.round();
+        // 参考图右上那行是「速度: 72.9 MB/秒」——单位沿用 human_speed 的量级切换
+        // （MB → KB → B），只把 "/s" 写成 "/秒"。暂停时写「已暂停」，别摆一个旧速率
+        // 和上面那行「已暂停」大字自相矛盾。
+        let chart_speed = if ctx.paused {
+            i18n::tr("已暂停", "paused").to_string()
+        } else {
+            human_speed(speed).replace("/s", "/秒")
+        };
+        let speed_line = format!("{}: {}", i18n::tr("速度", "Speed"), chart_speed);
+
+        // ---- 流光位置 ----
+        // 公式照抄 Windows 原生（WPF 默认模板的 PART_GlowRect），一句注释见 app.slint 里 band：
+        // 带宽 100px，匀速 200px/s 从填充区左边外面扫到右边外面，扫完停 1 秒再从头来。
+        // 以前这段跑在一个独立的 16ms Timer 上：整窗只有一块，亮带位置一个数就够了。
+        // 现在每块的填充宽度不同、亮带位置也就各不同，并进 tick 一块算（同一个节拍）。
+        // 只在「真在传 + 收起态 + 窗口可见」时推进：展开态分段条整条隐藏、窗口藏起来时
+        // 反正看不见，改了只会让 Slint 白重绘整窗。
+        let flow_on = !finished && !ctx.paused && speed > 0.5;
+        let mut flow = 0.0f32;
+        if flow_on {
+            let fill_px = (FLOW_BAR_PX * fill_frac.clamp(0.0, 1.0)).max(1.0);
+            // WPF：从 -带宽 扫到 填充宽 + 带宽 → 距离 = 填充宽 + 2×带宽
+            let travel_px = fill_px + 2.0 * FLOW_BAND_PX;
+            let sweep_s = travel_px / FLOW_SPEED_PX_S;
+            let cycle_s = sweep_s + FLOW_PAUSE_S;
+            if ctx.visible && !ctx.details {
+                self.flow_phase += 0.016;
+                if self.flow_phase >= cycle_s {
+                    self.flow_phase -= cycle_s;
+                }
+            }
+            // 扫描阶段线性走完 travel，剩下的时间（1 秒）停在最右边（已经在填充区外）
+            let t = (self.flow_phase / sweep_s).clamp(0.0, 1.0);
+            let x_px = -FLOW_BAND_PX + travel_px * t; // 亮带左边缘
+            flow = (x_px + FLOW_BAND_PX / 2.0) / FLOW_BAR_PX;
+        }
+        // fill 是进度条长度：量化到 0.1% 再比，避免 60Hz 下为了 0.02px 重绘整窗
+        let fill_q = (fill_frac * 1000.0).round() / 1000.0;
+
+        let op = XferOp {
+            action_text: action_now.into(),
+            percent: shown_pct,
+            detail_text: detail_now.into(),
+            file_name: short.into(),
+            eta_text: eta.into(),
+            remain_text: remain_now.into(),
+            speed_text: speed_line.into(),
+            paused: ctx.paused,
+            done: finished,
+            // 正常块永远不是「等待中」：等待块由 waiting_op() 单独造（见窗口那一层）
+            waiting: false,
+            failed: ctx.failed,
+            fail_text: ctx.failure_text.into(),
+            fill: fill_q,
+            flow,
+            flow_on,
+            segs: self.segs_model.clone(),
+            curve_path: self.curve_cmds.clone().into(),
+            guide_y: quantized,
+            rows: self.rows_model.clone(),
+        };
+        op
     }
 }
 
-fn transfer_window_height(details: bool, rows: usize, failed: bool) -> f32 {
-    // 收起 / 展开两套公式，和 app.slint 的 content-h 一个字一个字对得上：
-    //   收起 = 70 + 1 + 13 + 15 + 15 + 10 + 22 + 10 = 156
-    //   展开 = 70(上半) + 1(分隔线) + 13(分段条不画了留的呼吸) + 160(详情固定，含 80 图表条)
-    //          + 行数*22 + 53(尾部 10+1+10+22+10) = 297 + 行数*22
-    // 每通道一行；rows 为 0 时画的是「这一轮还没有分通道数据」那一行，同样 22px，故 max(1)。
-    let mut h = if details {
-        TW_TOP_PART
-            + TW_DIVIDER
-            + TW_DETAIL_GAP
-            + TW_DETAIL_BODY
-            + rows.max(1) as f32 * TW_ROW_H
-            + TW_DETAIL_TAIL
+/// 造一块「等待中」：手机队列里排着、还没开始传的那一条（QUEUE_STATE 的 state == 0）。
+///
+/// 字段和正常块用同一套（结构一样，只是等待块只画精简态），waiting 位是唯一的分叉 ——
+/// app.slint 那边据此把百分比那行换成小号灰字「等待中」、进度条留空、暂停 / 取消两颗
+/// 按钮藏掉，并且**永远不展开详情**（所以它的高度固定 114，和 details 无关）。
+/// 明细行和通道段都给空：排队中的文件电脑端既没开始收、也没分到任何通道 ——
+/// 反正等待块一行明细都不画。
+fn waiting_op(device_name: &str, op_count: usize, item: &hfx_receiver::queue::QueueItem) -> XferOp {
+    // 手机还在「准备中」（还没解析出文件）时名字是空串、字节数是 0：这时候别在界面上
+    // 留一个空括号，直接说「准备中…」—— 它也确实是排队中的一种。
+    let short = if item.name.is_empty() {
+        i18n::tr("准备中…", "preparing…").to_string()
     } else {
-        TW_H_COLLAPSED
+        item.name
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(&item.name)
+            .to_string()
     };
-    // 「接收失败：<原因>」那一行（app.slint 里 height: 20px）
-    if failed {
-        h += 20.0;
+    let size_text = human(item.size);
+    // 大小还没解析出来就别写「（0 B）」：那看着像这个文件是空的
+    let head = if item.size > 0 {
+        format!("{}（{}）", short, size_text)
+    } else {
+        short.clone()
+    };
+    // 第 1 行和正常块同一套写法：多块时前面带设备名（否则两块内容一样，分不出是谁的），
+    // 只有一块时就是「文件名（大小）」
+    let action_text = if op_count > 1 {
+        format!("{}：{}", device_name, head)
+    } else {
+        head
+    };
+    XferOp {
+        action_text: action_text.into(),
+        // 这个数在 waiting 时不会画出来（那一行换成「等待中」了），给 0 只是占位
+        percent: 0,
+        // 第 2 行右边那行灰字留空：排队中没有任何速率 / 进度可报
+        detail_text: "".into(),
+        file_name: short.into(),
+        eta_text: i18n::tr("正在计算...", "calculating...").into(),
+        // 剩余项目：这个文件整个还没开始，1 项、剩的就是它自己的大小
+        remain_text: format!("1 ({})", size_text).into(),
+        speed_text: "".into(),
+        paused: false,
+        done: false,
+        waiting: true,
+        failed: false,
+        fail_text: "".into(),
+        // 进度条留空：没有段、没有填充、流光不走
+        fill: 0.0,
+        flow: 0.0,
+        flow_on: false,
+        segs: slint::ModelRc::new(slint::VecModel::from(Vec::<XferSeg>::new())),
+        curve_path: "".into(),
+        guide_y: 75.0,
+        rows: slint::ModelRc::new(slint::VecModel::from(Vec::<XferRow>::new())),
     }
-    // 取消确认框现在是独立窗口，不再需要把传输窗口撑到 216 高（TRANSFER-WINDOW.md §6.2）
-    h
+}
+
+/// 传输窗口这一轮该多高（**未封顶**的完整内容高度）。
+///
+/// 逐项和 app.slint 的 raw-content-h 一个字一个字对得上：
+///   高度 = 非等待块数 × (收起 114 / 展开 244)
+///          + 明细行 22×detail_rows（**只在展开态**，且**只算非等待块**）
+///          + 等待块数 × 114（details 开不开都一样）
+///          + 失败块 20×failed_ops + 尾部（收起 42 / 展开 53）
+///
+/// 单块时就是改之前那两个数：
+///   收起 114 + 42 = 156 ✓
+///   展开 244 + 22*rows + 53 = 297 + 22*rows ✓（原来那条分隔线算在头部，这里算在块里）
+///   「接收失败：<原因>」那行红字每块 +20 ✓
+///
+/// detail_rows 由调用方汇总**非等待块**的明细行，每块至少按 1 行算 —— rows 为 0 时
+/// app.slint 画的是「这一轮还没有分通道数据」那一行，同样 22px。
+/// 一个块都没有（窗口本来就该收起的那些帧）时非等待块数按 1 算，和 app.slint 里
+/// Math.max(1, ops.length - waiting-ops) 那个兜底一致。
+///
+/// 手机队列里「等待中」的块（waiting_ops）单独一项、固定 114：它们只画精简态
+/// （见 app.slint 里 XferOperation 的 slim），窗口展开也不跟，所以不计明细行。
+/// 弹「取消」确认框时不用再撑高（它是独立窗口）。
+fn transfer_window_height(
+    details: bool,
+    op_count: usize,
+    waiting_ops: usize,
+    detail_rows: usize,
+    failed_ops: usize,
+) -> f32 {
+    let per_op = if details { TW_OP_EXPANDED } else { TW_OP_COLLAPSED };
+    let tail = if details { TW_DETAIL_TAIL } else { TW_TOGGLE_TAIL };
+    let normal = op_count.saturating_sub(waiting_ops).max(1) as f32;
+    // 明细行只在展开态算：收起态块里根本不画那些行（app.slint 里 rows 的 for 循环
+    // 包在 if root.details 里），算进去就是窗口底下多一块白。
+    let rows_h = if details {
+        detail_rows as f32 * TW_ROW_H
+    } else {
+        0.0
+    };
+    normal * per_op
+        + rows_h
+        + waiting_ops as f32 * TW_WAITING_OP
+        + failed_ops as f32 * TW_FAIL_LINE_H
+        + tail
+}
+
+/// 传输窗口高度的封顶值：屏幕可用高度 - 160，拿不到屏幕高度就退化成 720。
+///
+/// 和 app.slint 的 cap-h 是同一个算式（那边：root.screen-h > 0 ? screen-h-160 : 720）。
+/// screen_h 传 0 = 没拿到（Rust 那边量工作区失败时的约定）。
+fn transfer_window_cap(screen_h: i32) -> f32 {
+    if screen_h > 0 {
+        screen_h as f32 - TW_HEIGHT_CAP_SLACK
+    } else {
+        TW_HEIGHT_CAP_FALLBACK
+    }
 }
 
 fn main() -> Result<(), slint::PlatformError> {
@@ -924,9 +2001,13 @@ fn main() -> Result<(), slint::PlatformError> {
     }));
 
     let ui = AppWindow::new()?;
-    // 独立传输窗口：只读同一份 PROGRESS，不参与主界面布局。
+    // 每台设备一个独立传输窗口（键 = 设备串号）：只读 PROGRESS，不参与主界面布局。
     // 传输一开始自己弹出来，结束自己收起 —— 主窗口最小化到托盘时也能看到进度。
-    let xfer_win = TransferWindow::new()?;
+    //
+    // **Slint 对象不能跨线程**：窗口只在这个 UI 线程上建 / 驱动，所以整套东西塞在
+    // Rc<RefCell<..>> 里，由那个 16ms Timer（同一个 UI 线程）负责建、刷、收。
+    // 它不 Send，也就不可能被别的线程碰到。
+    let xfer_wins: Rc<RefCell<XferWins>> = Rc::new(RefCell::new(XferWins::default()));
     // 取消确认框的**独立窗口**（用户要求：不要再挤进传输窗口里）。
     // 传输窗口只负责把 cancel-ask 这个状态位翻成 true/false，这个窗口自己弹/收（见下面的定时器）。
     let ask_win = CancelAskWindow::new()?;
@@ -940,11 +2021,6 @@ fn main() -> Result<(), slint::PlatformError> {
     let push_round = Arc::new(Mutex::new(PushRound::default()));
     // 第 1 屏打勾的那几台（串号；顺序不重要，画的时候按设备表顺序比）
     let push_checked: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    // 用户在传输窗口上点了「收起」：这一轮就别再弹了（下一轮传输重新允许）
-    let xfer_dismissed = Arc::new(AtomicBool::new(false));
-    // 传输窗口的落位 / 置顶状态（收起回调也要用，所以放在外面共享）
-    #[cfg(windows)]
-    let tw_state = Arc::new(Mutex::new(TwWindow::default()));
     ui.set_dir_text(state.lock().unwrap().config.receive_dir.display().to_string().into());
     ui.set_port_text(state.lock().unwrap().config.port.to_string().into());
     ui.set_ip_text(ip_text.into());
@@ -977,7 +2053,7 @@ fn main() -> Result<(), slint::PlatformError> {
         let st = Arc::clone(&state);
         let ui_weak = ui.as_weak();
         // 开始接收：顺手把上一轮可能还开着的取消确认框（独立窗口）收掉
-        let tw_weak_start = xfer_win.as_weak();
+        let wins_start = Rc::clone(&xfer_wins);
         ui.on_start_clicked(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             let mut s = st.lock().unwrap();
@@ -1014,9 +2090,8 @@ fn main() -> Result<(), slint::PlatformError> {
             ui.set_message("".into());
             // 上一次取消留下的提示 / 没关掉的确认框，别带进这一次
             ui.set_notice_text("".into());
-            if let Some(tw) = tw_weak_start.upgrade() {
-                tw.set_cancel_ask(false);
-            }
+            // 上一轮可能还挂着的「取消确认」状态位，别带进这一次（所有窗口一起清）
+            clear_cancel_ask(&wins_start);
             hfx_receiver::control::pause(false);
             hfx_receiver::receiver::PROGRESS.reset();
             // 上一轮的「接收失败」提示别带进这一轮
@@ -1030,7 +2105,7 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let st = Arc::clone(&state);
         let ui_weak = ui.as_weak();
-        let tw_weak_stop = xfer_win.as_weak();
+        let wins_stop = Rc::clone(&xfer_wins);
         ui.on_stop_clicked(move || {
             let mut s = st.lock().unwrap();
             log::info("按钮：停止接收");
@@ -1042,9 +2117,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 ui.set_running(false);
                 ui.set_notice_text("".into());
             }
-            if let Some(tw) = tw_weak_stop.upgrade() {
-                tw.set_cancel_ask(false);
-            }
+            clear_cancel_ask(&wins_stop);
         });
     }
     {
@@ -1091,169 +2164,32 @@ fn main() -> Result<(), slint::PlatformError> {
     }
     // 主窗口上那个 `cancel-send` 回调没有任何地方 invoke（发送方向的取消都在
     // 传输窗口 / 推送小窗上），所以这里不再注册——留着只会让人以为还有第三条路。
-    {
-        // 传输窗口上那颗 × 在「电脑 -> 手机」（推送 / 手机来取文件）时走这里。
-        // 和接收方向一个套路：先申请、再弹「保留 / 不保留」，用户选完才真停。
-        // 返回 false = 这次点击该被忽略（没在发送 / 已经在取消中），界面不弹框。
-        xfer_win.on_cancel_send(cancel_send_request);
-    }
-    // ---- 独立传输窗口上的两颗按钮（和主窗口同一套控制函数）----
-    {
-        let weak = xfer_win.as_weak();
-        xfer_win.on_toggle_pause(move || {
-            let paused = !hfx_receiver::control::paused();
-            hfx_receiver::control::pause(paused);
-            if let Some(w) = weak.upgrade() {
-                w.set_paused(paused);
-            }
-        });
-    }
-    // ---- 流光的步进：照抄 Windows 原生的节奏 ----
     //
-    // WPF 默认模板（ProgressBar.cs 的 UpdateAnimation）是这么摆的：
-    //   startPos = -glowWidth，endPos = indicatorWidth + glowWidth，
-    //   translateTime = (endPos - startPos) / 200.0   // 注释原文：travel at 200px/second
-    //   pauseTime = 1.0s，Duration = translateTime + pauseTime，Linear、无限循环。
-    // 也就是「匀速 200px/s 扫过整条，扫完停 1 秒，再来」。这里按同样的公式算相位，
-    // flow = 亮带中心在条上的位置（单位：条宽），Slint 那边只负责按这个位置画。
-    //
-    // 窗口没显示 / 暂停 / 传完 / 速率为 0 时不动：进度不动还在闪，看着像卡死。
-    const BAND_PX: f32 = 100.0; // 高光带宽（WPF 就是 100px）
-    const SPEED_PX_S: f32 = 200.0; // 200 px/s（WPF 注释里的原值）
-    const PAUSE_S: f32 = 1.0; // 扫完停 1 秒
-    const BAR_PX: f32 = 428.0; // 条的实际像素宽：窗口 476 - 左右各 24 的内边距
-    let flow_phase = std::cell::Cell::new(0.0f32);
-    let flow_timer = slint::Timer::default();
-    {
-        let weak = xfer_win.as_weak();
-        flow_timer.start(slint::TimerMode::Repeated, Duration::from_millis(16), move || {
-            let Some(tw) = weak.upgrade() else { return };
-            // details 也要算进去：展开态分段条整条隐藏、只留图表条，
-            // 这时候还在每 16ms 改 flow，等于每帧无条件重绘 476x776 的整窗 ——
-            // 而屏幕上一个像素都没变。实测这就是展开态吃 76% 单核的真凶
-            // （收起态同一时刻只有 20%）。
-            if !tw.window().is_visible()
-                || tw.get_done()
-                || tw.get_paused()
-                || !tw.get_flow_on()
-                || tw.get_details()
-            {
-                return;
-            }
-            // 填充区宽度（像素）：条宽 × 已填充比例
-            let fill_px = (BAR_PX * tw.get_fill().clamp(0.0, 1.0)).max(1.0);
-            // WPF：从 -带宽 扫到 填充宽 + 带宽 → 距离 = 填充宽 + 2×带宽
-            let travel_px = fill_px + 2.0 * BAND_PX;
-            let sweep_s = travel_px / SPEED_PX_S;
-            let cycle_s = sweep_s + PAUSE_S;
-            let mut phase = flow_phase.get() + 0.016;
-            if phase >= cycle_s {
-                phase -= cycle_s;
-            }
-            flow_phase.set(phase);
-            // 扫描阶段线性走完 travel，剩下的时间（1 秒）停在最右边（已经在填充区外，看不见）
-            let t = (phase / sweep_s).clamp(0.0, 1.0);
-            let x_px = -BAND_PX + travel_px * t; // 亮带左边缘
-            tw.set_flow((x_px + BAND_PX / 2.0) / BAR_PX);
-        });
-    }
-    {
-        let weak = xfer_win.as_weak();
-        let dismissed = Arc::clone(&xfer_dismissed);
-        #[cfg(windows)]
-        let st = Arc::clone(&state);
-        #[cfg(windows)]
-        let tw_state = Arc::clone(&tw_state);
-        xfer_win.on_close_window(move || {
-            // 收起 = 藏起来，传输继续（要真停下得点窗口里的「取消」）
-            // 失败那一轮点这颗 = 「我知道了」：把失败提示消费掉，下一轮正常弹回来
-            hfx_receiver::receiver::clear_failure();
-            dismissed.store(true, Ordering::Relaxed);
-            if let Some(w) = weak.upgrade() {
-                #[cfg(windows)]
-                {
-                    // 用户可能把窗口拖到别处了：收起时顺手记住
-                    let placed = tw_state.lock().ok().and_then(|g| g.placed_at);
-                    if let Ok(mut s) = st.lock() {
-                        save_transfer_pos(&w, &mut s, placed);
-                    }
-                }
-                let _ = w.hide();
-            }
-        });
-    }
-    // 标题栏的 ✕ 和窗口里的「收起」是同一件事：藏起来，传输继续。
-    // （不接管的话 Slint 会当成「关窗」，窗口状态和这边的 tw_shown 就对不上了）
-    {
-        let weak = xfer_win.as_weak();
-        let dismissed = Arc::clone(&xfer_dismissed);
-        #[cfg(windows)]
-        let st = Arc::clone(&state);
-        #[cfg(windows)]
-        let tw_state = Arc::clone(&tw_state);
-        xfer_win.window().on_close_requested(move || {
-            hfx_receiver::receiver::clear_failure();
-            dismissed.store(true, Ordering::Relaxed);
-            if let Some(w) = weak.upgrade() {
-                #[cfg(windows)]
-                {
-                    let placed = tw_state.lock().ok().and_then(|g| g.placed_at);
-                    if let Ok(mut s) = st.lock() {
-                        save_transfer_pos(&w, &mut s, placed);
-                    }
-                }
-                let _ = w.hide();
-            }
-            slint::CloseRequestResponse::KeepWindowShown
-        });
-    }
-    // 「▾ 详细信息」：只翻一个 bool，窗口高度由主循环那边跟着算
-    //（收起/展开都不动窗口位置：set_size 只改大小）
-    {
-        let weak = xfer_win.as_weak();
-        xfer_win.on_toggle_details(move || {
-            if let Some(w) = weak.upgrade() {
-                // 传完之后明细没意义（窗口正准备收起来），别让它把窗口撑大
-                if w.get_done() {
-                    return;
-                }
-                w.set_details(!w.get_details());
-            }
-        });
-    }
+    // 传输窗口上那套回调（× 的两个方向 / 暂停 / 收起 / 标题栏 ✕ / 详细信息）现在跟着
+    // 窗口走：每台设备建窗口时由 wire_dev_xfer_win 挂一遍（见那个函数的说明）。
+    // 以前只有一个窗口，所以只在启动时挂一次；现在窗口数是运行中才定下来的。
     // ---- 接收方向的「取消」（不只是暂停 / 继续）----
     // 主界面和独立传输窗口注册的是同一套函数（见上面的 cancel_recv_request / cancel_keep /
     // cancel_discard / cancel_dismiss），语义只有一份 —— 弹窗上的 ✕ 和主界面上的「取消」
     // 完全等价：先暂停（手机端跟着停发），再问「保留进度 / 不保留，删掉 / 继续接收」。
     ui.on_cancel_recv(cancel_recv_request);
-    xfer_win.on_cancel_recv(cancel_recv_request);
     {
         let st = Arc::clone(&state);
         ui.on_cancel_keep(move || cancel_keep(&st));
     }
     {
         let st = Arc::clone(&state);
-        xfer_win.on_cancel_keep(move || cancel_keep(&st));
-    }
-    {
-        let st = Arc::clone(&state);
         ui.on_cancel_discard(move || cancel_discard(&st));
     }
-    {
-        let st = Arc::clone(&state);
-        xfer_win.on_cancel_discard(move || cancel_discard(&st));
-    }
     ui.on_cancel_dismiss(cancel_dismiss);
-    xfer_win.on_cancel_dismiss(cancel_dismiss);
-    // 独立窗口上的三个按钮：先收窗口、把传输窗口的状态位清零，再走同一套语义
+    // 独立窗口上的三个按钮：先收窗口、把传输窗口的状态位清零（所有窗口一起清：取消是
+    // 进程级的一件事，用户的回答只有一个），再走同一套语义
     {
         let st = Arc::clone(&state);
-        let tw_weak = xfer_win.as_weak();
+        let wins = Rc::clone(&xfer_wins);
         let aw = ask_win.as_weak();
         ask_win.on_keep(move || {
-            if let Some(tw) = tw_weak.upgrade() {
-                tw.set_cancel_ask(false);
-            }
+            clear_cancel_ask(&wins);
             if let Some(a) = aw.upgrade() {
                 let _ = a.hide();
             }
@@ -1262,12 +2198,10 @@ fn main() -> Result<(), slint::PlatformError> {
     }
     {
         let st = Arc::clone(&state);
-        let tw_weak = xfer_win.as_weak();
+        let wins = Rc::clone(&xfer_wins);
         let aw = ask_win.as_weak();
         ask_win.on_discard(move || {
-            if let Some(tw) = tw_weak.upgrade() {
-                tw.set_cancel_ask(false);
-            }
+            clear_cancel_ask(&wins);
             if let Some(a) = aw.upgrade() {
                 let _ = a.hide();
             }
@@ -1276,12 +2210,10 @@ fn main() -> Result<(), slint::PlatformError> {
     }
     {
         // 确认框的标题栏 ✕ = 「继续接收」（不改主意），和框里那个按钮一个语义
-        let tw_weak = xfer_win.as_weak();
+        let wins = Rc::clone(&xfer_wins);
         let aw = ask_win.as_weak();
         ask_win.window().on_close_requested(move || {
-            if let Some(tw) = tw_weak.upgrade() {
-                tw.set_cancel_ask(false);
-            }
+            clear_cancel_ask(&wins);
             if let Some(a) = aw.upgrade() {
                 let _ = a.hide();
             }
@@ -1290,12 +2222,10 @@ fn main() -> Result<(), slint::PlatformError> {
         });
     }
     {
-        let tw_weak = xfer_win.as_weak();
+        let wins = Rc::clone(&xfer_wins);
         let aw = ask_win.as_weak();
         ask_win.on_dismiss(move || {
-            if let Some(tw) = tw_weak.upgrade() {
-                tw.set_cancel_ask(false);
-            }
+            clear_cancel_ask(&wins);
             if let Some(a) = aw.upgrade() {
                 let _ = a.hide();
             }
@@ -1592,92 +2522,11 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let st = Arc::clone(&state);
         let ui_weak = ui.as_weak();
-        // 独立传输窗口：这一轮有没有弹过 / 用户是不是已经把它收起来了
-        let xfer_weak = xfer_win.as_weak();
+        // 每台设备的传输窗口：窗口 / 列表 model / 块状态 / 落位状态 / 收起标志都在里面，
+        // 建、刷、收全在这一条线程（这个 Timer）上做。
+        let xfer_wins = Rc::clone(&xfer_wins);
         // 取消确认框那个独立窗口
         let ask_weak = ask_win.as_weak();
-        let xfer_dismissed = Arc::clone(&xfer_dismissed);
-        #[cfg(windows)]
-        let tw_state = Arc::clone(&tw_state);
-        let mut tw_shown = false;
-        // 上一帧的「明细展开 / 取消框在显示」状态：只在变化的那一刻改窗口高度
-        let mut tw_failed_on = false;
-        // 明细行数（= 通道段数）。active 分支算出来的，给外面「每帧跟高度」那段用
-        let mut last_row_count = 0usize;
-        // 每截速率：拿「这一秒」和「上一秒」各截的已收字节做差。
-        // PROGRESS 只记了每段占比和完成度，没有速率数据源 —— 但差值就是速率，
-        // 一秒钟取一次样，既不抖也不用改协议层。
-        let mut seg_rate_bytes: Vec<u64> = Vec::new();
-        let mut seg_rate_prev: Vec<u64> = Vec::new();
-        let mut seg_rates: Vec<f32> = Vec::new();
-        let mut seg_rate_at: Option<std::time::Instant> = None;
-        // 展开态图表条的速度曲线：横轴是进度，所以按**固定的进度桶**存。
-        //
-        // 以前是 VecDeque<(进度, 速率)> + 绘制时按索引等间距抽稀 —— 那个做法有两个要命的毛病：
-        //   1) 桶满了要 pop_front → 曲线左端整段往前跳；
-        //   2) 抽稀步长每帧都在变 → 同一个进度位置上一帧抽到的是这个点、下一帧是那个点，
-        //      整条已经画过的曲线会跟着抖、扭（用户说的「画过的速度图示一直乱动扭曲」）。
-        // 改成固定分桶之后，第 i 个桶永远就是进度 i/CURVE_BINS 处的速率：
-        // 一旦写进去就不再变，曲线只会**向右长**，画过的部分一个像素都不会动。
-        let mut curve_bins: Vec<f32> = vec![0.0; CURVE_BINS];
-        // 已经画到哪儿了（进度 0..1）：曲线只铺到这里，未完成区间里没有面积。
-        let mut curve_cur_progress = 0f32;
-        let mut curve_last_at: Option<std::time::Instant> = None;
-        // 上一次采样时的进度：用来认「新一轮开始了」——进度往回退就清空历史，别把上一轮的波带过来。
-        let mut curve_last_progress = 0f32;
-        // 图表条的纵轴量程（B/s）。新一轮复位；涨的时候立刻跟上，跌的时候极慢地收敛。
-        //
-        // 为什么不能「只涨不跌」：刚开传那一两秒，多通道一起把缓冲区灌满，会冒出一个
-        // 远高于稳定值的水花（实测 9.5 MB/s 的传输，头一秒读到过 16 MB/s）。
-        // 那个水花把量程顶死，之后整条曲线就被压在 40% 的高度上 —— 真机上和原生一比，
-        // 我们的深绿只有 15px，原生是 35px。
-        //
-        // 所以峰值取**最近 5 秒**（滚动窗口），水花 5 秒后自己滑出窗口，量程再慢慢收敛。
-        // 窗口从 30 秒缩到 5 秒：原生那条曲线是紧跟当前速率的（naive-00 峰顶就是满幅 35px），
-        // 30 秒窗口会把「前一分钟的峰值」一直当量程，速度掉下来后曲线只剩一半高。
-        let mut curve_max_speed = 0f32;
-        // 最近 30 秒的速率采样（用于算滚动峰值）：(取样的时刻, 速率 B/s)
-        // 最近若干次曲线速率（用于取 90 分位定量程）。只存值不存时刻：
-        // 采样是等间隔的，按条数限长就等于按时间限长。
-        let mut curve_peak_win: Vec<f32> = Vec::new();
-        // 曲线自己一套速率：上一次采样时收到的字节数 + 时刻。
-        //
-        // **不能**拿上面那个 speed（0.2 秒窗口 + EMA 0.55/0.45）来画曲线：
-        // 那个值是给「11.4 MB/s」那行大字和黑线用的，天生被压得几乎不动
-        // （实测相邻两次采样 10889752 → 10348346，只差 5%，换算到 35px 振幅上只有 1.7px），
-        // 画出来就是一条平线 —— 用户说的「一开始还是平的」就是这个。
-        // 原生那条曲线的起伏是 ±50%（逐列实测 12..35px），那是**短间隔瞬时速率**
-        // 才有的噪声。所以曲线单独按 40ms 采样间隔算一次瞬时值，两套互不干扰。
-        // 滑窗：最近 2 秒的 (时刻, 累计字节)。曲线速率 = 窗口两端之差 / 时间差。
-        //
-        // 为什么不用「相邻两次采样之差」：PROGRESS 的字节数是按块累加的，
-        // 一块收完才跳一次，于是 40ms 窗口里会读到「0、0、42761232、21MB」这种突发序列
-        // （实测尖峰 66.8 MB/s，是正常值的 3 倍）—— 拿它算速率，量程立刻被顶飞，
-        // 曲线反而被压成贴底；读 0 的那些格子还会在曲线上留下 0 高度的断口。
-        // 滑 300ms 之后突发被摊平，又比 0.2 秒 EMA 保留更多真实起伏。
-        let mut curve_win: Vec<(std::time::Instant, u64)> = Vec::new();
-        // 每个分桶被写入了几次：写入用**加权平均**而不是覆盖。
-        // 覆盖会让「同一个桶被连着采样 8 次」的最后一次压掉前 7 次，
-        // 桶里的值就等于某一次的瞬时值 —— 相邻桶之间反而更容易跳成锯齿。
-        let mut curve_bin_cnt: Vec<u16> = vec![0; CURVE_BINS];
-        let mut tw_details_on = false;
-        let mut tw_cancel_on = false;
-        // 图表条 / 明细行的「上一帧快照」：内容没变就不碰 Slint 的 model 和 Path。
-        // 传输窗口每帧整窗重绘（Slint 没有脏矩形），所以少改一个属性就是省一整帧。
-        let mut rows_prev: Option<Vec<XferRow>> = None;
-        let mut rows_model_keep = slint::ModelRc::new(slint::VecModel::from(Vec::<XferRow>::new()));
-        let mut segs_prev: Option<Vec<XferSeg>> = None;
-        let mut segs_model_keep = slint::ModelRc::new(slint::VecModel::from(Vec::<XferSeg>::new()));
-        // 上一次真正重建 Path 时的进度 / 时刻：曲线按 200ms + 进度变化 0.2% 分频
-        let mut curve_path_progress = -1f32;
-        let mut curve_path_at: Option<std::time::Instant> = None;
-        // 黑线的「显示位置」：每帧朝目标值追 22%。
-        //
-        // 速率本身是 0.2 秒量一次（再快就是噪声），直接把那个值喂给黑线的话，
-        // 线就变成 5Hz 的跳格子 —— 用户原话「黑的速率线也卡」。
-        // 这里让它在 60Hz 的拍子上做一次指数逼近：约 4~5 帧（80ms）走到位，
-        // 既跟得上速率变化，又不会一格一格地跳。
-        let mut guide_y_disp: Option<f32> = None;
         // tick 耗时统计（HFX_TICK_STAT=1 时每秒往日志写一行）：
         // 用来确认「卡」到底是 tick 太重，还是渲染跟不上。
         // env 查询放到循环外：std::env::var 每拍都做一次是白烧（虽然不贵，但没必要）
@@ -1686,8 +2535,6 @@ fn main() -> Result<(), slint::PlatformError> {
         let mut tick_stat_sum = 0u128;
         let mut tick_stat_n = 0u32;
         let mut tick_stat_max = 0u128;
-        // 这一轮传完的时刻（用来数「已完成」亮够 3 秒没有）
-        let mut tw_finish_at: Option<std::time::Instant> = None;
         let mut last_bytes = 0u64;
         let mut last_tick = std::time::Instant::now();
         let mut speed = 0f64;
@@ -1722,10 +2569,29 @@ fn main() -> Result<(), slint::PlatformError> {
         timer.start(slint::TimerMode::Repeated, Duration::from_millis(16), move || {
             let tick_t0 = std::time::Instant::now();
             let Some(ui) = ui_weak.upgrade() else { return };
-            // ---- 取消确认框：独立窗口，跟着 cancel-ask 这个状态位弹/收 ----
+            // ---- 取消确认框：独立窗口，跟着「哪个传输窗口的 cancel-ask」弹/收 ----
             // 传完 / 已经取消 / 用户选了任意一项 → 状态位被清掉 → 这里把窗口收起来。
-            if let (Some(tw), Some(aw)) = (xfer_weak.upgrade(), ask_weak.upgrade()) {
-                let want = tw.get_cancel_ask();
+            if let Some(aw) = ask_weak.upgrade() {
+                // 是哪台设备的块弹了「保留 / 不保留」：确认框就摆到那个窗口正中
+                // （多窗口时按创建顺序取第一个想弹的 —— 取消是进程级的一件事，
+                // 同一时刻只会有一个窗口挂着这个状态位）
+                let anchor: Option<(i32, i32, u32, u32)> = {
+                    let mut found = None;
+                    if let Ok(g) = xfer_wins.try_borrow() {
+                        for key in &g.order {
+                            if let Some(d) = g.map.get(key) {
+                                if d.win.get_cancel_ask() {
+                                    let pos = d.win.window().position();
+                                    let size = d.win.window().size();
+                                    found = Some((pos.x, pos.y, size.width, size.height));
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    found
+                };
+                let want = anchor.is_some();
                 let shown = aw.window().is_visible();
                 if want && !shown {
                     // 标题和正文按方向走（见 app.slint 的 CancelAskWindow.sending）：
@@ -1733,13 +2599,13 @@ fn main() -> Result<(), slint::PlatformError> {
                     aw.set_sending(hfx_receiver::control::sending());
                     let _ = aw.show();
                     // 弹在传输窗口正中（先 show 再量尺寸：没显示时尺寸还不可信）
-                    let tw_pos = tw.window().position();
-                    let tw_size = tw.window().size();
-                    let aw_size = aw.window().size();
-                    let x = tw_pos.x + (tw_size.width as i32 - aw_size.width as i32) / 2;
-                    let y = tw_pos.y + (tw_size.height as i32 - aw_size.height as i32) / 2;
-                    aw.window()
-                        .set_position(slint::PhysicalPosition::new(x.max(0), y.max(0)));
+                    if let Some((tw_x, tw_y, tw_w, tw_h)) = anchor {
+                        let aw_size = aw.window().size();
+                        let x = tw_x + (tw_w as i32 - aw_size.width as i32) / 2;
+                        let y = tw_y + (tw_h as i32 - aw_size.height as i32) / 2;
+                        aw.window()
+                            .set_position(slint::PhysicalPosition::new(x.max(0), y.max(0)));
+                    }
                     // 传输窗口自己是 HWND_TOPMOST（§6.5），这个确认框也必须跟着置顶 + 抢前台，
                     // 否则用户看着它在前面、鼠标点下去命中的是后面那个置顶窗口 ——
                     // 真机 2026-11-19：点「保留进度」毫无反应，传输一路跑到 100%。
@@ -2469,9 +3335,22 @@ fn main() -> Result<(), slint::PlatformError> {
             // 时不该再看到它，更不该让那里再选一次「保留 / 不保留」。
             // 确认框现在是独立窗口、状态位挂在传输窗口上：这里只在「传输已经不在收」时
             // 把那个位清掉（定时器会把窗口收起来）。
-            if let Some(tw) = xfer_weak.upgrade() {
-                if tw.get_cancel_ask() && !busy_now {
-                    tw.set_cancel_ask(false);
+            if !busy_now {
+                // 「这个位」现在每个窗口一份：哪一个挂着就清哪一个（用户的回答只有一个，
+                // 所以一律全清 —— 见 clear_cancel_ask）
+                let mut any_ask = false;
+                if let Ok(g) = xfer_wins.try_borrow() {
+                    for key in &g.order {
+                        if let Some(d) = g.map.get(key) {
+                            if d.win.get_cancel_ask() {
+                                any_ask = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if any_ask {
+                    clear_cancel_ask(&xfer_wins);
                     if !hfx_receiver::control::cancel_requested() {
                         hfx_receiver::control::pause(false);
                     }
@@ -2507,501 +3386,253 @@ fn main() -> Result<(), slint::PlatformError> {
                     files
                 ).into());
 
-                // IDM 式分块：和手机端一样按"哪条通道负责哪一段"画。
-                // 两个方向都统一用块位图（mark_sent / mark_received 都按块记下真实通道号），
-                // 段边界 = 相邻块通道归属的变化处：一个块传完就重算一次分段，
-                // 通道抢走别人的段后，旧的边界会一直留在位图里（切分痕迹）。
-                // 之前发送方向用 SendPlan 的任务区间：边界只在"领任务"那一刻重算，
-                // 和实际发完的块对不上，看起来就是整段一起跳、没有切分痕迹。
-                let mut raw: Vec<hfx_receiver::receiver::XferSeg> =
-                    hfx_receiver::receiver::PROGRESS.segments();
-                let total: f32 = raw.iter().map(|s| s.span).sum::<f32>().max(1.0);
-                for s in raw.iter_mut() {
-                    s.span = (s.span / total).clamp(0.0, 1.0);
-                    s.filled = s.filled.clamp(0.0, 1.0);
-                }
-                // 已填充比例（按块算）：进度条画到哪、流光在哪儿扫都看它
-                let fill_frac: f32 = raw.iter().map(|s| s.span * s.filled).sum::<f32>().clamp(0.0, 1.0);
+                // ---- 独立传输窗口：一台设备一个窗口 ----
+                // 一条任务 = 一台设备的一次传输（进度按串号分开记，见 receiver::progress_for；
+                // 一台设备同时只有一条进行中的传输 —— PROGRESS 只记「当前文件」）。
+                // 所以「按设备分组」现在就是「每台设备一块」：每个窗口只喂自己那几块，
+                // 窗口内的多块堆叠能力（tracks / model / 竖向排列）原样保留 ——
+                // 将来同一台设备并行几条任务时，这里的分组不用改。
+                //
+                // 顺序用串号排序（和主界面设备列表同序）：块的位置不能因为 HashMap 的
+                // 遍历顺序每次都不一样而上下乱跳。
+                let mut task_keys: Vec<String> = s
+                    .devices
+                    .iter()
+                    .filter(|(serial, st)| {
+                        matches!(st, EngineState::Connected(_)) && !serial.is_empty()
+                    })
+                    .map(|(serial, _)| serial.clone())
+                    .collect();
+                task_keys.sort();
 
-                // ---- 「详细信息」里的明细行：一截一行 ----
-                // 每截：占整条多少 · 这段已收 / 这段总量 · 这段自己的速率 · 完成百分比。
-                // 速率是「这一秒和上一秒的已收字节做差」算出来的（见上面的 seg_rate_*）：
-                // PROGRESS 没有速率数据源，但差值就是速率，不用改协议层就能有。
-                let mut rows: Vec<XferRow> = Vec::with_capacity(raw.len());
-                // 行名先不带序号、行的排序键先攒着：手机端那张表是**按通道号**排的
-                // （1 USB_ADB、2 USB_ADB#2、3 wlan1 …），电脑这边段是按文件位置来的，
-                // 直接照段序排行两边就对不上。排完再统一编号。
-                let mut labels: Vec<String> = Vec::with_capacity(raw.len());
-                let mut row_order: Vec<(u8, f32)> = Vec::with_capacity(raw.len());
-                seg_rate_bytes.clear();
-                // 暂停中：速率列统一写 0 KB/s（这一秒本来就没在传，挂个旧速率是骗人）
-                let paused_now = hfx_receiver::control::paused();
-                for (i, s) in raw.iter().enumerate() {
-                    let seg_total = (total_bytes as f64 * s.span as f64) as u64;
-                    let seg_done = (seg_total as f64 * s.filled as f64) as u64;
-                    seg_rate_bytes.push(seg_done);
-                    let rate = seg_rates.get(i).copied().unwrap_or(0.0);
-                    // 「各通道速率」这一列的说法（这一轮定的，照原生的意思来）：
-                    //   这一截收满 → 「已完成」；暂停中 / 一秒没动静 → 「0 KB/s」；
-                    //   其余按真实速率（human_speed 自带 KB/s、MB/s 的量级切换）。
-                    let rate_text = if s.filled >= 0.999 {
-                        i18n::tr("已完成", "done").to_string()
-                    } else if paused_now || rate <= 0.05 {
-                        "0 KB/s".to_string()
-                    } else {
-                        human_speed(rate as f64)
+                // 还没窗口的设备：先把窗口建出来（Slint 对象只能在 UI 线程建，所以只在
+                // 这个 Timer 里建）。
+                for key in &task_keys {
+                    let exists = {
+                        let g = xfer_wins.borrow();
+                        g.map.contains_key(key)
                     };
-                    // 段名 = 「谁在负责」，和手机端那条明细（「1 USB_ADB」）同一个读法（序号后加）。
-                    // owner 是通道号（mark_sent / mark_received 记下的那个），从这里换成人能看的名字；
-                    // 还没分配的尾段、续传捡回来的块各有各的叫法。
-                    let label = if s.owner == u8::MAX {
-                        "未分配".to_string()
-                    } else if s.owner == hfx_receiver::receiver::OWNER_RESUMED {
-                        "续传".to_string()
+                    if exists {
+                        continue;
+                    }
+                    // 标签默认用设备显示名，重名依次加 " 2"、" 3"：标题后缀必须唯一，
+                    // 找 HWND 是按后缀匹配的（两台同名手机会互相抢到对方的窗口）。
+                    let base = device_display_name(&s, key);
+                    let taken: Vec<String> = {
+                        let g = xfer_wins.borrow();
+                        g.map.values().map(|d| d.label.clone()).collect()
+                    };
+                    let label = unique_label(&taken, &base);
+                    if let Some(d) = make_dev_xfer_win(&xfer_wins, &st, key, &label) {
+                        xfer_wins.borrow_mut().insert(key.clone(), d);
+                    }
+                }
+
+                // 这一帧没有任务的设备（断开了 / 停止接收了）：窗口收起来并从表里移除
+                //（下一轮重新建、重新摆位 —— 单实例改成每设备一个之后，不需要常驻的空窗口了）。
+                let dead: Vec<String> = {
+                    let g = xfer_wins.borrow();
+                    g.map
+                        .keys()
+                        .filter(|k| !task_keys.contains(k))
+                        .cloned()
+                        .collect()
+                };
+                for key in dead {
+                    drop_dev_xfer_win(&xfer_wins, &mut *s, &key);
+                }
+
+                // 每个窗口各喂各的块 + 该弹就弹 / 该收就收。
+                // 槽位（摆位时往上错开的档位）就是创建顺序里的下标。
+                let keys: Vec<String> = {
+                    let g = xfer_wins.borrow();
+                    g.order.clone()
+                };
+                // 只有「恰好一个窗口」时才沿用 config 里记的窗口坐标：多窗口是从右下角
+                // 自动往上排的（见 tray_win::nudge_to_bottom_right_up）
+                let single = keys.len() == 1;
+                let saved = if single { s.config.xfer_win_pos } else { None };
+                for (slot, key) in keys.iter().enumerate() {
+                    let mut wins_g = xfer_wins.borrow_mut();
+                    let Some(d) = wins_g.map.get_mut(key) else { continue };
+                    // 槽位 / 窗口总数变了（第二台设备冒出来、走掉一台）：按新槽位重排一遍 ——
+                    // 否则新窗口会叠在旧窗口上、走掉一台后底下空出一个洞，而且多窗口时不该
+                    // 再沿用 config 里那一份单独坐标（见 transfer_window_origin 的说明）。
+                    // 两个数都没变就一个像素都不动 —— 用户拖过的位置得保住。
+                    if d.slot_seen != slot || d.stack_seen != keys.len() {
+                        d.slot_seen = slot;
+                        d.stack_seen = keys.len();
+                        d.re_anchor();
+                        // 已经开着的窗口不会再走 show_at 那一套，这里补一帧落位
+                        if d.shown {
+                            d.settle(saved, slot);
+                        }
+                    }
+                    // 让这个窗口的 tracks 和「这台设备的任务」一一对应：还在的原样留着
+                    //（曲线 / 量程 / 速率不能因为别的设备下线就归零），没了的下车，
+                    // 新来的追加在末尾。
+                    let own: Vec<String> = task_keys
+                        .iter()
+                        .filter(|k| *k == &d.serial)
+                        .cloned()
+                        .collect();
+                    let mut old_tracks = std::mem::take(&mut d.tracks);
+                    let mut next_tracks: Vec<OpTrack> = Vec::with_capacity(own.len());
+                    for k in &own {
+                        match old_tracks.iter().position(|t| &t.serial == k) {
+                            Some(i) => next_tracks.push(old_tracks.remove(i)),
+                            None => next_tracks.push(OpTrack::new(k)),
+                        }
+                    }
+                    d.tracks = next_tracks;
+
+                    // ---- 手机排队中的任务（QUEUE_STATE，309）----
+                    //
+                    // 手机一次选了几十个文件时，同一刻只有一个在传，其余排着队；
+                    // 这些排队的以前电脑端完全看不见（用户以为选中的文件丢了）。
+                    // 现在它们接在「正在跑的那块」后面，画成「等待中」。
+                    //
+                    // 只画 state == 0：state == 1 的那一条就是本窗口正在跑的这个块
+                    //（再画一遍就成了同一份文件占两块），2 / 3 已经收尾 / 失败，
+                    // 失败的红字走 RESULT / failure 那一套，这里再画一块会自相矛盾。
+                    // 顺序就是手机报来的顺序 —— 那是用户眼里的排队次序。
+                    let waiting = hfx_receiver::queue::waiting_for(&d.serial);
+                    // 块总数 = 正在跑的 + 等待中的：第 1 行的「设备名：」前缀按它判断，
+                    // 只有一块时保持和以前一模一样的写法。
+                    let op_count = d.tracks.len() + waiting.len();
+                    let track_count = d.tracks.len();
+                    let fail_now = failure_now.clone().unwrap_or_default();
+                    // 暂停 / 失败是**进程级**的（control.rs 的 static 标志 + 全局失败快照），
+                    // 展开 / 可见性是**这个窗口**自己的。块数只算这个窗口里的。
+                    let ctx = OpCtx {
+                        paused: hfx_receiver::control::paused(),
+                        failed,
+                        failure_text: &fail_now,
+                        op_count,
+                        details: d.details,
+                        visible: d.win.window().is_visible(),
+                    };
+                    let mut ops_out: Vec<XferOp> = Vec::with_capacity(op_count);
+                    // 明细行只算**非等待块**：等待块永远只画精简态，一行明细都没有
+                    let mut detail_rows = 0usize;
+                    let mut failed_ops = 0usize;
+                    let mut all_finished = true;
+                    for track in d.tracks.iter_mut() {
+                        // 名字用手机自己报的（「Xiaomi Pad 7 Pro」）；还没解析出来就先顶
+                        // 串号前 8 位，免得设备刚连上来那一下界面上是个空名字。
+                        let name = device_display_name(&s, &track.serial);
+                        let op = track.frame(&ctx, &name);
+                        if op.failed {
+                            failed_ops += 1;
+                        }
+                        // 每块至少按 1 行算：rows 为 0 时块里画的是「这一轮还没有分通道数据」
+                        // 那一行，同样 22px（高度公式见 transfer_window_height）。
+                        detail_rows += track.rows_count.max(1);
+                        all_finished &= op.done;
+                        ops_out.push(op);
+                    }
+                    // 等待块接在后面。它们只画精简态（app.slint 里 XferOperation 的 slim），
+                    // 高度固定 114、明细行一行都不占 —— 高度公式里是单独的一项
+                    // （waiting_ops × TW_WAITING_OP），所以**不能**把它们的行数加进 detail_rows。
+                    let waiting_ops = waiting.len();
+                    if !waiting.is_empty() {
+                        let device_name = device_display_name(&s, &d.serial);
+                        for item in &waiting {
+                            ops_out.push(waiting_op(&device_name, op_count, item));
+                        }
+                        // 队列里还有排着的块：这一轮就不算「全部收尾」，别亮「已完成」
+                        all_finished = false;
+                    }
+                    // 写进模型：块数变了就整表换（Slint 正好该重建那几块）；否则只把内容变了
+                    // 的行写回去 —— 整表换会把每一块的元素全拆了重建（一块几十个元素），
+                    // 没变的块一个都不该动。
+                    //
+                    // 模型里第 i 行 = tracks[i]（i < track_count），之后才是等待块 ——
+                    // 两段的下标基准不同，所以比较时分开走：tracks 那份各自记在
+                    // OpTrack.sent 里，等待块那份记在 DevXferWin.waiting_sent 里。
+                    if d.model.row_count() != ops_out.len() {
+                        d.model.set_vec(ops_out.clone());
+                        for (i, op) in ops_out[..track_count].iter().enumerate() {
+                            d.tracks[i].sent = Some(op.clone());
+                        }
+                        d.waiting_sent = ops_out[track_count..].to_vec();
                     } else {
-                        match hfx_receiver::receiver::PROGRESS.channel_name(s.owner) {
-                            Some(n) => n,
-                            None => {
-                                if std::env::var("HFX_DEBUG_NAME").is_ok() {
-                                    log::info(&format!(
-                                        "通道名缺失 owner={} 已登记={}",
-                                        s.owner,
-                                        hfx_receiver::receiver::PROGRESS.channel_count()
-                                    ));
-                                }
-                                format!("通道 {}", s.owner as u32 + 1)
+                        for (i, op) in ops_out[..track_count].iter().enumerate() {
+                            if d.tracks[i].sent.as_ref() != Some(op) {
+                                d.model.set_row_data(i, op.clone());
+                                d.tracks[i].sent = Some(op.clone());
                             }
                         }
-                    };
-                    labels.push(label);
-                    row_order.push((s.owner, i as f32));
-                    rows.push(XferRow {
-                        name: "".into(),
-                        span_text: format!("{:.0}%", s.span * 100.0).into(),
-                        amount: format!("{} / {}", human(seg_done), human(seg_total)).into(),
-                        rate: rate_text.into(),
-                        percent: (s.filled * 100.0).round() as i32,
-                    });
-                }
-                // 按通道号重排（和手机端那张表同序：1 USB_ADB、2 USB_ADB#2 …），再统一编号；
-                // 「未分配 / 多通道合并」的段排最后（它们不对应某一条通道）。
-                {
-                    let mut order: Vec<usize> = (0..rows.len()).collect();
-                    order.sort_by(|&a, &b| {
-                        let (oa, xa) = row_order[a];
-                        let (ob, xb) = row_order[b];
-                        let ka = if oa == u8::MAX { (1u8, u8::MAX) } else { (0u8, oa) };
-                        let kb = if ob == u8::MAX { (1u8, u8::MAX) } else { (0u8, ob) };
-                        ka.cmp(&kb).then(xa.partial_cmp(&xb).unwrap_or(std::cmp::Ordering::Equal))
-                    });
-                    let mut sorted: Vec<XferRow> = Vec::with_capacity(rows.len());
-                    for (new_i, &old_i) in order.iter().enumerate() {
-                        let mut r = rows[old_i].clone();
-                        r.name = format!("{}. {}", new_i + 1, labels[old_i]).into();
-                        sorted.push(r);
-                    }
-                    rows = sorted;
-                }
-                let row_count = rows.len();
-                // 每截速率的取样：约一秒一次。帧是 150ms 一帧，逐帧做差会把
-                // 块到达的抖动放大成满屏跳动的数字；一秒取一次刚好稳。
-                {
-                    let now_at = std::time::Instant::now();
-                    let due = match seg_rate_at {
-                        Some(t) => now_at.duration_since(t).as_secs_f32() >= 0.9,
-                        None => true,
-                    };
-                    if due {
-                        if let Some(t) = seg_rate_at {
-                            let dt = now_at.duration_since(t).as_secs_f32().max(0.2);
-                            seg_rates = seg_rate_bytes
-                                .iter()
-                                .enumerate()
-                                .map(|(i, &b)| {
-                                    let prev = seg_rate_prev.get(i).copied().unwrap_or(b);
-                                    if b >= prev {
-                                        (b - prev) as f32 / dt
-                                    } else {
-                                        0.0
-                                    }
-                                })
-                                .collect();
+                        for (j, op) in ops_out[track_count..].iter().enumerate() {
+                            let row = track_count + j;
+                            if d.waiting_sent.get(j) != Some(op) {
+                                d.model.set_row_data(row, op.clone());
+                            }
                         }
-                        seg_rate_prev = seg_rate_bytes.clone();
-                        seg_rate_at = Some(now_at);
+                        if d.waiting_sent.as_slice() != &ops_out[track_count..] {
+                            d.waiting_sent = ops_out[track_count..].to_vec();
+                        }
                     }
-                }
-                // 进度条上的切分线：段是「相邻块换了通道」留下的痕迹，位置就是它占整条的比例。
-                // 主条按段画（每段从自己的左边缘往右填），这里只算每段的起点和宽度。
-                let mut segs: Vec<XferSeg> = Vec::with_capacity(raw.len());
-                let mut seg_at = 0.0f32;
-                for s in raw.iter() {
-                    segs.push(XferSeg {
-                        x: seg_at,
-                        span: s.span,
-                        filled: s.filled,
-                    });
-                    seg_at += s.span;
-                }
-                // 诊断：设了 HFX_DEBUG_SEGS=1 就把这一帧的段表写进日志（排查「条子画得不像」用）。
-                if std::env::var("HFX_DEBUG_SEGS").is_ok() {
-                    let mut acc = 0.0f32;
-                    let mut line = format!("段表 done={} n={}", done, raw.len());
-                    for s in raw.iter() {
-                        line.push_str(&format!(
-                            " [{:.3}+{:.3} f{:.2} o{}]",
-                            acc, s.span, s.filled, s.owner
-                        ));
-                        acc += s.span;
-                    }
-                    log::debug(&line);
-                }
-                // ---- 关键：model 不能每拍都换 ----
-                // 每 50ms 新建一个 VecModel 塞给 Slint，等于告诉它「整个列表全变了」：
-                // 它会把这 10 行 Rows 全部拆掉重建（每行里还有 10 来个 Text/Rectangle），
-                // 光这一步就吃掉整帧预算的大头 —— 真机上 20fps 都跑不满，看着就是卡。
-                // 所以先和自己的上一帧比，内容一样就沿用旧 model，Slint 那边什么都不会动。
-                let segs_model = if segs_prev.as_ref().map(|p| p.as_slice()) == Some(segs.as_slice()) {
-                    segs_model_keep.clone()
-                } else {
-                    segs_prev = Some(segs.clone());
-                    let m = slint::ModelRc::new(slint::VecModel::from(segs));
-                    segs_model_keep = m.clone();
-                    m
-                };
-                // 外面那段「每帧跟高度」要用：它跑的时候 active 可能是 false，拿不到 rows
-                last_row_count = row_count;
-                // 同 segs：明细行内容不变就不换 model（换一次 = Slint 重建全部行进）
-                let rows_model = if rows_prev.as_ref().map(|p| p.as_slice()) == Some(rows.as_slice()) {
-                    rows_model_keep.clone()
-                } else {
-                    rows_prev = Some(rows.clone());
-                    let m = slint::ModelRc::new(slint::VecModel::from(rows));
-                    rows_model_keep = m.clone();
-                    m
-                };
+                    // 这里**不能**再 set_ops 一次。
+                    //
+                    // 窗口建出来的时候已经 set_ops 过一次（见 create_dev_xfer_win），
+                    // 之后改的是同一个 VecModel，Slint 会自己跟着刷新。
+                    // 每帧再包一个新的 ModelRc 塞回去，等于每 16ms 告诉 Slint
+                    // 「整个列表换了」，它就把每一块连同里头上百个元素全拆了重建 ——
+                    // 表现就是暂停 / 取消按钮一直闪、按下去没反应（鼠标按下那一刻
+                    // 元素正好被销毁重建，clicked 根本不会派发）。
+                    // 真机 2026-11-22 复现，改回「只建一次」。
 
-                // ---- 独立传输窗口：同一份数据再喂一遍 ----
-                // 传完了没有：真机第一次跑出来的是「已完成 100%」+ 0 B/s 一直挂着不消失 ——
-                // 因为 active 只看「有设备连着 + 有进度」，传完之后 PROGRESS 不清零，
-                // 这两个条件依然成立。所以「结束」得单独认：字节满了就算完，
-                // 亮 3 秒「已完成」再自己收起来。
-                // 真机第二次跑出来：传完了 done 停在 599.0/600.0 MB（比 total 少 1MB，
-                // 块计数的尾巴对不上），只按 done>=total 判永远判不到「完成」，
-                // 窗口就挂着「已完成 99%」不消失。所以再认一个信号：
-                // control 那边 receiving()/sending() 都落下去，就是这一轮结束了。
-                let in_flight = hfx_receiver::control::receiving() || hfx_receiver::control::sending();
-                let finished = (total_bytes > 0 && done >= total_bytes) || !in_flight;
-                if let Some(tw) = xfer_weak.upgrade() {
-                    let size_text = human(total_bytes);
-                    // 界面精简：这一行只留「文件名（大小）」。
-                    // 标题栏已经写了「正在传输 / 已完成 / 接收失败」，再写一遍
-                    // 「正在将 … 从手机复制到 …」是把同一件事说两遍，还把条子挤下去一行。
-                    // 失败原因仍然单独一行红字（那是新信息，不能省）。
-                    // 字符串属性一律「变了才 set」：Slint 每次收到新的字符串都要重排版，
-                    // 中文排版尤其贵。60Hz 下每帧无脑 set 一遍，CPU 就是被这里吃掉的
-                    // （实测 78% 单核 → 加这层判断后降到个位数）。
-                    let action_now = if failed {
-                        i18n::tr("接收失败", "receiving failed").to_string()
-                    } else {
-                        format!("{}（{}）", short, size_text)
-                    };
-                    if tw.get_action_text() != action_now.as_str() {
-                        tw.set_action_text(action_now.into());
+                    // 标题栏那两个位：多块时标题只说「N 个正在运行的操作」，单块时靠它们
+                    // 保持原来那三种说法（正在传输 / 已完成 / 接收失败）。
+                    if d.win.get_failed() != failed {
+                        d.win.set_failed(failed);
                     }
-                    // × 的含义按方向分（接收 = 弹保留/不保留，发送 = 直接中断），
-                    // 方向由引擎的 control 标志给出，不靠界面自己猜。
-                    let sending_now = hfx_receiver::control::sending();
-                    if tw.get_sending_now() != sending_now {
-                        tw.set_sending_now(sending_now);
+                    if d.win.get_done() != all_finished {
+                        d.win.set_done(all_finished);
                     }
-                    // 失败原因挂在窗口上（红色那行），并在主窗口的状态卡下面也留一句
-                    if tw.get_failed() != failed {
-                        tw.set_failed(failed);
+                    // 高度公式要的三个汇总值：Slint 没有「对数组求和」的表达式，
+                    // 逐块累加只能在这边算（和 rows / segs 同一个来路）。
+                    // total_rows 只含非等待块，等待块自己的个数另走 waiting_ops。
+                    if d.win.get_total_rows() != detail_rows as i32 {
+                        d.win.set_total_rows(detail_rows as i32);
                     }
-                    let fail_now = failure_now.clone().unwrap_or_default();
-                    if tw.get_fail_text() != fail_now.as_str() {
-                        tw.set_fail_text(fail_now.into());
+                    if d.win.get_waiting_ops() != waiting_ops as i32 {
+                        d.win.set_waiting_ops(waiting_ops as i32);
                     }
+                    if d.win.get_failed_ops() != failed_ops as i32 {
+                        d.win.set_failed_ops(failed_ops as i32);
+                    }
+                    // 失败原因挂在每块自己身上（红色那行），这里再往主窗口的状态卡下面放一句
                     if let Some(reason) = failure_now.as_deref() {
                         let note = format!("{}：{}", i18n::tr("这次传输失败了", "the transfer failed"), reason);
                         if ui.get_notice_text() != note {
                             ui.set_notice_text(note.into());
                         }
                     }
-                    // 百分比往下取整：向上四舍五入会在「1.99 / 2.00 GB」就跳成 100%，
-                    // 而这时其实还在传（第一次真机就是 100% 挂着 3.5 MB/s，看着像卡死）。
-                    // 没传完最多显示 99%，满字节了才给 100%。
-                    let pct = if total_bytes > 0 {
-                        ((done.min(total_bytes) as f64 / total_bytes as f64) * 100.0).floor() as i32
-                    } else {
-                        0
-                    };
-                    // 失败的时候按块算：真机那次字节数明明满了、却缺 2 块，
-                    // 报「未完成 100%」是自相矛盾的，按块算出来是 99%。
-                    let shown_pct = if failed {
-                        // 用 set_failure 那一刻拍下来的百分比：失败之后 PROGRESS 可能已经
-                        // 是上一轮 / 下一轮的数字（真机撞见过「未完成 100%」）
-                        hfx_receiver::receiver::failure_percent().unwrap_or(99)
-                    } else if finished {
-                        100
-                    } else {
-                        pct.min(99)
-                    };
-                    if tw.get_percent() != shown_pct {
-                        tw.set_percent(shown_pct);
+                    // × 的含义按方向分（接收 = 弹保留/不保留，发送 = 直接中断），
+                    // 方向由引擎的 control 标志给出，不靠界面自己猜。多块时这条是共用的。
+                    let sending_now = hfx_receiver::control::sending();
+                    if d.win.get_sending_now() != sending_now {
+                        d.win.set_sending_now(sending_now);
                     }
-                    let detail_now = format!("{} / {} · {}", human(done), human(total_bytes), speed_text);
-                    if tw.get_detail_text() != detail_now.as_str() {
-                        tw.set_detail_text(detail_now.into());
-                    }
-                    // ---- 展开「详细信息」里那三行「标签：值」（标签在 Slint 那边写死）----
-                    // 1) 名称：当前文件名（和 action-text 用的是同一个 short，不带大小）
-                    if tw.get_file_name() != short.as_str() {
-                        tw.set_file_name(short.clone().into());
-                    }
-                    // 2) 剩余时间：算得出来给「x 分 y 秒」，算不出来给「正在计算...」——
-                    //    原生的写法就是这个。刚起步（速率还没稳定）、暂停、已经收满都算「算不出来」。
-                    let remain_bytes = total_bytes.saturating_sub(done);
-                    let eta = if !hfx_receiver::control::paused()
-                        && !finished
-                        && speed > 0.5
-                        && remain_bytes > 0
-                    {
-                        human_eta((remain_bytes as f64 / speed) as u64)
-                    } else {
-                        i18n::tr("正在计算...", "calculating...").to_string()
-                    };
-                    if tw.get_eta_text() != eta.as_str() {
-                        tw.set_eta_text(eta.into());
-                    }
-                    // 3) 剩余项目：「项目数 (剩余大小)」。这一轮一次只有一个文件在收
-                    //    （PROGRESS 只记「当前文件」），所以项目数是 0 / 1，
-                    //    后面的括号里是**这个文件**还剩多少字节（和参考图的「1 (17.0 MB)」同形）。
-                    let remain_now = format!(
-                        "{} ({})",
-                        if remain_bytes > 0 { 1 } else { 0 },
-                        human(remain_bytes)
-                    );
-                    if tw.get_remain_text() != remain_now.as_str() {
-                        tw.set_remain_text(remain_now.into());
-                    }
-                    // ---- 展开态图表条：速度曲线采样 + 拼 Path + 「速度:」那行 ----
-                    // 横轴是**进度**：把 0..1 切成 CURVE_BINS 格，每格记那一刻的速率。
-                    // 写进格子的值就不再改 —— 曲线只向右长，画过的部分一个像素都不动。
-                    // 暂停 / 失败时不写，波形冻在那一刻（原生暂停也是这样）。
-                    let paused_now = hfx_receiver::control::paused();
-                    // 回退检测要**狠一点**：进度是从 PROGRESS 里几千个块的计数算出来的，
-                    // 个别块先完成后重置，会让 fill_frac 瞬间回弹几个百分点。
-                    // 以前用的是「回退超过 2%」—— 于是一帧抖动就把曲线历史清空一次，
-                    // 曲线上永远只剩最近几个桶，前面整段贴底（实测非零桶只有 4~10 个，
-                    // 而进度已经 15%，也就是本该 60 个）。
-                    // 真正的新一轮必然是「回到接近 0」，所以要求回退超过 25% 且新进度 < 10%。
-                    if curve_last_progress - fill_frac > 0.25 && fill_frac < 0.10 {
-                        // 进度大幅回退 = 新一轮开始（上一轮传完 / 被取消），历史作废
-                        curve_bins.iter_mut().for_each(|b| *b = 0.0);
-                        curve_bin_cnt.iter_mut().for_each(|c| *c = 0);
-                        curve_cur_progress = 0.0;
-                        curve_last_at = None;
-                        curve_max_speed = 0.0;
-                        curve_peak_win.clear();
-                        curve_win.clear();
-                        curve_bin_cnt.iter_mut().for_each(|c| *c = 0);
-                    }
-                    curve_last_progress = fill_frac;
-                    // ---- 曲线专用速率：300ms 滑窗 ----
-                    let curve_now = std::time::Instant::now();
-                    curve_win.push((curve_now, received));
-                    while curve_win
-                        .first()
-                        .map(|(t, _)| curve_now.duration_since(*t).as_secs_f32() > 2.0)
-                        .unwrap_or(false)
-                    {
-                        curve_win.remove(0);
-                    }
-                    // 取「至少 300ms 前」的那个点当锚：窗口还不够长时用最老的点，
-                    // 这样刚起步时也有一个（偏小的）速率可用，而不是一路 0。
-                    let anchor = curve_win
-                        .iter()
-                        .rev()
-                        .find(|(t, _)| curve_now.duration_since(*t).as_millis() >= 300)
-                        .copied()
-                        .unwrap_or_else(|| *curve_win.first().unwrap_or(&(curve_now, received)));
-                    let curve_elapsed = curve_now.duration_since(anchor.0).as_secs_f64();
-                    let curve_instant = if curve_elapsed > 0.05 {
-                        (received.saturating_sub(anchor.1) as f64 / curve_elapsed) as f32
-                    } else {
-                        0.0
-                    };
-                    // ---- 量程：最近 5 秒的 90 分位 × 1.1 ----
-                    //
-                    // 用**分位数**而不是最大值：偶发的突发（实测 66.8 MB/s，正常 21）
-                    // 会把「最大值」顶到天上，量程跟着涨 3 倍，整条曲线被压成贴底。
-                    // 90 分位丢掉最高的那 10%，这些突发既看不见、也毁不掉画面。
-                    curve_peak_win.push(curve_instant);
-                    if curve_peak_win.len() > 125 {
-                        curve_peak_win.remove(0);
-                    }
-                    let peak_now = {
-                        let mut v: Vec<f32> = curve_peak_win.iter().copied().collect();
-                        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                        let idx = ((v.len() as f32) * 0.9) as usize;
-                        v.get(idx.min(v.len().saturating_sub(1))).copied().unwrap_or(0.0)
-                    };
-                    let want_max = chart_max_speed(peak_now);
-                    if want_max > curve_max_speed {
-                        // 涨：立刻跟上（不然曲线会冲出量程被削平）
-                        curve_max_speed = want_max;
-                    } else if curve_max_speed > want_max * 1.15 {
-                        // 跌：只在水花明显偏大时收敛，每拍 0.2%
-                        curve_max_speed =
-                            (curve_max_speed - (curve_max_speed - want_max) * 0.002).max(want_max);
-                    }
-                    let curve_due = curve_last_at
-                        .map(|t| curve_now.duration_since(t).as_millis() >= CURVE_SAMPLE_MS)
-                        .unwrap_or(true);
-                    if curve_due && !paused_now && !failed {
-                        curve_last_at = Some(curve_now);
-                        // 从上次写到的位置一直填到当前进度：中间的格子沿用这一拍的速率。
-                        // （不填的话进度一快，格子之间会留下 0 值，曲线变成一排向下的尖刺。）
-                        let upto = if finished || fill_frac >= 0.999 {
-                            1.0f32
-                        } else {
-                            fill_frac.clamp(0.0, 1.0)
-                        };
-                        let v = curve_instant.max(0.0);
-                        let from = curve_cur_progress;
-                        // 首帧（from==0）如果速率还没算出来，**先别填**。
-                        // 这是「深绿面积没有」的真凶：传输窗口在进度 13% 才建，
-                        // 首帧要从 0 一口气补 53 格，可那一拍的 speed 还是 0，
-                        // 于是 53 格全被 0 填死 —— 后面再填也只在 53 格之后加，
-                        // 曲线左边整段贴底（实测非零桶稳定只有 5~7 个）。
-                        // 速率一上来（>1KB/s）再补，那一次才是有意义的波形。
-                        let ready_to_fill = from > 0.0 || v >= 1024.0;
-                        if std::env::var("HFX_DEBUG_CURVE").is_ok() {
-                            log::info(&format!(
-                                "采样 fill={:.4} v={:.0} 量程={:.0} 峰值={:.0} from={:.4} upto={:.4}",
-                                fill_frac, v, curve_max_speed, peak_now, from, upto
-                            ));
-                        }
-                        if upto > from && ready_to_fill {
-                            // 首次填桶必须从 0 开始：传输窗口是在进度非零时才出现的
-                            // （「详细信息」展开 / 窗口刚建），那一刻 fill_frac 可能已经 15%，
-                            // 直接按 floor(0.15*400)=58 当起点时 bins[0..57] 就永远是 0，
-                            // 曲线前面整段贴底，只剩最右一小截有高度。
-                            // 所以首帧把 0..i1 整段补成当前速率，曲线从左边就是完整的一条。
-                            let i0 = if from <= 0.0 {
-                                0usize
-                            } else {
-                                (from * CURVE_BINS as f32).floor() as usize
-                            };
-                            let i1 = ((upto * CURVE_BINS as f32).ceil() as usize).min(CURVE_BINS);
-
-                            for i in i0..i1 {
-                                if let Some(b) = curve_bins.get_mut(i) {
-                                    // 加权平均：同一个桶被多次采样时取均值（见 curve_bin_cnt 的说明）
-                                    let c = curve_bin_cnt.get(i).copied().unwrap_or(0) as f32;
-                                    *b = (*b * c + v) / (c + 1.0);
-                                    if let Some(cnt) = curve_bin_cnt.get_mut(i) {
-                                        *cnt = cnt.saturating_add(1);
-                                    }
-                                }
-                            }
-                            curve_cur_progress = upto;
-                        }
-                    }
-                    // ---- 曲线 Path 降频重建 ----
-                    // Path 每次换 commands 字符串，Slint 都要把 200 个点重新三角化 + 重绘。
-                    // 这是整帧里最贵的一步，跟着 50ms 拍走会直接把帧预算吃光。
-                    // 实测：曲线右边界每涨 0.2%（600MB 文件约 1.2MB）才需要重画一次，
-                    // 且最少间隔 150ms —— 视觉上完全看不出延迟，帧率却能提上去。
-                    let path_due = curve_path_at
-                        .map(|t| t.elapsed().as_millis() >= 150)
-                        .unwrap_or(true)
-                        && (curve_cur_progress - curve_path_progress).abs() >= 0.002;
-                    let curve_cmds = if path_due {
-                        curve_path_at = Some(std::time::Instant::now());
-                        curve_path_progress = curve_cur_progress;
-
-                        build_curve_path(&curve_bins, curve_cur_progress, curve_max_speed)
-                    } else {
-                        tw.get_curve_path().to_string()
-                    };
-                    // 黑线：当前速度在刻度上的位置。暂停时钉在速度 0（贴底），
-                    // 和「速度: 已暂停」那行字一致。
-                    let guide_y = chart_guide_y(
-                        if paused_now { 0.0 } else { speed as f32 },
-                        curve_max_speed,
-                    );
-                    // 黑线：目标值是 0.1px 精度，但**每帧插值**逼近，所以线是连续滑动的。
-                    let disp = match guide_y_disp {
-                        // 第一帧 / 新一轮：直接落位，别从屏外滑进来
-                        None => guide_y,
-                        Some(prev) => prev + (guide_y - prev) * 0.22,
-                    };
-                    guide_y_disp = Some(disp);
-                    // ---- 量化到整数像素再写属性 ----
-                    // 黑线是 1px 高的横线，亚像素位置没有意义（原生就是整数像素）。
-                    // 但「速度: xx MB/秒」那行字的 y 绑在 guide-y 上，**属性一变它就重排一次**，
-                    // 中文重排很贵 —— 60Hz 下每帧都重排，实测展开态吃 74% 单核
-                    // （收起态只有 20%，差的就是图表条这一块）。
-                    // 量化到整数：黑线仍然每帧插值逼近，只是「跨过一整像素」才写一次属性，
-                    // 60Hz 下每秒最多 60 次跳、每次 1px，视觉上就是连续滑动。
-                    let quantized = disp.round();
-                    if tw.get_guide_y() != quantized {
-                        tw.set_guide_y(quantized);
-                    }
-                    if tw.get_curve_path().as_str() != curve_cmds {
-                        tw.set_curve_path(curve_cmds.into());
-                    }
-                    // 参考图右上那行是「速度: 72.9 MB/秒」——单位沿用 human_speed 的量级切换
-                    // （MB → KB → B），只把 "/s" 写成 "/秒"。
-                    // 暂停时写「已暂停」而不是冻住的那个旧速率：上面那行大字已经是「已暂停」、
-                    // 各通道速率全是 0 KB/s，这里再摆一个 10.0 MB/秒就是自相矛盾。
-                    let chart_speed = if paused_now {
-                        i18n::tr("已暂停", "paused").to_string()
-                    } else {
-                        human_speed(speed).replace("/s", "/秒")
-                    };
-                    let speed_line = format!("{}: {}", i18n::tr("速度", "Speed"), chart_speed);
-                    if tw.get_speed_text() != speed_line.as_str() {
-                        tw.set_speed_text(speed_line.into());
-                    }
-
-                    // 布尔 / 数值也要比较：Slint 收到「和上次一样的值」仍会标脏、重绘。
-                    // 展开态那一帧要重画 476x776，60Hz 下不比较就是纯浪费。
-                    if tw.get_paused() != paused_now {
-                        tw.set_paused(paused_now);
-                    }
-                    if tw.get_done() != finished {
-                        tw.set_done(finished);
-                    }
-                    // fill 是进度条长度：量化到 0.1% 再比，避免 60Hz 下为了 0.02px 重绘整窗
-                    let fill_q = (fill_frac * 1000.0).round() / 1000.0;
-                    if (tw.get_fill() - fill_q).abs() > 0.0005 {
-                        tw.set_fill(fill_q);
-                    }
-                    tw.set_rows(rows_model.clone());
-                    tw.set_segs(segs_model.clone());
                     let cancelling_now = hfx_receiver::control::cancel_requested();
-                    if tw.get_cancelling() != cancelling_now {
-                        tw.set_cancelling(cancelling_now);
+                    if d.win.get_cancelling() != cancelling_now {
+                        d.win.set_cancelling(cancelling_now);
                     }
-                    // 流光只在「真在传」的时候扫：暂停 / 传完 / 速率掉到 0 都停住
-                    let flow_now = !finished && !hfx_receiver::control::paused() && speed > 0.5;
-                    if tw.get_flow_on() != flow_now {
-                        tw.set_flow_on(flow_now);
-                    }
+                    // 流光的位置 / 亮不亮都在每块自己的 op.flow / op.flow-on 里，见 OpTrack::frame
+
                     // 精简：界面上不再显示「合计速率 · 剩余时间」（用户选的），这里照旧算一份
                     // 交给属性（日志和其它小窗复用），只是布局里不再占那一行高度。
+                    // 仍是**进程级**那组数字（PROGRESS 的总量），和改之前一模一样。
                     let summary = if speed > 0.5 && total_bytes > done {
                         let remain = ((total_bytes - done) as f64 / speed) as u64;
                         format!("合计 {} · 剩余约 {}", human_speed(speed), human_eta(remain))
                     } else {
                         format!("合计 {} · 剩余时间未知", human_speed(speed))
                     };
-                    if tw.get_summary_text() != summary.as_str() {
-                        tw.set_summary_text(summary.into());
+                    if d.win.get_summary_text() != summary.as_str() {
+                        d.win.set_summary_text(summary.into());
                     }
                     // 高度同步不放在这里：暂停等用户选「保留/不保留」的时候 active 已经是 false，
                     // 这一支根本不跑，对话框就会被 151 高的窗口裁掉（真机第一次点 ✕ 就是这个下场）。
@@ -3010,122 +3641,211 @@ fn main() -> Result<(), slint::PlatformError> {
                         // 失败了：停在窗口上等用户看见。3 秒自动收是对「传完了」才有的礼遇，
                         // 对失败用就是骗人（用户回头只看到文件在那儿，以为传好了）。
                         // 窗口要是已经收起来过（上一轮刚自动收完 / 用户点过收起），重新弹出来。
-                        if !tw_shown && !xfer_dismissed.load(Ordering::Relaxed) {
-                            tw_shown = true;
-                            show_transfer_window(&tw, &mut s, &tw_state);
+                        if !d.shown && !d.dismissed {
+                            d.shown = true;
+                            d.show_at(saved, slot);
                         }
-                        #[cfg(windows)]
-                        if tw_shown {
-                            let saved = s.config.xfer_win_pos;
-                            if let Ok(mut g) = tw_state.lock() {
-                                g.tick(&tw, saved);
-                            }
+                        if d.shown {
+                            d.settle(saved, slot);
                         }
-                        if tw.get_details() {
-                            tw.set_details(false);
+                        if d.details {
+                            d.details = false;
+                            d.win.set_details(false);
                         }
-                        tw_finish_at = None;
-                    } else if finished {
+                        d.finish_at = None;
+                    } else if all_finished {
+                        // 所有块都收尾了才算「传完」：一个窗口里有块还在跑，窗口就留着。
                         // 传完了就把明细收起来：窗口回到收起高度，
                         // 3 秒的「已完成」不用顶着 400px 的空白
-                        if tw.get_details() {
-                            tw.set_details(false);
+                        if d.details {
+                            d.details = false;
+                            d.win.set_details(false);
                         }
                         // 第一眼看到「满了」的时候记时间，3 秒后收窗口
-                        if tw_finish_at.is_none() {
-                            tw_finish_at = Some(std::time::Instant::now());
+                        if d.finish_at.is_none() {
+                            d.finish_at = Some(std::time::Instant::now());
                         }
-                        if tw_shown
-                            && tw_finish_at
-                                .map(|t| t.elapsed() >= Duration::from_secs(3))
-                                .unwrap_or(false)
-                        {
-                            tw_shown = false;
-                            xfer_dismissed.store(false, Ordering::Relaxed);
-                            #[cfg(windows)]
-                            {
-                                let placed = tw_state.lock().ok().and_then(|g| g.placed_at);
-                                save_transfer_pos(&tw, &mut s, placed);
+                        let lit = d
+                            .finish_at
+                            .map(|t| t.elapsed() >= Duration::from_secs(3))
+                            .unwrap_or(false);
+                        if d.shown && lit {
+                            d.shown = false;
+                            d.dismissed = false;
+                            let placed = d.placed_at();
+                            // 坐标只有「恰好一个窗口」时才记（多窗口是自动往上排的）
+                            if single {
+                                save_transfer_pos(&d.win, &mut *s, placed);
                             }
-                            let _ = tw.hide();
+                            let _ = d.win.hide();
                         }
                     } else {
                         // 又一轮新传输（文件换了 / 续传接上了）：允许重新弹
-                        tw_finish_at = None;
-                        // 新一轮传输才重新弹（用户点过「收起」就别再烦他）
-                        if !tw_shown && !xfer_dismissed.load(Ordering::Relaxed) {
-                            tw_shown = true;
-                            // 第一次出现：贴到工作区右下角（用户拖过就按记住的位置），
-                            // 窗口建出来后再补几帧落位 + 置顶
-                            show_transfer_window(&tw, &mut s, &tw_state);
+                        d.finish_at = None;
+                        // 新一轮传输才重新弹（用户在这个窗口上点过「收起」就别再烦他）
+                        if !d.shown && !d.dismissed {
+                            d.shown = true;
+                            // 第一次出现：贴到工作区右下角（多窗口时往上错开；只有单窗口
+                            // 才按用户拖过的位置），窗口建出来后再补几帧落位 + 置顶
+                            d.show_at(saved, slot);
                         }
-                        #[cfg(windows)]
-                        if tw_shown {
-                            let saved = s.config.xfer_win_pos;
-                            if let Ok(mut g) = tw_state.lock() {
-                                g.tick(&tw, saved);
-                            }
+                        if d.shown {
+                            d.settle(saved, slot);
                         }
                     }
                 }
             } else if failed {
-                // 失败但已经不在传输中（收尾那一帧就走到了这里）：保证窗口还在，
+                // 失败但已经不在传输中（收尾那一帧就走到了这里）：保证有个窗口还在，
                 // 别让用户错过「接收失败」这一眼。
-                if let Some(tw) = xfer_weak.upgrade() {
-                    if !tw.window().is_visible() && !xfer_dismissed.load(Ordering::Relaxed) {
-                        tw.set_done(true);
-                        tw.set_failed(true);
-                        tw.set_flow_on(false);
-                        tw.set_fail_text(failure_now.clone().unwrap_or_default().into());
-                        tw.set_action_text(i18n::tr("接收失败", "receiving failed").into());
-                        tw.set_percent(hfx_receiver::receiver::failure_percent().unwrap_or(99));
-                        tw_shown = true;
-                        show_transfer_window(&tw, &mut s, &tw_state);
+                //
+                // 这时已经拿不到「正在传的任务」了（引擎收尾时设备表已经清空），所以按失败
+                // 那一刻的快照拼一块出来：和正常帧同一个 model、同一个组件，布局 / 高度
+                // 都不用走特殊路径。
+                //
+                // 多窗口时**只让一个窗口亮**（创建顺序第一个；一个都没有就照上次那台设备的
+                // 身份重建一个）：失败是进程级的一件事，每台都亮一排同样的红字只会让用户
+                // 以为所有设备都传坏了。
+                let key = {
+                    let g = xfer_wins.borrow();
+                    g.order
+                        .first()
+                        .cloned()
+                        .or_else(|| g.last.clone())
+                        .unwrap_or_default()
+                };
+                let exists = {
+                    let g = xfer_wins.borrow();
+                    g.map.contains_key(&key)
+                };
+                if !exists {
+                    // 后缀不能是空串：find_transfer_window_of("") 会匹配本进程任何一个
+                    // 可见窗口（连主界面都会中），所以没身份也得给个兜底标签。
+                    let base = if key.is_empty() {
+                        i18n::tr("传输", "transfer").to_string()
+                    } else {
+                        device_display_name(&s, &key)
+                    };
+                    let taken: Vec<String> = {
+                        let g = xfer_wins.borrow();
+                        g.map.values().map(|d| d.label.clone()).collect()
+                    };
+                    let label = unique_label(&taken, &base);
+                    if let Some(d) = make_dev_xfer_win(&xfer_wins, &st, &key, &label) {
+                        xfer_wins.borrow_mut().insert(key.clone(), d);
                     }
                 }
-            } else if tw_shown {
-                // 传输结束：窗口自己收起来，下一轮重新允许弹出
-                tw_shown = false;
-                xfer_dismissed.store(false, Ordering::Relaxed);
-                if let Some(tw) = xfer_weak.upgrade() {
-                    tw.set_done(true);
-                    #[cfg(windows)]
-                    {
-                        let placed = tw_state.lock().ok().and_then(|g| g.placed_at);
-                        save_transfer_pos(&tw, &mut s, placed);
+                // 其余窗口这一帧没有块了：收起来并移除（和 active 分支同一套规矩）
+                let others: Vec<String> = {
+                    let g = xfer_wins.borrow();
+                    g.order.iter().filter(|k| **k != key).cloned().collect()
+                };
+                for k in others {
+                    drop_dev_xfer_win(&xfer_wins, &mut *s, &k);
+                }
+                let mut wins_g = xfer_wins.borrow_mut();
+                let single = wins_g.map.len() == 1;
+                let slot = wins_g.slot_of(&key);
+                let saved = if single { s.config.xfer_win_pos } else { None };
+                if let Some(d) = wins_g.map.get_mut(&key) {
+                    if !d.win.window().is_visible() && !d.dismissed {
+                        let pct = hfx_receiver::receiver::failure_percent().unwrap_or(99);
+                        let fail_text = failure_now.clone().unwrap_or_default();
+                        d.model.set_vec(vec![XferOp {
+                            action_text: i18n::tr("接收失败", "receiving failed").into(),
+                            percent: pct,
+                            detail_text: "".into(),
+                            file_name: "".into(),
+                            eta_text: i18n::tr("正在计算...", "calculating...").into(),
+                            remain_text: "0 (0 B)".into(),
+                            speed_text: "".into(),
+                            paused: false,
+                            done: true,
+                            waiting: false,
+                            failed: true,
+                            fail_text: fail_text.into(),
+                            fill: 0.0,
+                            flow: 0.0,
+                            flow_on: false,
+                            segs: slint::ModelRc::new(slint::VecModel::from(Vec::<XferSeg>::new())),
+                            curve_path: "".into(),
+                            guide_y: 75.0,
+                            rows: slint::ModelRc::new(slint::VecModel::from(Vec::<XferRow>::new())),
+                        }]);
+                        let model = d.model.clone();
+                        d.win.set_ops(slint::ModelRc::new(model));
+                        // 这一帧没有任务了：块状态留着没意义（下一轮重新建 OpTrack）
+                        d.tracks.clear();
+                        // 高度公式那三个汇总值：一块（不是等待块）、一行都没有、
+                        // 一块失败（那行红字 +20）
+                        d.win.set_total_rows(1);
+                        d.win.set_waiting_ops(0);
+                        d.win.set_failed_ops(1);
+                        d.win.set_done(true);
+                        d.win.set_failed(true);
+                        d.shown = true;
+                        d.show_at(saved, slot);
                     }
-                    let _ = tw.hide();
+                }
+            } else {
+                // 传输结束 / 停止接收 / 设备全断开：窗口自己收起来并从表里移除
+                //（下一轮重新建、重新摆位；不再需要一个常驻的空窗口了）
+                let keys: Vec<String> = {
+                    let g = xfer_wins.borrow();
+                    g.order.clone()
+                };
+                for key in keys {
+                    drop_dev_xfer_win(&xfer_wins, &mut *s, &key);
                 }
             }
 
             // 传输窗口的高度：明细展开 / 「接收失败」那行会改它，**每帧都要跟**。
             // （取消确认框改成独立窗口了，不再影响这个高度。）
-            if let Some(tw) = xfer_weak.upgrade() {
-                if tw.window().is_visible() {
-                    // 框还开着、传输自己先跑完了：框里的三个选项已经没有意义，
-                    // 直接收掉（不替用户选 —— 文件已经在盘上了，选「不保留」才会删，那是骗人）
-                    if tw.get_cancel_ask() && hfx_receiver::receiver::last_failure().is_none() {
-                        let pct = hfx_receiver::receiver::PROGRESS.snapshot();
-                        let (_, done_now, total_now, _, _) = &pct;
-                        if *total_now > 0 && *done_now >= *total_now {
-                            tw.set_cancel_ask(false);
-                        }
+            // 每个窗口各算各的：块数 / 明细行数 / 失败块都只算自己窗口里的那些块。
+            let all_keys: Vec<String> = {
+                let g = xfer_wins.borrow();
+                g.order.clone()
+            };
+            for win_key in all_keys {
+                let mut wins_g = xfer_wins.borrow_mut();
+                let Some(d) = wins_g.map.get_mut(&win_key) else { continue };
+                if !d.win.window().is_visible() {
+                    continue;
+                }
+                // 框还开着、传输自己先跑完了：框里的三个选项已经没有意义，
+                // 直接收掉（不替用户选 —— 文件已经在盘上了，选「不保留」才会删，那是骗人）
+                if d.win.get_cancel_ask() && hfx_receiver::receiver::last_failure().is_none() {
+                    let pct = hfx_receiver::receiver::PROGRESS.snapshot();
+                    let (_, done_now, total_now, _, _) = &pct;
+                    if *total_now > 0 && *done_now >= *total_now {
+                        d.win.set_cancel_ask(false);
                     }
-                    let details_now = tw.get_details();
-                    let failed_now = hfx_receiver::receiver::last_failure().is_some();
-                    if details_now != tw_details_on || failed_now != tw_failed_on {
-                        tw_details_on = details_now;
-                        tw_failed_on = failed_now;
-                        let h = transfer_window_height(details_now, last_row_count, failed_now);
-                        tw.window().set_size(slint::LogicalSize::new(460.0, h));
-                        // 长高之后可能探出屏幕下沿（真机：明细一展开，后 6 行跑到屏幕外），
-                        // 这里只做「越界才推回来」，不抢用户拖过的位置。
-                        #[cfg(windows)]
-                        if let Some(hwnd) =
-                            tray_win::find_transfer_window(WINDOW_TITLE, &[PUSH_TITLE])
-                        {
-                            tray_win::keep_on_screen(hwnd, TW_MARGIN);
-                        }
+                }
+                // 每帧按当前状态重算目标高度，和上一次比：变了才 set_size。
+                // 以前只在「明细展开 / 失败」变化时才动，靠 active 分支里记的
+                // last_row_count 兜底；块数也会变（设备增减），干脆每帧算一遍再比，
+                // 反正只是几次乘法。
+                let details_now = d.details;
+                // 先算完整内容高度，再按屏幕可用高度封顶 —— 内容更高的时候窗口不长高，
+                // 改成窗口里能滚（app.slint 里把整列包进了 Flickable）。
+                // 封顶值和 app.slint 的 cap-h 是同一个算式（screen-h 那条属性也从这里喂）。
+                let want_h = transfer_window_height(
+                    details_now,
+                    d.model.row_count(),
+                    d.win.get_waiting_ops().max(0) as usize,
+                    d.win.get_total_rows().max(0) as usize,
+                    d.win.get_failed_ops().max(0) as usize,
+                )
+                .min(transfer_window_cap(d.win.get_screen_h()));
+                if (want_h - d.last_h).abs() > 0.5 {
+                    d.last_h = want_h;
+                    d.win
+                        .window()
+                        .set_size(slint::LogicalSize::new(460.0, want_h));
+                    // 长高之后可能探出屏幕下沿（真机：明细一展开，后 6 行跑到屏幕外），
+                    // 这里只做「越界才推回来」，不抢用户拖过的位置。
+                    #[cfg(windows)]
+                    if let Some(hwnd) = tray_win::find_transfer_window_of(&d.suffix) {
+                        tray_win::keep_on_screen(hwnd, TW_MARGIN);
                     }
                 }
             }

@@ -132,6 +132,14 @@ public class ServerService extends Service implements ServiceConnection {
     private static final String GROUP_TASKS = "hfx.transfer.tasks";
     private static final String CHANNEL_ID = "server";
     private static final long PING_INTERVAL_MS = 3000;
+    /**
+     * 309：传输进行中，多久补发一帧 QUEUE_STATE。
+     *
+     * <p>队列变化时会立刻推一帧（{@code SendTasks#notifyQueueChanged}），这一秒一次是<b>兜底</b>：
+     * 传输期间任务状态也会在别的地方变（让出通道、收尾的边角、电脑端取消），
+     * 漏一帧不影响大局，但一直漏就会让电脑上的队列和手机对不上。
+     */
+    private static final long QUEUE_STATE_INTERVAL_MS = 1000;
     /** 「进度帧」的最小间隔：前台服务通知是同一个 id 反复 notify，20Hz 地刷会掉帧、发烫，500ms 一帧够了 */
     private static final long PROGRESS_NOTIFY_INTERVAL_MS = 500;
 
@@ -1293,6 +1301,8 @@ public class ServerService extends Service implements ServiceConnection {
         ServerListener acceptListener = this.listener;
         try {
             long lastPing = SystemClock.elapsedRealtime();
+            // 309：上一次补发 QUEUE_STATE 的时刻（传输期间每秒一帧兜底）
+            long lastQueueState = SystemClock.elapsedRealtime();
             while (active && gen == generation && server.isAlive()) {
                 SystemClock.sleep(250);
                 if (!active || gen != generation || !server.isAlive()) {
@@ -1330,6 +1340,18 @@ public class ServerService extends Service implements ServiceConnection {
                     break;
                 }
                 long now = SystemClock.elapsedRealtime();
+                // 309：传输进行中每 1 秒补发一帧 QUEUE_STATE 兜底。
+                // 只写不读 —— 这段时间控制通道的读权在传输线程手里（见上面那段注释），
+                // 会话线程去读就会把结论帧吃掉。
+                if (server.isTransferring() && now - lastQueueState >= QUEUE_STATE_INTERVAL_MS) {
+                    lastQueueState = now;
+                    try {
+                        server.writeQueueState();
+                    } catch (IOException e) {
+                        Log.i(TAG, "queue state push failed (" + server.getDisplayName() + "): " + e);
+                        break;
+                    }
+                }
                 if (now - lastPing < PING_INTERVAL_MS) {
                     continue;
                 }

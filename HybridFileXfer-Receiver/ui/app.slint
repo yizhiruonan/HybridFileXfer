@@ -165,6 +165,47 @@ export struct XferSeg {
     filled: float,
 }
 
+// 传输窗口里「一个操作块」的全部界面数据（一块 = 一条传输任务）。
+//
+// 为什么用一个结构体 + 模型，而不是给 XferOperation 挂一大排 in-out 属性：
+// 窗口里要堆 N 块，Rust 那边每帧只需要把「变了的那几块」写回模型（VecModel::set_row_data），
+// Slint 就原地更新那几块的属性、不重建元素；要是给每块单独挂属性，Rust 侧就得按块
+// 攒一大堆属性句柄，块数变了还要重新收集，反而更绕。
+export struct XferOp {
+    // 第 1 行：这一块在传什么（「文件名（大小）」；失败时是「接收失败」）
+    action-text: string,
+    // 第 2 行：大号百分比 + 旁边那行灰字
+    percent: int,
+    detail-text: string,
+    // 展开态那三行「标签：值」的**值**（标签写死在 XferOperation 里）
+    file-name: string,
+    eta-text: string,
+    remain-text: string,
+    // 展开态图表条里那行「速度: xx MB/秒」
+    speed-text: string,
+    paused: bool,
+    done: bool,
+    // 这一块是手机队列里「还没开始传」的那一条（QUEUE_STATE 的 state == 0）。
+    //
+    // 影响四处：百分比那行换成小一号的灰字「等待中」、进度条留空、暂停 / 取消两颗按钮
+    // 藏掉、**整块永远只画精简态**（窗口的「详细信息」展开时也不跟着展开，见下面
+    // XferOperation 里的 slim）。所以它的高度固定是精简块那 114，details 开不开都一样 ——
+    // content-h 和 Rust 那边 transfer_window_height() 里各有一项「等待块数 * 114」。
+    waiting: bool,
+    // 这一块是失败收尾的：显示「接收失败」+ 红字原因，✕ 变成「关掉这个提示」
+    failed: bool,
+    fail-text: string,
+    // 收起态那条分段进度条：填充比例 / 流光位置 / 流光要不要走 / 分段表
+    fill: float,
+    flow: float,
+    flow-on: bool,
+    segs: [XferSeg],
+    // 展开态图表条：速度曲线 / 黑线位置 / 各通道速率行
+    curve-path: string,
+    guide-y: float,
+    rows: [XferRow],
+}
+
 // （取消确认框的旧遮罩组件已删除：现在是独立窗口 CancelAskWindow，见下面。）
 // 取消接收的确认框：**独立窗口**（用户要求，不要挤在传输窗口里）。
 //
@@ -822,117 +863,47 @@ export component AppWindow inherits Window {
 //   * 传完亮 3 秒「已完成」自己收；
 //   * 位置 / 置顶 / 记住坐标都在 gui_slint.rs（贴工作区右下角 + HWND_TOPMOST）。
 // ---------------------------------------------------------------------------
-export component TransferWindow inherits Window {
-    title: root.failed ? "接收失败" : root.done ? "已完成" : "正在传输";
-    // 和主窗口同一个字体，别让两个窗口的字长得不一样
-    default-font-family: "Segoe UI, Microsoft YaHei UI";
-    default-font-size: 13px;
-    preferred-width: 460px;
-    // ---- 高度：这里和 gui_slint.rs 的 transfer_window_height() 两处必须一模一样 ----
-    // 收起态（2026-11-19 那一轮逐像素量出来的，这一轮一个字都没改）：
-    //   14(上留白) + 20(主文案) + 6 + 30(百分比行)
-    //   + 13(百分比行到分段条) + 15(分段条) + 15(分段条到分隔线)
-    //   + 1(分隔线) + 10(线到开关行) + 22(「详细信息」行) + 10(下留白) = 156
-    //
-    // 展开态（这一轮重排，用户拍板：展开后顶上那条分段条整块不画，只留详情里那条图表条）：
-    //   14 + 20 + 6 + 30                        = 70  ← 上半原样，只是 13+15(条)+15 这 43px 没了
-    //   + 13(分段条不画了，百分比行到分隔线仍留 13 的呼吸)
-    //   + 1(分隔线)
-    //   + 10(分隔线到「名称：」)
-    //   + 18*3(名称 / 剩余时间 / 剩余项目 —— 原生这三行的行距就是 18，见下面的量测注释)
-    //   + 8(三行到速度图表条)
-    //   + 80(速度图表条 —— 参考图 native-details.png y=92..171 逐行数的，不是 79：
-    //        y=92 外框 / 93 内侧 / 94..141 上层48 / 142 黑基线 / 143..169 下层实心27 /
-    //        170 内侧 / 171 外框，一共 80 行；y=172 起是纯白，所以条子就是 80 高)
-    //   + 8(图表条到各通道速率第一行)
-    //   + 22*max(1,rows)(每条通道一行；rows 为 0 时画「还没有分通道数据」那行，同样 22)
-    //   + 10(行区下留白) + 1(「简略信息」上面那条分隔线，native-details.png y=250)
-    //   + 10 + 22(行) + 10
-    //   合计 = 297 + 22*max(1, rows)
-    //   （拆开验算：70(上半) + 1(分隔线) + 13 + 160(详情固定 10+18*3+8+80+8)
-    //     + 22*rows + 53(尾部 10+1+10+22+10)）
-    // （「接收失败：<原因>」那行红字 +20，收起 / 展开两种状态都加。）
-    //
-    // 光靠 Rust 的 set_size 不够：窗口高度最终以这边的 preferred-height 为准，
-    // 暂停着等用户选「保留 / 不保留」时（active 已经是 false）Rust 调 set_size 窗口不会长
-    // —— 2026-11-17 真机撞见过「继续接收」只露出半截。所以内容高度这里也声明一遍。
-    property <length> content-h: (root.failed ? 20px : 0px)
-        + (root.details ? 297px + Math.max(1, root.rows.length) * 22px : 156px);
-    // 确认框现在是独立窗口，不再需要把高度撑到 216 —— 传“细节”让位给它自己的窗口
-    preferred-height: root.content-h;
-    background: #FFFFFF;
 
-    in-out property <string> action-text: "正在接收文件";
-    in-out property <int> percent: 0;
-    // 大号百分比后面那行小字：「210.0 MB / 3.00 GB · 82.9 MB/s」
-    in-out property <string> detail-text: "";
-    // ---- 展开「详细信息」里那三行「标签：值」的**值**（标签固定在 Slint 这边，和原生一致）----
-    // 参考图 native-details.png：「名称： vendor_boot_b.img / 剩余时间：正在计算... /
-    // 剩余项目： 1 (17.0 MB)」三行，12px 黑字、行距 18px，左边距和正文同一条线（x=27）。
-    // 名称：当前文件名
-    in-out property <string> file-name: "";
-    // 剩余时间：算得出来是「x 秒 / x 分 x 秒」，算不出来由 Rust 传「正在计算...」
-    in-out property <string> eta-text: "";
-    // 剩余项目：剩余项数 + 剩余大小，例如「1 (17.0 MB)」
-    in-out property <string> remain-text: "";
-    // ---- 展开态那条「速度图表条」里的曲线面积 ----
-    // Rust 每 100ms 往环形缓冲里塞一个 (进度比例, 瞬时速度)，再拼成 Path 的 commands
-    // 推过来。坐标是归一化的：x 0..1000、y 0..76（76 = 图表主体高度，面积下沿压在主体现底沿），
-    // Path 的 viewbox 也是 1000×76，纵向 1:1，横向拉伸到条内宽。
-    // 面积的右边界 = 最后一个采样点（= 当时进度），所以**未完成区间里没有面积**。
-    in-out property <string> curve-path: "";
-    // 黑线（速度基准线）在主体里的 y：0 = 顶、76 = 底。由 Rust 按「当前速度 / 量程」算，
-    // 原生实测这条线每帧都在动（速度越快线越高），不是画死在中间的一条装饰线。
-    in-out property <float> guide-y: 75.0;
-    // 图表条里那行「速度: 72.9 MB/秒」：**底边恒在黑线上方 6px**（原生实测 4 帧都是 6px），
-    // 所以它会跟着黑线上下走，不是一个固定位置的标签。
-    in-out property <string> speed-text: "";
-    in-out property <bool> paused: false;
-    in-out property <bool> done: false;
-    // 这一轮失败了（块账本对不上 / 手机端说指纹不一致）：窗口停在「接收失败」上，
-    // 不自动收 —— 用户不看见就会以为传完了（TRANSFER-WINDOW.md §2.1）。
-    in-out property <bool> failed: false;
-    // 失败原因，例如「缺 2 块 (#1318 #1319)」
-    in-out property <string> fail-text: "";
-    // 「详细信息」展开了没有
-    in-out property <bool> details: false;
-    // 明细：每段（每条通道）一行
-    in-out property <[XferRow]> rows: [];
-    // 进度条上的分段（IDM 同款切分）：每截的位置 / 宽度 / 填充比例
-    in-out property <[XferSeg]> segs: [];
-    // 「合计 82.9 MB/s · 剩余约 25 秒」—— 用户选了「去掉这行」，属性留着不显示，
-    // Rust 那边还在算（日志/其它地方要用），界面上不再占一行高度。
-    in-out property <string> summary-text: "";
-    // 已填充比例（0..1，按块算）：流光只在这段里扫，别扫到灰色空条上
-    in-out property <float> fill: 0.0;
-    // 流光位置（0..1 循环），由 Rust 那边 16ms 的 Timer 推着走
-    in-out property <float> flow: 0.0;
-    // 速率掉到 0 / 暂停 / 传完了 → 流光停住（一边 0 MB/s 一边还在流，看着像卡死）
-    in-out property <bool> flow-on: true;
-    // 这一轮是「电脑 -> 手机」（手机从电脑取文件）还是「手机 -> 电脑」。
-    // × 的含义两个方向不一样：接收方向要弹「保留 / 不保留」再收尾，
-    // 发送方向没有半截落盘文件可留，直接中断这一轮就行。
-    // 不分方向的话，推送过程中点 × 会走到 cancel-recv，而 control::receiving()
-    // 在发送时是 false，于是被当成「当前没有接收在进行」直接忽略 ——
-    // 真机 2026-11-21 日志连打 20 行「取消接收被忽略」，用户看到的就是「按了不管用」。
-    in-out property <bool> sending-now: false;
-    // 取消的确认框（和主界面那套是同一个组件、同一套 Rust 处理函数）
-    in-out property <bool> cancel-ask: false;
+// ---------------------------------------------------------------------------
+// 一个「操作块」：传输窗口里纵向堆叠的一项（一项 = 一条传输任务）
+//
+// 块里的行结构和尺寸全部照搬「窗口里只有一个操作」那一版的 TransferWindow ——
+// 那一版是拿参考图（docs/explorer-copy-dialog.png、native-details.png）逐像素量出来的，
+// 这一轮只是把它搬进可复用组件，**一个数值都没动**：单块时的窗口外观必须和改之前一模一样。
+//
+// 块自己的高度不是写死的，而是里面那些定高的行自然堆出来的（和改之前同构）：
+//   收起 = 14 + 20 + 6 + 30 + [失败红字 20] + 13 + 15(分段条) + 15(条到分隔线) + 1(分隔线)
+//        = 114（失败时 134）
+//   展开 = 14 + 20 + 6 + 30 + [失败红字 20] + 13(分段条不画了，留的呼吸) + 1(分隔线)
+//        + 10 + 18*3 + 8 + 80(图表条) + 8 + 22*max(1,rows) = 244 + 22*max(1,rows)
+//   等待块 = 收起那一套的 114，**details 展开也不变**（slim，见下）：它不画 ETA 三行、
+//        不画图表条、不画「这一轮还没有分通道数据」，所以展开态那半段一行都不涨。
+// 块末尾那条 1px #E3E3E3 兼职「块与块之间的分隔线」：单块时它就是改之前
+// 「进度区 ↔ 详细信息行」之间那条，位置一模一样；多块时块与块之间正好一条线，
+// 所以窗口那边不用再额外画分隔线（多画一条就会变成 2px 的黑缝）。
+// ---------------------------------------------------------------------------
+component XferOperation inherits Rectangle {
+    // 这一块要显示的东西（Rust 每帧按任务组装一份，见文件开头的 XferOp）
+    in property <XferOp> op;
+    // 「详细信息」展开了没有：由窗口最底下那一行开关控制，**所有块一起**展开 / 收起
+    in property <bool> details: false;
     // 这一轮已经受理过取消：把「取消」按钮收起来（同一轮只让取消一次）
-    in-out property <bool> cancelling: false;
+    in property <bool> cancelling: false;
 
+    // 精简态：等待块（op.waiting）**永远**只画精简态。
+    //
+    // 为什么不跟着窗口的 details 走：排队中的文件电脑端还没开始收，展开出来的
+    // 「名称 / 剩余时间 / 剩余项目」三行、速度图表条、「这一轮还没有分通道数据」全是噪音 ——
+    // 真机上一轮排 6 个文件，5 个等待块被一起撑开，窗口直接长出屏幕顶（就是这一轮要修的事）。
+    // 所以「窗口展不展开」和「这一块能不能展开」拆成两件事：slim 只看块自己。
+    private property <bool> slim: root.op.waiting;
+
+    // 块里那两颗按钮点下去交给窗口那一级处理：control.rs 里的暂停 / 取消是**进程级**
+    // 全局标志（static AtomicBool），不区分设备也不区分任务，处理逻辑只该有一份。
+    // 多块时点任意一块的暂停 / 取消都会影响到所有块 —— 各块各自的控制要等 control
+    // 按设备隔离之后再接，这一轮不动它。
     callback toggle-pause();
-    // 收起（标题栏 ✕ 也走它）：藏窗口，传输继续
-    callback close-window();
-    callback toggle-details();
-    // 返回 false = 这次点击被忽略（没在接收 / 已经在取消中），别弹确认框
-    callback cancel-recv() -> bool;
-    // 发送方向同理：半截文件在手机上，也要问「保留 / 不保留」。
-    // 返回 false = 这次点击被忽略（没在发送 / 已经在取消中），别弹确认框
-    callback cancel-send() -> bool;
-    callback cancel-keep();
-    callback cancel-discard();
-    callback cancel-dismiss();
+    callback cancel-request();
 
     VerticalLayout {
         spacing: 0px;
@@ -948,7 +919,7 @@ export component TransferWindow inherits Window {
             Rectangle { height: 14px; }
 
             Text {
-                text: root.action-text;
+                text: root.op.action-text;
                 font-size: 14px;
                 // #000000 = 参考图主文案「正在将…」那一行的最暗像素（(46,50) 一带，纯黑），
                 // 原来是 #1A1A1A（比原生浅一档）
@@ -964,19 +935,34 @@ export component TransferWindow inherits Window {
                 height: 30px;
                 spacing: 6px;
 
-                Text {
+                // 大号百分比：只有正常块画。它必须是这一行**第一个**元素 —— 正常块的
+                // 像素布局在真机上验收过，一个像素都不能动。
+                if !root.op.waiting : Text {
                     // 精简：不再拼「已完成 / 未完成」前缀 —— 标题栏已经说明状态，
-                    // 大号数字只报百分比
-                    text: root.percent + "%";
+                    // 大号数字只报百分比。
+                    text: root.op.percent + "%";
                     font-size: 20px;
                     font-weight: 600;
                     // #000000 = 参考图「已完成 8%」大字的最暗像素（(28..120, 66..79) 里的纯黑）；
                     // 失败那一行的红 #C42B1C 没动（参考图里没有失败态可采，沿用现值）
-                    color: root.failed ? #C42B1C : #000000;
+                    color: root.op.failed ? #C42B1C : #000000;
+                    vertical-alignment: center;
+                }
+                // 排队中这一块还没开始传，没有百分比可言：写「0%」看着像传了但卡住，
+                // 所以这个位置直接说「等待中」。
+                //
+                // 字号比百分比那行小一号（20 → 15）、颜色用次级灰 #616161（和 detail-text
+                // 同一个灰）：原来它复用 20px 的百分比字号，看着像个标题，和「还没开始」
+                // 这件事的分量对不上。位置没变，仍是原来百分比那一行的左边（同一条水平布局
+                // 的第 1 项）—— 用 if 而不是 visible，正常块那边才不会多出一个占位。
+                if root.op.waiting : Text {
+                    text: "等待中";
+                    font-size: 15px;
+                    color: #616161;
                     vertical-alignment: center;
                 }
                 Text {
-                    text: root.detail-text;
+                    text: root.op.detail-text;
                     // #616161 = 沿用现值：参考图里没有次级灰字（正文全是黑的），
                     // 这已经是中性灰（R=G=B），不存在「太鲜艳」的问题
                     font-size: 12px;
@@ -988,16 +974,17 @@ export component TransferWindow inherits Window {
 
                 // 暂停 / 继续：参考图右边那两颗方框按钮，鼠标移上去才有底色
                 Rectangle {
-                    width: root.paused ? 36px : 30px;
+                    width: root.op.paused ? 36px : 30px;
                     height: 28px;
                     border-radius: 4px;
                     background: pause-ta.has-hover ? #F0F0F0 : transparent;
-                    visible: !root.done;
+                    // 排队中的块没有在跑，暂停 / 继续对它没有意义（点了也只会暂停别的块）
+                    visible: !root.op.done && !root.op.waiting;
 
                     // 运行中画两条竖杠（字体里不一定有 ⏸，画出来最稳）
                     // #000000 = 参考图 ⏸ 图标 (355..385, 64..82) 的最暗像素（纯黑），原来是 #1A1A1A
                     Rectangle {
-                        visible: !root.paused;
+                        visible: !root.op.paused;
                         x: 10px;
                         y: 8px;
                         width: 3px;
@@ -1005,7 +992,7 @@ export component TransferWindow inherits Window {
                         background: #000000;
                     }
                     Rectangle {
-                        visible: !root.paused;
+                        visible: !root.op.paused;
                         x: 17px;
                         y: 8px;
                         width: 3px;
@@ -1013,7 +1000,7 @@ export component TransferWindow inherits Window {
                         background: #000000;
                     }
                     Text {
-                        visible: root.paused;
+                        visible: root.op.paused;
                         text: "继续";
                         font-size: 12px;
                         color: #000000;
@@ -1027,7 +1014,7 @@ export component TransferWindow inherits Window {
                     // 名字跟着状态走（和可见的「继续」一致）。
                     pause-ta := TouchArea {
                         accessible-role: button;
-                        accessible-label: root.paused ? "继续" : "暂停";  // 英文：Resume / Pause
+                        accessible-label: root.op.paused ? "继续" : "暂停";  // 英文：Resume / Pause
                         clicked => { root.toggle-pause(); }
                     }
                 }
@@ -1039,7 +1026,9 @@ export component TransferWindow inherits Window {
                     border-radius: 4px;
                     background: cancel-ta.has-hover ? #F0F0F0 : transparent;
                     // 失败时也要留着这颗 ✕：它是把「接收失败」这个窗口关掉的唯一按钮
-                    visible: (!root.done || root.failed) && !root.cancelling;
+                    // 排队中的块也不给 ✕：取消是**这一轮传输**的事（control.rs 里是进程级
+                    // 标志），从一块还没开始的块上点取消，停掉的是正在传的那一块 —— 骗人。
+                    visible: (!root.op.done || root.op.failed) && !root.cancelling && !root.op.waiting;
 
                     Text {
                         // × 是 GB2312 里就有的乘号，✕(U+2715) 在 YaHei 里没有，会变豆腐块
@@ -1058,21 +1047,9 @@ export component TransferWindow inherits Window {
                         accessible-role: button;
                         accessible-label: "取消接收";  // 英文：Cancel
                         clicked => {
-                            // 失败那一轮：这颗 ✕ 变成「关掉这个失败提示」
-                            // （已经没有传输在跑了，走取消流程只会被忽略，按钮就成死的了）
-                            if (root.failed) {
-                                root.close-window();
-                            } else if (root.sending-now) {
-                                // 电脑 -> 手机：半截文件写在手机那头，同样要问
-                                // 「保留 / 不保留」—— 「不保留」由 CANCEL_DISCARD
-                                // 让手机自己删掉（见 session.rs rebuild_transfers）。
-                                if (root.cancel-send()) {
-                                    root.cancel-ask = true;
-                                }
-                            } else if (root.cancel-recv()) {
-                                // 手机 -> 电脑：先暂停（手机端跟着停发），再问保留不保留
-                                root.cancel-ask = true;
-                            }
+                            // 具体怎么处置（失败态关窗 / 发送方向中断 / 接收方向先暂停再问）写在窗口那一级：
+                            // 整个窗口只有一个 cancel-ask 状态位、一套 Rust 处理函数。
+                            root.cancel-request();
                         }
                     }
                 }
@@ -1082,8 +1059,8 @@ export component TransferWindow inherits Window {
             // content-h / transfer_window_height() 里一直挂着「failed 时 +20px」，但布局里
             // 从某一轮精简起就没画过这行了 —— 失败时窗口底下会白白多出 20px。这轮补上，
             // 让它和那两个公式对得上（红色 #C42B1C = 失败态百分比大字的那个红）。
-            if root.failed : Text {
-                text: root.fail-text;
+            if root.op.failed : Text {
+                text: root.op.fail-text;
                 font-size: 12px;
                 color: #C42B1C;
                 height: 20px;
@@ -1096,7 +1073,10 @@ export component TransferWindow inherits Window {
             // 顶部那条分段进度条就不显示了，整窗只留详情里那条大聚合进度条」）----
             // 用 if 而不是 visible:false —— visible:false 仍然占着 13+15 的高度，展开后窗口
             // 顶上会横一条空白，那就是「底部留白」的另一种样子。
-            if !root.details : VerticalLayout {
+            // 等待块也画这一条（空的分段条）：它说的就是「还没开始、0 进度」，
+            // 而且这 43px（13+15+15）正是 114 和 71 的差 —— 不画它，等待块就只剩 71，
+            // 要么和精简块的高度对不上、要么在底下白留 43px 空档，两者都比一条空轨道难看。
+            if !root.details || root.slim : VerticalLayout {
                 spacing: 0px;
 
                 // 百分比行到条 13px：参考图大字墨迹底 y=79、条顶 y=92，中间 13 行。原来是 12。
@@ -1128,7 +1108,7 @@ export component TransferWindow inherits Window {
                     clip: true;
 
                     // 一截一块，各填各的（段宽 ∝ 这段占整条的比例）
-                    for seg in root.segs : Rectangle {
+                    for seg in root.op.segs : Rectangle {
                         x: 1px + (bar.width - 2px) * seg.x;
                         width: Math.max(0px, (bar.width - 2px) * seg.span);
                         height: bar.height - 2px;
@@ -1144,7 +1124,7 @@ export component TransferWindow inherits Window {
                             height: 100%;
                             // 暂停 → 深琥珀 #9D5D00（参考图 native-paused.png 整条 (200,97) 都是它；
                             // 这一轮补上：以前暂停时条子还是绿的，和原生的「暂停色」差着一档）
-                            background: root.paused ? #9D5D00 : #0F7B0F;
+                            background: root.op.paused ? #9D5D00 : #0F7B0F;
                             clip: true;
 
                             // 流光：**一道光扫整条**，不是每截各扫各的。
@@ -1156,9 +1136,9 @@ export component TransferWindow inherits Window {
                             //   匀速 200 px/s 从左边外面扫到填充区右边外面，扫完停 1 秒再从头来。
                             // 出处：dotnet/wpf Themes/XAML/ProgressBar.xaml + ProgressBar.cs 的 UpdateAnimation。
                             band := Rectangle {
-                                visible: root.flow-on && piece.width > 8px;
+                                visible: root.op.flow-on && piece.width > 8px;
                                 private property <length> band-w: 100px;
-                                x: (bar.width - 2px) * root.flow - (bar.width - 2px) * seg.x - band.band-w / 2;
+                                x: (bar.width - 2px) * root.op.flow - (bar.width - 2px) * seg.x - band.band-w / 2;
                                 y: 0px;
                                 width: band.band-w;
                                 height: 100%;
@@ -1173,7 +1153,7 @@ export component TransferWindow inherits Window {
                     }
 
                     // 切分线画在最上面：灰底和绿底上都看得见，一条通道一截全靠它分
-                    for seg in root.segs : Rectangle {
+                    for seg in root.op.segs : Rectangle {
                         visible: seg.x > 0.0001;
                         x: 1px + (bar.width - 2px) * seg.x;
                         width: 1px;
@@ -1190,8 +1170,9 @@ export component TransferWindow inherits Window {
         // 「段落分隔」的位置上。
         // 展开态这一块整段被 if 掉了（见上面），这里换成 13px：条子不画了，但百分比行和
         // 分隔线之间还得留一口气，否则那条线会贴到 20px 大字的脚上（content-h 里记的就是 13）。
-        if root.details : Rectangle { height: 13px; }
-        if !root.details : Rectangle { height: 15px; }
+        // 等待块不管 details 开没开都走「收起态」这一支（上面那条进度条同一套判断）。
+        if root.details && !root.slim : Rectangle { height: 13px; }
+        if !root.details || root.slim : Rectangle { height: 15px; }
 
         // ---- 分隔线：贯穿整窗（参考图就是整窗宽，不带内边距）----
         // #E3E3E3 = 参考图 (10,122)/(200,122)/(440,122)，整行 447 个像素全是这个值。
@@ -1208,7 +1189,10 @@ export component TransferWindow inherits Window {
             padding-right: 26px;
             spacing: 0px;
 
-            if root.details : VerticalLayout {
+            // 详情区：窗口展开了**且**这一块不是等待块才画。
+            // 等待块展开出来是空的（rows 是空的，图表没有数据），只会在窗口中间堆一堆
+            // 「正在计算...」「这一轮还没有分通道数据」—— 见 XferOperation 里 slim 的说明。
+            if root.details && !root.slim : VerticalLayout {
                 spacing: 0px;
 
                 // 分隔线 → 「名称：」第一行 10px（和收起态「线到开关行」同一个 10）。
@@ -1222,7 +1206,7 @@ export component TransferWindow inherits Window {
                 // /偏蓝的点是 ClearType 的次像素边，不是字色。
                 // 值由 Rust 每帧喂（file-name / eta-text / remain-text），标签固定在这边。
                 Text {
-                    text: "名称：" + root.file-name;
+                    text: "名称：" + root.op.file-name;
                     font-size: 12px;
                     color: #000000;
                     height: 18px;
@@ -1232,7 +1216,7 @@ export component TransferWindow inherits Window {
                 }
                 Text {
                     // 算不出来时 Rust 传「正在计算...」（原生的写法就是这个）
-                    text: "剩余时间：" + root.eta-text;
+                    text: "剩余时间：" + root.op.eta-text;
                     font-size: 12px;
                     color: #000000;
                     height: 18px;
@@ -1241,7 +1225,7 @@ export component TransferWindow inherits Window {
                     overflow: elide;
                 }
                 Text {
-                    text: "剩余项目：" + root.remain-text;
+                    text: "剩余项目：" + root.op.remain-text;
                     font-size: 12px;
                     color: #000000;
                     height: 18px;
@@ -1310,7 +1294,7 @@ export component TransferWindow inherits Window {
                         Rectangle {
                             x: 0px;
                             y: 0px;
-                            width: body.width * root.fill;
+                            width: body.width * root.op.fill;
                             height: 100%;
                             background: #A7E591;
                         }
@@ -1319,7 +1303,7 @@ export component TransferWindow inherits Window {
                         done-zone := Rectangle {
                             x: 0px;
                             y: 0px;
-                            width: body.width * root.fill;
+                            width: body.width * root.op.fill;
                             height: 76px;
                             clip: true;
 
@@ -1348,29 +1332,29 @@ export component TransferWindow inherits Window {
                                 viewbox-y: 0;
                                 viewbox-width: 1000;
                                 viewbox-height: 76;
-                                commands: root.curve-path;
+                                commands: root.op.curve-path;
                                 // 暂停 → 面积换琥珀 #9D5D00（网格、黑线不变）
-                                fill: root.paused ? #9D5D00 : #06B025;
+                                fill: root.op.paused ? #9D5D00 : #06B025;
                             }
                         }
 
                         // ---- 未完成区：只有浅网格，没有面积 ----
                         undone-zone := Rectangle {
-                            x: body.width * root.fill;
+                            x: body.width * root.op.fill;
                             y: 0px;
-                            width: body.width - body.width * root.fill;
+                            width: body.width - body.width * root.op.fill;
                             height: 76px;
                             clip: true;
 
                             // 网格坐标还是按整条算，只是被这个容器裁掉左半截 ——
                             // 所以这里减去已完成宽度，线才能落在和已完成区同一条 x 上。
                             for i in 9 : Rectangle {
-                                x: body.width * (i + 1) / 10 - body.width * root.fill;
+                                x: body.width * (i + 1) / 10 - body.width * root.op.fill;
                                 y: 0px;
                                 width: 1px;
                                 height: 100%;
                                 background: #CDEFD3;
-                                visible: (body.width * (i + 1) / 10) > (body.width * root.fill);
+                                visible: (body.width * (i + 1) / 10) > (body.width * root.op.fill);
                             }
                             Rectangle { x: 0px; y: 15px; width: 100%; height: 1px; background: #CDEFD3; }
                             Rectangle { x: 0px; y: 30px; width: 100%; height: 1px; background: #CDEFD3; }
@@ -1383,7 +1367,7 @@ export component TransferWindow inherits Window {
                         // 原生实测 25 帧 y 在 7..40（相对主体）之间来回跳，速度越快线越高。
                         Rectangle {
                             x: 0px;
-                            y: root.guide-y * 1px;
+                            y: root.op.guide-y * 1px;
                             width: 100%;
                             height: 1px;
                             background: #000000;
@@ -1392,14 +1376,14 @@ export component TransferWindow inherits Window {
                         // ---- 「速度: xx MB/秒」：底边恒在黑线上方 6px，靠右留 6px ----
                         // 它跟着黑线走（原生 4 帧实测都是 6px 间距），所以不是固定标签。
                         Text {
-                            text: root.speed-text;
+                            text: root.op.speed-text;
                             font-size: 12px;
                             color: #000000;
                             x: 0px;
                             // 字底 = 黑线上方 6px（原生 4 帧实测都是 6px）：
                             // 12px 字在 18px 高的盒子里垂直居中，盒子底 = y + 18，
                             // 要让盒子底落在 guide-6，就是 y = guide - 24。
-                            y: (root.guide-y * 1px) - 24px;
+                            y: (root.op.guide-y * 1px) - 24px;
                             width: parent.width - 6px;
                             height: 18px;
                             horizontal-alignment: right;
@@ -1417,7 +1401,7 @@ export component TransferWindow inherits Window {
                 // 四列：序号+通道名 110 / 已收·该段总量 / 速率 78（右对齐）/ 完成度 44（右对齐）。
                 // 速率列这一轮提到黑字（它是这一块的主角），完成度留在 #616161。
                 // 行高 22px（Windows 列表的标准行高），12px 字。
-                for row in root.rows : HorizontalLayout {
+                for row in root.op.rows : HorizontalLayout {
                     height: 22px;
                     spacing: 14px;
 
@@ -1458,7 +1442,7 @@ export component TransferWindow inherits Window {
                     }
                 }
 
-                if root.rows.length == 0 : Text {
+                if root.op.rows.length == 0 : Text {
                     text: "这一轮还没有分通道数据";
                     font-size: 12px;
                     color: #8A8A8A;
@@ -1466,84 +1450,268 @@ export component TransferWindow inherits Window {
                     vertical-alignment: center;
                 }
             }
+        }
+    }
+}
 
-            // 详情最后一行（或收起态的分隔线）到开关行 10px。
-            // 收起态：参考图线 y=122、行框 133..155，所以「线到行框 10px」=「线到文字 15px」。
-            if root.details : Rectangle { height: 10px; }
-            // 展开态在「简略信息」上面**还有一条分隔线**：参考图 native-details.png 的 x=5 一列
-            // 从客户区顶到窗底只有 y=250 这一行是 #E3E3E3，位置正好在「∧ 简略信息」上面
-            // （y=250 线 → 文字墨迹 266..278）。收起态那条线（y=122）在这个位置之外，
-            // 所以这里是展开态独有的 1px。content-h / transfer_window_height() 里记成 +1。
-            if root.details : Rectangle { height: 1px; background: #E3E3E3; }
-            Rectangle { height: 10px; }
+export component TransferWindow inherits Window {
+    // 标题 = 状态文案 + 标题后缀。
+    //
+    // 状态文案：只有一块时和平常一样（三种状态）；多块时只说「有几项操作在跑」——
+    // 原生资源管理器就是这种写法（「2 个正在运行的操作」），每块自己的状态写在块里面。
+    property <string> state-title: root.ops.length > 1
+        ? root.ops.length + " 个正在运行的操作"
+        : root.failed ? "接收失败" : root.done ? "已完成" : "正在传输";
+    // 后缀（" · 小米 15"）由 Rust 按设备喂进来：一台设备一个窗口之后标题必须**唯一**，
+    // 因为下游是**按标题后缀**找 HWND 的（tray_win::find_transfer_window_of）——
+    // 状态前缀会变（正在传输 / 已完成 / 接收失败），后缀一辈子不变。
+    in-out property <string> title-suffix: "";
+    title: root.state-title + root.title-suffix;
+    // 和主窗口同一个字体，别让两个窗口的字长得不一样
+    default-font-family: "Segoe UI, Microsoft YaHei UI";
+    default-font-size: 13px;
+    preferred-width: 460px;
+    // ---- 高度：这里和 gui_slint.rs 的 transfer_window_height() / transfer_window_cap()
+    //      两处必须一模一样（以前就是因为两处算式不一致，把取消确认框裁掉过）----
+    //
+    // 拆成「每块自己的高度 + 随数据变的明细行 + 共用的尾部」三段：
+    //   正常块（收起）= 14(上留白) + 20(主文案) + 6 + 30(百分比行)
+    //             + 13(百分比行到分段条) + 15(分段条) + 15(分段条到分隔线) + 1(分隔线) = 114
+    //   正常块（展开）= 14 + 20 + 6 + 30 + 13(分段条不画了，百分比行到分隔线仍留 13 的呼吸)
+    //             + 1(分隔线) + 10(分隔线到「名称：」)
+    //             + 18*3(名称 / 剩余时间 / 剩余项目 —— 原生这三行的行距就是 18)
+    //             + 8(三行到速度图表条) + 80(速度图表条)
+    //             + 8(图表条到各通道速率第一行) = 244
+    //   等待块 = 114，**details 开不开都一样**（它只画精简态，见 XferOperation 的 slim；
+    //   里面仍是 14+20+6+30+13+15+15+1 那八项，所以和精简块同值）
+    //   明细行 22px/行：**只算非等待块**，而且**只在展开态**算 ——
+    //   收起态块里根本不画那些行；等待块永远不展开，一行都没有。
+    //   rows 为 0 时正常块里画的是「这一轮还没有分通道数据」那一行，同样 22px，按 1 行算。
+    //   尾部（所有块共用一条开关行）= 收起 10+22+10 = 42；展开 10+1+10+22+10 = 53
+    //   （展开态「简略信息」上面那条 1px #E3E3E3 是原生独有的，native-details.png y=250）。
+    //   失败块多一行红字：每块 +20（只加失败的那几块）。
+    //
+    // 单块验算（= 改之前那两个公式，一个像素都没变）：
+    //   收起 114 + 42 = 156 ✓（14+20+6+30+13+15+15+1+10+22+10）
+    //   展开 244 + 22*max(1,rows) + 53 = 297 + 22*max(1,rows) ✓
+    //   （改之前把那条分隔线算在展开态头部，这里算在块里 —— 总数一样）
+    //   失败时再 +20 ✓
+    //
+    // 逐块的行数 / 失败状态 / 等待块个数是 Rust 每帧汇总后喂进来的：Slint 没有
+    // 「对数组求和」的表达式，只能把 sum 算在 Rust 那边（和 rows / segs 同一个来路）。
+    // 块数为 0（窗口本来就该收起的那些帧）时按一块算，免得 preferred-height 缩成一条。
+    //
+    // 顺序和 Rust 的 transfer_window_height() 逐项对齐：非等待块、明细行、等待块、
+    // 失败红字、尾部。算术全部用「无单位数字」做，最后再乘 1px，这样和 Rust 那边的
+    // f32 算式一个符号都不差。
+    in-out property <int> total-rows: 0;
+    in-out property <int> failed-ops: 0;
+    // 等待块（op.waiting）的个数：每个固定 114，且一行明细都不占
+    in-out property <int> waiting-ops: 0;
+    // 屏幕可用高度（逻辑像素，0 = 还没拿到）。Slint 自己问不到屏幕尺寸，
+    // 由 Rust 建窗口时喂进来（tray_win 量工作区高，再除以缩放）。
+    in-out property <int> screen-h: 0;
+    // 完整内容高度 = 一块一块堆起来的真实高度（Flickable 里那一列就是它）
+    private property <float> raw-content-h: Math.max(1, root.ops.length - root.waiting-ops)
+            * (root.details ? 244 : 114)
+        + (root.details ? root.total-rows * 22 : 0)
+        + root.waiting-ops * 114
+        + root.failed-ops * 20
+        + (root.details ? 53 : 42);
+    // 封顶值 = 屏幕可用高度 - 160（上下留白）。拿不到屏幕高度就退化成 720。
+    // 160 和 Rust 的 TW_HEIGHT_CAP_SLACK 是同一个数。
+    private property <float> cap-h: root.screen-h > 0 ? root.screen-h - 160 : 720;
+    // 窗口高度 = min(内容高度, 封顶值)。它同时是 Flickable 的可见高度：
+    // 内容比它高的时候窗口不再长，改成里面能滚（见下面的 Flickable）。
+    private property <float> content-h: Math.min(root.raw-content-h, root.cap-h);
+    // 确认框现在是独立窗口，不再需要把高度撑到 216 —— 传“细节”让位给它自己的窗口
+    preferred-height: root.content-h * 1px;
+    background: #FFFFFF;
 
-            // ---- 开关行（整行可点，和资源管理器一样，不用非得点到字上）----
-            // 行高 22px = Windows 列表的标准行高；12px 字 = 参考图「详细信息」4 个字 48px。
-            Rectangle {
-                height: 22px;
-                // 悬浮时**不刷底色**（用户 2026-11-19：「鼠标悬浮停留时这个详细信息阴影删除，
-                // 或者 1:1 仿原生」）。原生这一行确实有 hover 高亮，但整行 460px 刷成 #F5F5F5
-                // 之后，白底窗口里横着一条灰带，比原生那张图里任何一处都显眼。宁可没有。
-                background: transparent;
+    // ---- 纵向堆叠的操作块（一块 = 一条传输任务）----
+    // Rust 每帧按任务组装，块在窗口里的上下顺序就是任务在这个数组里的顺序；
+    // 块数变了就是「窗口里有几项操作」，标题栏那个 N 直接读它的长度。
+    in-out property <[XferOp]> ops: [];
+    // 「详细信息」展开了没有（窗口最底下那一行开关，一次性切换所有块）
+    in-out property <bool> details: false;
+    // 这一轮失败了（块账本对不上 / 手机端说指纹不一致）：窗口停在「接收失败」上，
+    // 不自动收 —— 用户不看见就会以为传完了（TRANSFER-WINDOW.md §2.1）。
+    // 这个位只给标题栏用，块自己的失败态在 XferOp.failed 里。
+    in-out property <bool> failed: false;
+    // 同上，只给标题栏用：所有块都传完了才算「已完成」
+    in-out property <bool> done: false;
+    // 「合计 82.9 MB/s · 剩余约 25 秒」—— 用户选了「去掉这行」，属性留着不显示，
+    // Rust 那边还在算（日志/其它地方要用），界面上不再占一行高度。
+    in-out property <string> summary-text: "";
+    // 这一轮是「电脑 -> 手机」（手机从电脑取文件）还是「手机 -> 电脑」。
+    // × 的含义两个方向不一样：接收方向要弹「保留 / 不保留」再收尾，
+    // 发送方向没有半截落盘文件可留，直接中断这一轮就行。
+    // 不分方向的话，推送过程中点 × 会走到 cancel-recv，而 control::receiving()
+    // 在发送时是 false，于是被当成「当前没有接收在进行」直接忽略 ——
+    // 真机 2026-11-21 日志连打 20 行「取消接收被忽略」，用户看到的就是「按了不管用」。
+    in-out property <bool> sending-now: false;
+    // 取消的确认框（和主界面那套是同一个组件、同一套 Rust 处理函数）
+    in-out property <bool> cancel-ask: false;
+    // 这一轮已经受理过取消：把每块那颗「取消」都收起来（同一轮只让取消一次）
+    in-out property <bool> cancelling: false;
 
-                // ---- 箭头：V 形，用 Path 画（不再用 ▼/▲ 字形）----
-                // 量测（native-paused.png）：箭头墨迹 x=31..41（11px 宽）、y=141..147（7px 高），
-                // 最暗 #1F1F1F（12px 细笔画抗锯齿后还是黑），像 1px 圆头的两笔斜线；
-                // 行框是 y=133..155（22px），墨迹上下各留 8px → 7px 高摆在 y=7 正好居中。
-                // 左边：26px 内边距 + 4px = 30，ink 从 31 起（形状自己留 1px）；
-                // 文字 ink 从 51 起 → 文字框 x=24（26+24=50，字形自带 1px 左留白）。
-                chevron := Path {
-                    // 左边距：26px 内边距 + 3px = 29，描边圆头再吃掉 0.5 → 墨迹从 30 起
-                    // （参考图墨迹 31..41，客户区从 1 起 → 相对正文线 3..13）
-                    x: 3px;
-                    // 纵向：参考图箭头墨迹 x=31..41 / y=142..146（11 宽、5 高、1px 圆头细线），
-                    // 行框 133..155 → 墨迹在 +9..+13。这里元素 12x6、笔画 0.5..5，
-                    // 描边圆头再各探出 0.5 → 实墨 +8..+13，和参考图差半像素以内。
-                    y: 8px;
-                    width: 12px;
-                    height: 6px;
-                    // viewbox 和元素尺寸一样大 → 缩放正好 1:1，描边不会被缩放拉粗拉细
-                    viewbox-x: 0;
-                    viewbox-y: 0;
-                    viewbox-width: 12;
-                    viewbox-height: 6;
-                    // 收起 = ∨（尖朝下，笔尖在 y 大的那边）—— 参考图 native-paused.png 就是这个；
-                    // 展开 = ∧（尖朝上）。圆头（stroke-line-cap: round）和参考图的细笔画一致。
-                    commands: root.details
-                        ? "M 1 5 L 6 0.5 L 11 5"
-                        : "M 1 0.5 L 6 5 L 11 0.5";
-                    stroke: #1F1F1F;
-                    stroke-width: 1px;
-                    stroke-line-cap: round;
-                    stroke-line-join: round;
-                }
+    callback toggle-pause();
+    // 收起（标题栏 ✕ 也走它）：藏窗口，传输继续
+    callback close-window();
+    callback toggle-details();
+    // 返回 false = 这次点击被忽略（没在接收 / 已经在取消中），别弹确认框
+    callback cancel-recv() -> bool;
+    // 发送方向同理：半截文件在手机上，也要问「保留 / 不保留」。
+    // 返回 false = 这次点击被忽略（没在发送 / 已经在取消中），别弹确认框
+    callback cancel-send() -> bool;
+    callback cancel-keep();
+    callback cancel-discard();
+    callback cancel-dismiss();
 
-                Text {
-                    // 文字跟着原生走：收起「详细信息」/ 展开「简略信息」
-                    // （▼/▲/✕ 这类符号会缺字形或宽窄不一，图标一律 Path 画）
-                    x: 24px;
-                    text: root.details ? "简略信息" : "详细信息";
-                    font-size: 12px;
-                    color: #000000;
-                    height: 100%;
-                    vertical-alignment: center;
-                }
-                // 整行一个按钮：UIA 里以前只是一颗 Text，自动化点不到。
-                // 名字跟可见文字同步（收起「详细信息」/ 展开「简略信息」），两个状态下都能点。
-                details-ta := TouchArea {
-                    accessible-role: button;
-                    accessible-label: root.details ? "简略信息" : "详细信息";  // 英文：Hide/Show details
-                    clicked => { root.toggle-details(); }
+    // ---- 内容比窗口高的时候在窗口里滚，而不是把窗口撑出屏幕 ----
+    //
+    // 以前这块内容直接挂在窗口上：块一多，窗口高度就跟着长（真机一排 6 个文件就长出
+    // 屏幕顶，下面的块根本看不到，而窗口又不能滚）。现在把整列包进 Flickable：
+    //   * 窗口高度 = min(完整内容高度, 屏幕可用高度 - 160)（见上面 content-h）；
+    //   * Flickable 自己就是「封顶后的可见高度」，里面那一列仍然是完整内容高度；
+    //   * 只有内容真的比窗口高时才会滚，装得下的时候一个像素都不动
+    //     （单块 / 收起 / 展开都还是改之前的样子）。
+    //
+    // content-height / content-y 就是旧文档里的 viewport-height / viewport-y：Slint 1.18
+    // 把它们改叫 content-*，viewport-* 只剩兼容别名 —— 语义没变，都是「可见区」那一份。
+    //
+    // 滚轮能用，拖动平移不要：这一行里全是按钮和可点行（暂停 / 取消 / 「详细信息」），
+    // 拖拽平移会在按下和松手之间插一段判断，点击时序就变了。滚轮不受下面两个开关影响
+    // （builtin_elements 里 Flickable 的文档写明「不管 interactive 都会响应滚轮」）。
+    Flickable {
+        content-height: root.raw-content-h * 1px;
+        // 内容列跟着窗口宽度走（和包进 Flickable 之前一样，横向永远不滚）：
+        // 不给的话它是「窗口宽」和「内容最小宽」里取大的那个，用户把窗口拖窄之后
+        // 那一列会比可见区宽，等于多出一个没有滚动条的横向溢出。
+        content-width: root.width;
+        // 只滚竖向：滚轮 / 触摸板都能滚，拖动平移不行（理由见上）。
+        interactive: false;
+        mouse-drag-pan-enabled: false;
+
+        VerticalLayout {
+            spacing: 0px;
+            padding: 0px;
+
+            // ---- N 个操作块：纵向堆叠，块之间靠每块自己末尾那条 1px 线分开 ----
+            // （所以这里不再额外画分隔线，多画一条就是 2px 的双线）
+            for o in root.ops : XferOperation {
+                op: o;
+                details: root.details;
+                cancelling: root.cancelling;
+
+                toggle-pause => { root.toggle-pause(); }
+                // 块里那颗 ✕ 的语义按方向分（接收 = 弹「保留 / 不保留」，发送 = 直接中断），
+                // 和改之前一样挂在窗口这一级：只有一个 cancel-ask 状态位和一套 Rust 处理函数。
+                cancel-request => {
+                    if (o.failed) {
+                        // 失败那一轮：这颗 ✕ 变成「关掉这个失败提示」
+                        // （已经没有传输在跑了，走取消流程只会被忽略，按钮就成死的了）
+                        root.close-window();
+                    } else if (root.sending-now) {
+                        // 电脑 -> 手机：半截文件写在手机那头，同样要问
+                        // 「保留 / 不保留」—— 「不保留」由 CANCEL_DISCARD
+                        // 让手机自己删掉（见 session.rs rebuild_transfers）。
+                        if (root.cancel-send()) {
+                            root.cancel-ask = true;
+                        }
+                    } else if (root.cancel-recv()) {
+                        // 手机 -> 电脑：先暂停（手机端跟着停发），再问保留不保留
+                        root.cancel-ask = true;
+                    }
                 }
             }
 
-            Rectangle { height: 10px; }
+            // ---- 尾部：所有块共用的「简略信息 / 详细信息」开关行 ----
+            // 展开时详情各自长在所属的块里，这一行永远在最底下；收起时它紧跟在最后一块的
+            // 分隔线后面 —— 单块时的位置和改之前一模一样。
+            VerticalLayout {
+                padding-left: 26px;
+                padding-right: 26px;
+                spacing: 0px;
+                // 详情最后一行（或收起态的分隔线）到开关行 10px。
+                // 收起态：参考图线 y=122、行框 133..155，所以「线到行框 10px」=「线到文字 15px」。
+                if root.details : Rectangle { height: 10px; }
+                // 展开态在「简略信息」上面**还有一条分隔线**：参考图 native-details.png 的 x=5 一列
+                // 从客户区顶到窗底只有 y=250 这一行是 #E3E3E3，位置正好在「∧ 简略信息」上面
+                // （y=250 线 → 文字墨迹 266..278）。收起态那条线（y=122）在这个位置之外，
+                // 所以这里是展开态独有的 1px。content-h / transfer_window_height() 里记成 +1。
+                if root.details : Rectangle { height: 1px; background: #E3E3E3; }
+                Rectangle { height: 10px; }
 
-            // 取消确认框不再画在这里：它现在是**独立窗口**（见文件开头的 CancelAskWindow）。
-            // 这里只留 cancel-ask 这个状态位，Rust 每帧读它，翻成 true 就把那个窗口弹出来。
-            // 以前是遮罩层，得靠「加 65px 占位」把窗口物理撑高才露得全（§6.2），独立窗口不用。
+                // ---- 开关行（整行可点，和资源管理器一样，不用非得点到字上）----
+                // 行高 22px = Windows 列表的标准行高；12px 字 = 参考图「详细信息」4 个字 48px。
+                Rectangle {
+                    height: 22px;
+                    // 悬浮时**不刷底色**（用户 2026-11-19：「鼠标悬浮停留时这个详细信息阴影删除，
+                    // 或者 1:1 仿原生」）。原生这一行确实有 hover 高亮，但整行 460px 刷成 #F5F5F5
+                    // 之后，白底窗口里横着一条灰带，比原生那张图里任何一处都显眼。宁可没有。
+                    background: transparent;
+
+                    // ---- 箭头：V 形，用 Path 画（不再用 ▼/▲ 字形）----
+                    // 量测（native-paused.png）：箭头墨迹 x=31..41（11px 宽）、y=141..147（7px 高），
+                    // 最暗 #1F1F1F（12px 细笔画抗锯齿后还是黑），像 1px 圆头的两笔斜线；
+                    // 行框是 y=133..155（22px），墨迹上下各留 8px → 7px 高摆在 y=7 正好居中。
+                    // 左边：26px 内边距 + 4px = 30，ink 从 31 起（形状自己留 1px）；
+                    // 文字 ink 从 51 起 → 文字框 x=24（26+24=50，字形自带 1px 左留白）。
+                    chevron := Path {
+                        // 左边距：26px 内边距 + 3px = 29，描边圆头再吃掉 0.5 → 墨迹从 30 起
+                        // （参考图墨迹 31..41，客户区从 1 起 → 相对正文线 3..13）
+                        x: 3px;
+                        // 纵向：参考图箭头墨迹 x=31..41 / y=142..146（11 宽、5 高、1px 圆头细线），
+                        // 行框 133..155 → 墨迹在 +9..+13。这里元素 12x6、笔画 0.5..5，
+                        // 描边圆头再各探出 0.5 → 实墨 +8..+13，和参考图差半像素以内。
+                        y: 8px;
+                        width: 12px;
+                        height: 6px;
+                        // viewbox 和元素尺寸一样大 → 缩放正好 1:1，描边不会被缩放拉粗拉细
+                        viewbox-x: 0;
+                        viewbox-y: 0;
+                        viewbox-width: 12;
+                        viewbox-height: 6;
+                        // 收起 = ∨（尖朝下，笔尖在 y 大的那边）—— 参考图 native-paused.png 就是这个；
+                        // 展开 = ∧（尖朝上）。圆头（stroke-line-cap: round）和参考图的细笔画一致。
+                        commands: root.details
+                            ? "M 1 5 L 6 0.5 L 11 5"
+                            : "M 1 0.5 L 6 5 L 11 0.5";
+                        stroke: #1F1F1F;
+                        stroke-width: 1px;
+                        stroke-line-cap: round;
+                        stroke-line-join: round;
+                    }
+
+                    Text {
+                        // 文字跟着原生走：收起「详细信息」/ 展开「简略信息」
+                        // （▼/▲/✕ 这类符号会缺字形或宽窄不一，图标一律 Path 画）
+                        x: 24px;
+                        text: root.details ? "简略信息" : "详细信息";
+                        font-size: 12px;
+                        color: #000000;
+                        height: 100%;
+                        vertical-alignment: center;
+                    }
+                    // 整行一个按钮：UIA 里以前只是一颗 Text，自动化点不到。
+                    // 名字跟可见文字同步（收起「详细信息」/ 展开「简略信息」），两个状态下都能点。
+                    details-ta := TouchArea {
+                        accessible-role: button;
+                        accessible-label: root.details ? "简略信息" : "详细信息";  // 英文：Hide/Show details
+                        clicked => { root.toggle-details(); }
+                    }
+                }
+
+                Rectangle { height: 10px; }
+
+                // 取消确认框不再画在这里：它现在是**独立窗口**（见文件开头的 CancelAskWindow）。
+                // 这里只留 cancel-ask 这个状态位，Rust 每帧读它，翻成 true 就把那个窗口弹出来。
+                // 以前是遮罩层，得靠「加 65px 占位」把窗口物理撑高才露得全（§6.2），独立窗口不用。
+            }
         }
     }
+
 }
 
 // ---------------------------------------------------------------------------

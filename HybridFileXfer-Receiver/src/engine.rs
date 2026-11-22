@@ -525,8 +525,23 @@ static ACTIVE_SESSIONS: AtomicUsize = AtomicUsize::new(0);
 
 fn run_session(session: &mut Session, options: &EngineOptions, stop: &Arc<AtomicBool>) -> SessionEnd {
     ACTIVE_SESSIONS.fetch_add(1, Ordering::SeqCst);
-    let receiver = Arc::new(Receiver::with_shared(crate::webserve::current_dir()));
+    // 进度按设备分开记：主界面每台设备那一行读的是 progress_for(串号)（gui_slint.rs 设备行），
+    // 以前这里一律用 with_shared —— 它的键是固定的 "default"，
+    // 于是 progress_for(真串号) 那份从来没人写，设备行永远显示「已接收 0 B · 0 个文件」。
+    // 收块时本来就同时写「本设备」和「全局」两份（见 receiver.rs write_block 的进度上报），
+    // 所以这里带上串号只是把「本设备」那份接到正确的键上，全局那份和界面大卡片不受影响。
+    let receiver = {
+        let dir = crate::webserve::current_dir();
+        match options.device.as_deref() {
+            Some(dev) if !dev.is_empty() => Arc::new(Receiver::with_device(dir, dev)),
+            _ => Arc::new(Receiver::with_shared(dir)),
+        }
+    };
     let end = session.run(&receiver, stop);
+    // 309：这台手机的队列快照跟着会话一起作废 —— 断线之后界面不该再挂着一排
+    // 「等待中」的块（那些文件是上一次连接时排的，手机那边可能早换了队列）。
+    // 键就是会话自己的串号，和 QUEUE_STATE 入库时用的是同一个。
+    crate::queue::clear(&session.device);
     // 会话结束（断开/被停止/出错）：把还开着的文件句柄放掉、续传日志落盘，
     // 界面进度也复位，否则卡片上会一直挂着一个停住不动的假进度。
     //

@@ -12,6 +12,7 @@ pub mod journal;
 pub mod log;
 pub mod netif;
 pub mod proto;
+pub mod queue;
 pub mod ratelimit;
 pub mod receiver;
 pub mod session;
