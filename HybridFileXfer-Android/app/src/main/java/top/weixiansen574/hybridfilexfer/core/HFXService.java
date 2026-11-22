@@ -151,8 +151,30 @@ public abstract class HFXService {
      * 绝不能丢 —— 丢一个帧头，整条控制通道的帧流就错位了。
      */
     protected volatile short pendingOpcode = -1;
-    /** 304：在别的读循环里读到的重建请求通道名，交给 rebuildTransfers 消费 */
-    private final java.util.Queue<String> pendingRebuildNames = new java.util.concurrent.ConcurrentLinkedQueue<>();
+    /**
+     * 304：在别的读循环里读到的重建请求，交给 rebuildTransfers 消费（按到达顺序配对）。
+     *
+     * <p>元素带着「这一条的 REBUILD_ACK 是不是已经就地回过了」：绝大多数读循环只是把
+     * 通道名存下来，由重建握手领到通道时回 ACK；但 {@link #drainStaleControlFrames()} 和
+     * {@code HFXServer.queryResume} 这两条路**必须当场回一帧**（它们正握着 controlLock
+     * 阻塞在别的等待上，电脑那边也停在等 ACK，谁都没机会补），那种元素标记为 true，
+     * 重建握手只领通道、不准再回第二帧 —— 电脑端一帧 REBUILD_REQ 只等一帧 REBUILD_ACK，
+     * 多出来的一帧会被它读成下一条通道的答复（传输期间更会被当成「意外控制帧」直接断线）。
+     */
+    private final java.util.Queue<RebuildRequest> pendingRebuildNames = new java.util.concurrent.ConcurrentLinkedQueue<>();
+
+    /** 304：一条提前读到的重建请求（= 电脑要恢复的一条传输通道） */
+    public static final class RebuildRequest {
+        /** 电脑报的通道名：它按这个名字认通道，两边必须一致 */
+        public final String name;
+        /** true = 这一条的 REBUILD_ACK 已经就地写过了，重建握手别再写第二遍 */
+        public final boolean ackAlreadySent;
+
+        RebuildRequest(String name, boolean ackAlreadySent) {
+            this.name = name;
+            this.ackAlreadySent = ackAlreadySent;
+        }
+    }
     /** 本次发送的读文件任务：界面从它拿"当前文件被切成哪几段"画动态进度条 */
     private volatile ReadFileCall currentReadFileCall;
 
@@ -319,7 +341,20 @@ public abstract class HFXService {
 
     protected void stashRebuildName(String name) {
         if (name != null) {
-            pendingRebuildNames.add(name);
+            pendingRebuildNames.add(new RebuildRequest(name, false));
+        }
+    }
+
+    /**
+     * 304：记下一条「REBUILD_ACK 已经就地回过」的重建请求。
+     *
+     * <p>和 {@link #stashRebuildName(String)} 的唯一差别是那个标记：
+     * 重建握手领到这条通道、把它加回 {@code connections} 时**不能再回 ACK**
+     * （一帧 REQ 只配一帧 ACK，多发一帧会让电脑端的帧序整体错一拍）。
+     */
+    protected void stashAckedRebuildName(String name) {
+        if (name != null) {
+            pendingRebuildNames.add(new RebuildRequest(name, true));
         }
     }
 
@@ -412,9 +447,61 @@ public abstract class HFXService {
         return closed;
     }
 
+    /** 取一个提前读到的重建请求；没有返回 null */
+    public RebuildRequest pollRebuildRequest() {
+        return pendingRebuildNames.poll();
+    }
+
     /** 取一个提前读到的重建通道名；没有返回 null */
     public String pollRebuildName() {
-        return pendingRebuildNames.poll();
+        RebuildRequest request = pendingRebuildNames.poll();
+        return request == null ? null : request.name;
+    }
+
+    /**
+     * 304：就地在控制通道上回一帧 {@code {i16 REBUILD_ACK}{bool 接受}}。
+     *
+     * <p><b>调用方必须已经持有 {@link #controlLock}</b>：这里只管往通道里写、不再拿锁。
+     * 走到这里的路径（drainStaleControlFrames / queryResume 的读循环）本来就在
+     * controlLock 里面，再加一层 synchronized 虽然可重入不会自锁，但会让读者以为
+     * 这是两个临界区，也容易被别处误当"线程安全"的函数随手调用，帧序就乱了。
+     *
+     * <p>写失败只打日志并返回 false，绝不抛：能走到这里的场合上面还有别的等待，
+     * 通道真断了的话后面的读 / 心跳会自己报出来；为了回不出一帧 ACK 就把调用方
+     * （比如整个 drain 循环，它没有"部分失败"的收尾）打崩，只会把可恢复的错变成长眠。
+     */
+    protected boolean writeRebuildAckLocked(boolean accepted) {
+        DataByteChannel channel = ctChannel;
+        if (channel == null || !channel.isOpen()) {
+            top.weixiansen574.hybridfilexfer.core.HFXLog.d(
+                    "writeRebuildAck skipped (accepted=" + accepted + "): control channel not usable");
+            return false;
+        }
+        try {
+            byte[] frame = new byte[3];
+            frame[0] = (byte) (ControllerIdentifiers.REBUILD_ACK >> 8);
+            frame[1] = (byte) ControllerIdentifiers.REBUILD_ACK;
+            frame[2] = (byte) (accepted ? 1 : 0);
+            channel.writeFully(frame);
+            top.weixiansen574.hybridfilexfer.core.HFXLog.d("REBUILD_ACK " + accepted);
+            return true;
+        } catch (Throwable e) {
+            top.weixiansen574.hybridfilexfer.core.HFXLog.d(
+                    "writeRebuildAck failed (accepted=" + accepted + ")", e);
+            return false;
+        }
+    }
+
+    /**
+     * 304：读到对端的 REBUILD_REQ 时回调 —— 电脑正在重建传输通道。
+     *
+     * <p>默认什么都不做。{@code HFXServer} 覆写成"先跟 accept 线程挂号"：电脑这之后
+     * 新连进来的安静连接是重建通道，accept 线程本来会当成上一轮残留直接关掉，
+     * 那样我们回了 ACK{true} 手里却没有那条通道，电脑就一直往一条死 socket 上写。
+     *
+     * <p>调用方已经持有 {@link #controlLock}：实现里不许阻塞、不许碰这条控制通道。
+     */
+    protected void onPeerRebuildRequest() {
     }
 
     protected boolean sendFiles(List<RemoteFile> fileList, Directory localDir, Directory remoteDir, TransferFileCallback callback) throws IOException {
@@ -1295,12 +1382,34 @@ public abstract class HFXService {
                         // 上一次传输的收尾结论：没人要了，读干净丢掉
                         discardResultPayload(ctChannel);
                         break;
-                    case ControllerIdentifiers.REBUILD_REQ:
-                        stashRebuildName(ctChannel.readUTF());
+                    case ControllerIdentifiers.REBUILD_REQ: {
+                        // 304：电脑端取消后正在重建传输通道 —— 它对每条通道发 REBUILD_REQ{名字}，
+                        // 然后就**停在控制通道上等 REBUILD_ACK**，期间不会再读我们发过去的任何帧。
+                        //
+                        // 以前这里只把名字存下来（stash）+ 置 needsRebuild 就 return，一帧 ACK
+                        // 都不回：电脑永久阻塞；而这条路径的调用方（queryResume / checkPending）
+                        // 全程持有 controlLock 并阻塞在等自己的回复上，会话线程的
+                        // readControlOpcode 抢不到锁，连"兜底补一帧 ACK"的机会都没有 ——
+                        // 真机 07:22:47 那单就是两端互等、谁都不动，电脑的读超时都没触发。
+                        //
+                        // 所以必须**就地**回一帧（这里已经持有 controlLock，直接写，别再拿锁）。
+                        String name = ctChannel.readUTF();
+                        top.weixiansen574.hybridfilexfer.core.HFXLog.d(
+                                "drainStaleControlFrames: REBUILD_REQ " + name);
+                        // 先跟 accept 线程挂号，再 ACK：反了会出现"回了 true，通道却已经被当残留关掉"。
+                        onPeerRebuildRequest();
+                        // 判定 = 「收下了」：名字进待领队列，重建握手稍后从 accept 队列领到这条
+                        // 通道并加回 connections（ackAlreadySent 标记让它别再回第二帧 ACK）。
+                        // 手里确实领不到通道时（电脑的连接在我们挂号之前就被当残留关掉了），
+                        // 重建握手那边会记一条 refused 日志 —— 但 ACK 已经发出去了，改不了，
+                        // 宁可这样也不能让电脑端死等。
+                        stashAckedRebuildName(name);
                         // 电脑端已经在重建传输通道：这就是「对端取消」的另一种形态
                         peerCancelled = true;
                         needsRebuild = true;
+                        writeRebuildAckLocked(true);
                         return;
+                    }
                     case ControllerIdentifiers.CANCEL:
                         peerCancelled = true;
                         transferCancelled = true;

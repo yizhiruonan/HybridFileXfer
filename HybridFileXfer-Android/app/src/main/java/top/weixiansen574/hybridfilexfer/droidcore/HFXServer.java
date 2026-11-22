@@ -552,8 +552,76 @@ public class HFXServer extends HFXService {
                 ctChannel.writeLong(plain.get(i).lastModified());
             }
             // 回复是带 opcode 的帧：{i16 RESUME_REPLY}{i32 count}{...}
-            short opcode = ctChannel.readShort();
-            if (opcode != ControllerIdentifiers.RESUME_REPLY) {
+            //
+            // 304：等这帧回复的这段时间里，电脑可能正好在跑「重建传输通道」——
+            // 它对每条通道发 REBUILD_REQ{名字}，然后停在控制通道上等 REBUILD_ACK，
+            // 期间不会读我们刚写的 RESUME_QUERY，也就永远不会发 RESUME_REPLY。
+            // 以前这里读到 26 直接抛 "expected RESUME_REPLY, got 26"，而且那个 UTF 通道名
+            // 还留在流里（下一帧就错位），于是电脑等 ACK、手机等 RESUME_REPLY，两端谁也不动
+            // （真机 07:22:47 那单，连电脑的读超时都没触发）。
+            //
+            // 现在：REBUILD_REQ 就地处理 —— 读掉 UTF 通道名（绝不留在流里）→ 回一帧
+            // REBUILD_ACK{true} → 继续等下一条帧，循环最终一定还能等到 RESUME_REPLY。
+            // 在这里写 ACK 是安全的：调用方 sendFilesToRemote 已经持有 controlLock，
+            // 不会有第二个读者来抢帧（写走同一个 DataByteChannel，帧不会交错）。
+            short opcode;
+            while (true) {
+                // 这一轮现在可能读到**不止一帧**（重建窗口里电脑会夹着发 REBUILD_REQ），
+                // 所以这段时间里"一定会到"的帧都得就地处理掉：以前只认 RESUME_REPLY、
+                // 别的一律当"帧序错位"抛出去，一次擦肩而过就把这一单打死。
+                // 每个分支都必须把载荷读完 —— 留半个帧在流里，后面整条通道都错位。
+                opcode = ctChannel.readShort();
+                if (opcode == ControllerIdentifiers.RESUME_REPLY) {
+                    break;
+                }
+                if (opcode == ControllerIdentifiers.REBUILD_REQ) {
+                    // 电脑取消后重建传输通道：它对每条通道发 REQ，然后停在等 ACK，
+                    // 这期间它不读 RESUME_QUERY，所以 RESUME_REPLY 要等它重建完才来。
+                    // 就地回 ACK 才不会两端互等（真机 07:22:47 那单）。
+                    String rebuildName = ctChannel.readUTF();
+                    top.weixiansen574.hybridfilexfer.core.HFXLog.d(
+                            "queryResume: REBUILD_REQ " + rebuildName);
+                    // 顺序：先挂号再 ACK（和 drainStaleControlFrames 同一个口径）
+                    onPeerRebuildRequest();
+                    // 「收下了」：名字交给重建握手去领通道，ackAlreadySent 让它别再回第二帧
+                    stashAckedRebuildName(rebuildName);
+                    // REBUILD_REQ 本身也是「对端取消」的一种形态：这一单已经没意义了
+                    // （电脑把旧通道都关了，它收完这条新通道后才会再处理我们的请求），
+                    // 和 drain 里保持一致，等通道重建回来再说。
+                    peerCancelled = true;
+                    needsRebuild = true;
+                    writeRebuildAckLocked(true);
+                    continue;
+                }
+                // 电脑的暂停回报：传输期间（sendingFiles=true）会话线程每 250ms 只写
+                // 不读 PAUSE_STATE，回报就落在这里。1 字节 bool，读掉并应用。
+                if (opcode == ControllerIdentifiers.PAUSE_REPLY) {
+                    applyPcPause(ctChannel.readBoolean());
+                    continue;
+                }
+                if (opcode == ControllerIdentifiers.PING) {
+                    continue;
+                }
+                // 308：电脑在重建 / 取消窗口里也可能推限速，整帧 6 字节（4 字节载荷必须读掉）
+                if (opcode == ControllerIdentifiers.SPEED_LIMIT) {
+                    onPeerSpeedLimit(ctChannel.readInt());
+                    continue;
+                }
+                // 上一次传输的收尾结论（变长载荷）：这一单已经作废，读干净丢掉
+                if (opcode == ControllerIdentifiers.RESULT) {
+                    discardResultPayload(ctChannel);
+                    continue;
+                }
+                // 电脑再点一次取消：置标志 + 关传输通道，但**继续等** RESUME_REPLY
+                // （它把这一单的位图发完才轮到重建，等不到就等于把帧留在外面）
+                if (opcode == ControllerIdentifiers.CANCEL) {
+                    cancelByPeer("queryResume: peer CANCEL");
+                    continue;
+                }
+                if (opcode == ControllerIdentifiers.CANCEL_DISCARD) {
+                    cancelByPeerDiscard("queryResume: peer CANCEL_DISCARD");
+                    continue;
+                }
                 throw new IOException("expected RESUME_REPLY, got " + opcode);
             }
             int count = ctChannel.readInt();
@@ -771,12 +839,36 @@ public class HFXServer extends HFXService {
     /** 回一帧 REBUILD_ACK：这条通道收不收（收不下来时电脑会跳过它） */
     public void writeRebuildAck(boolean accepted) throws IOException {
         synchronized (controlLock) {
-            byte[] frame = new byte[3];
-            frame[0] = (byte) (ControllerIdentifiers.REBUILD_ACK >> 8);
-            frame[1] = (byte) ControllerIdentifiers.REBUILD_ACK;
-            frame[2] = (byte) (accepted ? 1 : 0);
-            ctChannel.writeFully(frame);
+            if (ctChannel == null) {
+                throw new IOException("control channel is not connected");
+            }
+            // 帧格式和失败处理都在 HFXService.writeRebuildAckLocked 里：
+            // drainStaleControlFrames / queryResume 这两条已经持锁的路径也要写同一帧，
+            // 两条路径各拼一份字节，哪天改了判断就只改一处（别长出两种 ACK）。
+            if (!writeRebuildAckLocked(accepted)) {
+                throw new IOException("write REBUILD_ACK failed");
+            }
         }
+    }
+
+    /**
+     * 304：读到对端 REBUILD_REQ 的回调 —— 先把 accept 线程挂号。
+     *
+     * <p>电脑收到取消后会立刻连一批新的传输通道过来，随后的 REBUILD_REQ 才告诉我们是哪一条。
+     * accept 线程在"没人要传输通道"时会把这种安静连接当成上一轮残留直接关掉；
+     * 不先挂号（{@link ServerListener#wantTransfers(int)}），我们回给电脑的
+     * ACK{true} 就成了谎话：电脑那边留着那条 socket 一直写，我们这边一条都没有。
+     *
+     * <p>调用时已经持有 controlLock（见 HFXService.onPeerRebuildRequest 的约定）：
+     * wantTransfers 只是给 ServerListener 的一个计数器赋值，不阻塞、不碰控制通道。
+     */
+    @Override
+    protected void onPeerRebuildRequest() {
+        ServerListener current = listener;
+        if (current == null) {
+            return;
+        }
+        current.wantTransfers(getTransferCount());
     }
 
     /**

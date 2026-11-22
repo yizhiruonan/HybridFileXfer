@@ -1418,6 +1418,13 @@ public class ServerService extends Service implements ServiceConnection {
      * → 一帧一帧读 REBUILD_REQ，每收到一条就向 accept 线程要一条通道，
      * 收下就回 REBUILD_ACK{true}，要不到就回 {false} 让电脑跳过这条。
      *
+     * <p><b>有的 REBUILD_REQ 的 ACK 已经被别人回过了</b>：drainStaleControlFrames /
+     * queryResume 在等自己的回复时撞上 REBUILD_REQ，必须当场回一帧（电脑就停在等 ACK，
+     * 它不读别的东西，谁也不会来补这一帧 —— 那就是两端互等）。那几条进队列时带着
+     * {@code ackAlreadySent=true}，这里只把它们对应的通道领回来加进 connections，
+     * <b>不再回第二帧 ACK</b>：电脑端一帧 REQ 只等一帧 ACK，多出来的一帧会被它当成
+     * 下一条通道的答复，名字和 socket 从此整体错位。
+     *
      * <p>帧必须带 opcode：手机随时可能在飞 PAUSE_STATE，裸 bool 握手会和它的帧头撞车，
      * 帧流一错位整条会话就报废（这就是 304 不用"裸 bool 重建握手"的原因）。
      *
@@ -1456,8 +1463,13 @@ public class ServerService extends Service implements ServiceConnection {
                 if (now > deadline || now > idleUntil) {
                     break;
                 }
-                // 别的读循环提前读到的重建请求（exchangePause 兜底里收的）
-                String name = server.pollRebuildName();
+                // 别的读循环提前读到的重建请求（exchangePause 兜底 / drainStaleControlFrames /
+                // queryResume 收的）。ackAlreadySent=true 的那几条，ACK 已经由读帧的人当场
+                // 回了 —— 这里只领通道，别再回第二帧（一帧 REQ 只配一帧 ACK）。
+                top.weixiansen574.hybridfilexfer.core.HFXService.RebuildRequest pending =
+                        server.pollRebuildRequest();
+                String name = pending == null ? null : pending.name;
+                boolean ackAlreadySent = pending != null && pending.ackAlreadySent;
                 if (name == null) {
                     short opcode;
                     try {
@@ -1493,12 +1505,17 @@ public class ServerService extends Service implements ServiceConnection {
                         debugFile("rebuild: unexpected opcode " + opcode);
                         return false;
                     }
-                    // 通道名已经在 readControlOpcode 的锁里读出来存好了
-                    name = server.pollRebuildName();
-                    if (name == null) {
+                    // 通道名已经在 readControlOpcode 的锁里读出来存好了。
+                    // 这里必须按 FIFO 取"最早那条还没处理的"：队列里可能还排着前几轮
+                    // 被 drain / queryResume 就地回过 ACK 的那几条（它们只欠领通道），
+                    // 取头一条才不会让"名字 ↔ socket ↔ ACK"三者错位。
+                    pending = server.pollRebuildRequest();
+                    if (pending == null) {
                         debugFile("rebuild: REBUILD_REQ without channel name");
                         continue;
                     }
+                    name = pending.name;
+                    ackAlreadySent = pending.ackAlreadySent;
                 }
                 SocketChannel socket = listener.takeTransferChannel(12000);
                 boolean accepted = socket != null;
@@ -1506,7 +1523,17 @@ public class ServerService extends Service implements ServiceConnection {
                     if (accepted) {
                         server.addRebuiltConnection(name, socket);
                     }
-                    server.writeRebuildAck(accepted);
+                    // 提前回过 ACK 的那批（drain / queryResume 就地回的）这里只补"领通道"，
+                    // 绝不再写第二帧：电脑端已经在等下一条通道的答复了，多一帧会让
+                    // 通道名和 socket 整体错位（它会把这一帧当成下一条通道的 ACK）。
+                    if (!ackAlreadySent) {
+                        server.writeRebuildAck(accepted);
+                    } else if (!accepted) {
+                        // ACK 已经说了"收下"，手里却没通道：电脑那边会一直往这条死
+                        // socket 上写，只能在日志里留证据（已经没法撤回那一帧了）。
+                        debugFile("rebuild: channel " + name
+                                + " was acked early but no socket arrived");
+                    }
                 } catch (IOException e) {
                     debugFile("rebuild: ack failed: " + e);
                     return got > 0;

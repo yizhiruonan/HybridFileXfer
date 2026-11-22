@@ -29,6 +29,32 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 /// 用户看到的就是「要等一分钟才连上」。
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(12);
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(60);
+/// 取消路径上写一帧 CANCEL 的时间上限。
+///
+/// 取消这条路上**任何一步都不许无限期等**：手机处于暂停态时它不读控制通道、
+/// 也不往传输通道写，任何一次「等对端」都可能永远等下去（实测：点了取消，
+/// 日志停在「先关传输通道，再通知手机端」那一行，后面一行都没有了）。
+/// CANCEL 只有 2 字节，只要 socket 发送缓冲还有一点空就瞬间写完 ——
+/// 正常路径上这个超时一次也用不上，它只是把「可能永远等」变成「最多等半秒」。
+const CANCEL_FRAME_TIMEOUT: Duration = Duration::from_millis(500);
+/// 取消 / 停止之后，还留给传输线程多久自己退出（整段合计，不是每条通道各算）。
+///
+/// 会话线程**不能**无条件 join 它们：暂停态下那些线程正停在「等手机发下一块」
+/// 的阻塞读里，等它们退出就是把取消按钮钉死。过了这个宽限期，
+/// 还没退出的线程就脱离 join 继续跑（它们自己会随取消标志 / socket shutdown 走掉），
+/// 会话线程带着「有一个线程还没退」这件事继续收尾和重建。
+const CANCEL_JOIN_GRACE: Duration = Duration::from_millis(1500);
+/// 传输通道读循环里等「下一帧帧头」的轮询粒度，也是取消在通道读线程里的响应粒度。
+///
+/// 以前这里直接拿 120 秒的读超时去读帧头：手机在块与块之间暂停时（它不发数据），
+/// 一次读就要挂到超时，取消之后会话线程还得 join 它 —— 取消看起来「卡死」的
+/// 一大半时间就是这种没人打断的阻塞读。
+const TRANSFER_POLL: Duration = Duration::from_millis(50);
+/// 传输通道多久一点数据都没读到就当它已经死了（和原来的 120 秒读超时同一个尺度）。
+///
+/// 以前这个数是 socket 上一次读的超时，现在是「累计没有任何进展」的上限：
+/// 每读一段都回去看一眼取消标志，所以取消不必等这个数。
+const TRANSFER_STALL: Duration = Duration::from_secs(120);
 /// 连不上的通道地址缓存两分钟：重连/拔插时直接跳过，不用每条再等 2 秒超时
 const UNREACHABLE_TTL: Duration = Duration::from_secs(120);
 
@@ -590,8 +616,9 @@ impl Session {
                     "the phone was told to remove the incomplete file (CANCEL_DISCARD)",
                 ));
             }
-            let _ = proto::write_i16(&mut self.writer, opcode);
-            let _ = self.writer.flush();
+            // 兜底那一帧同样带超时：这里要是顶满 15 秒的写超时，
+            // 「取消 → CANCEL 发出」这段时间又回到十几秒（用户看到的就是进度还在涨）。
+            let _ = self.write_control_frame_within(opcode, CANCEL_FRAME_TIMEOUT);
         }
         let names: Vec<String> = self.transfers.iter().map(|(name, _)| name.clone()).collect();
         if names.is_empty() {
@@ -1001,10 +1028,36 @@ impl Session {
     /// 不这么做，卡在 read/write 里的传输线程会一直等到 socket 的 120 秒超时才醒，
     /// 期间界面和日志整段冻住 —— 实测 am force-stop 之后 PC 静默 120 秒才去删半截文件。
     /// shutdown 之后阻塞中的读写立刻返回，收尾（删半截文件、写结论帧）马上做。
+    ///
+    /// **只做 shutdown，绝不 join 线程、也不拿锁**：这条路径是取消 / 停止时从会话线程
+    /// 直接调用的，暂停态下传输线程正停在「等手机发下一块」里，等它们退出就是死等。
+    /// shutdown 本身是一次内核调用（把本地这一端关掉，让对端那次阻塞的 write 立刻失败），
+    /// 数据还堵在不在缓冲区里都一样，几十微秒就返回。
     fn shutdown_transfers(&self) {
         for (_, stream) in self.transfers.iter() {
             let _ = stream.shutdown(std::net::Shutdown::Both);
         }
+    }
+
+    /// 把一帧控制指令写出去，最多等 timeout 这么久；写成功返回 true。
+    ///
+    /// 控制通道的写超时是握手时设的 15 秒（HANDSHAKE_TIMEOUT），而手机暂停时它根本不读
+    /// 控制通道 —— 一次写就可能顶满整个超时。取消路径上这一等就把会话线程钉住了
+    /// （实测日志停在「先关传输通道，再通知手机端」之后，一行都没有）。
+    ///
+    /// 写失败时**不**把「这一帧的写名额」还给别人：一轮取消在控制通道上只写一帧 CANCEL
+    /// 是硬要求（多写一帧会被手机端正在做的重建握手当成未知指令，帧序一乱整条会话就废，
+    /// 见 control::claim_cancel_frame）。代价是这一次取消可能没通知到手机，那就靠它自己
+    /// 那条被 shutdown 的传输通道发现异常 —— 它会重连，重建握手照样能对上。
+    fn write_control_frame_within(&mut self, opcode: i16, timeout: Duration) -> bool {
+        let mut written = self.writer.set_write_timeout(Some(timeout)).is_ok();
+        if written {
+            written =
+                proto::write_i16(&mut self.writer, opcode).is_ok() && self.writer.flush().is_ok();
+        }
+        // 恢复握手时的写超时：下面还要写 REBUILD_REQ、RESULT 这些帧，不能留着这个短超时
+        let _ = self.writer.set_write_timeout(Some(HANDSHAKE_TIMEOUT));
+        written
     }
 
     fn poll_control_during_transfer(&mut self) -> io::Result<()> {
@@ -1901,19 +1954,24 @@ impl Session {
         let mut remaining = handles.len();
         // 取消时"关掉所有传输通道"只做一次（关 socket 是幂等的，但没必要每 10ms 打一遍）
         let mut abort_shutdown = false;
+        // 关掉通道之后开始计时的宽限期：过了它就不再等线程，带着「还有线程没退」往下走。
+        // 取消 / 停止都必须有这一个上限，否则暂停态下这里就是一堵墙（见 CANCEL_JOIN_GRACE）。
+        let mut grace_deadline: Option<Instant> = None;
         while remaining > 0 {
             // 点「停止」也要能打断传输（主循环这时候不转，只有这里看一眼）。
             // 和取消同一条路：先关传输通道，手机端那次阻塞的 write 才会立刻失败。
             if self.stop_requested() {
-                abort_shutdown = true;
+                // 下面紧跟着就 break 出去，abort_shutdown 不用置：它的作用是
+                // 「取消那段只关一次通道」，停止之后这一轮已经结束了。
                 log::warn(crate::i18n::tr(
                     "接收中途被停止（关掉传输通道）",
                     "receiving stopped midway (closing the transfer channels)",
                 ));
                 self.shutdown_transfers();
+                // 停止同样是「通知手机端」的时刻，这一帧也必须带超时写：
+                // 手机暂停时它不读控制通道，裸 write 会顶满握手时设的 15 秒写超时。
                 if crate::control::claim_cancel_frame() {
-                    let _ = proto::write_i16(&mut self.writer, controller::CANCEL);
-                    let _ = self.writer.flush();
+                    let _ = self.write_control_frame_within(controller::CANCEL, CANCEL_FRAME_TIMEOUT);
                 }
                 break;
             }
@@ -1934,23 +1992,40 @@ impl Session {
             // 中间那几百毫秒到几秒手机一直在发（用户报的"取消后手机还在继续发"）。
             if !abort_shutdown && crate::control::cancelled() {
                 abort_shutdown = true;
+                grace_deadline = Some(Instant::now() + CANCEL_JOIN_GRACE);
                 log::warn(crate::i18n::tr(
                     "取消接收：先关传输通道，再通知手机端（它才能立刻停下）",
                     "cancel: closing the transfer channels first, then telling the phone",
                 ));
                 // 顺序很重要：先关通道，手机端那次阻塞的 write 才会立刻失败；
                 // 它这一下自己就会停，不用等我们后面那帧 CANCEL 走到重建阶段。
+                // shutdown_transfers 只做 shutdown：不 join、不拿锁，所以这一步不会卡；
+                // 「等线程退出」挪到循环外面的 join 段，那里有 grace_deadline 兜着。
                 self.shutdown_transfers();
                 // 立刻把 CANCEL 写出去（别等 join + finish_with + rebuild_transfers）。
                 // 手机端的控制读取线程和发块线程是两个线程，它随时能读到这一帧。
                 // claim_cancel_frame() 保证重建阶段不会再写第二帧。
+                //
+                // 写这一帧**必须有上限**：手机暂停时它不读控制通道，裸 write 会一直顶到
+                // 握手时设的 15 秒写超时才回来 —— 用户在界面上看到的就是「点了取消没反应」。
+                // 写不出去只记一行日志，取消流程照旧往下走（关通道 + 重建）。
                 if crate::control::claim_cancel_frame() {
-                    let _ = proto::write_i16(&mut self.writer, controller::CANCEL);
-                    let _ = self.writer.flush();
-                    log::warn(crate::i18n::tr(
-                        "已通知手机端取消（CANCEL 帧已发出）",
-                        "the phone has been told about the cancel (CANCEL sent)",
-                    ));
+                    let started = Instant::now();
+                    if self.write_control_frame_within(controller::CANCEL, CANCEL_FRAME_TIMEOUT) {
+                        log::warn(&format!(
+                            "{}（{} ms）",
+                            crate::i18n::tr(
+                                "已通知手机端取消（CANCEL 帧已发出）",
+                                "the phone has been told about the cancel (CANCEL sent)",
+                            ),
+                            started.elapsed().as_millis()
+                        ));
+                    } else {
+                        log::warn(crate::i18n::tr(
+                            "CANCEL 帧没写出去（手机端可能没在读控制通道），继续走重建",
+                            "the CANCEL frame could not be written (the phone may not be reading the control channel); going on with the rebuild",
+                        ));
+                    }
                 }
             }
             for (i, (_, handle)) in handles.iter().enumerate() {
@@ -1960,13 +2035,51 @@ impl Session {
                 }
             }
             if remaining > 0 {
+                // 宽限期到了还剩下的线程不再等：它们自己会随取消标志 / socket shutdown
+                // 走掉，等在这里只会让取消这条路径没有终点。
+                if let Some(deadline) = grace_deadline {
+                    if Instant::now() >= deadline {
+                        log::warn(&format!(
+                            "{}（{} 条通道）",
+                            crate::i18n::tr(
+                                "取消：传输线程还没全部退出，先继续收尾（不再等它们）",
+                                "cancel: some transfer threads are still running; going on without waiting for them",
+                            ),
+                            remaining
+                        ));
+                        break;
+                    }
+                }
                 thread::sleep(Duration::from_millis(10));
             }
         }
         let _ = self
             .reader
             .set_read_timeout(Some(Duration::from_secs(120)));
+        // 等各通道线程退出，但**整段有上限**：grace_deadline 是取消 / 停止那一刻算好的
+        // （正常传完时没有它，也不会有线程没退），过了它还没退的线程就脱离 join 继续跑。
+        //
+        // 为什么要这条：暂停态下传输线程正停在阻塞读里等手机发下一块，
+        // 这里无条件的 join 就是取消流程真正的「墙」—— 会话线程钉在这儿，
+        // 后面的 finish_with / rebuild_transfers 一步都走不到，日志也就停了。
+        // 脱离 join 是安全的：线程持有的是 Arc<Receiver>，取消标志 + socket 已 shutdown
+        // 之后它自己会退出；代价只是这一次少了一条通道的退出原因。
+        let join_deadline = grace_deadline.unwrap_or_else(Instant::now);
         for (name, handle) in handles {
+            while !handle.is_finished() && Instant::now() < join_deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+            if !handle.is_finished() {
+                log::warn(&format!(
+                    "{}: {}",
+                    name,
+                    crate::i18n::tr(
+                        "传输线程还没退出（不再等它，先走取消收尾）",
+                        "the transfer thread has not finished; not waiting for it, going on with the wrap-up",
+                    )
+                ));
+                continue;
+            }
             match handle.join() {
                 Ok(Ok(ChannelEnd::Eof)) => {}
                 Ok(Ok(ChannelEnd::RemoteAbort(reason))) => {
@@ -1976,6 +2089,8 @@ impl Session {
                 Ok(Err(e)) => {
                     // 用户取消时线程是以 Interrupted/连接被 reset 退出的，
                     // 那不是"接收失败"，别当成错误弹窗，也别写进错误结论帧。
+                    // （卡在帧体里的线程由 TransferReader 叫醒，它故意用 Other
+                    //   而不是 Interrupted —— read_exact 会重试 Interrupted，见那里的注释。）
                     if crate::control::cancelled()
                         || e.kind() == io::ErrorKind::Interrupted
                         || is_disconnect(&e)
@@ -2545,6 +2660,72 @@ enum ChannelEnd {
     RemoteAbort(String),
 }
 
+/// 传输通道的读包了一层：每次读最多等 TRANSFER_POLL，回来先看一眼「取消」。
+///
+/// 为什么不能直接用 read_exact：本端 shutdown 一个 socket **叫不醒**另一个线程里
+/// 已经阻塞住的读（实测 Windows 上：本端 shutdown 立刻返回，阻塞中的读一直等到
+/// 对端关连接才醒）。手机暂停时它就停在块中间不发数据，那一块永远凑不齐，
+/// 于是这个线程会挂到 120 秒的读超时才回来 —— 而这期间取消流程还得等它退出，
+/// 用户看到的就是「点了取消，界面和日志一起定格」。
+///
+/// 这里把「等 120 秒」换成了「每 50 毫秒看一眼取消标志」，顺带把「多久没有任何
+/// 进展就当连接死了」也管起来（语义和原来的读超时一致）。
+struct TransferReader<'a> {
+    stream: &'a mut TcpStream,
+    stall: Duration,
+    last_progress: Instant,
+}
+
+impl<'a> TransferReader<'a> {
+    fn new(stream: &'a mut TcpStream, stall: Duration) -> Self {
+        TransferReader {
+            stream,
+            stall,
+            last_progress: Instant::now(),
+        }
+    }
+
+    /// peek 不消费数据，只是把还没处理的那几个字节打出来（日志用）
+    fn peek(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.stream.peek(buf)
+    }
+}
+
+impl Read for TransferReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        loop {
+            if crate::control::cancelled() {
+                // 取消：先把这条通道关掉，手机端那次阻塞的 write 才会立刻失败
+                // （见下面 read_transfer_channel 里那段注释），再把错误交上去。
+                //
+                // 这里**不能**用 ErrorKind::Interrupted：Read::read_exact 的默认实现
+                // 会把它当成「系统调用被打断」重新再读一遍，取消就又被吞掉了
+                // （第一版就是这么写的，线程照样卡在帧体里到 120 秒超时）。
+                let _ = self.stream.shutdown(std::net::Shutdown::Both);
+                return Err(io::Error::new(io::ErrorKind::Other, "cancelled by user"));
+            }
+            match self.stream.read(buf) {
+                Ok(n) => {
+                    if n > 0 {
+                        self.last_progress = Instant::now();
+                    }
+                    return Ok(n);
+                }
+                Err(ref e) if is_timeout(e) => {
+                    if self.last_progress.elapsed() >= self.stall {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "the transfer channel stalled",
+                        ));
+                    }
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
+
 fn read_transfer_channel(
     mut stream: TcpStream,
     receiver: Arc<Receiver>,
@@ -2558,7 +2739,7 @@ fn read_transfer_channel(
         // 如果这里只会 sleep，线程就永远等下去 —— handle_receive 的等待循环
         // 不会结束，界面和日志都定格在「已暂停」（实测就是这么卡死的）。
         // peek 不消费数据，暂停期间对端也不发数据，所以用它探活是安全的。
-        let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
+        let _ = stream.set_read_timeout(Some(TRANSFER_POLL));
         let mut probe = [0u8; 1];
         while crate::control::paused() && !crate::control::cancelled() {
             match stream.peek(&mut probe) {
@@ -2581,9 +2762,8 @@ fn read_transfer_channel(
                 }
                 Err(e) => return Err(e),
             }
-            thread::sleep(Duration::from_millis(50));
+            thread::sleep(TRANSFER_POLL);
         }
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(120)));
         if crate::control::cancelled() {
             // 3.0.0：取消的时候**必须**先把这条通道关掉，别只是自己退出。
             //
@@ -2596,7 +2776,48 @@ fn read_transfer_channel(
             let _ = stream.shutdown(std::net::Shutdown::Both);
             return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled by user"));
         }
-        let header = match proto::read_i16(&mut stream) {
+        // 等下一帧的帧头：用短超时的 peek 轮询，每一圈都看一眼「取消」。
+        //
+        // 以前这里直接拿 120 秒的读超时去 read_i16：手机在块与块之间暂停时它不发数据，
+        // 这一读就要挂满 120 秒，而取消之后会话线程还得 join 它 —— 用户看到的「点了取消
+        // 卡死」里就有一大半是这种没人打断的阻塞读。
+        //
+        // 帧头只有 2 字节，所以先用 peek 等它到齐（peek 不消费数据，等到了再正式读，
+        // 不会把半截帧头吃到肚子里）；帧体那一段交给下面的 TransferReader，
+        // 同样是每 50 毫秒看一眼取消。整条通道的读从此都随时可以放手。
+        let mut head = [0u8; 2];
+        loop {
+            if crate::control::cancelled() {
+                // 和下面那段「取消必须关通道」同一个道理：先让手机那次阻塞的 write 失败
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled by user"));
+            }
+            match stream.peek(&mut head) {
+                // 对端把这条通道关了（手机取消 / 断线）：报给上层，别在这里转圈
+                Ok(0) => {
+                    return Ok(ChannelEnd::RemoteAbort(
+                        crate::i18n::tr("手机端取消了传输", "the phone cancelled the transfer")
+                            .to_string(),
+                    ))
+                }
+                // 整帧头到齐。peek 不消费数据，下面 read_i16 读到的还是这两个字节
+                Ok(n) if n >= 2 => break,
+                // 半个帧头：它在 TCP 的下一段里，歇一下再看，别空转
+                Ok(_) => thread::sleep(Duration::from_millis(2)),
+                Err(ref e) if is_timeout(e) => {}
+                Err(e) if is_disconnect(&e) => {
+                    return Ok(ChannelEnd::RemoteAbort(
+                        crate::i18n::tr("手机端断开了连接", "the phone closed the connection")
+                            .to_string(),
+                    ))
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        // 帧头已经在缓冲区里了（上面 peek 确认过），从这里开始整帧都走取消感知的读：
+        // 帧体最大 1 MiB，手机暂停就是停在块中间，裸 read_exact 会把这一等变成 120 秒。
+        let mut reader = TransferReader::new(&mut stream, TRANSFER_STALL);
+        let header = match proto::read_i16(&mut reader) {
             Ok(h) => h,
             Err(e) => {
                 log::debug(&format!("ch{}: read header failed: {}", channel, e));
@@ -2605,14 +2826,14 @@ fn read_transfer_channel(
         };
         match header {
             transfer::FILE => {
-                let _file_index = proto::read_i32(&mut stream)?;
-                let path = proto::read_utf(&mut stream)?;
-                let modified_ms = proto::read_i64(&mut stream)?;
-                let total_size = proto::read_i64(&mut stream)?;
-                let index = proto::read_i32(&mut stream)?;
-                let length = proto::read_i32(&mut stream)?;
+                let _file_index = proto::read_i32(&mut reader)?;
+                let path = proto::read_utf(&mut reader)?;
+                let modified_ms = proto::read_i64(&mut reader)?;
+                let total_size = proto::read_i64(&mut reader)?;
+                let index = proto::read_i32(&mut reader)?;
+                let length = proto::read_i32(&mut reader)?;
                 // 303：这一块的 CRC32，写盘前必须一致
-                let expected_crc = proto::read_i32(&mut stream)? as u32;
+                let expected_crc = proto::read_i32(&mut reader)? as u32;
                 log::debug(&format!(
                     "ch{}: FILE idx={} len={} path={}",
                     channel, index, length, path
@@ -2631,7 +2852,7 @@ fn read_transfer_channel(
                 }
                 let length = length as usize;
                 if length > 0 {
-                    stream.read_exact(&mut buffer[..length])?;
+                    reader.read_exact(&mut buffer[..length])?;
                 }
                 let actual_crc = crc32fast::hash(&buffer[..length]);
                 if actual_crc != expected_crc {
@@ -2658,9 +2879,9 @@ fn read_transfer_channel(
                 )?;
             }
             transfer::FOLDER => {
-                let _file_index = proto::read_i32(&mut stream)?;
-                let path = proto::read_utf(&mut stream)?;
-                let _modified_ms = proto::read_i64(&mut stream)?;
+                let _file_index = proto::read_i32(&mut reader)?;
+                let path = proto::read_utf(&mut reader)?;
+                let _modified_ms = proto::read_i64(&mut reader)?;
                 receiver.make_dir(&path)?;
             }
             transfer::EOF => return Ok(ChannelEnd::Eof),
@@ -2688,7 +2909,7 @@ fn read_transfer_channel(
             other => {
                 // 顺手把后续字节抓出来：能看出对端到底发了什么（错误帧？控制帧？半截块？）
                 let mut tail = [0u8; 32];
-                let n = stream.peek(&mut tail).unwrap_or(0);
+                let n = reader.peek(&mut tail).unwrap_or(0);
                 log::error(&format!(
                     "ch{}: unexpected transfer frame {} tail={:02x?}",
                     channel, other, &tail[..n]
@@ -3528,6 +3749,244 @@ mod tests {
         assert!(
             session.pending_resume.is_none(),
             "清单用完就该清掉，别带到再下一单"
+        );
+        crate::control::reset();
+    }
+
+    /// 手机已经暂停（PAUSE_STATE = true）时，用户在电脑上点「取消」。
+    ///
+    /// 这是「取消卡死」那条 bug 的现场：暂停态下手机既不往传输通道写、也不读控制通道，
+    /// 于是电脑这边「关通道 / 写 CANCEL / 等传输线程退出」任何一步都可能永远等下去 ——
+    /// 实测日志停在「取消接收：先关传输通道，再通知手机端」那一行，之后一行都没有，
+    /// 界面也没有任何重建 / 报错。
+    ///
+    /// 现在断言三件事：
+    ///   1. CANCEL 帧确实写进控制通道了（mock 手机在 1 秒内读得到它）；
+    ///   2. 整条取消路径在有限时间内走完（会话线程不会为了等传输线程而挂住）；
+    ///   3. 会话继续走到重建阶段：两条通道都重建回来，最后正常 SHUTDOWN 收场，
+    ///      既不是挂死，也不是被当成断线。
+    #[test]
+    fn cancel_while_the_phone_is_paused_does_not_hang() {
+        let _serial = rate_serial();
+        let dir = temp_dir("cancel-paused");
+        let home = util::normalize_dir(&dir).to_string_lossy().to_string();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // 手机暂停之后「不读控制通道」多久（模拟它那边停在暂停等待里）
+        const PHONE_DEAF_MS: u64 = 400;
+        // 电脑端确实把暂停应用到本地了（收到它回的 PAUSE_REPLY 才算数）
+        let paused_confirmed = Arc::new(AtomicBool::new(false));
+        // mock 手机读到 CANCEL 帧的时刻 —— 这就是「取消到 CANCEL 发出」的实测点
+        let cancel_seen = Arc::new(Mutex::new(None::<Instant>));
+        let rebuilt_count = Arc::new(AtomicU64::new(0));
+
+        // 手机停在「一块的中间」用的那个文件（这一块永远传不完，因为手机随后就暂停了）
+        let partial_path = dir.join("半块.bin").to_string_lossy().to_string();
+        let home_for_mock = home.clone();
+        let partial_for_mock = partial_path.clone();
+        let paused_flag = Arc::clone(&paused_confirmed);
+        let cancel_stamp = Arc::clone(&cancel_seen);
+        let rebuilt = Arc::clone(&rebuilt_count);
+        let server = thread::spawn(move || {
+            let (control, _) = listener.accept().unwrap();
+            control
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            control
+                .set_write_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut cr: &TcpStream = &control;
+            let mut cw: &TcpStream = &control;
+            // ---- 握手：和 spawn_mock_phone 那一套完全一致 ----
+            let mut header = [0u8; 4];
+            cr.read_exact(&mut header).unwrap();
+            assert_eq!(&header, proto::CLIENT_HEADER);
+            assert_eq!(proto::read_i32(&mut cr).unwrap(), proto::VERSION_CODE);
+            proto::write_bool(&mut cw, true).unwrap();
+            let pc_limit = proto::read_i32(&mut cr).unwrap();
+            let shared = crate::ratelimit::shared_value(pc_limit as i64, 0) as i32;
+            proto::write_i32(&mut cw, shared).unwrap();
+            proto::write_i32(&mut cw, 2).unwrap();
+            for name in ["USB_ADB", "wlan0"] {
+                proto::write_utf(&mut cw, name).unwrap();
+                proto::write_u8(&mut cw, 4).unwrap();
+                cw.write_all(&[127, 0, 0, 1]).unwrap();
+                proto::write_u8(&mut cw, 0).unwrap();
+            }
+            let mut old = Vec::new();
+            for _ in 0..2 {
+                let (transfer, _) = listener.accept().unwrap();
+                assert!(proto::read_bool(&mut cr).unwrap());
+                assert!(!proto::read_utf(&mut cr).unwrap().is_empty());
+                proto::write_bool(&mut cw, true).unwrap();
+                old.push(transfer);
+            }
+            proto::write_i32(&mut cw, 512).unwrap();
+            assert!(proto::read_bool(&mut cr).unwrap());
+            proto::write_bool(&mut cw, true).unwrap();
+            assert_eq!(
+                proto::read_i32(&mut cr).unwrap(),
+                proto::current_file_system()
+            );
+            assert_eq!(proto::read_utf(&mut cr).unwrap(), home_for_mock);
+
+            // ---- 手机开始发送：这一单故意一个文件都没有（要考的是取消，不是数据）----
+            proto::write_i16(&mut cw, controller::REQUEST_RECEIVE).unwrap();
+            proto::write_i16(&mut cw, controller::RESUME_QUERY).unwrap();
+            proto::write_i32(&mut cw, 0).unwrap();
+            assert_eq!(
+                next_opcode(&mut cr),
+                controller::RESUME_REPLY,
+                "电脑端应该用 RESUME_REPLY 回答续传查询"
+            );
+            assert_eq!(proto::read_i32(&mut cr).unwrap(), 0);
+
+            // ---- 手机在「一块的中间」停下：先写半块，再暂停 ----
+            //
+            // 这是真机上的停法：暂停不是停在块边界上，而是手机写了一半就停了。
+            // 电脑那条通道的读循环此刻正卡在帧体中间（还差 1 MiB - 4 KiB），
+            // 以前那里是一次 120 秒的 read_exact：本端 shutdown 根本叫不醒它
+            // （实测：本端 shutdown 立刻返回，阻塞中的读要等对端关连接才醒），
+            // 于是取消之后会话线程只能干等 —— 这就是「卡死在取消路径上」的真相。
+            {
+                let mut w: &TcpStream = &old[0];
+                proto::write_i16(&mut w, transfer::FILE).unwrap();
+                proto::write_i32(&mut w, 1).unwrap();
+                proto::write_utf(&mut w, &partial_for_mock).unwrap();
+                proto::write_i64(&mut w, 1_700_000_000_000).unwrap();
+                proto::write_i64(&mut w, BLOCK_SIZE as i64).unwrap();
+                proto::write_i32(&mut w, 0).unwrap();
+                proto::write_i32(&mut w, BLOCK_SIZE as i32).unwrap();
+                // 这一块的 CRC32：反正永远收不齐，写什么都无所谓
+                proto::write_i32(&mut w, 0).unwrap();
+                w.write_all(&[7u8; 4096]).unwrap();
+                w.flush().unwrap();
+            }
+            // 让电脑那条通道先把帧头读进去、停在帧体上，再让暂停生效（时序才确定）
+            thread::sleep(Duration::from_millis(150));
+
+            // ---- 手机点了暂停：电脑回 PAUSE_REPLY 就说明它已经应用了 ----
+            proto::write_i16(&mut cw, controller::PAUSE_STATE).unwrap();
+            proto::write_bool(&mut cw, true).unwrap();
+            assert_eq!(
+                next_opcode(&mut cr),
+                controller::PAUSE_REPLY,
+                "暂停之后电脑端要回 PAUSE_REPLY"
+            );
+            assert!(
+                proto::read_bool(&mut cr).unwrap(),
+                "电脑端应当已经跟着暂停（否则下面这一轮就不是暂停态下的取消）"
+            );
+            // 从这里开始电脑端确实处于「手机已暂停」：传输线程停在暂停等待里，
+            // 手机这边也不读控制通道 —— 正是取消会卡死的那个状态。
+            paused_flag.store(true, Ordering::SeqCst);
+            thread::sleep(Duration::from_millis(PHONE_DEAF_MS));
+
+            // ---- 现在才回头读控制通道：取消那一帧必须已经在这儿 ----
+            assert_eq!(
+                next_opcode(&mut cr),
+                controller::CANCEL,
+                "暂停态下点了取消，CANCEL 帧必须真的写出来（不能卡在写控制帧上）"
+            );
+            *cancel_stamp.lock().unwrap() = Some(Instant::now());
+
+            // ---- 取消之后电脑会把传输通道重建回来（会话不断）----
+            let mut rebuilt_streams = Vec::new();
+            for _ in 0..2 {
+                let (transfer, _) = listener.accept().unwrap();
+                assert_eq!(
+                    next_opcode(&mut cr),
+                    controller::REBUILD_REQ,
+                    "取消之后紧接着就该是重建握手"
+                );
+                assert!(!proto::read_utf(&mut cr).unwrap().is_empty());
+                proto::write_i16(&mut cw, controller::REBUILD_ACK).unwrap();
+                proto::write_bool(&mut cw, true).unwrap();
+                rebuilt.fetch_add(1, Ordering::SeqCst);
+                rebuilt_streams.push(transfer);
+            }
+            drop(old);
+
+            proto::write_i16(&mut cw, controller::SHUTDOWN).unwrap();
+            thread::sleep(Duration::from_millis(150));
+            drop(rebuilt_streams);
+        });
+
+        crate::control::reset();
+        let mut session = Session::connect(IpAddr::from([127, 0, 0, 1]), port, &home, 0).unwrap();
+        session.device = "MOCK-PAUSED-CANCEL".to_string();
+        let receiver = Arc::new(Receiver::new(util::normalize_dir(&dir)));
+        let stop = Arc::new(AtomicBool::new(false));
+        let receiver_for_run = Arc::clone(&receiver);
+        let stop_for_run = Arc::clone(&stop);
+        // run() 会一直转到会话结束，所以放到自己的线程里：主线程要在「暂停中」点取消
+        let runner = thread::spawn(move || session.run(&receiver_for_run, &stop_for_run));
+
+        // 等到「接收已经在进行、手机已经暂停」—— 界面上那颗「取消」这时才点得下去
+        let ready_by = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < ready_by {
+            if paused_confirmed.load(Ordering::SeqCst) && crate::control::receiving() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            crate::control::receiving(),
+            "接收应当已经开始（否则取消点不下去，这个用例就没意义了）"
+        );
+        assert!(
+            crate::control::paused(),
+            "手机上报的暂停必须已经应用到本地"
+        );
+
+        // ---- 用户点「取消 · 保留进度」（界面上先记选择、再置取消标志）----
+        let started = Instant::now();
+        assert!(
+            crate::control::cancel_receive(crate::control::CancelChoice::Keep),
+            "这一次取消必须被受理"
+        );
+
+        // 会话线程必须在有限时间内收场。这里只轮询 -- 不用无超时的 join，
+        // 否则这个用例自己也会跟着挂死（真机上挂的就是这条 join）。
+        let finished_by = Instant::now() + Duration::from_secs(8);
+        while !runner.is_finished() && Instant::now() < finished_by {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            runner.is_finished(),
+            "取消路径必须在有限时间内走完：会话线程到现在还挂着（暂停态下就是死等）"
+        );
+        let total = started.elapsed();
+        match runner.join().unwrap() {
+            SessionEnd::Shutdown => {}
+            SessionEnd::Disconnected(reason) => {
+                panic!("取消不该被当成断线（会话要保持连接并重建通道）：{}", reason)
+            }
+            SessionEnd::Stopped => panic!("unexpected stop"),
+        }
+        server.join().unwrap();
+
+        // 1) CANCEL 帧写出去了，而且够快：mock 手机暂停 400ms 之后才回来读，
+        //    它读到的时刻减去点取消的时刻必须在 1 秒以内（旧代码这里要等十几秒）。
+        let seen = (*cancel_seen.lock().unwrap()).expect("CANCEL 帧必须真的写进控制通道");
+        let to_frame = seen.saturating_duration_since(started);
+        assert!(
+            to_frame < Duration::from_secs(1),
+            "从点取消到 CANCEL 发出花了 {:?}，必须在 1 秒以内",
+            to_frame
+        );
+        // 2) 取消之后走到了重建阶段（不是挂死、也不是直接断线）
+        assert_eq!(
+            rebuilt_count.load(Ordering::SeqCst),
+            2,
+            "取消之后两条传输通道都要重建回来"
+        );
+        // 3) 整条路径（关通道 + 写 CANCEL + 收尾 + 重建）的总时长
+        assert!(
+            total < Duration::from_secs(5),
+            "整条取消路径用了 {:?}，太久了",
+            total
         );
         crate::control::reset();
     }
