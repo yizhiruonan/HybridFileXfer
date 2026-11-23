@@ -64,9 +64,14 @@ import top.weixiansen574.hybridfilexfer.droidcore.HFXServer;
  *
  * <p><b>暂停管住整个队列</b>（3.7.0）：连接上有任务被暂停着，队列里的下一个任务就<b>不开跑</b>
  * （{@link SendTasks#acquire} 里那个暂停判断）。以前这里是"请暂停着的任务让出通道"
- * （{@link #requestHandover()}：保留进度的取消），于是暂停了正在传的那个，
- * 下一个文件立刻顶上来 —— 用户看到的就是"暂停了还在一个接一个地传"。
- * 让出通道那条路还在，但只剩 {@code SUSPENDED} 这个状态在用。
+ * （保留进度的取消），于是暂停了正在传的那个，下一个文件立刻顶上来 ——
+ * 用户看到的就是"暂停了还在一个接一个地传"。
+ *
+ * <p><b>「让出通道」这条路已经注销</b>（2026-11-22 真机「暂停一个任务就开始下个任务」）：
+ * 队列闸门里那句 {@code requestHandover()} 删掉了，现在只有「holder 干完 / 取消 → release」
+ * 才会把通道交给下一位。{@link #STATE_SUSPENDED} 这个状态还留着（老日志、老面板文案里
+ * 还读得到），但已经没有代码会走到它 —— 真要恢复"新任务顶掉旧任务"，得先把暂停语义
+ * 和它分清楚，别再让两条路互相打架。
  *
  * <p><b>状态机</b>：
  * <pre>
@@ -289,6 +294,12 @@ public final class SendTask {
                 if (srv != null) {
                     srv.resumeTransfer();
                 }
+                // 队列里排着的那些任务就等在 {@link SendTasks#acquire} 的暂停判断上，
+                // 它们只会被 notifyAll 叫醒 —— 只放开闸门不叫醒，下一个任务得等 300ms
+                // 那一拍才动；而暂停之后又没别的东西会去叫它（真机实测：继续之后
+                // 排队的那几个纹丝不动）。
+                SendTasks.notifyQueueGate(srv == null ? -1 : srv.getId());
+                SendTasks.notifyQueueChanged();
                 return;
             }
             if (state == STATE_SUSPENDED) {
@@ -459,6 +470,7 @@ public final class SendTask {
      * 让出 = 保留进度的取消（{@code abortTransfer(false)}）：电脑上那份半截文件和
      * {@code .hfxpart} 都留着，点继续时只补缺的块。
      */
+    @Deprecated() // 队列闸门不再调用它（见类头上「让出通道这条路已注销」）
     void requestHandover() {
         if (!suspendRequested.compareAndSet(false, true)) {
             return;
@@ -757,6 +769,10 @@ public final class SendTask {
                 }
             }
         }
+        // 暂停放开了：队列里排着的任务等在 SendTasks 的闸门上，它们等的那个条件刚刚变了，
+        // 没人叫就会一直睡（理由见 SendTasks#notifyQueueGate）
+        HFXServer srv = server;
+        SendTasks.notifyQueueGate(srv == null ? -1 : srv.getId());
     }
 
     /**

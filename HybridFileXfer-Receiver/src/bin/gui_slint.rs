@@ -286,9 +286,29 @@ struct DevXferWin {
     stack_seen: usize,
     /// 这一轮弹过没有（对应以前单例上的 tw_shown）
     shown: bool,
-    /// 这个窗口里所有块都收尾的时刻：用来数「已完成」亮够 3 秒没有（以前整进程一个）
-    finish_at: Option<std::time::Instant>,
+    /// 这个窗口「上一单已经收尾、下一单还没开始」的空档是从什么时候开始的。
+    ///
+    /// 为什么要它：手机端多选时是一个文件一个任务、同一刻只传一个。两单之间电脑端
+    /// 有一小段真空（进度被 reset，total = 0，active 落成 false）。以前这一段走到
+    /// 「这一帧没有块了」的分支里，**把窗口整个销毁**，下一单再建一个新的 ——
+    /// 用户看到的就是「一个任务传完，窗口消失一下又打开」（2026-11-22 真机报的）。
+    /// 现在留着窗口等下一单，只有空档超过 TW_IDLE_KEEP_SECS 才真销毁。
+    idle_since: Option<std::time::Instant>,
 }
+
+/// 「上一单收尾了、下一单还没来」的窗口最多留这么久（秒）。
+///
+/// 队列模式下两单之间的真空只有零点几秒，这个值把它整个盖住；而一次普通传输结束、
+/// 用户也没再分享时，窗口在「已完成」显示 3 秒后就已经藏起来了，这里只是把 Slint
+/// 对象多留一会儿（再建一个的成本 = 几十个元素的布局 + 一次 show，比一闪便宜）。
+const TW_IDLE_KEEP_SECS: u64 = 30;
+
+/// 「已完成」要等这么久才认（毫秒）。
+///
+/// 队列模式下两单之间只有零点几秒：一转身就把标题改成「已完成」、下一单再翻回
+/// 「正在传输」，标题栏在那儿闪（真机 2026-11-22 的窗口标题采样里能抓到
+/// 「已完成」只亮了 0.4 秒）。等这么久还闲着才认「这一轮传完了」。
+const TW_DONE_QUIET_MS: u128 = 800;
 
 impl DevXferWin {
     /// 这个窗口在我们摆的位置（用户拖走之后和它比，就知道该不该记进 config）
@@ -341,6 +361,26 @@ impl DevXferWin {
         let _ = self.win.show();
         self.settle(saved, slot);
     }
+}
+
+/// 界面回调要交给主循环（16ms Timer）去做的那些「脏活」。
+///
+/// **为什么要有这一层**（2026-11-22 关窗卡死的根因）：
+/// 16ms 那条 Timer 从拿 `State` 锁开始一直持到整帧结束，中间会调 Slint 的
+/// `show()` / `set_size()` / `SetForegroundWindow` —— 这些都会进 Windows 的消息泵，
+/// 于是**界面回调可能在 Timer 里被重入**。回调要是自己也去 `state.lock()`，
+/// 同一个线程对自己已经持有的 std::Mutex 再 lock 一次 = 自死锁，
+/// 主窗口「未响应」，引擎也停摆（用户看到的「两边一起卡死」）。
+///
+/// 所以界面回调里**一律不碰 State 锁**：只把要做的事（记窗口坐标、写取消提示）
+/// 丢进这个小队列，由那条本来就持锁的 Timer 顺手做掉。
+/// 这把锁本身只在极短的几行里持有，绝不跨任何 Slint / Windows 调用。
+#[derive(Default)]
+struct UiPending {
+    /// 收起 / 关窗时要记下的窗口坐标（物理像素）：(用户拖到的位置, 我们自己摆的位置)
+    pos_saves: Vec<((i32, i32), Option<(i32, i32)>)>,
+    /// 取消确认框选了「保留 / 不保留」之后要写进 `State.cancel_note` 的那句话
+    cancel_note: Option<String>,
 }
 
 /// 所有设备的传输窗口（UI 线程私有，理由见 DevXferWin）。
@@ -406,7 +446,7 @@ fn drop_dev_xfer_win(wins: &Rc<RefCell<XferWins>>, s: &mut State, serial: &str) 
 /// 用它 —— 删窗口是 tick 里「这块设备这一轮没块了」那件事。
 fn hide_dev_xfer_win(
     wins: &std::rc::Weak<RefCell<XferWins>>,
-    state: &Arc<Mutex<State>>,
+    pending: &Arc<Mutex<UiPending>>,
     serial: &str,
     weak: &slint::Weak<TransferWindow>,
 ) {
@@ -418,11 +458,17 @@ fn hide_dev_xfer_win(
             if let Some(d) = g.map.get_mut(serial) {
                 d.dismissed = true;
                 // 用户可能把窗口拖到别处了：收起时顺手记住（只有单窗口才记，理由见
-                // drop_dev_xfer_win）
+                // drop_dev_xfer_win）。
+                //
+                // **这里不能顺手存**：存盘要 State 锁（config_path / config），而这条回调
+                // 可能是被 Timer 重入进来的（理由见 UiPending）。所以只把坐标丢进队列，
+                // 由那条本来就持锁的 Timer 写盘。
                 if single {
                     let placed = d.placed_at();
-                    if let Ok(mut st) = state.lock() {
-                        save_transfer_pos(&d.win, &mut st, placed);
+                    let pos = d.win.window().position();
+                    let pos = (pos.x, pos.y);
+                    if let Ok(mut q) = pending.lock() {
+                        q.pos_saves.push((pos, placed));
                     }
                 }
             }
@@ -487,7 +533,7 @@ fn screen_height_logical(win: &TransferWindow) -> i32 {
 /// 只能在 UI 线程调（Slint 对象不 Send），所以只从那个 16ms Timer 里进来。
 fn make_dev_xfer_win(
     wins: &Rc<RefCell<XferWins>>,
-    state: &Arc<Mutex<State>>,
+    pending: &Arc<Mutex<UiPending>>,
     serial: &str,
     label: &str,
 ) -> Option<DevXferWin> {
@@ -509,7 +555,7 @@ fn make_dev_xfer_win(
     win.set_screen_h(screen_height_logical(&win));
     let model = Rc::new(slint::VecModel::from(Vec::<XferOp>::new()));
     win.set_ops(slint::ModelRc::new(model.clone()));
-    wire_dev_xfer_win(&win, serial, wins, state);
+    wire_dev_xfer_win(&win, serial, wins, pending);
     Some(DevXferWin {
         serial: serial.to_string(),
         label: label.to_string(),
@@ -527,7 +573,7 @@ fn make_dev_xfer_win(
         // 1 = 「刚建出来时默认是单窗口摆法」：真多窗口时下面的判断会立刻重排一次
         stack_seen: 1,
         shown: false,
-        finish_at: None,
+        idle_since: None,
     })
 }
 
@@ -541,7 +587,7 @@ fn wire_dev_xfer_win(
     win: &TransferWindow,
     serial: &str,
     wins: &Rc<RefCell<XferWins>>,
-    state: &Arc<Mutex<State>>,
+    pending: &Arc<Mutex<UiPending>>,
 ) {
     // 窗口回调里一律用 Weak 回指（理由见 hide_dev_xfer_win）
     let wins_weak: std::rc::Weak<RefCell<XferWins>> = Rc::downgrade(wins);
@@ -552,29 +598,43 @@ fn wire_dev_xfer_win(
     // 暂停位是**进程级**的（control.rs 里那个 static AtomicBool）：一个窗口按暂停，
     // 所有块都该停，所以这里没有「按窗口」的记录。
     win.on_toggle_pause(|| {
+        // 没有在传的时候按它一律不生效：这两个标志是**进程级**的，空闲时按一下
+        // 会把它带到下一单（下一单刚起步就是「已暂停」，用户以为卡住了）。
+        // 真机上这颗按钮在收尾那一两帧里可能还看得见，所以这里必须挡一道。
+        if !hfx_receiver::control::receiving() && !hfx_receiver::control::sending() {
+            log::warn(i18n::tr(
+                "按键无效：没有正在传输的任务（暂停）",
+                "ignored: nothing is transferring (pause)",
+            ));
+            return;
+        }
         let paused = !hfx_receiver::control::paused();
+        log::warn(i18n::tr(
+            if paused { "按钮：暂停" } else { "按钮：继续" },
+            if paused { "button: pause" } else { "button: resume" },
+        ));
         hfx_receiver::control::pause(paused);
     });
     win.on_cancel_recv(cancel_recv_request);
     win.on_cancel_dismiss(cancel_dismiss);
     {
-        let st = Arc::clone(state);
-        win.on_cancel_keep(move || cancel_keep(&st));
+        let q = Arc::clone(pending);
+        win.on_cancel_keep(move || cancel_keep(&q));
     }
     {
-        let st = Arc::clone(state);
-        win.on_cancel_discard(move || cancel_discard(&st));
+        let q = Arc::clone(pending);
+        win.on_cancel_discard(move || cancel_discard(&q));
     }
     // 收起（窗口里那颗按钮）：藏起来，传输继续。失败那一轮点它 = 「我知道了」——
     // 把失败提示消费掉，下一轮正常弹回来。
     {
         let key = serial.to_string();
         let wins = wins_weak.clone();
-        let st = Arc::clone(state);
+        let q = Arc::clone(pending);
         let weak = win.as_weak();
         win.on_close_window(move || {
             hfx_receiver::receiver::clear_failure();
-            hide_dev_xfer_win(&wins, &st, &key, &weak);
+            hide_dev_xfer_win(&wins, &q, &key, &weak);
         });
     }
     // 标题栏的 ✕ 和窗口里的「收起」是同一件事：藏起来，传输继续。
@@ -582,11 +642,11 @@ fn wire_dev_xfer_win(
     {
         let key = serial.to_string();
         let wins = wins_weak.clone();
-        let st = Arc::clone(state);
+        let q = Arc::clone(pending);
         let weak = win.as_weak();
         win.window().on_close_requested(move || {
             hfx_receiver::receiver::clear_failure();
-            hide_dev_xfer_win(&wins, &st, &key, &weak);
+            hide_dev_xfer_win(&wins, &q, &key, &weak);
             slint::CloseRequestResponse::KeepWindowShown
         });
     }
@@ -635,20 +695,28 @@ fn transfer_window_px(tw: &TransferWindow) -> (i32, i32) {
 /// 它是从「跟平台无关」的那几段代码里调的，加 cfg 反而要在调用处再套一层。
 fn save_transfer_pos(tw: &TransferWindow, state: &mut State, placed: Option<(i32, i32)>) {
     let pos = tw.window().position();
+    save_transfer_pos_at((pos.x, pos.y), state, placed);
+}
+
+/// `save_transfer_pos` 的「坐标已经在手上」版本。
+///
+/// 界面回调拿到坐标后不能自己存（要 State 锁，见 UiPending），只能把坐标丢进队列，
+/// 由 Timer 调这一个 —— 那时候窗口可能已经藏起来了，但坐标早就量好了。
+fn save_transfer_pos_at(pos: (i32, i32), state: &mut State, placed: Option<(i32, i32)>) {
     // (0,0) 一般是「拿不到位置」而不是真的拖到了左上角
-    if pos.x == 0 && pos.y == 0 {
+    if pos.0 == 0 && pos.1 == 0 {
         return;
     }
     if let Some((px, py)) = placed {
         // 和我们摆的位置一样 → 用户没拖过，不用写盘
-        if (pos.x - px).abs() <= 4 && (pos.y - py).abs() <= 4 {
+        if (pos.0 - px).abs() <= 4 && (pos.1 - py).abs() <= 4 {
             return;
         }
     }
-    if state.config.xfer_win_pos == Some((pos.x, pos.y)) {
+    if state.config.xfer_win_pos == Some(pos) {
         return;
     }
-    state.config.xfer_win_pos = Some((pos.x, pos.y));
+    state.config.xfer_win_pos = Some(pos);
     let path = state.config_path.clone();
     let config = state.config.clone();
     if let Err(e) = config.save(&path) {
@@ -1016,7 +1084,7 @@ fn apply_cancel_choice(choice: hfx_receiver::control::CancelChoice) -> bool {
 }
 
 /// 保留：收尾时留着半截文件和 .hfxpart（下次同一个文件接着传）
-fn cancel_keep(st: &Arc<Mutex<State>>) {
+fn cancel_keep(pending: &Arc<Mutex<UiPending>>) {
     if !apply_cancel_choice(hfx_receiver::control::CancelChoice::Keep) {
         // 幂等：这次取消已经受理过（收尾 / 重建还没做完）时不再做任何事，
         // 上一次的结果原样复用，界面不重复提示、控制通道不插第二帧。
@@ -1030,8 +1098,9 @@ fn cancel_keep(st: &Arc<Mutex<State>>) {
         "按钮：取消 · 保留进度（半截文件和 .hfxpart 留着，可续传）",
         "button: cancel · keep the partial file (resumable)",
     ));
-    if let Ok(mut s) = st.lock() {
-        s.cancel_note = Some(
+    // 这句话由 Timer 写进 State（理由见 UiPending：回调里拿 State 锁会自死锁）
+    if let Ok(mut q) = pending.lock() {
+        q.cancel_note = Some(
             i18n::tr(
                 "已取消：保留已收到的部分，下次同一个文件可续传",
                 "cancelled: what already arrived is kept and can be resumed",
@@ -1043,7 +1112,7 @@ fn cancel_keep(st: &Arc<Mutex<State>>) {
 
 /// 不保留：接收方向由 Receiver::finish_with(false) 本地删，
 /// 发送方向由 CANCEL_DISCARD 让手机把它写了一半的文件和续传记录删掉
-fn cancel_discard(st: &Arc<Mutex<State>>) {
+fn cancel_discard(pending: &Arc<Mutex<UiPending>>) {
     if !apply_cancel_choice(hfx_receiver::control::CancelChoice::Discard) {
         log::warn(i18n::tr(
             "按钮：取消 · 不保留被忽略（这次取消已经受理过）",
@@ -1066,8 +1135,8 @@ fn cancel_discard(st: &Arc<Mutex<State>>) {
             "button: cancel · discard the incomplete files"
         },
     ));
-    if let Ok(mut s) = st.lock() {
-        s.cancel_note = Some(
+    if let Ok(mut q) = pending.lock() {
+        q.cancel_note = Some(
             if sending {
                 i18n::tr(
                     "已取消：已通知手机删除未传完的文件和续传记录",
@@ -1252,6 +1321,13 @@ struct OpTrack {
     sent: Option<XferOp>,
     /// 这一块的明细行数（0 = 块里画「这一轮还没有分通道数据」那一行，仍占 22px）
     rows_count: usize,
+    /// 这一块**当前这一单**传的是哪个文件（PROGRESS 里的路径）。
+    ///
+    /// 队列模式下同一个窗口连着跑好几单，OpTrack 是按设备复用的：不记路径的话，
+    /// 第 2 单的曲线会接着第 1 单的样子往右画、速率从上一单的末值开始衰减、
+    /// 分段条也还是上一单的读数（真机 2026-11-22 队列测试里第 2 单开头就是一条
+    /// 半截的旧曲线）。路径一变就说明换单了，历史清零。
+    run_path: String,
 }
 
 /// tick 每帧给所有块准备的公共上下文。
@@ -1300,7 +1376,39 @@ impl OpTrack {
             segs_prev: None,
             sent: None,
             rows_count: 0,
+            run_path: String::new(),
         }
+    }
+
+    /// 换了一单（PROGRESS 里的路径变了）：把上一单留在身上的历史清零。
+    ///
+    /// 归零的是**一条任务内部的累计量**（曲线分桶、每截速率、平滑过的速率、
+    /// 明细行缓存）；不动的只有 Slint 那几个 model 对象（换对象 = 整块重建，见
+    /// 「只建一次」那条注释）和 sent（下一帧的 op 本来就全变了）。
+    fn begin_run(&mut self, path: &str) {
+        self.run_path = path.to_string();
+        self.speed = 0.0;
+        self.last_bytes = 0;
+        self.last_tick = std::time::Instant::now();
+        self.seg_rate_bytes.clear();
+        self.seg_rate_prev.clear();
+        self.seg_rates.clear();
+        self.seg_rate_at = None;
+        self.curve_bins = vec![0.0; CURVE_BINS];
+        self.curve_bin_cnt = vec![0; CURVE_BINS];
+        self.curve_cur_progress = 0.0;
+        self.curve_last_at = None;
+        self.curve_last_progress = 0.0;
+        self.curve_max_speed = 0.0;
+        self.curve_peak_win.clear();
+        self.curve_win.clear();
+        self.curve_path_progress = -1.0;
+        self.curve_path_at = None;
+        self.curve_cmds.clear();
+        self.guide_y_disp = None;
+        self.rows_prev = None;
+        self.segs_prev = None;
+        self.rows_count = 0;
     }
 
     /// 算出这一帧这个块该显示什么（顺手把 model / Path 换掉）。
@@ -1323,6 +1431,12 @@ impl OpTrack {
             &dev_prog
         };
         let (path, done, total_bytes, _session_bytes, _files) = prog.snapshot();
+        // 换文件 = 换了一单（队列模式下同一个窗口连着跑好几单）：先把上一单留在
+        // 这里的曲线 / 速率 / 分段历史清掉，再往下算这一单的数字。
+        // 路径还是空的那几帧不算换单 —— 那一轮还没解析出文件呢。
+        if !path.is_empty() && path != self.run_path {
+            self.begin_run(&path);
+        }
 
         // 速率只按「这次真收到的字节」算：续传基线（磁盘上本来就有的一块）不算进去，
         // 否则续传一开始会跳出一个几 GB/s 的假峰值。
@@ -1355,7 +1469,12 @@ impl OpTrack {
         // 撞见过 done 停在 599.0/600.0 MB（块计数尾巴对不上），再认一个信号：
         // control 那边 receiving()/sending() 都落下去，就是这一轮结束了。
         let in_flight = hfx_receiver::control::receiving() || hfx_receiver::control::sending();
-        let finished = (total_bytes > 0 && done >= total_bytes) || !in_flight;
+        // 数据已经全到了就算「传完」，哪怕这一刻还在等对端结论帧（receiving 仍是 true）：
+        // 否则暂停 / 取消落在「最后一块之后、收尾之前」这个窗口里时，界面会一直停在
+        // 「100% · 已暂停」，用户以为没传完（真机 2026-11-22 报的就是这个）。
+        // 字节没满的那些块仍然按 in_flight 判断，正常收尾不受影响。
+        let bytes_full = total_bytes > 0 && done >= total_bytes;
+        let finished = bytes_full || !in_flight;
 
         let short = path
             .rsplit(['/', '\\'])
@@ -2008,6 +2127,9 @@ fn main() -> Result<(), slint::PlatformError> {
     // Rc<RefCell<..>> 里，由那个 16ms Timer（同一个 UI 线程）负责建、刷、收。
     // 它不 Send，也就不可能被别的线程碰到。
     let xfer_wins: Rc<RefCell<XferWins>> = Rc::new(RefCell::new(XferWins::default()));
+    // 界面回调要交给主循环去做的脏活（记窗口坐标 / 写取消提示）。
+    // 回调里**不拿 State 锁**的原因见 UiPending 的注释（关窗卡死就是这么来的）。
+    let ui_pending: Arc<Mutex<UiPending>> = Arc::new(Mutex::new(UiPending::default()));
     // 取消确认框的**独立窗口**（用户要求：不要再挤进传输窗口里）。
     // 传输窗口只负责把 cancel-ask 这个状态位翻成 true/false，这个窗口自己弹/收（见下面的定时器）。
     let ask_win = CancelAskWindow::new()?;
@@ -2155,6 +2277,14 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let ui_weak = ui.as_weak();
         ui.on_toggle_pause_send(move || {
+            // 同传输窗口那颗：空闲时不改进程级标志，免得把「暂停」带进下一单
+            if !hfx_receiver::control::receiving() && !hfx_receiver::control::sending() {
+                log::warn(i18n::tr(
+                    "按键无效：没有正在传输的任务（暂停）",
+                    "ignored: nothing is transferring (pause)",
+                ));
+                return;
+            }
             let paused = !hfx_receiver::control::paused();
             hfx_receiver::control::pause(paused);
             if let Some(ui) = ui_weak.upgrade() {
@@ -2174,18 +2304,18 @@ fn main() -> Result<(), slint::PlatformError> {
     // 完全等价：先暂停（手机端跟着停发），再问「保留进度 / 不保留，删掉 / 继续接收」。
     ui.on_cancel_recv(cancel_recv_request);
     {
-        let st = Arc::clone(&state);
-        ui.on_cancel_keep(move || cancel_keep(&st));
+        let q = Arc::clone(&ui_pending);
+        ui.on_cancel_keep(move || cancel_keep(&q));
     }
     {
-        let st = Arc::clone(&state);
-        ui.on_cancel_discard(move || cancel_discard(&st));
+        let q = Arc::clone(&ui_pending);
+        ui.on_cancel_discard(move || cancel_discard(&q));
     }
     ui.on_cancel_dismiss(cancel_dismiss);
     // 独立窗口上的三个按钮：先收窗口、把传输窗口的状态位清零（所有窗口一起清：取消是
     // 进程级的一件事，用户的回答只有一个），再走同一套语义
     {
-        let st = Arc::clone(&state);
+        let q = Arc::clone(&ui_pending);
         let wins = Rc::clone(&xfer_wins);
         let aw = ask_win.as_weak();
         ask_win.on_keep(move || {
@@ -2193,11 +2323,11 @@ fn main() -> Result<(), slint::PlatformError> {
             if let Some(a) = aw.upgrade() {
                 let _ = a.hide();
             }
-            cancel_keep(&st);
+            cancel_keep(&q);
         });
     }
     {
-        let st = Arc::clone(&state);
+        let q = Arc::clone(&ui_pending);
         let wins = Rc::clone(&xfer_wins);
         let aw = ask_win.as_weak();
         ask_win.on_discard(move || {
@@ -2205,7 +2335,7 @@ fn main() -> Result<(), slint::PlatformError> {
             if let Some(a) = aw.upgrade() {
                 let _ = a.hide();
             }
-            cancel_discard(&st);
+            cancel_discard(&q);
         });
     }
     {
@@ -2525,6 +2655,7 @@ fn main() -> Result<(), slint::PlatformError> {
         // 每台设备的传输窗口：窗口 / 列表 model / 块状态 / 落位状态 / 收起标志都在里面，
         // 建、刷、收全在这一条线程（这个 Timer）上做。
         let xfer_wins = Rc::clone(&xfer_wins);
+        let ui_pending = Arc::clone(&ui_pending);
         // 取消确认框那个独立窗口
         let ask_weak = ask_win.as_weak();
         // tick 耗时统计（HFX_TICK_STAT=1 时每秒往日志写一行）：
@@ -2620,6 +2751,20 @@ fn main() -> Result<(), slint::PlatformError> {
                 }
             }
             let mut s = st.lock().unwrap();
+
+            // ---- 界面回调攒下来的脏活：这里持锁顺手做掉 ----
+            //
+            // 反过来的顺序（回调自己拿锁）在关窗那一下会自死锁：Timer 正持着这把锁调
+            // Slint 的 show/set_size，Windows 消息泵把「关窗」回调重入进来，回调再
+            // lock 一次 = 同一线程重入 std::Mutex = 永远等下去（主窗口「未响应」）。
+            if let Ok(mut q) = ui_pending.lock() {
+                for (pos, placed) in q.pos_saves.drain(..) {
+                    save_transfer_pos_at(pos, &mut s, placed);
+                }
+                if let Some(note) = q.cancel_note.take() {
+                    s.cancel_note = Some(note);
+                }
+            }
 
             // 「在不在接收」只看引擎：设备数不行 —— 停止过程中设备表里那条还在，
             // 界面就会自己跳回「已连接」，得按两次停止（用户报的那个 bug）
@@ -3423,7 +3568,7 @@ fn main() -> Result<(), slint::PlatformError> {
                         g.map.values().map(|d| d.label.clone()).collect()
                     };
                     let label = unique_label(&taken, &base);
-                    if let Some(d) = make_dev_xfer_win(&xfer_wins, &st, key, &label) {
+                    if let Some(d) = make_dev_xfer_win(&xfer_wins, &ui_pending, key, &label) {
                         xfer_wins.borrow_mut().insert(key.clone(), d);
                     }
                 }
@@ -3455,6 +3600,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 for (slot, key) in keys.iter().enumerate() {
                     let mut wins_g = xfer_wins.borrow_mut();
                     let Some(d) = wins_g.map.get_mut(key) else { continue };
+
                     // 槽位 / 窗口总数变了（第二台设备冒出来、走掉一台）：按新槽位重排一遍 ——
                     // 否则新窗口会叠在旧窗口上、走掉一台后底下空出一个洞，而且多窗口时不该
                     // 再沿用 config 里那一份单独坐标（见 transfer_window_origin 的说明）。
@@ -3534,6 +3680,37 @@ fn main() -> Result<(), slint::PlatformError> {
                     // 等待块接在后面。它们只画精简态（app.slint 里 XferOperation 的 slim），
                     // 高度固定 114、明细行一行都不占 —— 高度公式里是单独的一项
                     // （waiting_ops × TW_WAITING_OP），所以**不能**把它们的行数加进 detail_rows。
+                    //
+                    // 手机队列里 state==1 的那一条（正在传）**不画**：它对应的是本窗口已有的
+                    // 那块进度，再画一遍就成了同一个文件占两行。这里只用它的名字校准块标题 ——
+                    // 用户实测「多选后电脑端一直显示第一个文件」，就是因为块的标题来自本端
+                    // PROGRESS 的路径，而"手机现在在传哪一个"只有队列知道。
+                    let queue_running = hfx_receiver::queue::running_for(&d.serial);
+                    if let (Some(run), Some(op)) = (queue_running.as_ref(), ops_out.first_mut()) {
+                        // 只有「还在传、没失败」的块才改：已经收尾的那块名字是实的，不该被覆盖
+                        if !op.failed && !op.done {
+                            let short = run
+                                .name
+                                .rsplit(['/', '\\'])
+                                .next()
+                                .unwrap_or(&run.name)
+                                .to_string();
+                            if !short.is_empty() && op.file_name.as_str() != short {
+                                op.file_name = short.as_str().into();
+                                op.action_text = if op_count > 1 {
+                                    format!(
+                                        "{}：{}（{}）",
+                                        device_display_name(&s, &d.serial),
+                                        short,
+                                        human(run.size)
+                                    )
+                                    .into()
+                                } else {
+                                    format!("{}（{}）", short, human(run.size)).into()
+                                };
+                            }
+                        }
+                    }
                     let waiting_ops = waiting.len();
                     if !waiting.is_empty() {
                         let device_name = device_display_name(&s, &d.serial);
@@ -3585,11 +3762,24 @@ fn main() -> Result<(), slint::PlatformError> {
 
                     // 标题栏那两个位：多块时标题只说「N 个正在运行的操作」，单块时靠它们
                     // 保持原来那三种说法（正在传输 / 已完成 / 接收失败）。
+                    //
+                    // 「空闲」计时器：这一窗口的所有块都收尾了就从这一刻起算，
+                    // 只要还有一块在跑 / 队列里还有排着的就清零。它同时管三件事 ——
+                    // 「已完成」要不要亮（TW_DONE_QUIET_MS）、窗口几时收（3 秒）、
+                    // 以及没在传的时候窗口还要不要留（TW_IDLE_KEEP_SECS）。
+                    if all_finished {
+                        d.idle_since.get_or_insert(now);
+                    } else {
+                        d.idle_since = None;
+                    }
+                    // 队列两单之间那零点几秒不算「传完」：标题别在「已完成 / 正在传输」之间闪
+                    let quiet_ms = d.idle_since.map(|t| t.elapsed().as_millis()).unwrap_or(0);
+                    let done_now = all_finished && quiet_ms >= TW_DONE_QUIET_MS;
                     if d.win.get_failed() != failed {
                         d.win.set_failed(failed);
                     }
-                    if d.win.get_done() != all_finished {
-                        d.win.set_done(all_finished);
+                    if d.win.get_done() != done_now {
+                        d.win.set_done(done_now);
                     }
                     // 高度公式要的三个汇总值：Slint 没有「对数组求和」的表达式，
                     // 逐块累加只能在这边算（和 rows / segs 同一个来路）。
@@ -3652,7 +3842,6 @@ fn main() -> Result<(), slint::PlatformError> {
                             d.details = false;
                             d.win.set_details(false);
                         }
-                        d.finish_at = None;
                     } else if all_finished {
                         // 所有块都收尾了才算「传完」：一个窗口里有块还在跑，窗口就留着。
                         // 传完了就把明细收起来：窗口回到收起高度，
@@ -3661,27 +3850,27 @@ fn main() -> Result<(), slint::PlatformError> {
                             d.details = false;
                             d.win.set_details(false);
                         }
-                        // 第一眼看到「满了」的时候记时间，3 秒后收窗口
-                        if d.finish_at.is_none() {
-                            d.finish_at = Some(std::time::Instant::now());
-                        }
-                        let lit = d
-                            .finish_at
-                            .map(|t| t.elapsed() >= Duration::from_secs(3))
-                            .unwrap_or(false);
-                        if d.shown && lit {
-                            d.shown = false;
-                            d.dismissed = false;
-                            let placed = d.placed_at();
-                            // 坐标只有「恰好一个窗口」时才记（多窗口是自动往上排的）
-                            if single {
-                                save_transfer_pos(&d.win, &mut *s, placed);
+                        // 空档满 3 秒就收窗口。数的是 idle_since（和「已完成」同一个起点）：
+                        // 队列模式下两单之间那零点几秒够不着这个数，窗口一动不动；
+                        // 真传完了用户在干别的，3 秒后照旧自己收起来。
+                        if quiet_ms >= 3000 {
+                            if d.shown {
+                                d.shown = false;
+                                let placed = d.placed_at();
+                                // 坐标只有「恰好一个窗口」时才记（多窗口是自动往上排的）
+                                if single {
+                                    save_transfer_pos(&d.win, &mut *s, placed);
+                                }
+                                let _ = d.win.hide();
                             }
-                            let _ = d.win.hide();
+                            // 这一轮到此为止：用户中途点过的「收起」只对那一轮有效。
+                            // 窗口现在**不销毁、留着给下一单**（见 idle_since 的说明），
+                            // 所以必须在这里把 dismissed 清掉 —— 否则用户收起过一次之后，
+                            // 后面每一单都不再弹了（以前靠「每轮重建窗口」掩盖了这一条）。
+                            d.dismissed = false;
                         }
                     } else {
                         // 又一轮新传输（文件换了 / 续传接上了）：允许重新弹
-                        d.finish_at = None;
                         // 新一轮传输才重新弹（用户在这个窗口上点过「收起」就别再烦他）
                         if !d.shown && !d.dismissed {
                             d.shown = true;
@@ -3730,7 +3919,7 @@ fn main() -> Result<(), slint::PlatformError> {
                         g.map.values().map(|d| d.label.clone()).collect()
                     };
                     let label = unique_label(&taken, &base);
-                    if let Some(d) = make_dev_xfer_win(&xfer_wins, &st, &key, &label) {
+                    if let Some(d) = make_dev_xfer_win(&xfer_wins, &ui_pending, &key, &label) {
                         xfer_wins.borrow_mut().insert(key.clone(), d);
                     }
                 }
@@ -3787,13 +3976,81 @@ fn main() -> Result<(), slint::PlatformError> {
                     }
                 }
             } else {
-                // 传输结束 / 停止接收 / 设备全断开：窗口自己收起来并从表里移除
-                //（下一轮重新建、重新摆位；不再需要一个常驻的空窗口了）
+                // 传输结束 / 停止接收 / 设备全断开。
+                //
+                // **不能一律立刻销毁**（2026-11-22 真机：「一个任务传完，窗口消失一下又打开」）：
+                // 手机多选时是一个文件一个任务，两单之间电脑端有一段真空（进度 reset、
+                // total = 0 → active 落成 false），这一支就会把窗口销毁，下一单再建一个 ——
+                // 屏幕上就是闪一下。
+                //
+                // 现在的规矩：
+                //   * 引擎停了（用户按了「停止接收」）/ 这台设备已经不在 Connected 里了
+                //     → 立刻销毁（这才是「这一轮结束了」的真正含义）；
+                //   * 还连着、只是暂时没在传 → 留着等下一单；空档超过 TW_IDLE_KEEP_SECS
+                //     才销毁（一次普通传输结束后窗口早就藏起来了，这里只是多留个对象）。
                 let keys: Vec<String> = {
                     let g = xfer_wins.borrow();
                     g.order.clone()
                 };
+                let running_now = s.running();
                 for key in keys {
+                    let still_connected = running_now
+                        && matches!(s.devices.get(&key), Some(EngineState::Connected(_)));
+                    if still_connected {
+                        let now = std::time::Instant::now();
+                        // (窗口还留不留, 这个空档是不是刚开始的, 这个空档已经空了多久)
+                        let (keep, fresh, quiet_ms) = {
+                            let mut g = xfer_wins.borrow_mut();
+                            match g.map.get_mut(&key) {
+                                Some(d) => {
+                                    let fresh = d.idle_since.is_none();
+                                    let since = *d.idle_since.get_or_insert(now);
+                                    (
+                                        since.elapsed().as_secs() < TW_IDLE_KEEP_SECS,
+                                        fresh,
+                                        since.elapsed().as_millis(),
+                                    )
+                                }
+                                None => (false, false, 0),
+                            }
+                        };
+                        if keep {
+                            // 一次空档只记一行（这一支每 16ms 跑一次，逐帧记会把日志刷爆）。
+                            // 这行也是「窗口闪一下」那件事的证据：改之前这里没有任何判断，
+                            // 任何一帧 active=false 都会把窗口整个销毁、下一帧再建一个。
+                            if fresh {
+                                log::info(&format!("{}：空档开始，窗口先留着等下一单", key));
+                            }
+                            // 空档满 3 秒 = 这一轮真的结束了（队列两单之间只有零点几秒，
+                            // 够不到这个数）。收窗口 + 把「用户点过收起」复位这件事，
+                            // active 分支里也做了一遍，但那一支**根本不会再跑**：
+                            // 一单传完 total 就归零，active 立刻落成 false，从那一刻起
+                            // 每帧都走这一支。所以必须在这儿补上，否则 ——
+                            // 用户中途点过「收起」，下一单就永远不弹了
+                            //（窗口现在不销毁、留着给下一单，见 idle_since 的说明）。
+                            if quiet_ms >= 3000 {
+                                let single = xfer_wins.borrow().map.len() == 1;
+                                let mut hide_now = false;
+                                if let Some(d) = xfer_wins.borrow_mut().map.get_mut(&key) {
+                                    d.dismissed = false;
+                                    if d.shown {
+                                        d.shown = false;
+                                        hide_now = true;
+                                        let placed = d.placed_at();
+                                        if single {
+                                            save_transfer_pos(&d.win, &mut *s, placed);
+                                        }
+                                    }
+                                }
+                                if hide_now {
+                                    if let Some(d) = xfer_wins.borrow().map.get(&key) {
+                                        let _ = d.win.hide();
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                    }
                     drop_dev_xfer_win(&xfer_wins, &mut *s, &key);
                 }
             }

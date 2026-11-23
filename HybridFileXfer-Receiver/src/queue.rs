@@ -78,6 +78,20 @@ pub fn waiting_for(device: &str) -> Vec<QueueItem> {
         .collect()
 }
 
+/// 这台设备上手机正在传的那一条（state == 1）。
+///
+/// 为什么要读它：手机端「多选分享」是**一个文件一个任务**，队列里 state==1 的那条才是
+/// 当前在传的。电脑端拿到的进度（PROGRESS）只知道自己收到的字节，不知道"手机认为现在是
+/// 哪一个文件在跑"—— 两者对不上时（续传跳过、多任务轮转），界面上的文件名会停在上一个，
+/// 用户看到的就是「一直在传第一个文件」。所以渲染那一块时以手机报的这条为准。
+///
+/// 暂停（PAUSED）在手机上也算 RUNNING（它还占着传输通道），语义一致。
+pub fn running_for(device: &str) -> Option<QueueItem> {
+    get_for(device)
+        .into_iter()
+        .find(|item| item.state == state::RUNNING)
+}
+
 /// 设备断开 / 会话结束时清掉（下次连上手机重新报，留着只会让界面挂着上一轮的等待块）。
 pub fn clear(device: &str) {
     let Ok(mut guard) = QUEUES.lock() else {
@@ -181,6 +195,44 @@ mod tests {
         // 空表 = 队列空了：连键都不留
         set_for(device, Vec::new());
         assert!(get_for(device).is_empty());
+        clear(device);
+    }
+
+    /// 「手机说现在在传的是哪一个」只有一个答案，而且必须是 state==1 那一条。
+    ///
+    /// 界面靠它校准块标题（用户报的「多选后电脑端一直显示第一个文件」）：
+    /// 电脑端 PROGRESS 只知道自己收了多少字节，不知道手机把哪个文件算作当前任务。
+    #[test]
+    fn running_item_is_the_single_track_in_flight() {
+        let _guard = TEST_LOCK.lock();
+        let device = "TEST-SERIAL-RUNNING";
+        clear(device);
+        // 手机报的顺序：正在传的在最前（SendTasks.queueStateFor 的排序约定），
+        // 但「谁在跑」是按 state 判断的，不是按下标 —— 顺序反了也得认对。
+        set_for(
+            device,
+            vec![
+                item("排队一.mp4", 100, state::WAITING),
+                item("正在传.mp4", 200, state::RUNNING),
+                item("已收尾.mp4", 300, state::DONE),
+            ],
+        );
+        let run = running_for(device).expect("应该能找到正在传的那一条");
+        assert_eq!(run.name, "正在传.mp4");
+        assert_eq!(run.size, 200);
+        // 等待块只有 state==0 的两条里的一条（DONE / RUNNING 都不画）
+        let waiting = waiting_for(device);
+        assert_eq!(waiting.len(), 1);
+        assert_eq!(waiting[0].name, "排队一.mp4");
+        // 暂停时手机把它报成 RUNNING（它还占着通道）：这里照样认它是"当前这个"
+        set_for(device, vec![item("正在传.mp4", 200, state::RUNNING)]);
+        assert_eq!(running_for(device).unwrap().name, "正在传.mp4");
+        // 全收尾了就没有"正在传"的那一条，界面那块回到本端 PROGRESS 的路径
+        set_for(device, vec![item("已收尾.mp4", 300, state::DONE)]);
+        assert!(running_for(device).is_none());
+        assert!(waiting_for(device).is_empty());
+        // 没收到过 QUEUE_STATE 的设备：两份都空，调用方不用再判 Option
+        assert!(running_for("TEST-SERIAL-NEVER").is_none());
         clear(device);
     }
 

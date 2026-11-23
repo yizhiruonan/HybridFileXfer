@@ -882,6 +882,9 @@ public abstract class HFXService {
             pauseGate.pause();
         } else {
             pauseGate.resume();
+            // 电脑那边放开了暂停：队列里排着的任务立刻可以开跑，得有人把闸门等待者叫醒
+            // （理由见 SendTasks#notifyQueueGate）。-1 = 记不清是哪条连接，全叫一遍。
+            top.weixiansen574.hybridfilexfer.SendTasks.notifyQueueGate(-1);
         }
     }
 

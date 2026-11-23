@@ -622,10 +622,14 @@ public final class SendTasks {
                     gate.holder = null;
                     continue;
                 }
-                if (holder.isSuspended()) {
-                    // 让出通道的那个任务正在退出（进度已经交回电脑），等它 release 就能进去
-                    holder.requestHandover();
-                }
+                // 到这里 holder 一定**不在暂停**（上面两道判据都过了）：它只是还在跑这一单。
+                // 以前这里还有一句 {@code holder.requestHandover()}（请它保留进度让出通道）——
+                // 3.7.0 已删除，理由：
+                //   * 用户要的是「队列一个一个来」，而不是「新的顶掉旧的」。让出通道等于
+                //     把正在传的文件半路掐掉（电脑端还得重建通道），然后下一单从头开始；
+                //   * 它和暂停闸门是两条互相打架的路：闸门判定「暂停就别开跑」，handover 却在
+                //     「holder 暂停着」的时候把它踹走。真机上表现为「暂停一个任务，下一个自己开始」。
+                // 现在只剩一条路：holder 干完 → finally 里 release → 这里 notifyAll 醒来。
                 task.onSlotWaiting();
                 try {
                     gate.wait(300L);
@@ -662,6 +666,27 @@ public final class SendTasks {
             return true;
         }
         return server != null && server.isTransferPaused();
+    }
+
+    /**
+     * 叫醒这条连接上所有排队等闸门的任务（暂停放开之后用）。
+     *
+     * <p>排队者平时是靠 {@code gate.wait(300)} 自己醒的，但暂停那一段是"闸门开着却谁也不动"
+     * 的状态：每次醒来看一眼 {@link #queuePaused} 就又睡回去。所以暂停一放开，必须有人
+     * 立刻 notifyAll，不然队列要等满一拍（300ms）才开始，真机上还会因为没人唤醒而完全不动。
+     *
+     * <p>connectionId &lt; 0（任务还没落到某条连接上）时按"全部"处理：那种情况下
+     * 排队者自己也分不清该等哪把闸门，一起叫一遍最省事。
+     */
+    public static void notifyQueueGate(int connectionId) {
+        for (Map.Entry<Integer, Gate> e : GATES.entrySet()) {
+            if (connectionId >= 0 && e.getKey() != connectionId) {
+                continue;
+            }
+            synchronized (e.getValue()) {
+                e.getValue().notifyAll();
+            }
+        }
     }
 
     /** 让出 / 结束：唤醒所有排队者 */

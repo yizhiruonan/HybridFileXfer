@@ -957,7 +957,10 @@ component XferOperation inherits Rectangle {
                 // 的第 1 项）—— 用 if 而不是 visible，正常块那边才不会多出一个占位。
                 if root.op.waiting : Text {
                     text: "等待中";
-                    font-size: 15px;
+                    // 13px：用户看过之后说「等待中字体再弄小」—— 15 还是像个状态标题，
+                    // 和旁边 12px 的明细、右边 12px 的按钮字不齐。13 是三档里最小的一档，
+                    // 再小（12 与明细同号）就看不出它是这一块的主语了。
+                    font-size: 13px;
                     color: #616161;
                     vertical-alignment: center;
                 }
