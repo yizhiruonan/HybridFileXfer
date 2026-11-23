@@ -1460,11 +1460,20 @@ component XferOperation inherits Rectangle {
 export component TransferWindow inherits Window {
     // 标题 = 状态文案 + 标题后缀。
     //
-    // 状态文案：只有一块时和平常一样（三种状态）；多块时只说「有几项操作在跑」——
+    // 状态文案：只有一块时和平常一样（三种状态）；多块时先说「有几项操作在跑」——
     // 原生资源管理器就是这种写法（「2 个正在运行的操作」），每块自己的状态写在块里面。
-    property <string> state-title: root.ops.length > 1
-        ? root.ops.length + " 个正在运行的操作"
-        : root.failed ? "接收失败" : root.done ? "已完成" : "正在传输";
+    //
+    // 但有等待块时不能照抄那一句（原来的写法把等待的也数进去了：1 个在跑 + 8 个等待
+    // 显示成「9 个正在运行的操作」，等于把「排队」说成「在跑」）。所以拆成两段数：
+    // 正在跑的 = 总块数 - 等待块数。运行的那种数到 0 时只说等待。
+    private property <int> running-count: Math.max(0, root.ops.length - root.waiting-ops);
+    property <string> state-title: root.ops.length <= 1
+        ? root.failed ? "接收失败" : root.done ? "已完成" : "正在传输"
+        : root.waiting-ops <= 0
+            ? root.ops.length + " 个正在运行的操作"
+            : root.running-count <= 0
+                ? root.waiting-ops + " 个等待中"
+                : root.running-count + " 个正在运行，" + root.waiting-ops + " 个等待中";
     // 后缀（" · 小米 15"）由 Rust 按设备喂进来：一台设备一个窗口之后标题必须**唯一**，
     // 因为下游是**按标题后缀**找 HWND 的（tray_win::find_transfer_window_of）——
     // 状态前缀会变（正在传输 / 已完成 / 接收失败），后缀一辈子不变。
