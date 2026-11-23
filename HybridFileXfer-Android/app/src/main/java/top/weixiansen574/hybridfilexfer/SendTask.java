@@ -104,6 +104,8 @@ public final class SendTask {
     private static final long CONNECT_TIMEOUT_MS = 30_000L;
     /** 等这条连接上一次传输真的退出（它现在正被取消）最多等这么久 */
     private static final long PREV_IDLE_TIMEOUT_MS = 10_000L;
+    /** 等电脑端把传输通道重建回来最多等这么久（正常一两秒就完事） */
+    private static final long REBUILD_WAIT_TIMEOUT_MS = 20_000L;
 
     /** 「这一轮被取消 / 被让出 / 被电脑端取消」的哨兵值：和真正的错误文案区分开 */
     private static final String ERR_ABANDONED = "\u0000abandoned";
@@ -584,6 +586,17 @@ public final class SendTask {
                     }
                     return;
                 }
+                // 上一轮是被取消的：传输通道已经关了，电脑端正在重建（needsRebuild 只由
+                // ServerService#rebuildTransfers 在握手结束时清掉）。这时候必须等 ——
+                // 真机上没等的结果是：下一单抢在重建之前开跑，在 queryResume 上读控制通道，
+                // 把电脑端正在发的 REBUILD_REQ 当别的帧读串，30 秒后超时失败，
+                // 后面排着的任务跟着连坐（『取消一个任务之后整条队列就废了』）。
+                if (!awaitChannelRebuilt(srv)) {
+                    if (!isAbandoned()) {
+                        fail(appContext.getString(R.string.share_busy));
+                    }
+                    return;
+                }
                 runGroups(srv);
             } finally {
                 SendTasks.release(this);
@@ -798,6 +811,30 @@ public final class SendTask {
             }
         }
         return !srv.isTransferring() && !srv.isSendingFiles();
+    }
+
+    /**
+     * 等电脑端把传输通道重建回来（取消之后那一段）。
+     *
+     * <p>{@code needsRebuild} 是「这一轮的传输通道已经关了，会话线程正在跟电脑对建新通道」
+     * 的标志，由 {@code ServerService#rebuildTransfers} 在握手收尾时清掉。这段时间里控制
+     * 通道的读者是会话线程，发送线程一开跑就会两边抢帧 —— 真机现象是下一单在
+     * {@code queryResume} 上卡满 30 秒然后报超时失败，整条队列跟着作废。
+     *
+     * <p>所以拿到闸门之后还要等这一位。等不到（电脑端一直没把通道建回来）就按「连接忙」
+     * 收场：宁可让用户重新分享一次，也不要两个读者一起把帧流读串。
+     */
+    private boolean awaitChannelRebuilt(HFXServer srv) {
+        long deadline = System.currentTimeMillis() + REBUILD_WAIT_TIMEOUT_MS;
+        while (srv.isNeedsRebuild() && System.currentTimeMillis() < deadline && !isAbandoned()) {
+            try {
+                Thread.sleep(50L);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        }
+        return !srv.isNeedsRebuild();
     }
 
     private void complete() {

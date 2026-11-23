@@ -48,6 +48,14 @@ public final class SendTasks {
     /** 一条连接上的发送闸门：同一时刻只放一个任务进去 */
     static final class Gate {
         SendTask holder;
+        /**
+         * 排队者的到达顺序（{@link SendTask} 对象身份去重）。
+         *
+         * <p>为什么要有它：{@code notifyAll()} 醒来之后谁抢到锁是随机的 —— 真机上出现过
+         * 「任务 3 抢在任务 2 前面开跑」，同一个文件队列传完的顺序和面板上排的顺序不一致。
+         * 现在只有队头能进：醒了看一眼自己是不是第一个，不是就接着等。
+         */
+        final java.util.LinkedHashSet<SendTask> waiters = new java.util.LinkedHashSet<>();
     }
 
     static Gate gateFor(int connectionId) {
@@ -596,13 +604,57 @@ public final class SendTasks {
     static boolean acquire(SendTask task, HFXServer server) {
         Gate gate = gateFor(server.getId());
         synchronized (gate) {
-            while (true) {
-                if (task.isAbandoned()) {
-                    return false;
-                }
-                SendTask holder = gate.holder;
-                if (queuePaused(task, holder, server)) {
-                    // 暂停期间不启动新任务：就地等，用户点继续 / 取消后下一轮(≤300ms)自己就过去了
+            // 排队登记（按到达顺序）：下面每次都检查自己是不是队头，见 Gate#waiters
+            gate.waiters.add(task);
+            boolean got = false;
+            try {
+                while (true) {
+                    if (task.isAbandoned()) {
+                        return false;
+                    }
+                    SendTask holder = gate.holder;
+                    if (queuePaused(task, holder, server)) {
+                        // 暂停期间不启动新任务：就地等，用户点继续 / 取消后下一轮(≤300ms)自己就过去了
+                        task.onSlotWaiting();
+                        try {
+                            gate.wait(300L);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            return false;
+                        }
+                        continue;
+                    }
+                    if (holder == null || holder == task) {
+                        // 空出来了也得先问队头：不然「刚取消、刚让出」那一下谁抢到锁谁先跑
+                        if (isHeadOfQueue(gate, task)) {
+                            gate.holder = task;
+                            gate.waiters.remove(task);
+                            got = true;
+                            task.onSlotAcquired(server.getId());
+                            return true;
+                        }
+                        task.onSlotWaiting();
+                        try {
+                            gate.wait(300L);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            return false;
+                        }
+                        continue;
+                    }
+                    if (holder.isAbandoned()) {
+                        // 占着通道那个任务已经取消了，它马上就会在 finally 里 release
+                        gate.holder = null;
+                        continue;
+                    }
+                    // 到这里 holder 一定**不在暂停**（上面两道判据都过了）：它只是还在跑这一单。
+                    // 以前这里还有一句 {@code holder.requestHandover()}（请它保留进度让出通道）——
+                    // 3.7.0 已删除，理由：
+                    //   * 用户要的是「队列一个一个来」，而不是「新的顶掉旧的」。让出通道等于
+                    //     把正在传的文件半路掐掉（电脑端还得重建通道），然后下一单从头开始；
+                    //   * 它和暂停闸门是两条互相打架的路：闸门判定「暂停就别开跑」，handover 却在
+                    //     「holder 暂停着」的时候把它踹走。真机上表现为「暂停一个任务，下一个自己开始」。
+                    // 现在只剩一条路：holder 干完 → finally 里 release → 这里 notifyAll 醒来。
                     task.onSlotWaiting();
                     try {
                         gate.wait(300L);
@@ -610,35 +662,21 @@ public final class SendTasks {
                         Thread.currentThread().interrupt();
                         return false;
                     }
-                    continue;
                 }
-                if (holder == null || holder == task) {
-                    gate.holder = task;
-                    task.onSlotAcquired(server.getId());
-                    return true;
-                }
-                if (holder.isAbandoned()) {
-                    // 占着通道那个任务已经取消了，它马上就会在 finally 里 release
-                    gate.holder = null;
-                    continue;
-                }
-                // 到这里 holder 一定**不在暂停**（上面两道判据都过了）：它只是还在跑这一单。
-                // 以前这里还有一句 {@code holder.requestHandover()}（请它保留进度让出通道）——
-                // 3.7.0 已删除，理由：
-                //   * 用户要的是「队列一个一个来」，而不是「新的顶掉旧的」。让出通道等于
-                //     把正在传的文件半路掐掉（电脑端还得重建通道），然后下一单从头开始；
-                //   * 它和暂停闸门是两条互相打架的路：闸门判定「暂停就别开跑」，handover 却在
-                //     「holder 暂停着」的时候把它踹走。真机上表现为「暂停一个任务，下一个自己开始」。
-                // 现在只剩一条路：holder 干完 → finally 里 release → 这里 notifyAll 醒来。
-                task.onSlotWaiting();
-                try {
-                    gate.wait(300L);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    return false;
+            } finally {
+                // 拿不到（取消 / 中断）就别留在排队表里：留着会让后面的任务永远等一个
+                // 不会再有人来接的位置。拿到了（got）当然也不用留 —— 它已经是 holder。
+                if (!got) {
+                    gate.waiters.remove(task);
                 }
             }
         }
+    }
+
+    /** 这个任务是不是排在最前面的那一个（{@link Gate#waiters} 的队头） */
+    private static boolean isHeadOfQueue(Gate gate, SendTask task) {
+        java.util.Iterator<SendTask> it = gate.waiters.iterator();
+        return it.hasNext() && it.next() == task;
     }
 
     /**
@@ -704,6 +742,9 @@ public final class SendTasks {
             if (gate.holder == task) {
                 gate.holder = null;
             }
+            // 取消的任务可能还留在排队表里（acquire 里那个 finally 一般已经清掉了，
+            // 这里补一刀：它永远不会再来开跑了，占着队头等于把后面的人锁死）
+            gate.waiters.remove(task);
             gate.notifyAll();
         }
     }
