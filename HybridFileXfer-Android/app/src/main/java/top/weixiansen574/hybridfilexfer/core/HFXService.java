@@ -391,6 +391,15 @@ public abstract class HFXService {
         }
         transferCancelled = true;
         needsRebuild = true;
+        // 立刻跟 accept 线程挂号「接下来会有一批安静的连接」。
+        //
+        // 电脑端一读到它自己发的那帧 CANCEL 就往下走，几毫秒后就 connect 第一批重建通道；
+        // 而我们这边要等会话线程那 250ms 的一圈转回来、发现 needsRebuild，才进重建流程。
+        // 挂号要是排在后面，那第一批连接会落在「还没人认领」的空窗里，被 accept 线程
+        // 当成上一轮的残留关掉 —— 于是电脑必有一条通道要白等一个取通道超时再重连，
+        // 用户看到的就是「点了取消，总要愣一两秒才开始下一个」。
+        // 挂号只是给 ServerListener 的计数器赋值，不阻塞、不碰控制通道，任何线程调都安全。
+        onPeerRebuildRequest();
         try {
             TransferPause gate = pauseGate;
             if (gate != null) {

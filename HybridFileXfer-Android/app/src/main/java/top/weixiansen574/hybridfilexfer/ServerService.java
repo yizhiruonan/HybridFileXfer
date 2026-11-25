@@ -1407,8 +1407,26 @@ public class ServerService extends Service implements ServiceConnection {
 
     /** 304：取消后等电脑把通道重建回来的总窗口 */
     private static final long REBUILD_WINDOW_MS = 30000;
-    /** 已经恢复出通道之后，多久没有新的 REBUILD_REQ 就认为电脑发完了 */
-    private static final long REBUILD_IDLE_MS = 5000;
+    /**
+     * 已经恢复出通道之后，多久没有新的 REBUILD_REQ 就认为电脑发完了。
+     *
+     * <p>电脑端是一条一条来（connect → REQ → 等 ACK → 下一条），相邻两条之间的间隔
+     * 真机实测 300~400ms；最坏的一条要先白等 {@link #REBUILD_TAKE_MS} 再重连一次，也就
+     * 2 秒出头。所以这个窗口给 2.5 秒既够用、又不会像以前的 5 秒那样，在这之后整整
+     * 白坐 5 秒才去开下一单（用户看到的「点了取消，半天不开始下一个」就是这个尾巴）。
+     * 提前收窗口也不算错：通道少几条只是慢一点，电脑端知道这一轮只要回收到了的那几条。
+     */
+    private static final long REBUILD_IDLE_MS = 2500;
+    /**
+     * 等一条传输通道接入的上限。
+     *
+     * <p>电脑端是「先 connect 再发 REBUILD_REQ」，读到请求时 socket 早已在 accept 队列里，
+     * 正常路径只要一个分类窗口（100ms）。所以这条上限定得短：真到了 800ms 还没取到，
+     * 说明这条是电脑连得太早、被 accept 线程当成上一轮残留关掉的那种 —— 早点回
+     * REBUILD_ACK false，电脑端就能早点重连，而不是陪着这里白等（以前给 1500ms，
+     * 加上电脑重连，那一条通道要 2.3 秒才回来，用户看到的就是「取消后要等四五秒」）。
+     */
+    private static final long REBUILD_TAKE_MS = 800;
 
     /**
      * 304：取消之后等电脑把传输通道重建回来（会话不断）。
@@ -1435,25 +1453,44 @@ public class ServerService extends Service implements ServiceConnection {
             debugFile("rebuild: no listener (" + server.getDisplayName() + ")");
             return false;
         }
+        // 0) 先挂号，再等传输线程交权。
+        //
+        // 电脑端一收到 CANCEL 就开始 connect，比我们这里进到重建握手早一秒多。
+        // 以前挂号排在「等传输线程退出」之后，那一秒多里 accept 线程把电脑连过来的
+        // 安静连接当成上一轮残留全部关掉，于是第一条通道必然等不到、整轮重建要
+        // 多花一次 1.5 秒的重连 —— 用户看到的就是「点了取消还要等五六秒」。
+        // 挂号只是给 accept 线程一个计数器，不碰控制通道，提前做完全安全：
+        // 这段时间攒下来的连接本来就该交给接下来的重建。
+        int wantEarly = server.getTransferCount();
+        if (wantEarly > 0) {
+            listener.wantTransfers(wantEarly);
+        }
         // 1) 等传输线程交出控制通道的读权
-        long waitDeadline = System.currentTimeMillis() + 15000;
+        long waitStart = System.currentTimeMillis();
+        long waitDeadline = waitStart + 15000;
         while ((server.isTransferring() || server.isSendingFiles())
                 && System.currentTimeMillis() < waitDeadline) {
             SystemClock.sleep(50);
         }
+        // 这一段在真机上能占到十几秒（取消之后到重建握手开始之间的空转），
+        // 用户看到的就是「点了取消，半天才开始下一单」。留一行数，别靠猜。
+        top.weixiansen574.hybridfilexfer.core.HFXLog.d("rebuild: waitTransferExit "
+                + (System.currentTimeMillis() - waitStart) + "ms transferring="
+                + server.isTransferring() + " sendingFiles=" + server.isSendingFiles());
         if (server.isTransferring() || server.isSendingFiles()) {
             // 传输线程还没退出就抢控制通道 = 两个读者各吃半帧，整条会话必废。
             // 宁可断线重连，也不要把帧流搞错位。
             debugFile("rebuild: transfer thread still owns the control channel");
+            listener.endWantTransfers();
             return false;
         }
         int want = server.beginRebuild();
         if (want <= 0) {
             debugFile("rebuild: no channel to restore (" + server.getDisplayName() + ")");
+            listener.endWantTransfers();
             return false;
         }
         debugFile("rebuild: waiting for " + want + " channel(s) from " + server.getDisplayName());
-        listener.wantTransfers(want);
         int got = 0;
         long deadline = System.currentTimeMillis() + REBUILD_WINDOW_MS;
         long idleUntil = Long.MAX_VALUE;
@@ -1517,7 +1554,13 @@ public class ServerService extends Service implements ServiceConnection {
                     name = pending.name;
                     ackAlreadySent = pending.ackAlreadySent;
                 }
-                SocketChannel socket = listener.takeTransferChannel(12000);
+                // 等通道要短：电脑端是「先 connect 再发 REBUILD_REQ」，读到这个请求时
+                // socket 早就躺在 accept 队列里了，正常路径 100~200ms（分类窗口）就取到。
+                // 以前给 12 秒，一旦这一条真的没到（电脑连得太早、被 accept 线程当成
+                // 上一轮残留关掉），整条队列就要白等 12 秒才继续 —— 用户看到的就是
+                // 「点了取消，二十秒后才开始下一单」。电脑端现在也会重连一次，
+                // 800ms 加上它自己的一次 connect 足够把这条捡回来。
+                SocketChannel socket = listener.takeTransferChannel(REBUILD_TAKE_MS);
                 boolean accepted = socket != null;
                 try {
                     if (accepted) {

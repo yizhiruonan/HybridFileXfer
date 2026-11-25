@@ -1467,8 +1467,13 @@ export component TransferWindow inherits Window {
     // 显示成「9 个正在运行的操作」，等于把「排队」说成「在跑」）。所以拆成两段数：
     // 正在跑的 = 总块数 - 等待块数。运行的那种数到 0 时只说等待。
     private property <int> running-count: Math.max(0, root.ops.length - root.waiting-ops);
+    // 取消之后不能亮「已完成」：用户点的是「中断」，看到「已完成」会以为文件传完了
+    // （真机实测：取消一单 58/200 MB，窗口亮着「已完成」两秒才自己收起来）。
+    // 所以这一轮是怎么结束的，要单独一位告诉标题栏。
     property <string> state-title: root.ops.length <= 1
-        ? root.failed ? "接收失败" : root.done ? "已完成" : "正在传输"
+        ? root.failed
+            ? "接收失败"
+            : root.ended-by-cancel ? "已取消" : root.done ? "已完成" : "正在传输"
         : root.waiting-ops <= 0
             ? root.ops.length + " 个正在运行的操作"
             : root.running-count <= 0
@@ -1552,6 +1557,10 @@ export component TransferWindow inherits Window {
     in-out property <bool> failed: false;
     // 同上，只给标题栏用：所有块都传完了才算「已完成」
     in-out property <bool> done: false;
+    // 这一轮是被「取消」结束的（不是传完、也不是失败）：标题说「已取消」。
+    // 取消之后块会立刻撤掉（见 gui_slint.rs），窗口里一块不剩 = all_finished，
+    // 只看 done 就会把「用户中断」说成「传完了」。
+    in-out property <bool> ended-by-cancel: false;
     // 「合计 82.9 MB/s · 剩余约 25 秒」—— 用户选了「去掉这行」，属性留着不显示，
     // Rust 那边还在算（日志/其它地方要用），界面上不再占一行高度。
     in-out property <string> summary-text: "";

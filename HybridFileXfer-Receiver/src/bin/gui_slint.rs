@@ -278,6 +278,14 @@ struct DevXferWin {
     details: bool,
     /// 上一帧设过的窗口高度：变了才 set_size（set_size 会触发一次重排 + 落位）
     last_h: f32,
+    /// 上一帧量到的真实窗口高度（逻辑像素）。只为了能有日志说清「谁把它改小了」。
+    last_actual_h: f32,
+    /// 取消前最后一张正常的卡片。
+    ///
+    /// 为什么要冻住：卡片上的字节数来自 PROGRESS，而取消会把 PROGRESS 清空，
+    /// 重算那一帧就变成「0% · 0 B / 0 B」。用户点的是「保留进度」，卡片上就该停在
+    /// 断开那一刻的数字上，而不是把一个已经传了几十 MB 的任务显示成 0。
+    frozen_op: Option<XferOp>,
     /// 上次摆位用的槽位（往上错开的档位）。窗口数一变槽位就变，这时要按新槽位重排一遍；
     /// 槽位没变就一个像素都不动 —— 用户拖过的位置得保住。
     slot_seen: usize,
@@ -430,6 +438,7 @@ fn drop_dev_xfer_win(wins: &Rc<RefCell<XferWins>>, s: &mut State, serial: &str) 
         g.map.remove(serial).map(|d| (d, single, placed))
     };
     if let Some((d, single, placed)) = removed {
+        log::debug(&format!("窗口收掉：{}（设备这一轮没有块了）", serial));
         // 只有「这一轮真弹出来过」的窗口才记坐标：从没 show 过的窗口报告的坐标是假的
         // （以前那个单例走的是同一个判断 —— 只在 tw_shown 时保存）
         if single && d.shown {
@@ -569,6 +578,8 @@ fn make_dev_xfer_win(
         dismissed: false,
         details: false,
         last_h: 0.0,
+        last_actual_h: 0.0,
+        frozen_op: None,
         slot_seen: 0,
         // 1 = 「刚建出来时默认是单窗口摆法」：真多窗口时下面的判断会立刻重排一次
         stack_seen: 1,
@@ -3446,7 +3457,13 @@ fn main() -> Result<(), slint::PlatformError> {
                 .devices
                 .values()
                 .any(|st| matches!(st, EngineState::Connected(_)));
-            let active = s.running() && total > 0 && any_connected;
+            // 取消之后有一段真空：电脑端在重建传输通道（实测十几秒），这期间 PROGRESS
+            // 已经 reset、total = 0，可手机队列里明明还排着后面的任务。按老条件
+            // active 当场落 false，窗口 3 秒后被自动收起、下一单再弹出来 ——
+            // 用户看到的就是「点了取消，窗口消失一下又出现」。
+            // 队列里还有没跑完的任务（等待中 / 正在跑）就算这一轮没结束。
+            let queue_pending = s.devices.keys().any(|k| hfx_receiver::queue::has_pending(k));
+            let active = s.running() && any_connected && (total > 0 || queue_pending);
             ui.set_xfer_visible(active);
             // 发送中 / 接收中都显示「暂停 / 继续」，发送时额外给「中断发送」
             ui.set_send_active(hfx_receiver::control::sending());
@@ -3617,11 +3634,35 @@ fn main() -> Result<(), slint::PlatformError> {
                     // 让这个窗口的 tracks 和「这台设备的任务」一一对应：还在的原样留着
                     //（曲线 / 量程 / 速率不能因为别的设备下线就归零），没了的下车，
                     // 新来的追加在末尾。
-                    let own: Vec<String> = task_keys
+                    let mut own: Vec<String> = task_keys
                         .iter()
                         .filter(|k| *k == &d.serial)
                         .cloned()
                         .collect();
+                    // 取消之后这一单就作废了：卡片要撤掉。
+                    //
+                    // 以前不撤：块是「一台设备一块」常驻的（这样连传几单不会闪），取消之后
+                    // 它要么停在半路、要么亮成「已完成 100%」，而真机上它要等到**下一单开始**
+                    // 才被换掉 —— 用户实测这段有 20 秒，中间盯着一个再也不动的进度条，
+                    // 当然以为卡死了。
+                    //
+                    // 失败不在此列：那块红字要留在屏幕上给用户看原因。
+                    //
+                    // 只在**后面还排着等待中的任务**时才撤：那种情形下整窗的高度由后面的
+                    // 等待块撑住，撤掉中间这块是「刷新」，用户马上看到队列在往前走。
+                    // 若队列里没有等待块（单文件分享后取消，或最后一单被取消），撤掉之后
+                    // 窗口里一块不剩，高度当场从 156 塌成一条只挂着「详细信息」的 42px 窄条
+                    // —— 那才是真的「窗口消失一下又出来」。这种情形留着这块：标题已经改成
+                    // 「已取消」，块里停住的就是取消那一刻的进度，3 秒后随窗口一起收起来。
+                    //
+                    // 判据必须用 waiting_for 而不是 has_pending：被取消的这一单在手机的
+                    // QUEUE_STATE 里还会留着 state==1（正在跑）直到它自己收尾，按
+                    // has_pending 算就永远是「后面还有」，卡片当场被撤、窗口照样塌成 42px
+                    //（2026-11-24 真机复现：ops=1 → ops=0，高度 156 → 42）。
+                    let more_queued = !hfx_receiver::queue::waiting_for(&d.serial).is_empty();
+                    if hfx_receiver::control::cancelled() && !failed && more_queued {
+                        own.clear();
+                    }
                     let mut old_tracks = std::mem::take(&mut d.tracks);
                     let mut next_tracks: Vec<OpTrack> = Vec::with_capacity(own.len());
                     for k in &own {
@@ -3711,6 +3752,32 @@ fn main() -> Result<(), slint::PlatformError> {
                             }
                         }
                     }
+                    // 取消之后卡片上的数字要冻在断开那一刻（原因见 frozen_op 的说明）。
+                    // 没取消就每帧把这张卡记下来 —— 它永远是「最近一张正常卡片」。
+                    let cancelled_now = hfx_receiver::control::cancelled();
+                    if cancelled_now {
+                        if !failed && !d.tracks.is_empty() {
+                            if let Some(mut frozen) = d.frozen_op.clone() {
+                                frozen.done = true;
+                                frozen.flow_on = false;
+                                frozen.paused = false;
+                                // 速率那一栏换成「已取消」：冻住的 5.0 MB/s 看着像还在传，
+                                // 和暂停时把速率位写「已暂停」同一个道理。
+                                // 明细是「已收 / 总量 · 速率」一整条，按最后那个分隔符切开再换尾。
+                                if let Some((head, _)) = frozen.detail_text.rsplit_once(" · ") {
+                                    frozen.detail_text =
+                                        format!("{} · {}", head, i18n::tr("已取消", "cancelled"))
+                                            .into();
+                                }
+                                if !ops_out.is_empty() {
+                                    ops_out[0] = frozen;
+                                    all_finished = ops_out.iter().all(|o| o.waiting || o.done);
+                                }
+                            }
+                        }
+                    } else if let Some(first) = ops_out.first() {
+                        d.frozen_op = Some(first.clone());
+                    }
                     let waiting_ops = waiting.len();
                     if !waiting.is_empty() {
                         let device_name = device_display_name(&s, &d.serial);
@@ -3780,6 +3847,13 @@ fn main() -> Result<(), slint::PlatformError> {
                     }
                     if d.win.get_done() != done_now {
                         d.win.set_done(done_now);
+                    }
+                    // 取消之后块已经撤掉（上面 own.clear()），这里一块不剩 = all_finished。
+                    // 只看 done 的话标题会亮「已完成」—— 用户点的是「中断」，
+                    // 看到「已完成」会以为文件传完了（真机实测亮了 2 秒才收窗口）。
+                    let ended_by_cancel = all_finished && hfx_receiver::control::cancelled();
+                    if d.win.get_ended_by_cancel() != ended_by_cancel {
+                        d.win.set_ended_by_cancel(ended_by_cancel);
                     }
                     // 高度公式要的三个汇总值：Slint 没有「对数组求和」的表达式，
                     // 逐块累加只能在这边算（和 rows / segs 同一个来路）。
@@ -3855,6 +3929,7 @@ fn main() -> Result<(), slint::PlatformError> {
                         // 真传完了用户在干别的，3 秒后照旧自己收起来。
                         if quiet_ms >= 3000 {
                             if d.shown {
+                                log::debug(&format!("窗口收起：{} 空闲 {} ms（已取消={}）", d.serial, quiet_ms, hfx_receiver::control::cancelled()));
                                 d.shown = false;
                                 let placed = d.placed_at();
                                 // 坐标只有「恰好一个窗口」时才记（多窗口是自动往上排的）
@@ -4082,6 +4157,23 @@ fn main() -> Result<(), slint::PlatformError> {
                 // last_row_count 兜底；块数也会变（设备增减），干脆每帧算一遍再比，
                 // 反正只是几次乘法。
                 let details_now = d.details;
+                // 「谁把窗口改小了」的对照日志：Slint 自己会按 preferred-height 重排，
+                // 光看 set_size 那一处并不知道窗口后来被别人改成什么样。
+                {
+                    let scale_now = d.win.window().scale_factor();
+                    let actual_h = d.win.window().size().height as f32 / scale_now;
+                    if (actual_h - d.last_actual_h).abs() > 1.0 {
+                        log::debug(&format!(
+                            "窗口实际高度 {} → {}（ops={} waiting={} rows={}）",
+                            d.last_actual_h,
+                            actual_h,
+                            d.model.row_count(),
+                            d.win.get_waiting_ops(),
+                            d.win.get_total_rows()
+                        ));
+                        d.last_actual_h = actual_h;
+                    }
+                }
                 // 先算完整内容高度，再按屏幕可用高度封顶 —— 内容更高的时候窗口不长高，
                 // 改成窗口里能滚（app.slint 里把整列包进了 Flickable）。
                 // 封顶值和 app.slint 的 cap-h 是同一个算式（screen-h 那条属性也从这里喂）。
@@ -4094,6 +4186,12 @@ fn main() -> Result<(), slint::PlatformError> {
                 )
                 .min(transfer_window_cap(d.win.get_screen_h()));
                 if (want_h - d.last_h).abs() > 0.5 {
+                    log::debug(&format!(
+                        "窗口高度 {} → {}（ops={} waiting={} rows={} failed={} details={}）",
+                        d.last_h, want_h, d.model.row_count(),
+                        d.win.get_waiting_ops(), d.win.get_total_rows(),
+                        d.win.get_failed_ops(), details_now
+                    ));
                     d.last_h = want_h;
                     d.win
                         .window()

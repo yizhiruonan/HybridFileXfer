@@ -92,6 +92,20 @@ pub fn running_for(device: &str) -> Option<QueueItem> {
         .find(|item| item.state == state::RUNNING)
 }
 
+/// 这台设备上还有没有没收场的任务（等待中或正在跑）。
+///
+/// 用处在界面的「这一轮结束了没」：取消之后电脑端要重建传输通道（实测十几秒），
+/// 这段时间 PROGRESS 已经 reset、total = 0，可手机队列里还排着后面的任务 ——
+/// 只按 total 判，窗口会在 3 秒后被自动收起、下一单再弹出来，看着就是消失一下。
+///
+/// 注意不能拿「队列非空」代替：传完之后那些条目还在（改成 state = DONE），
+/// 那样窗口就永远不收起来了。
+pub fn has_pending(device: &str) -> bool {
+    get_for(device)
+        .into_iter()
+        .any(|item| item.state == state::WAITING || item.state == state::RUNNING)
+}
+
 /// 设备断开 / 会话结束时清掉（下次连上手机重新报，留着只会让界面挂着上一轮的等待块）。
 pub fn clear(device: &str) {
     let Ok(mut guard) = QUEUES.lock() else {

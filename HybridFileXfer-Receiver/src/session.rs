@@ -583,16 +583,27 @@ impl Session {
             "开始重建传输通道（已通知手机端取消）",
             "rebuilding the transfer channels",
         ));
-        // 顺序：先关掉旧的传输通道，再告诉手机"这是取消"。
+        // 先把这一轮用过的通道名字记下来（下面 self.transfers 会被整个取空）。
+        let names: Vec<String> = self.transfers.iter().map(|(name, _)| name.clone()).collect();
+        // 旧通道必须**扔掉**，不能只 shutdown：shutdown 只发 FIN，手机端那头照样能
+        // 继续往这条连接里写（FIN 只表示"我不发了"），它要写到自己的发送缓冲满了才
+        // 发现 —— 真机实测这一刻要拖 4~5 秒，手机还在按满速往一条死连接里灌数据，
+        // 用户看到的就是「点了取消，进度条挂着不动，二十秒后才开始下一单」。
+        // 所以先把 SO_LINGER 设成 0（关闭时回 RST 而不是 FIN），再 drop：手机下一次写
+        // 立刻抛 "Connection reset by peer"，发块线程当场退出。
+        // （linger=0 只影响 close 的收尾方式，对正常收发没有副作用。）
         //
-        // 手机端是发送方，它在写满缓冲时会阻塞在 write 里、看不到控制通道；
-        // 关通道（shutdown 会回 RST）是让它立刻停下的唯一手段。先关再发帧，
-        // 手机端就不用「先读到 CANCEL 还得等写失败」。
+        // 先关+发帧、还是先发帧+关？这里保持「先关再发帧」：这一段跑在会话线程上，
+        // 主循环里那条「先写 CANCEL」的快路径通常已经先把帧发出去了（claim_cancel_frame），
+        // 走到这里时多半不用再写。
         // （read_transfer_channel / handle_receive 的等待循环里已经关过一遍，
         //   这里再关一次是幂等的，覆盖"线程已经正常 EOF 退出"的情形。）
-        for (_, stream) in self.transfers.iter() {
+        let old_transfers = std::mem::take(&mut self.transfers);
+        for (_, stream) in old_transfers.iter() {
+            crate::netif::abort(stream);
             let _ = stream.shutdown(std::net::Shutdown::Both);
         }
+        drop(old_transfers);
         // 整个取消过程只写**一帧** CANCEL：它是「重建握手」的开场白，不是可重复的
         // 指令。第二次点「取消 → 保留」会被 control::cancel_receive 的幂等闸门挡掉；
         // 等待循环里通常已经抢先把这一帧写出去了（claim_cancel_frame），这里只是兜底
@@ -620,7 +631,6 @@ impl Session {
             // 「取消 → CANCEL 发出」这段时间又回到十几秒（用户看到的就是进度还在涨）。
             let _ = self.write_control_frame_within(opcode, CANCEL_FRAME_TIMEOUT);
         }
-        let names: Vec<String> = self.transfers.iter().map(|(name, _)| name.clone()).collect();
         if names.is_empty() {
             return Ok(0);
         }
@@ -639,137 +649,206 @@ impl Session {
         let _ = self
             .reader
             .set_read_timeout(Some(Duration::from_millis(200)));
-        let mut rebuilt: Vec<(String, TcpStream)> = Vec::with_capacity(names.len());
-        for name in names {
-            let interface = match self.interfaces.iter().find(|iface| iface.name == name) {
-                Some(interface) => interface.clone(),
-                None => {
-                    log::warn(&format!("rebuild: unknown channel {name}"));
-                    continue;
-                }
-            };
-            // 回环通道走 adb 转发的本地端口，其它网卡走手机监听的端口
-            let port = if interface.address.is_loopback() {
-                self.local_port
-            } else {
-                self.port
-            };
-            let target = SocketAddr::new(interface.address, port);
-            let stream = match crate::netif::connect(target, CONNECT_TIMEOUT, interface.bind) {
-                Ok(stream) => stream,
-                Err(e) => {
-                    log::warn(&format!(
-                        "{} {}: {} — {}",
-                        crate::i18n::tr("重建通道失败", "cannot rebuild channel"),
-                        name,
-                        target,
-                        e
-                    ));
-                    continue;
-                }
-            };
-            let _ = stream.set_nodelay(true);
-            let _ = stream.set_read_timeout(Some(TRANSFER_TIMEOUT));
-            let _ = stream.set_write_timeout(Some(TRANSFER_TIMEOUT));
-            proto::write_i16(&mut self.writer, controller::REBUILD_REQ)?;
-            proto::write_utf(&mut self.writer, &name)?;
-            self.writer.flush()?;
-            loop {
-                // 重建要等 REBUILD_ACK（读超时 45 秒）。这里点了「停止」也得能走开，
-                // 否则 stop_engine 的 join 会把界面卡住这么久。
-                if self.stop_requested() {
-                    return Err(io::Error::new(io::ErrorKind::Interrupted, "stopped"));
-                }
-                if Instant::now() > rebuild_deadline {
-                    return Err(io::Error::new(io::ErrorKind::TimedOut, "rebuild timed out"));
-                }
-                let id = match self.pending_opcode.take() {
-                    Some(id) => id,
+        // 先把「名字 → 目标地址」整批算出来：下面要预连接，握手循环里还要用同一份。
+        let plan: Vec<(String, SocketAddr, Option<IpAddr>)> = names
+            .into_iter()
+            .filter_map(|name| {
+                let interface = match self.interfaces.iter().find(|iface| iface.name == name) {
+                    Some(interface) => interface.clone(),
                     None => {
-                        let mut window = [0u8; 2];
-                        match self.reader.peek(&mut window) {
-                            // 对端把控制通道关了
-                            Ok(0) => {
-                                return Err(io::Error::new(
-                                    io::ErrorKind::UnexpectedEof,
-                                    "control channel closed by peer",
-                                ))
-                            }
-                            // 半个帧头：下一轮再看（此时一个字节都还没读走）
-                            Ok(n) if n < 2 => continue,
-                            Ok(_) => {
-                                let _ = self
-                                    .reader
-                                    .set_read_timeout(Some(Duration::from_secs(45)));
-                                proto::read_i16(&mut self.reader)?
-                            }
-                            // 200ms 没数据：回去再看一眼 stop / deadline
-                            Err(e) if is_timeout(&e) => continue,
-                            Err(e) => return Err(e),
-                        }
+                        log::warn(&format!("rebuild: unknown channel {name}"));
+                        return None;
                     }
                 };
-                match id {
-                    controller::REBUILD_ACK => {
-                        if proto::read_bool(&mut self.reader)? {
-                            log::debug(&format!("rebuild: channel {} is back", name));
-                            rebuilt.push((name.clone(), stream));
-                        } else {
+                // 回环通道走 adb 转发的本地端口，其它网卡走手机监听的端口
+                let port = if interface.address.is_loopback() {
+                    self.local_port
+                } else {
+                    self.port
+                };
+                Some((name, SocketAddr::new(interface.address, port), interface.bind))
+            })
+            .collect();
+        // 预连接：把这一批通道一次全连上，再逐条做握手。
+        //
+        // 手机端每收一条连接要付一个 100ms 的「分类窗口」（它在 accept 线程里串行做，
+        // 靠「连上之后安静不安静」区分控制通道和传输通道），而 connect 本身只要几毫秒。
+        // 以前是「连一条 → 发 REQ → 等 ACK → 连下一条」，那 6 个 100ms 全落在握手窗口里，
+        // 光分类就 0.6 秒；而这些连接早一秒躺进它的 accept 队列是没关系的 ——
+        // 它那边这会儿正忙着等自己的传输线程退出（真机 1 秒左右），分类正好和那段并行。
+        // 握手开始时通道已经在它的待领队列里，一条只要几毫秒。
+        let mut pre: Vec<Option<TcpStream>> = Vec::with_capacity(plan.len());
+        for (name, target, bind) in &plan {
+            let stream = crate::netif::connect(*target, CONNECT_TIMEOUT, *bind).ok();
+            match stream.as_ref() {
+                Some(stream) => {
+                    let _ = stream.set_nodelay(true);
+                    let _ = stream.set_read_timeout(Some(TRANSFER_TIMEOUT));
+                    let _ = stream.set_write_timeout(Some(TRANSFER_TIMEOUT));
+                }
+                None => log::debug(&format!(
+                    "rebuild: 通道 {} 预连接失败，握手时再试一次",
+                    name
+                )),
+            }
+            pre.push(stream);
+        }
+        let mut rebuilt: Vec<(String, TcpStream)> = Vec::with_capacity(plan.len());
+        for (index, (name, target, bind)) in plan.into_iter().enumerate() {
+            let mut prepared = pre[index].take();
+            // 为什么这里要允许「重连一次」：手机端从收到 CANCEL 到真正进入重建握手，
+            // 中间隔着它自己的传输线程退出（真机实测 1~6 秒）。我们这个 socket 要是
+            // 比它早到，就会落在它「还没登记要通道」的空窗里 —— 那边 accept 线程把这种
+            // 安静连接当成上一轮的残留关掉，于是这一条通道永远等不到，手机端白等一个
+            // 读超时（以前 12 秒）才回 REBUILD_ACK false，整条队列就卡在那里不开工。
+            // 重连一次能把这条通道捡回来，代价只有一次 connect。
+            let mut restored: Option<TcpStream> = None;
+            let channel_started = Instant::now();
+            for attempt in 0..2 {
+                // 第一次用预连接好的那条；它没连上或者被手机端拒了，这里再连一条。
+                let stream = match prepared.take() {
+                    Some(stream) => stream,
+                    None => match crate::netif::connect(target, CONNECT_TIMEOUT, bind) {
+                        Ok(stream) => {
+                            let _ = stream.set_nodelay(true);
+                            let _ = stream.set_read_timeout(Some(TRANSFER_TIMEOUT));
+                            let _ = stream.set_write_timeout(Some(TRANSFER_TIMEOUT));
+                            stream
+                        }
+                        Err(e) => {
                             log::warn(&format!(
-                                "{} {}",
-                                crate::i18n::tr("手机端没有收下通道", "the phone refused the channel"),
-                                name
+                                "{} {}: {} — {}",
+                                crate::i18n::tr("重建通道失败", "cannot rebuild channel"),
+                                name,
+                                target,
+                                e
+                            ));
+                            break;
+                        }
+                    },
+                };
+                proto::write_i16(&mut self.writer, controller::REBUILD_REQ)?;
+                proto::write_utf(&mut self.writer, &name)?;
+                self.writer.flush()?;
+                loop {
+                    // 重建要等 REBUILD_ACK（读超时 45 秒）。这里点了「停止」也得能走开，
+                    // 否则 stop_engine 的 join 会把界面卡住这么久。
+                    if self.stop_requested() {
+                        return Err(io::Error::new(io::ErrorKind::Interrupted, "stopped"));
+                    }
+                    if Instant::now() > rebuild_deadline {
+                        return Err(io::Error::new(io::ErrorKind::TimedOut, "rebuild timed out"));
+                    }
+                    let id = match self.pending_opcode.take() {
+                        Some(id) => id,
+                        None => {
+                            let mut window = [0u8; 2];
+                            match self.reader.peek(&mut window) {
+                                // 对端把控制通道关了
+                                Ok(0) => {
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::UnexpectedEof,
+                                        "control channel closed by peer",
+                                    ))
+                                }
+                                // 半个帧头：下一轮再看（此时一个字节都还没读走）
+                                Ok(n) if n < 2 => continue,
+                                Ok(_) => {
+                                    let _ = self
+                                        .reader
+                                        .set_read_timeout(Some(Duration::from_secs(45)));
+                                    proto::read_i16(&mut self.reader)?
+                                }
+                                // 200ms 没数据：回去再看一眼 stop / deadline
+                                Err(e) if is_timeout(&e) => continue,
+                                Err(e) => return Err(e),
+                            }
+                        }
+                    };
+                    match id {
+                        controller::REBUILD_ACK => {
+                            if proto::read_bool(&mut self.reader)? {
+                                log::debug(&format!("rebuild: channel {} is back", name));
+                                restored = Some(stream);
+                            } else {
+                                log::warn(&format!(
+                                    "{} {}",
+                                    crate::i18n::tr("手机端没有收下通道", "the phone refused the channel"),
+                                    name
+                                ));
+                            }
+                            break;
+                        }
+                        controller::RESULT => self.discard_result()?,
+                        // 重建期间手机端照旧会发暂停同步、翻目录、取消：必须当场应答，
+                        // 否则它那边会卡在 controlLock 上等应答（界面的目录请求），
+                        // 重建循环也跟着停摆。以前这里一律 break + 不读载荷，帧流直接错位。
+                        controller::PING
+                        | controller::CANCEL
+                        | controller::CANCEL_DISCARD
+                        | controller::PAUSE_STATE
+                        | controller::SPEED_LIMIT
+                        // 309：队列快照也是「走到哪儿都能吞」的那种 —— 它载荷变长，
+                        // 当 pending 留给主循环会把后面的帧读错位
+                        | controller::QUEUE_STATE
+                        | controller::LIST_FILES
+                        | controller::DELETE_FILE
+                        | controller::MKDIR
+                        | controller::CHECK_PENDING
+                        // 手机端正常断开前会发这一帧：当成断线报上去（不是"意外帧"），
+                        // 否则要干等到 45 秒的 deadline 才失败，界面卡在那儿不动
+                        | controller::SHUTDOWN => self.handle_control_frame(id)?,
+                        // 手机端要开「下一单」（多选排队）。REQUEST_RECEIVE 自己不载荷，
+                        // 真正带载荷的是紧跟其后的一帧 RESUME_QUERY（整份文件清单）。
+                        // 这里只做记号、把帧头吃掉是安全的；清单那一帧由下面那支读干净。
+                        controller::REQUEST_RECEIVE => self.note_pending_receive(),
+                        // 清单来了：载荷当场读完存进 pending_resume（回主循环再回位图）。
+                        // 也可能 REQUEST_RECEIVE 已经落在重建窗口之前，这里补上记号。
+                        controller::RESUME_QUERY => self.stash_resume_query()?,
+                        // 306：反方向的续传状态帧。重建期间没有 handle_send 在读它，
+                        // 也没有能接手它的人 —— 载荷读干净丢掉，绝不能留在流里。
+                        controller::RESUME_STATE => self.discard_resume_state()?,
+                        // 手机来电脑取文件（发送方向的「下一单」）：它的载荷变长，
+                        // 而重建窗口里跑不了 handle_send —— 同样读干净丢掉。
+                        controller::REQUEST_SEND => self.discard_send_request()?,
+                        other => {
+                            // 认不出来的帧：协议里没有"帧长"字段，它有没有载荷、
+                            // 载荷多长都无从得知。但**不能**因此放弃重建 —— 那等于因为
+                            // 手机上多传了一帧就把整条会话拆掉（就是这一轮报的那个 bug）。
+                            // 只吃掉它的 opcode（和主循环遇到不认识指令时一模一样：
+                            // 警告 + 忽略），重建继续等 ACK。
+                            log::warn(&format!(
+                                "{} {}（已忽略，重建继续）",
+                                crate::i18n::tr(
+                                    "重建通道时收到不认识的控制帧",
+                                    "unknown control frame while waiting for REBUILD_ACK",
+                                ),
+                                other
                             ));
                         }
-                        break;
                     }
-                    controller::RESULT => self.discard_result()?,
-                    // 重建期间手机端照旧会发暂停同步、翻目录、取消：必须当场应答，
-                    // 否则它那边会卡在 controlLock 上等应答（界面的目录请求），
-                    // 重建循环也跟着停摆。以前这里一律 break + 不读载荷，帧流直接错位。
-                    controller::PING
-                    | controller::CANCEL
-                    | controller::CANCEL_DISCARD
-                    | controller::PAUSE_STATE
-                    | controller::SPEED_LIMIT
-                    // 309：队列快照也是「走到哪儿都能吞」的那种 —— 它载荷变长，
-                    // 当 pending 留给主循环会把后面的帧读错位
-                    | controller::QUEUE_STATE
-                    | controller::LIST_FILES
-                    | controller::DELETE_FILE
-                    | controller::MKDIR
-                    | controller::CHECK_PENDING
-                    // 手机端正常断开前会发这一帧：当成断线报上去（不是"意外帧"），
-                    // 否则要干等到 45 秒的 deadline 才失败，界面卡在那儿不动
-                    | controller::SHUTDOWN => self.handle_control_frame(id)?,
-                    // 手机端要开「下一单」（多选排队）。REQUEST_RECEIVE 自己不载荷，
-                    // 真正带载荷的是紧跟其后的一帧 RESUME_QUERY（整份文件清单）。
-                    // 这里只做记号、把帧头吃掉是安全的；清单那一帧由下面那支读干净。
-                    controller::REQUEST_RECEIVE => self.note_pending_receive(),
-                    // 清单来了：载荷当场读完存进 pending_resume（回主循环再回位图）。
-                    // 也可能 REQUEST_RECEIVE 已经落在重建窗口之前，这里补上记号。
-                    controller::RESUME_QUERY => self.stash_resume_query()?,
-                    // 306：反方向的续传状态帧。重建期间没有 handle_send 在读它，
-                    // 也没有能接手它的人 —— 载荷读干净丢掉，绝不能留在流里。
-                    controller::RESUME_STATE => self.discard_resume_state()?,
-                    // 手机来电脑取文件（发送方向的「下一单」）：它的载荷变长，
-                    // 而重建窗口里跑不了 handle_send —— 同样读干净丢掉。
-                    controller::REQUEST_SEND => self.discard_send_request()?,
-                    other => {
-                        // 认不出来的帧：协议里没有"帧长"字段，它有没有载荷、
-                        // 载荷多长都无从得知。但**不能**因此放弃重建 —— 那等于因为
-                        // 手机上多传了一帧就把整条会话拆掉（就是这一轮报的那个 bug）。
-                        // 只吃掉它的 opcode（和主循环遇到不认识指令时一模一样：
-                        // 警告 + 忽略），重建继续等 ACK。
-                        log::warn(&format!(
-                            "{} {}（已忽略，重建继续）",
-                            crate::i18n::tr(
-                                "重建通道时收到不认识的控制帧",
-                                "unknown control frame while waiting for REBUILD_ACK",
-                            ),
-                            other
-                        ));
-                    }
+                }
+                if let Some(stream) = restored {
+                    // 每条通道恢复要多久，是「取消之后下一单多久才开跑」里最大的一块。
+                    // 打这一行（debug 级）是为了以后不用再靠猜：真机实测 300~400ms/条，
+                    // 大头是手机端 accept 线程里那 100ms 分类窗口（一次只处理一条连接）。
+                    log::debug(&format!(
+                        "rebuild: channel {} restored in {} ms",
+                        name,
+                        channel_started.elapsed().as_millis()
+                    ));
+                    rebuilt.push((name.clone(), stream));
+                    break;
+                }
+                if attempt == 0 {
+                    log::warn(&format!(
+                        "{} {}",
+                        crate::i18n::tr(
+                            "手机端没能在窗口里收下通道，重连一次",
+                            "the phone did not take the channel in time, retrying once",
+                        ),
+                        name
+                    ));
                 }
             }
         }
@@ -1985,35 +2064,36 @@ impl Session {
                 self.shutdown_transfers();
                 break;
             }
-            // 3.0.0：本地点了「取消」（control::cancel_receive）就立刻把传输通道全关掉。
-            // 手机端是发送方，它写满缓冲就阻塞在 write 里，看不到控制通道；
-            // 把 socket 关掉它的写才会失败、才会自己停下。放在这里而不是只放在
-            // rebuild_transfers：那一步要等所有线程 join + finish_with 写完续传日志，
-            // 中间那几百毫秒到几秒手机一直在发（用户报的"取消后手机还在继续发"）。
+            // 3.0.0：本地点了「取消」（control::cancel_receive）就立刻通知手机端 + 关通道。
+            // 放在这里而不是只放在 rebuild_transfers：那一步要等所有线程 join +
+            // finish_with 写完续传日志，中间那几百毫秒到几秒手机一直在发
+            // （用户报的"取消后手机还在继续发"）。
             if !abort_shutdown && crate::control::cancelled() {
                 abort_shutdown = true;
                 grace_deadline = Some(Instant::now() + CANCEL_JOIN_GRACE);
                 log::warn(crate::i18n::tr(
-                    "取消接收：先关传输通道，再通知手机端（它才能立刻停下）",
-                    "cancel: closing the transfer channels first, then telling the phone",
+                    "取消接收：先通知手机端，再关传输通道",
+                    "cancel: telling the phone first, then closing the transfer channels",
                 ));
-                // 顺序很重要：先关通道，手机端那次阻塞的 write 才会立刻失败；
-                // 它这一下自己就会停，不用等我们后面那帧 CANCEL 走到重建阶段。
-                // shutdown_transfers 只做 shutdown：不 join、不拿锁，所以这一步不会卡；
-                // 「等线程退出」挪到循环外面的 join 段，那里有 grace_deadline 兜着。
-                self.shutdown_transfers();
-                // 立刻把 CANCEL 写出去（别等 join + finish_with + rebuild_transfers）。
-                // 手机端的控制读取线程和发块线程是两个线程，它随时能读到这一帧。
-                // claim_cancel_frame() 保证重建阶段不会再写第二帧。
+                // 顺序：**先写 CANCEL，再关通道**。
+                //
+                // 以前是先关再写，理由是「手机端那次阻塞的 write 失败得越早它停得越早」。
+                // 真机测下来这个理由站不住：shutdown 这一步本身要花将近 1 秒（6 条通道
+                // 上有别的线程正在写，Windows 的 shutdown 得等内核把在途数据收拾掉，
+                // 实测 985 ms），而手机端认取消靠的是控制通道上这一帧 —— 它读到就自己
+                // 把 6 条通道关掉了，根本不依赖我们把 socket 关掉。
+                // 所以先写帧：手机端立刻开始收尾，那 1 秒的 shutdown 就在它收尾的同时跑。
+                // 关通道留着，是给「手机暂停了、没在读控制通道」那种情形兜底。
                 //
                 // 写这一帧**必须有上限**：手机暂停时它不读控制通道，裸 write 会一直顶到
                 // 握手时设的 15 秒写超时才回来 —— 用户在界面上看到的就是「点了取消没反应」。
                 // 写不出去只记一行日志，取消流程照旧往下走（关通道 + 重建）。
+                // claim_cancel_frame() 保证重建阶段不会再写第二帧。
                 if crate::control::claim_cancel_frame() {
                     let started = Instant::now();
                     if self.write_control_frame_within(controller::CANCEL, CANCEL_FRAME_TIMEOUT) {
                         log::warn(&format!(
-                            "{}（{} ms）",
+                            "{}（写信令 {} ms）",
                             crate::i18n::tr(
                                 "已通知手机端取消（CANCEL 帧已发出）",
                                 "the phone has been told about the cancel (CANCEL sent)",
@@ -2027,6 +2107,16 @@ impl Session {
                         ));
                     }
                 }
+                // 最后才关通道（给「手机没读控制通道」兜底）。这一步在真机上要花将近
+                // 1 秒，放在写帧之后，它就和手机端的收尾并行跑了。
+                // 它只做 shutdown：不 join、不拿锁；「等线程退出」挪到循环外面的 join 段，
+                // 那里有 grace_deadline 兜着。
+                let shutdown_started = Instant::now();
+                self.shutdown_transfers();
+                log::debug(&format!(
+                    "取消：关通道用了 {} ms",
+                    shutdown_started.elapsed().as_millis()
+                ));
             }
             for (i, (_, handle)) in handles.iter().enumerate() {
                 if !finished[i] && handle.is_finished() {

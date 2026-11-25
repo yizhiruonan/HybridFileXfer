@@ -5,28 +5,27 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Returns (local "HH:MM:SS", utc "YYYY-MM-DD HH:MM:SS").
 pub fn timestamps() -> (String, String) {
-    let now = SystemTime::now();
-    let secs = now
+    let since_epoch = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO)
-        .as_secs();
-    let utc = format_utc(secs as i64);
+        .unwrap_or(Duration::ZERO);
+    let utc = format_utc(since_epoch.as_secs() as i64, since_epoch.subsec_millis());
     let local = local_hms();
     (local, utc)
 }
 
-fn format_utc(unix_secs: i64) -> String {
+fn format_utc(unix_secs: i64, millis: u32) -> String {
     let days = unix_secs.div_euclid(86_400);
     let rem = unix_secs.rem_euclid(86_400);
     let (y, m, d) = civil_from_days(days);
     format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03} UTC",
         y,
         m,
         d,
         rem / 3600,
         (rem % 3600) / 60,
-        rem % 60
+        rem % 60,
+        millis
     )
 }
 
@@ -66,21 +65,24 @@ fn local_hms() -> String {
 
     let mut st = WinSystemTime::default();
     unsafe { GetLocalTime(&mut st) };
-    format!("{:02}:{:02}:{:02}", st.hour, st.minute, st.second)
+    // 带上毫秒：这一轮排查的是「取消之后到下一单开跑隔了几秒」这种秒级延迟，
+    // 只到秒的日志根本分不清是哪一段慢（用户的体感和日志对不上）。
+    format!("{:02}:{:02}:{:02}.{:03}", st.hour, st.minute, st.second, st.milliseconds)
 }
 
 #[cfg(not(windows))]
 fn local_hms() -> String {
-    let now = SystemTime::now();
-    let secs = now
+    let since_epoch = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO)
-        .as_secs();
+        .unwrap_or(Duration::ZERO);
+    let secs = since_epoch.as_secs();
+    let millis = since_epoch.subsec_millis();
     format!(
-        "{:02}:{:02}:{:02}",
+        "{:02}:{:02}:{:02}.{:03}",
         (secs % 86_400) / 3600,
         (secs % 3600) / 60,
-        secs % 60
+        secs % 60,
+        millis
     )
 }
 

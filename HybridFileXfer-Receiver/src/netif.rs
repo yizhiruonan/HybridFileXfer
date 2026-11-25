@@ -33,6 +33,47 @@ pub fn connect(remote: SocketAddr, timeout: Duration, bind_hint: Option<IpAddr>)
     TcpStream::connect_timeout(&remote, timeout)
 }
 
+/// 取消时用的「立刻断掉」：设 SO_LINGER=0 再关，close 走 RST 而不是 FIN。
+///
+/// 为什么需要它：手机端（发送方）在 write 里阻塞着往这条连接灌数据，它看不见
+/// 控制通道上的 CANCEL。只发 FIN 是关不掉它的 —— FIN 只表示「我不发了」，
+/// 对端照样能继续写，要写到自己的发送缓冲满了才失败（真机实测：PC 端已经取消，
+/// 手机还在按满速往一条死连接里灌 4 秒数据，白占带宽、下一单也开不了）。
+/// 设了 linger=0 之后 close 立刻发 RST，手机下一次写当场收到 reset、发块线程退出。
+///
+/// std 的 `TcpStream::set_linger` 到 1.19 还是 unstable，这里直接走 WinSock。
+pub fn abort(stream: &TcpStream) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawSocket;
+        use windows_sys::Win32::Networking::WinSock::{setsockopt, LINGER, SO_LINGER, SOL_SOCKET};
+        let l = LINGER {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                &l as *const LINGER as *const u8,
+                std::mem::size_of::<LINGER>(),
+            )
+        };
+        unsafe {
+            setsockopt(
+                stream.as_raw_socket() as usize,
+                SOL_SOCKET,
+                SO_LINGER,
+                bytes.as_ptr(),
+                bytes.len() as i32,
+            );
+        }
+    }
+    // 非 Windows 平台没有这个问题（关掉就是关掉），保持原样。
+    #[cfg(not(windows))]
+    {
+        let _ = stream;
+    }
+}
+
 /// 本机所有可以用来直连的 IPv4 地址（跳过回环、隧道网卡、169.254 自动配置地址）
 pub fn local_ipv4() -> Vec<std::net::Ipv4Addr> {
     #[cfg(windows)]
