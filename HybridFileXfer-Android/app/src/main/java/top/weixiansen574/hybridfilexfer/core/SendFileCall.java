@@ -15,6 +15,8 @@ public class SendFileCall implements Callable<Void> {
     private final int channelIndex;
     /** 所属服务：写异常要问它「这次传输是不是已经被对端取消了」 */
     private final HFXService owner;
+    /** 「收工前还有活」这条日志上一次记的时刻（每条通道最多 3 秒一行） */
+    private long endPointWaitLoggedAt;
 
     /**
      * 通道被关掉之后，等「对端取消」标志落位的最长时间。
@@ -120,6 +122,36 @@ public class SendFileCall implements Callable<Void> {
                     }
                     Thread.sleep(2);
                     continue;
+                }
+                // 拿到收工信号 ≠ 没活干了。
+                //
+                // 块是「按段预读」投递的：收尾那一刻自己队列里、公共队列里都还可能压着
+                // 几十块。END_POINT 是最后 add 进来的，正常情况下排在它们后面；但队列被
+                // drainSlowQueues 搬空过、或者块正好在收尾瞬间才投进来，「END_POINT 排在
+                // 有数据的块前面」就会发生 —— 通道一见到它就发 EOF 收工，剩下那些块
+                // 一条通道都不会再发。
+                // 真机踩过：暂停 18 秒后恢复，6 条通道每条只写出 13 块就收工，
+                // 200MB 那单剩下 120 块全留在队列里，收尾比对报「缺 120 块」。
+                if (block == ReadFileCall.END_POINT) {
+                    FileBlock more = null;
+                    if (readFileCall.ownQueueSize(channelIndex) > 0) {
+                        more = readFileCall.pollOwnBlock(channelIndex, 5);
+                    } else if (readFileCall.hasSpecialBlocks()) {
+                        more = readFileCall.pollSpecialBlock();
+                    }
+                    if (more != null && more.fileIndex != -1) {
+                        // 这段会在收尾尾巴上反复命中（每发完一块就来一次），每条通道限流记一行，
+                        // 否则 118 块尾巴就刷 118 行日志，真出问题时反而看不见。
+                        long now = System.currentTimeMillis();
+                        if (now - endPointWaitLoggedAt >= 3000) {
+                            endPointWaitLoggedAt = now;
+                            top.weixiansen574.hybridfilexfer.core.HFXLog.d("收工前还有活 "
+                                    + connection.iName + " 自己队列=" + readFileCall.ownQueueSize(channelIndex)
+                                    + " 公共队列=" + readFileCall.specialSize() + "，先发完再收工");
+                        }
+                        readFileCall.requeueEndPoint(channelIndex);
+                        block = more;
+                    }
                 }
                 fileBlock = block;
                 if (fileBlock.isFile && fileBlock.data != null) {

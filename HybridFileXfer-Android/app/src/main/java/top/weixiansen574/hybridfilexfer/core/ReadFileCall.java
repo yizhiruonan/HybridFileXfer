@@ -368,6 +368,19 @@ public abstract class ReadFileCall implements Callable<Void> {
         return Math.min(60000L, Math.max(STALL_MS, perBlock * 3));
     }
 
+    /**
+     * 刚从暂停里恢复：把所有通道的「最后一次进展」刷到现在。
+     *
+     * <p>理由见上面 awaitResume 处的注释 —— 暂停不是卡死，别让它在恢复瞬间
+     * 把所有通道一起判死。
+     */
+    private void noteResumed() {
+        long now = System.currentTimeMillis();
+        for (int i = 0; i < operateThreadCount; i++) {
+            lastProgressAt[i] = now;
+        }
+    }
+
     /** 这条通道还有没有可能把块发出去（没卡死） */
     private boolean couldSend(int channel) {
         return !isStalledChannel(channel);
@@ -660,6 +673,14 @@ public abstract class ReadFileCall implements Callable<Void> {
                     TransferPause gate = pause();
                     if (gate != null) {
                         gate.awaitResume();
+                        // 暂停这段空档不能算进「多久没进展」。
+                        //
+                        // 卡死判据是「now - lastProgressAt[ch] >= 时限」，暂停期间谁都不动，
+                        // 恢复后 6 条通道会被一起判成卡死：它们的段全被搬进公共队列，
+                        // 随后收尾时那个「最多等 5 秒」的窗口在 5MB/s 下限速下根本排不完
+                        // （真机：暂停 18 秒，118 块被搬进公共队列，最后 120 块没发出去）。
+                        // 恢复了就把基准时间刷新到「现在」，暂停时长一律不计。
+                        noteResumed();
                     }
                     int blockIndex = blockOf == null ? (int) ordinal : blockOf[(int) ordinal];
                     long pos = (long) blockIndex * FileBlock.BLOCK_SIZE;
@@ -737,6 +758,34 @@ public abstract class ReadFileCall implements Callable<Void> {
      */
     public boolean hasSpecialBlocks() {
         return !specialQueue.isEmpty();
+    }
+
+    /** 这条通道自己队列里还压着多少块（收尾自检用） */
+    public int ownQueueSize(int channel) {
+        if (channel < 0 || channel >= operateThreadCount) {
+            return 0;
+        }
+        return queues[channel].size();
+    }
+
+    /** 公共队列里还有多少块（收尾自检用） */
+    public int specialSize() {
+        return specialQueue.size();
+    }
+
+    /**
+     * 把 END_POINT 塞回自己队列的尾部，稍后再说。
+     *
+     * <p>END_POINT 是「收工信号」，但拿到它不等于没活干了：投递是按段预读的，
+     * 收尾时队列里完全可能还压着几十块。真机踩过：暂停 18 秒后恢复，6 条通道
+     * 每条只写出 13 块就收工，200MB 那单剩下 120 块全留在队列里没人发，
+     * 收尾比对直接报「块账本与写盘不一致（缺 120 块）」。
+     */
+    public void requeueEndPoint(int channel) {
+        if (channel < 0 || channel >= operateThreadCount) {
+            return;
+        }
+        queues[channel].add(END_POINT);
     }
 
     /** 这条通道自己那段还没产完，或者抢到了别人的一段尾巴 → 还有活干 */

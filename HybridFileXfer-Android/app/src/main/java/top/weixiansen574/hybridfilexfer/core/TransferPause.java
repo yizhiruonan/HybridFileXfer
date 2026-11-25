@@ -21,6 +21,15 @@ public class TransferPause {
             paused = false;
             lock.notifyAll();
         }
+        // 恢复时把限速的计时窗作废。
+        //
+        // SpeedLimiter 是**累计式**账本：记下「这一轮从开始到现在发了多少字节」，
+        // 再和「本该花掉多少时间」比。暂停期间一个字节都不发，但 elapsed 照样在涨，
+        // 恢复那一刻手上就攒出一笔和暂停时长等额的"免费额度"。
+        // 真机实测：限 5MB/s、200MB 传一半暂停 17.3 秒，恢复后整单只花 23 秒
+        // （平均 8.7MB/s），多出来的正好是 17.3 × 5 ≈ 85MB。
+        // 电脑端对称的位置是 control.rs 的 pause()。
+        SpeedLimiter.resetWindow();
     }
 
     public boolean isPaused() {

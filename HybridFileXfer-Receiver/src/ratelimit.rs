@@ -228,6 +228,28 @@ mod tests {
         assert!(started.elapsed().as_millis() < 50);
     }
 
+    /// 暂停期间不许攒"免费额度"：恢复之后那一次限速必须照常生效。
+    ///
+    /// 真机踩到过（限 5MB/s、200MB 传一半暂停 17 秒，恢复后整单只花 23 秒 =
+    /// 平均 8.7MB/s，多出来正好是 17.3 × 5 ≈ 85MB）。
+    #[test]
+    fn resuming_after_pause_does_not_grant_free_quota() {
+        let _serial = serial();
+        set_limit(1024 * 1024);
+        // 第一块是即时额度，不睡
+        throttle(1024 * 1024);
+        // 暂停 → 恢复：控制层必须把计时窗作废，否则下面那块的 elapsed 里
+        // 会带着这段空闲时间，算出来的债是负的，一个字节都不用睡。
+        crate::control::pause(true);
+        crate::control::pause(false);
+        let started = Instant::now();
+        throttle(1024 * 1024);
+        let took = started.elapsed().as_millis();
+        crate::control::reset();
+        set_limit(0);
+        assert!(took >= 800, "暂停恢复后攒出了免费额度，只花了 {took}ms");
+    }
+
     #[test]
     fn heavy_limit_actually_sleeps() {
         let _serial = serial();

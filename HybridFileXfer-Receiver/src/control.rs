@@ -44,7 +44,20 @@ static CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
 static CANCEL_FRAME_SENT: AtomicBool = AtomicBool::new(false);
 
 pub fn pause(on: bool) {
-    PAUSE_SEND.store(on, Ordering::Relaxed);
+    let was = PAUSE_SEND.swap(on, Ordering::Relaxed);
+    // 恢复时把限速的计时窗作废。
+    //
+    // 限速用的是**累计式**账本（见 ratelimit 模块头）：记下「这一轮从开始到现在发了
+    // 多少字节」，再和「本该花掉多少时间」比。暂停期间一个字节都不发，但 elapsed
+    // 照样在涨 —— 恢复那一刻手上就攒出了一笔和暂停时长等额的"免费额度"。
+    // 真机实测：限 5MB/s、200MB 传到一半暂停 17.3 秒，恢复后整单只花 23 秒
+    // （平均 8.7MB/s），多出来的正好是 17.3 × 5 ≈ 85MB。
+    //
+    // 闸门里那次重置（ratelimit::throttle 睡眠循环里）只覆盖"正欠着债"的情况；
+    // 债已经睡满、然后就暂停的那种，走不到那里。所以在这里再兜一次。
+    if was && !on {
+        crate::ratelimit::reset_window();
+    }
 }
 
 pub fn paused() -> bool {
