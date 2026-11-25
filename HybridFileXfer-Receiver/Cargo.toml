@@ -2,7 +2,7 @@
 # src/bin 下的 tray_win.rs 是模块而不是独立程序
 autobins = false
 name = "hybridfilexfer-receiver"
-version = "1.6.0"
+version = "1.7.0"
 edition = "2021"
 description = "Receiver for HybridFileXfer / 多轨快传, with a GUI"
 
@@ -57,3 +57,23 @@ opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
+
+# 改代码时用的：除了「不做跨 crate 优化」以外，和 release 完全一样。
+#
+# 为什么要它：release 那条 lto=true + codegen-units=1 是给发布包用的，
+# 但每改一行 Rust，链接就得把整个程序重新做一遍全量 LTO —— 实测 141 秒，
+# 其中真正编译本 crate 的只有十几秒，剩下全是链接。调试一个界面细节要等两分半，
+# 一圈真机验证下来一小时就没了。
+#
+# quick 用 opt-level 3（传输路径、SHA-256、CRC 的机器码和发布版一致，测速和
+# 校验结论才能直接信）、关掉 LTO、codegen-units 放到 16：改一个 .rs 从 141 秒
+# 降到 31 秒（什么都没改时 0.7 秒），产物在 target/quick/ 下，不和 release 抢目录。
+#
+# 注意别把 quick 的 exe 复制进 target/release/：cargo 把产物从 deps/ 硬链接到
+# release/ 根目录，原地覆盖会把 deps/ 里那份发布产物一起改掉，之后 cargo 认为它
+# 是 Fresh —— 「重新编译」只要 0.7 秒，打出来却是没做 LTO 的开发版。
+[profile.quick]
+inherits = "release"
+lto = false
+codegen-units = 16
+debug = false
