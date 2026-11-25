@@ -12,6 +12,33 @@ pub static CANCEL_SEND: AtomicBool = AtomicBool::new(false);
 pub static SENDING: AtomicBool = AtomicBool::new(false);
 /// 当前是否正在接收手机推过来的文件（界面据此显示暂停按钮）
 pub static RECEIVING: AtomicBool = AtomicBool::new(false);
+/// 「电脑 → 手机」这一轮点名给了哪台设备（串号）；空 = 没点名（谁先来谁取走）。
+///
+/// 为什么需要它：发送方向的进度只有**全局**那一份 PROGRESS（session.rs 的 mark_sent
+/// 写的就是它，会话层并不知道自己在跟哪台手机说话），于是「另一台手机在拉文件」和
+/// 「这台手机在拉文件」在界面看来一模一样 —— 两台都连着时，只往其中一台投任务，
+/// 另一台的传输窗口也会冒出来显示同一组数字（真机：红米那个窗口亮成「正在传输 0 B」）。
+/// 这里记下目标串号，界面就能把「不是这一轮的主角」的窗口按住不动。
+static SEND_TARGET: std::sync::LazyLock<std::sync::Mutex<Option<String>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+/// 记下这一轮推送的目标设备（None = 没点名，任何一台都可能是主角）
+pub fn set_send_target(serial: Option<&str>) {
+    if let Ok(mut g) = SEND_TARGET.lock() {
+        *g = serial.map(|s| s.to_string());
+    }
+}
+
+/// 这一轮推送是不是点名给了这台设备；没点名时一律返回 true（不知道就别乱挡）
+pub fn send_target_is(serial: &str) -> bool {
+    match SEND_TARGET.lock() {
+        Ok(g) => match g.as_deref() {
+            None => true,
+            Some(t) => t.is_empty() || t == serial,
+        },
+        Err(_) => true,
+    }
+}
 /// 手机端最近一次上报的暂停状态：只有它变了才说明是手机点的暂停，
 /// 这时才把电脑本地的暂停开关同步过去（否则电脑自己点的暂停会被手机的状态覆盖）
 pub static PHONE_PAUSED: AtomicBool = AtomicBool::new(false);
@@ -214,6 +241,9 @@ impl SendingGuard {
 impl Drop for SendingGuard {
     fn drop(&mut self) {
         SENDING.store(false, Ordering::Relaxed);
+        // 这一轮完了就把目标清掉：留着的话下一轮「没点名」的推送会被上一轮的目标挡住，
+        // 主角那台窗口反而不亮。
+        set_send_target(None);
         reset();
     }
 }

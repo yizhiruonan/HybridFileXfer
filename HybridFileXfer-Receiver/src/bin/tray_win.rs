@@ -397,6 +397,16 @@ pub fn window_visible_rect(hwnd: HwndVal) -> Option<WorkArea> {
 /// 这里只处理「长得太高/太靠边被屏幕切掉」这一种情况（真机：明细展开后窗口往下长到
 /// 屏幕外，后 6 行明细根本看不见）。
 pub fn keep_on_screen(hwnd: HwndVal, margin: i32) -> bool {
+    keep_on_screen_up(hwnd, margin, 0)
+}
+
+/// 同 [`keep_on_screen`]，但把「允许的最低边」按多窗口的错开档位往上抬 up 像素。
+///
+/// 多窗口时两个窗口是**错开**摆的（第 i 个往上 i*(高+间距)）。窗口长高之后如果照旧
+/// 拿「工作区底边 - margin」这一条线去收尾，两个窗口会被推到**同一条线**上，错开直接
+/// 被抹平 —— 真机症状：两台手机同时传，两个窗口叠在 1427,820 一模一样的位置。
+/// 所以这里的下边界必须按槽位抬高，已经错开摆好的窗口才会一个像素都不动。
+pub fn keep_on_screen_up(hwnd: HwndVal, margin: i32, up: i32) -> bool {
     let Some((left, top, right, bottom)) = window_visible_rect(hwnd) else {
         return false;
     };
@@ -413,8 +423,8 @@ pub fn keep_on_screen(hwnd: HwndVal, margin: i32) -> bool {
     if right > work_right - margin {
         dx = (work_right - margin) - right;
     }
-    if bottom > work_bottom - margin {
-        dy = (work_bottom - margin) - bottom;
+    if bottom > work_bottom - margin - up {
+        dy = (work_bottom - margin - up) - bottom;
     }
     if left + dx < work_left {
         dx = work_left - left;

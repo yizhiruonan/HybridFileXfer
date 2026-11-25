@@ -52,6 +52,10 @@ pub fn push_with_target(paths: Vec<PathBuf>, target: Option<String>) {
     if target.is_none() && !empty {
         HOLD.store(true, Ordering::Relaxed);
     }
+    // 点名了目标就记进 control：界面靠它分辨「这一轮是谁在收」（见 control::send_target_is）
+    if !empty {
+        crate::control::set_send_target(target.as_deref());
+    }
     if let Ok(mut guard) = PENDING.lock() {
         for path in paths {
             if !guard.iter().any(|item| item.path == path) {
