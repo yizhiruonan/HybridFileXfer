@@ -164,12 +164,6 @@ struct TwWindow {
     anchored: bool,
     /// 已经置顶过（省得每帧都 SetWindowPos）
     pinned: bool,
-    /// 落位时定下的「往上错开多少像素」。
-    ///
-    /// 必须**定一次就不再变**：它按窗口可见高算，而窗口会随队列增长长高 ——
-    /// 每次长高都重算一遍的话，窗口会一级级往上爬（真机：3 单排队时 200 → 314 → 428，
-    /// 最后一个窗口顶到屏幕最上面一栏）。
-    stack_up: i32,
 }
 
 /// 补几次落位（150ms 一帧 → 约 0.9 秒）。之后再动窗口就是抢用户的拖动。
@@ -200,7 +194,8 @@ impl TwWindow {
     ///   * 没拖过 → 贴着工作区右下角（+ 往上错开）。这一步用「量一下现在的可见右下角
     ///     离工作区还差多少、再挪多少」的写法（tray_win::nudge_to_bottom_right_up），
     ///     不去猜标题栏和边框多高，多显示器也是按窗口自己所在那块屏算。
-    fn tick(&mut self, tw: &TransferWindow, suffix: &str, saved: Option<(i32, i32)>, slot: usize) {
+    /// `up` = 这一帧该用的错开量（调用方按「下面那些窗口有多高」算好，见 stack_up_for）。
+    fn tick(&mut self, tw: &TransferWindow, suffix: &str, saved: Option<(i32, i32)>, slot: usize, up: i32) {
         if self.settle == 0 {
             return;
         }
@@ -217,10 +212,8 @@ impl TwWindow {
             }
             return;
         };
-        let up = stack_up_px(hwnd, tw, slot);
+
         if !self.anchored {
-            // 定下落位这一刻的错开量；之后窗口怎么长高都不许再改（见字段说明）。
-            self.stack_up = up;
             if let Some((x, y)) = saved {
                 // 记住的位置：show 之前已经放好了，这里只是再确认一次
                 tw.window().set_position(slint::PhysicalPosition::new(x, y));
@@ -255,23 +248,40 @@ impl TwWindow {
 #[cfg(windows)]
 const TW_STACK_GAP: i32 = 12;
 
-/// 第 slot 个窗口往上错开多少像素。
-///
-/// 按**量出来的可见高**算（不是外框高：外框里还带着 DWM 那圈看不见的缩放边框），
-/// 量不到就用 .slint 里的偏好尺寸估。
-///
-/// tick() 摆位和「窗口长高之后别探出屏幕」两处必须用同一个口径 —— 用两条不同的
-/// 边线收尾，错开就会被抹平（见 keep_on_screen_up 的说明）。
+/// 量不到窗口高时用的估值（一张卡片那种窗口）。
 #[cfg(windows)]
-fn stack_up_px(hwnd: tray_win::HwndVal, tw: &TransferWindow, slot: usize) -> i32 {
-    if slot == 0 {
-        return 0;
+const TW_STACK_H_GUESS: i32 = 195;
+
+/// 第 slot 个窗口往上错开多少像素 = **比它低的那些窗口**的可见高之和 + 每个缝隙。
+///
+/// 这个口径踩过两个坑，都别改回去：
+///
+/// 1. 按**自己**的可见高算（slot *（自己的高 + 缝隙））→ 窗口每长高一次错开量就变大一次，
+///    而收尾时下边界又跟着抬高，于是窗口一级级往上爬：真机 3 单排队实测 200 → 314 → 428，
+///    最后一个顶到屏幕最上沿。
+/// 2. 落位那一刻量一次、之后定死 → 那时候窗口才 42~86 高，窗口后来长到 195 就压住了
+///    上面那台：真机截图里小米那个窗口只露出 86px 标题栏，进度条和暂停/取消按钮全被
+///    红米窗口盖着，看着像「只传了一个」。
+///
+/// 按「下面那些窗口现在有多高」算就没有这两个毛病：自己长高只往上长，下面那台长高
+/// 上面这台才跟着抬高，两边都是确定的量，不会累积。
+///
+/// 量不到（窗口还没建出来）就先按 TW_STACK_H_GUESS 估，下一帧量到了自然就对了。
+#[cfg(windows)]
+fn stack_up_for(wins: &XferWins, keys: &[String], slot: usize) -> i32 {
+    let mut acc = 0;
+    for k in keys.iter().take(slot) {
+        let h = wins
+            .map
+            .get(k)
+            .and_then(|d| tray_win::find_transfer_window_of(&d.suffix))
+            .and_then(|hw| tray_win::window_visible_rect(hw))
+            .map(|(_, t, _, b)| b - t)
+            .filter(|h| *h > 0)
+            .unwrap_or(TW_STACK_H_GUESS);
+        acc += h + TW_STACK_GAP;
     }
-    let h = tray_win::window_visible_rect(hwnd)
-        .map(|(_, t, _, b)| b - t)
-        .filter(|h| *h > 0)
-        .unwrap_or_else(|| transfer_window_px(tw).1);
-    slot as i32 * (h + TW_STACK_GAP)
+    acc
 }
 
 /// 一台设备的独立传输窗口（每台设备一个 OS 窗口，键 = 设备串号）。
@@ -372,25 +382,25 @@ impl DevXferWin {
     }
 
     /// 补一帧「摆位置 + 置顶」（只有窗口刚 show 出来那几帧真的做事，见 TwWindow::tick）
-    fn settle(&mut self, saved: Option<(i32, i32)>, slot: usize) {
+    fn settle(&mut self, saved: Option<(i32, i32)>, slot: usize, up: i32) {
         #[cfg(windows)]
-        self.tw.tick(&self.win, &self.suffix, saved, slot);
+        self.tw.tick(&self.win, &self.suffix, saved, slot, up);
         #[cfg(not(windows))]
-        let _ = (saved, slot);
+        let _ = (saved, slot, up);
     }
 
     /// 把窗口摆到该在的位置再显示，然后补一帧落位。
     ///
     /// 先按估算尺寸摆个大概位置（省得在系统默认位置闪一下），真实边框和尺寸由 settle()
     /// 量出来再吸过去 —— 和改之前那个 show_transfer_window 同一个套路。
-    fn show_at(&mut self, saved: Option<(i32, i32)>, slot: usize) {
+    fn show_at(&mut self, saved: Option<(i32, i32)>, slot: usize, up: i32) {
         #[cfg(windows)]
         {
             let (pw, ph) = transfer_window_px(&self.win);
             // +16 / +40 是边框和标题栏的估算值，只影响这一两帧
             let origin = tray_win::transfer_window_origin(pw + 16, ph + 40, saved);
-            // 第 slot 个窗口往上先错开一段：否则 show 出来那一瞬所有窗口都叠在右下角
-            let up = slot as i32 * (ph + TW_STACK_GAP);
+            // 往上错开一段再 show：否则出来那一瞬所有窗口都叠在右下角闪一下。
+            // 用的是调用方按「下面那些窗口有多高」算好的 up（不是 slot*(自己的高)）。
             let origin = (origin.0, origin.1 - up);
             log::debug(&format!(
                 "预摆位 {}：槽位 {} 估算 {}x{} 错开 {} px → {:?}",
@@ -405,7 +415,7 @@ impl DevXferWin {
         #[cfg(not(windows))]
         let _ = (saved, slot);
         let _ = self.win.show();
-        self.settle(saved, slot);
+        self.settle(saved, slot, up);
     }
 }
 
@@ -3669,6 +3679,12 @@ fn main() -> Result<(), slint::PlatformError> {
                 let single = keys.len() == 1;
                 let saved = if single { s.config.xfer_win_pos } else { None };
                 for (slot, key) in keys.iter().enumerate() {
+                    // 错开量要在取可变借用**之前**算：stack_up_for 要读一遍所有比它低的窗口，
+                    // 那个借用不能和下面的 borrow_mut 撞上。
+                    #[cfg(windows)]
+                    let up_now = stack_up_for(&xfer_wins.borrow(), &keys, slot);
+                    #[cfg(not(windows))]
+                    let up_now = 0;
                     let mut wins_g = xfer_wins.borrow_mut();
                     let Some(d) = wins_g.map.get_mut(key) else { continue };
 
@@ -3682,7 +3698,7 @@ fn main() -> Result<(), slint::PlatformError> {
                         d.re_anchor();
                         // 已经开着的窗口不会再走 show_at 那一套，这里补一帧落位
                         if d.shown {
-                            d.settle(saved, slot);
+                            d.settle(saved, slot, up_now);
                         }
                     }
                     // 让这个窗口的 tracks 和「这台设备的任务」一一对应：还在的原样留着
@@ -3961,10 +3977,10 @@ fn main() -> Result<(), slint::PlatformError> {
                         // 窗口要是已经收起来过（上一轮刚自动收完 / 用户点过收起），重新弹出来。
                         if !d.shown && !d.dismissed {
                             d.shown = true;
-                            d.show_at(saved, slot);
+                            d.show_at(saved, slot, up_now);
                         }
                         if d.shown {
-                            d.settle(saved, slot);
+                            d.settle(saved, slot, up_now);
                         }
                         if d.details {
                             d.details = false;
@@ -4005,10 +4021,10 @@ fn main() -> Result<(), slint::PlatformError> {
                             d.shown = true;
                             // 第一次出现：贴到工作区右下角（多窗口时往上错开；只有单窗口
                             // 才按用户拖过的位置），窗口建出来后再补几帧落位 + 置顶
-                            d.show_at(saved, slot);
+                            d.show_at(saved, slot, up_now);
                         }
                         if d.shown {
-                            d.settle(saved, slot);
+                            d.settle(saved, slot, up_now);
                         }
                     }
                 }
@@ -4064,6 +4080,15 @@ fn main() -> Result<(), slint::PlatformError> {
                 let single = wins_g.map.len() == 1;
                 let slot = wins_g.slot_of(&key);
                 let saved = if single { s.config.xfer_win_pos } else { None };
+                // 错开量按「下面那些窗口有多高」算（这一支里 wins_g 已经借出去了，
+                // 直接把它的不可变重借用传进去，别再 borrow 一次）。
+                #[cfg(windows)]
+                let up_now = {
+                    let order = wins_g.order.clone();
+                    stack_up_for(&wins_g, &order, slot)
+                };
+                #[cfg(not(windows))]
+                let up_now = 0;
                 if let Some(d) = wins_g.map.get_mut(&key) {
                     if !d.win.window().is_visible() && !d.dismissed {
                         let pct = hfx_receiver::receiver::failure_percent().unwrap_or(99);
@@ -4101,7 +4126,7 @@ fn main() -> Result<(), slint::PlatformError> {
                         d.win.set_done(true);
                         d.win.set_failed(true);
                         d.shown = true;
-                        d.show_at(saved, slot);
+                        d.show_at(saved, slot, up_now);
                     }
                 }
             } else {
@@ -4191,7 +4216,10 @@ fn main() -> Result<(), slint::PlatformError> {
                 let g = xfer_wins.borrow();
                 g.order.clone()
             };
-            for (hslot, win_key) in all_keys.into_iter().enumerate() {
+            // 这一帧有窗口改过高度 → 循环结束后把所有窗口重新对一次线
+            let mut layout_dirty = false;
+            for (_hslot, win_key) in all_keys.iter().enumerate() {
+                let win_key = win_key.clone();
                 let mut wins_g = xfer_wins.borrow_mut();
                 let Some(d) = wins_g.map.get_mut(&win_key) else { continue };
                 if !d.win.window().is_visible() {
@@ -4250,39 +4278,69 @@ fn main() -> Result<(), slint::PlatformError> {
                     d.win
                         .window()
                         .set_size(slint::LogicalSize::new(460.0, want_h));
-                    // 长高之后可能探出屏幕下沿（真机：明细一展开，后 6 行跑到屏幕外），
-                    // 这里只做「越界才推回来」，不抢用户拖过的位置。
-                    //
-                    // 下边界必须按**自己这个槽位**抬高：多窗口时两个窗口是错开摆的，
-                    // 用同一条边线收尾会把它们推到同一处（真机：两台同时传，两个窗口叠在
-                    // 1427,820 一模一样的位置，上面那个完全看不见）。
-                    #[cfg(windows)]
-                    if let Some(hwnd) = tray_win::find_transfer_window_of(&d.suffix) {
-                        // 用户自己拖走的窗口不按槽位收尾：那条线他只是路过，不是他要的位置。
-                        // 判据沿用 save_transfer_pos 那一套（当前位置 ≠ 我们摆的位置 = 他拖过）。
-                        let dragged = matches!((d.tw.placed_at, tray_win::window_position(hwnd)),
-                            (Some(a), Some(b)) if a != b);
-                        // 错开量用**落位那一刻定下的那个**，不是按现在的窗口高重算 ——
-                        // 重算会让窗口每长高一次就往上爬一格（真机：200 → 314 → 428，顶到屏幕最上沿）。
-                        let up = if dragged { 0 } else { d.tw.stack_up };
-                        let before = tray_win::window_position(hwnd);
-                        if tray_win::keep_on_screen_up(hwnd, TW_MARGIN, up) {
-                            let after = tray_win::window_position(hwnd);
-                            if before != after {
-                                log::debug(&format!(
-                                    "长高后收尾 {}：槽位 {} 错开 {} px（拖过={}），{:?} → {:?}",
-                                    d.suffix, hslot, up, dragged, before, after
-                                ));
-                            }
-                            // 收尾把窗口挪了：我们摆的位置要跟着更新，否则下一帧会把它
-                            // 当成「用户拖过」，错开从此失效。
-                            if let Some(after) = after {
-                                d.tw.placed_at = Some(after);
-                            }
-                        }
+                    // 长高之后要重新摆一次，但**不能在这一格里做**：底下的窗口长高时，
+                    // 上面那台的底边也得跟着抬，而它这一帧的高度根本没变、压根不进这个 if
+                    // （真机截图：红米长到 195，把上面的小米压得只剩 86px 标题栏）。
+                    // 所以这里只记个标记，循环结束后统一重排 —— 见下面「摆位重排」。
+                    layout_dirty = true;
+                }
+            }
+
+            // ---- 摆位重排：任何一个窗口的高度变过，就把**所有**窗口重新对一次线 ----
+            //
+            // 为什么必须全体重排：窗口是从下往上叠的，下面那台长高之后，上面那台的底边
+            // 也得跟着抬，否则就被压住（真机截图：红米长到 195，把上面的小米压得只剩
+            // 86px 标题栏，进度条和暂停/取消按钮全被盖着，看着像只传了一个）。
+            // 而高度没变的那台根本不会进上面那个 if，所以只能在这里统一做。
+            //
+            // 对线用 nudge_to_bottom_right_up（把可见下边对到「工作区底边 - margin - 错开量」），
+            // **上下都会走**。只用 keep_on_screen 那种「越界才推回来」不行：窗口长矮了
+            // 永远不回位，一次一次往上爬，最后贴着屏幕顶。
+            #[cfg(windows)]
+            if layout_dirty {
+                let keys_now: Vec<String> = {
+                    let g = xfer_wins.borrow();
+                    g.order.clone()
+                };
+                // 错开量先一次算齐：算的时候要读所有窗口的高度，不能一边拿可变借用一边读
+                let ups: Vec<i32> = {
+                    let g = xfer_wins.borrow();
+                    (0..keys_now.len())
+                        .map(|i| stack_up_for(&g, &keys_now, i))
+                        .collect()
+                };
+                for (i, k) in keys_now.iter().enumerate() {
+                    let mut g = xfer_wins.borrow_mut();
+                    let Some(d) = g.map.get_mut(k) else { continue };
+                    if !d.win.window().is_visible() {
+                        continue;
+                    }
+                    let Some(hwnd) = tray_win::find_transfer_window_of(&d.suffix) else {
+                        continue;
+                    };
+                    let before = tray_win::window_position(hwnd);
+                    // 用户自己拖走的窗口不按槽位对线：那条线他只是路过，不是他要的位置。
+                    // 判据沿用 save_transfer_pos 那一套（当前位置 ≠ 我们摆的位置 = 他拖过）。
+                    let dragged = matches!((d.tw.placed_at, before), (Some(a), Some(b)) if a != b);
+                    if dragged {
+                        // 拖过的只保证别被屏幕切掉
+                        tray_win::keep_on_screen_up(hwnd, TW_MARGIN, 0);
+                    } else {
+                        tray_win::nudge_to_bottom_right_up(hwnd, TW_MARGIN, ups[i]);
+                    }
+                    let after = tray_win::window_position(hwnd);
+                    if before != after {
+                        log::debug(&format!(
+                            "重排 {}：槽位 {} 错开 {} px（拖过={}），{:?} → {:?}",
+                            d.suffix, i, ups[i], dragged, before, after
+                        ));
+                        // 我们摆的位置跟着更新，否则下一帧会把它当成「用户拖过」
+                        d.tw.placed_at = after;
                     }
                 }
             }
+            #[cfg(not(windows))]
+            let _ = layout_dirty;
 
             // 更新提示 / 设备列表出现时调整窗口高度（否则底部按钮会被裁掉）
             // 进度卡已经从主界面删掉了（进度只在独立传输窗口里看），所以这里不再为它让高度。
