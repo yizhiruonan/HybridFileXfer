@@ -193,7 +193,7 @@ pub fn write_i64<W: Write>(w: &mut W, v: i64) -> io::Result<()> {
 }
 
 pub fn write_utf<W: Write>(w: &mut W, s: &str) -> io::Result<()> {
-    let bytes = encode_modified_utf8(s);
+    let bytes = encode_utf(s);
     if bytes.len() > u16::MAX as usize {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -242,38 +242,32 @@ pub fn read_utf<R: Read>(r: &mut R) -> io::Result<String> {
     }
     let mut bytes = vec![0u8; len as usize];
     r.read_exact(&mut bytes)?;
-    Ok(decode_modified_utf8(&bytes))
+    Ok(decode_utf_lenient(&bytes))
 }
 
-/// Encode a Rust string exactly like Java's `DataOutput::writeUTF`.
-pub fn encode_modified_utf8(s: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(s.len() + 2);
-    for unit in s.encode_utf16() {
-        let cp = unit as u32;
-        match cp {
-            0 => {
-                out.push(0xC0);
-                out.push(0x80);
-            }
-            1..=0x7F => out.push(cp as u8),
-            0x80..=0x7FF => {
-                out.push(0xC0 | (cp >> 6) as u8);
-                out.push(0x80 | (cp & 0x3F) as u8);
-            }
-            _ => {
-                // BMP code point, including lone surrogates (CESU-8 style).
-                out.push(0xE0 | (cp >> 12) as u8);
-                out.push(0x80 | ((cp >> 6) & 0x3F) as u8);
-                out.push(0x80 | (cp & 0x3F) as u8);
-            }
-        }
-    }
-    out
+/// 写字符串：u16 大端字节长度 + **标准 UTF-8**。
+///
+/// 为什么不是 Java 的 writeUTF（修改版 UTF-8）：手机端读字符串走的是
+/// DataByteChannel.readUTF，内部就是 `new String(bytes, StandardCharsets.UTF_8)`，
+/// 按标准 UTF-8 解。修改版 UTF-8 会把 U+1F680 这类星平面字符拆成两个 3 字节代理
+/// （ED A0 BD ED B8 80），标准解码器看到这一段只会吐出 6 个 U+FFFD。
+/// 真机症状（2026-11-26 实测）：日志里 `报告 50% ������.bin: 系统找不到指定的文件。`、
+/// 推送 0 B、文件永远到不了手机。BMP 字符（含全部中文）两种编码完全一致，
+/// 所以只有 emoji 这类星平面字符会踩到 —— 也正因为这样，以前一直没人发现。
+///
+/// 读的时候仍然两种都收（见 [`decode_utf_lenient`]）：手机端有一处 —— 队列快照 ——
+/// 是用真正的 DataOutputStream.writeUTF 拼的整帧，那是修改版 UTF-8。
+pub fn encode_utf(s: &str) -> Vec<u8> {
+    s.as_bytes().to_vec()
 }
 
-/// Decode modified UTF-8 (CESU-8) produced by Java, also tolerating standard
-/// UTF-8 4-byte sequences.
-pub fn decode_modified_utf8(bytes: &[u8]) -> String {
+/// 读字符串：标准 UTF-8 和 Java 修改版 UTF-8（CESU-8）都收。
+///
+/// 手机上绝大多数字符串是标准 UTF-8；只有队列快照那一帧是真正的
+/// DataOutputStream.writeUTF —— 星平面字符在那里会变成两个 3 字节代理，
+/// 所以这里按 UTF-16 码元收，最后统一 from_utf16_lossy 让代理对拼回一个字符。
+/// 标准 UTF-8 的 4 字节序列（0xF0..）也照收。
+pub fn decode_utf_lenient(bytes: &[u8]) -> String {
     let mut units: Vec<u16> = Vec::with_capacity(bytes.len());
     let mut i = 0usize;
     while i < bytes.len() {
@@ -342,31 +336,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn modified_utf8_matches_java() {
-        assert_eq!(encode_modified_utf8("abc"), vec![0x61, 0x62, 0x63]);
-        assert_eq!(
-            encode_modified_utf8("测试"),
-            vec![0xE6, 0xB5, 0x8B, 0xE8, 0xAF, 0x95]
-        );
-        // Java encodes U+1F600 as the surrogate pair D83D DE00 -> two 3 byte groups.
-        assert_eq!(
-            encode_modified_utf8("😀"),
-            vec![0xED, 0xA0, 0xBD, 0xED, 0xB8, 0x80]
-        );
-        assert_eq!(encode_modified_utf8("a\0b"), vec![0x61, 0xC0, 0x80, 0x62]);
+    fn utf_is_standard_utf8() {
+        assert_eq!(encode_utf("abc"), vec![0x61, 0x62, 0x63]);
+        assert_eq!(encode_utf("测试"), vec![0xE6, 0xB5, 0x8B, 0xE8, 0xAF, 0x95]);
+        // 星平面字符必须是 4 字节标准 UTF-8。写成 CESU-8（ED A0 BD ED B8 80）的话，
+        // 手机端 new String(bytes, UTF_8) 会解出 6 个 U+FFFD —— 就是真机上那条
+        // 「报告 50% ������.bin: 系统找不到指定的文件」。
+        assert_eq!(encode_utf("😀"), vec![0xF0, 0x9F, 0x98, 0x80]);
+        assert_eq!(encode_utf("a\0b"), vec![0x61, 0x00, 0x62]);
     }
 
     #[test]
-    fn modified_utf8_round_trip() {
-        for s in ["", "hello", "中文/路径", "😀 emoji", "a\0b", "ümlaut"] {
-            let bytes = encode_modified_utf8(s);
-            assert_eq!(decode_modified_utf8(&bytes), s, "round trip for {:?}", s);
+    fn utf_round_trip() {
+        for s in ["", "hello", "中文/路径", "😀 emoji", "报告 50% 🚀.bin", "a\0b", "ümlaut"] {
+            let bytes = encode_utf(s);
+            assert_eq!(decode_utf_lenient(&bytes), s, "round trip for {:?}", s);
         }
         // Cross-check a Java style UTF length prefix.
         let mut buf = Vec::new();
         write_utf(&mut buf, "文件").unwrap();
         assert_eq!(&buf[..2], &[0, 6]);
         assert_eq!(read_utf(&mut buf.as_slice()).unwrap(), "文件");
+    }
+
+    /// 手机端那一帧队列快照是真正的 DataOutputStream.writeUTF（修改版 UTF-8），
+    /// 星平面字符在里面是两个 3 字节代理 —— 读进来必须还能还原成一个字符。
+    #[test]
+    fn cesu8_from_java_still_reads() {
+        let cesu = [0xED, 0xA0, 0xBD, 0xED, 0xB8, 0x80];
+        assert_eq!(decode_utf_lenient(&cesu), "😀");
+        let mut buf = Vec::new();
+        write_i16(&mut buf, cesu.len() as i16).unwrap();
+        buf.extend_from_slice(&cesu);
+        assert_eq!(read_utf(&mut buf.as_slice()).unwrap(), "😀");
     }
 
     #[test]
