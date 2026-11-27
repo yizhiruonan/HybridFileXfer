@@ -68,6 +68,7 @@ import top.weixiansen574.hybridfilexfer.Config
 import top.weixiansen574.hybridfilexfer.NetInterfaceInfo
 import top.weixiansen574.hybridfilexfer.NetInterfaces
 import top.weixiansen574.hybridfilexfer.R
+import top.weixiansen574.hybridfilexfer.SendTasks
 import top.weixiansen574.hybridfilexfer.ServerService
 import top.weixiansen574.hybridfilexfer.ShareActivity
 import top.yukonga.miuix.kmp.basic.Button
@@ -472,6 +473,9 @@ fun HfxApp(
             emptyList()
         }
         var lastFullRead = 0L
+        // 网卡集合变了但当时正在传文件：这一轮不能重开监听（会把传输掐断），
+        // 记一个"欠着的重开"，等这一单结束后的下一圈再补（见下面 changed 那段）。
+        var interfaceRefreshPending = false
         while (true) {
             // 用户点了常驻通知回到应用 → 重新弹出接收进度窗口
             if (ServerService.consumeShowTransfer()) {
@@ -528,13 +532,41 @@ fun HfxApp(
                 }
                 if (changed) {
                     interfaces = fresh
-                    // 服务在跑但还没连上电脑时，用新网卡列表重启会话。
-                    // 否则会残留上一轮的网卡（比如 WiFi 重连后名字从 wlan0 变成 wlan1，旧通道还在）。
-                    if (ServerService.isRunning() && !ServerService.isConnected()) {
-                        try {
-                            ServerService.restartSession(activity)
-                        } catch (_: Exception) {
-                        }
+                    // 网卡列表变了要让服务按**新列表**重开监听，否则上一轮的网卡会残留
+                    // （WiFi 重连后名字从 wlan0 变 wlan1、或者某张网卡整个消失，旧通道还在，
+                    //  电脑端看着「6 条通道」实际只有一两条能用 —— 用户必须 force-stop 才好）。
+                    //
+                    // 注意不能再用 restartSession：它只带 EXTRA_FRESH、**不带网卡列表**，
+                    // onStartCommand 在 requested 为空时什么都不做，通道集合根本不会重算。
+                    // 真正的重算只有 startServer(带列表) 那一跳；用户勾选变化（toggleInterface）
+                    // 用的也是它。服务端自己还有一套 ConnectivityManager 回调兜底，
+                    // 这里这圈轮询是它不可用时的备份，两条路都指向同一个 startServer。
+                    //
+                    // 但**传输中绝不能这么干**：startServer 最终会走到 begin() → stopLoop(true)
+                    // → disconnectAll()，正在跑的这一单当场被掐断。而这段代码在看的是
+                    // 「手机 → 电脑」的分享发送（SendTasks），那条路上 xferActive 一直是 false
+                    // （它来自 currentTransfer()/LIVE，只有「电脑 → 手机」推送才会置位），
+                    // 所以上面那个 if (state.xferActive) 的保护在这里根本不起作用。
+                    //
+                    // 服务端自己的 ConnectivityManager 回调有 isBusy() 保护，这条路漏了，
+                    // 两条路的口径必须一致：忙的时候不重开，等这轮结束再补。
+                    //
+                    // 注意不能只是"跳过"：interfaces 已经更新成新列表了，下一圈的 changed
+                    // 就是 false，这次重开会永远丢 —— 用户看到的还是「蓝牙通道要重开 App 才有」。
+                    // 所以忙的时候留一个 pending，由下面那段在传输结束后补做。
+                    interfaceRefreshPending = true
+                }
+                if (interfaceRefreshPending && ServerService.isRunning()
+                    && !ServerService.isBusy() && !SendTasks.isBusy()
+                ) {
+                    interfaceRefreshPending = false
+                    try {
+                        val config = Config.getInstance(activity)
+                        ServerService.startServer(
+                            activity, config.mode, NetInterfaces.forAutoConnect(activity),
+                            config.getLocalBufferCount(), config.getRemoteBufferCount(),
+                        )
+                    } catch (_: Exception) {
                     }
                 }
             }
@@ -701,10 +733,9 @@ fun HfxApp(
                         // 于是主页一直显示「8 条通道（2 条不通）」——那 2 条根本不存在。
                         plannedChannels = interfaces
                             .filter { it.enabled }
-                            .sumOf {
-                                val n = it.name.lowercase()
-                                if (n.startsWith("wlan") || n.startsWith("wifi") || n.startsWith("eth")) 4 else 2
-                            },
+                            // 同一个函数算，口径不会再和 ServerService 跑偏
+                            // （设置里「每张网卡几条通道」改了两边一起变）
+                            .sumOf { ServerService.channelsPerInterface(activity, it.name) },
                         onStart = ::startServer,
                         onStop = {
                             if (serviceBusy == 0) {
@@ -962,6 +993,8 @@ private fun ConnectionsPage(
 ) {
     val usb = interfaces.filter { it.name.startsWith("USB_ADB") }
     val wlan = interfaces.filter { !it.name.startsWith("USB_ADB") }
+    // 每张网卡开几条通道要以设置为准，和 ServerService.startServer 用同一个函数
+    val context = LocalContext.current
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
         contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 96.dp),
@@ -1016,11 +1049,8 @@ private fun ConnectionsPage(
                                 title = top.weixiansen574.hybridfilexfer.NetInterfaces.label(iface.name),
                                 summary = iface.address.hostAddress + "   " + iface.name,
                             )
-                            // 和 ServerService.startServer 的分通道数保持一致：
-                            // Wi-Fi 链路能压满，开 4 条；USB 数据线受 adb 限制、蓝牙共享网络只有几 Mbps，2 条足够
-                            val lower = iface.name.lowercase()
-                            val channelCount =
-                                if (lower.contains("wlan") || lower.contains("wifi")) 4 else 2
+                            // 和 ServerService.startServer 的分通道数保持一致（同一个函数，设置改了两边一起变）
+                            val channelCount = ServerService.channelsPerInterface(context, iface.name)
                             for (index in 1..channelCount) {
                                 val channel = if (index == 1) iface.name else iface.name + "#" + index
                                 SwitchPreference(

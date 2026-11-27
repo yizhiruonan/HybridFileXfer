@@ -162,6 +162,18 @@ public final class SendTasks {
         return list;
     }
 
+    /**
+     * 有发送任务还没收尾吗（在传的 / 排队的 / 准备中的都算）。
+     *
+     * <p>给「网卡变化后要不要重开监听」这类操作做前置判断用：手机 → 电脑的分享发送
+     * 走的是这里（{@code SendTasks}），而不是 {@code HFXServer} 的服务端会话，
+     * 所以 {@code ServerService.isBusy()} 在这个方向上永远是 false —— 只看它会让
+     * 「正在发送时网卡列表变了 → 重开监听 → 把这一单掐断」漏过去。
+     */
+    public static boolean isBusy() {
+        return anyLive();
+    }
+
     /** 队列里还有没收尾的任务吗（在传的 / 排队的 / 准备中的都算） */
     private static boolean anyLive() {
         for (SendTask task : TASKS.values()) {

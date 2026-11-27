@@ -90,7 +90,39 @@ public final class NetInterfaces {
         return ifName;
     }
 
-    /** 数据线插着吗（USB 供电）；查不到时按插着处理，保持旧行为 */
+    /**
+     * 有没有一条<b>能跑数据</b>的 USB 线（不是「有没有外部电源」）。
+     *
+     * <p>真机踩过：插墙充（AC）时这里也回 true（旧判据里带着 {@code BATTERY_PLUGGED_AC}），
+     * 于是 {@link #enumerate} 凭空多列一条 {@code USB_ADB} —— 界面通道数虚高（12 条显示 13 条），
+     * 那条通道万一被派了数据还会白连一次、失败后重试（用户看到的就是「有一条通道连不上」）。
+     *
+     * <p>判据分两层：
+     * <ol>
+     *   <li><b>必须走 USB 口供电</b>（{@code BATTERY_PLUGGED_USB}）：墙充走 AC、无线充电走
+     *       WIRELESS，这两种都<b>不可能</b>有数据线，一律不报 USB_ADB；</li>
+     *   <li><b>这条 USB 链路要真的被主机配置起来</b>（gadget 的 UDC 状态 = configured/suspended）。
+     *       只看供电分不清「插电脑」和「插充电宝」—— 不少充电宝报的也是 USB 供电，而 USB_ADB
+     *       通道靠 adb 转发，只有设备被电脑枚举之后才通。</li>
+     * </ol>
+     *
+     * <p><b>{@code suspended} 为什么也算已连接</b>：宿主（电脑）睡眠 / 忙到不发 SOF 时，
+     * UDC 状态就是 suspended —— 线还插着、电脑一醒就能通。这时候照旧报 USB_ADB 是<b>有意的</b>：
+     * 电脑睡着的那段时间这条通道本来就连不上（跟电脑卡死分不开），代价是一次重连；
+     * 而不报要等到「重新枚举」才回来，用户唤醒电脑后可能就一直少这条最快的通道。
+     * 充电器不会走到 {@code suspended}（没枚举过），所以不会因此多报。
+     *
+     * <p><b>读不到系统节点怎么办</b>：第 1 层（AC / 无线充电 → 不报）不依赖任何系统节点，
+     * 所以「插墙充多一条 USB 通道」这个 bug 在老内核、SELinux 严格的机型上照样修好；
+     * 会退化的只有第 2 层（插充电宝那种「USB 供电但不是主机」），此时以
+     * {@code BATTERY_PLUGGED_USB} 的结果为准 —— 也就是当作有数据线。
+     * <b>绝不在这里回 false</b>：那会把真插着数据线的用户最快的那条通道判掉
+     * （老 gadget / sysfs 被收紧的机型上一半速度就没了），代价比多一条连不上的通道大得多。
+     *
+     * <p>第 2 层读的是 {@code /sys/class/udc}（configfs gadget，内核 3.10+ / Android 6+ 基本都有）。
+     * 老 gadget（{@code android_usb}）没有这个节点、个别厂商把 sysfs 收紧了，都只会「读不到」，
+     * 不会误判成「没插」。真插数据线时行为不变。
+     */
     private static boolean usbCablePresent(Context context) {
         try {
             android.content.Intent intent = context.registerReceiver(null,
@@ -99,10 +131,75 @@ public final class NetInterfaces {
                 return true;
             }
             int plugged = intent.getIntExtra(android.os.BatteryManager.EXTRA_PLUGGED, 0);
-            return plugged == android.os.BatteryManager.BATTERY_PLUGGED_USB
-                    || plugged == android.os.BatteryManager.BATTERY_PLUGGED_AC;
+            // 不是 USB 口供电 = 墙充 / 无线充电 / 没插：都不可能是数据线
+            if (plugged != android.os.BatteryManager.BATTERY_PLUGGED_USB) {
+                return false;
+            }
+            Boolean configured = usbLinkConfigured();
+            return configured == null || configured;
         } catch (Throwable e) {
             return true;
+        }
+    }
+
+    /**
+     * USB 设备模式这条链路是不是已经被主机配置起来了（= 真数据线）。
+     *
+     * <p>读 USB gadget 的 UDC 状态（{@code /sys/class/udc/<控制器>/state}）：{@code configured}
+     * 表示电脑已经把设备配置好（adb 转发就是这时候才通），{@code suspended} 是主机省电挂起
+     * （线还连着，随时能通）；其余 {@code not attached} / {@code powered} / {@code default}
+     * 只是在供电或者刚接触。
+     *
+     * <p>多个控制器时要看<b>全部</b>：任一报 configured/suspended 就算真数据线。只看第一条不行 ——
+     * 多控制器机型（dwc3 + 厂商自定义 UDC 之类）上第一条恰好 not attached、第二条才是真链路时，
+     * 会把真插着的数据线判掉，正好违反调用方「绝不误判成没插」的约定。
+     *
+     * @return null = 一个控制器都读不到（老内核 / 权限被挡），调用方按旧行为处理
+     */
+    private static Boolean usbLinkConfigured() {
+        boolean readAny = false;
+        try {
+            java.io.File udcDir = new java.io.File("/sys/class/udc");
+            String[] controllers = udcDir.list();
+            if (controllers == null || controllers.length == 0) {
+                return null;
+            }
+            for (String controller : controllers) {
+                String state = firstLine(new java.io.File(new java.io.File(udcDir, controller), "state"));
+                if (state == null) {
+                    continue;
+                }
+                state = state.trim().toLowerCase(java.util.Locale.US);
+                if (state.isEmpty()) {
+                    continue;
+                }
+                readAny = true;
+                if ("configured".equals(state) || "suspended".equals(state)) {
+                    return Boolean.TRUE;
+                }
+            }
+        } catch (Throwable ignored) {
+            // 读不到就当不知道，交给调用方按旧行为处理
+        }
+        // 读到了、但每一条都不是「已配置/挂起」→ 确实只是供电（插充电宝）
+        return readAny ? Boolean.FALSE : null;
+    }
+
+    /** 读文件第一行；读不到返回 null */
+    private static String firstLine(java.io.File file) {
+        java.io.BufferedReader reader = null;
+        try {
+            reader = new java.io.BufferedReader(new java.io.FileReader(file));
+            return reader.readLine();
+        } catch (Throwable e) {
+            return null;
+        } finally {
+            if (reader != null) {
+                try {
+                    reader.close();
+                } catch (Throwable ignored) {
+                }
+            }
         }
     }
 

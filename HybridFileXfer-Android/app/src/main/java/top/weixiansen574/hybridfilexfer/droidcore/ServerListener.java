@@ -41,6 +41,17 @@ public class ServerListener implements AutoCloseable {
      * 电脑端会自己重连）。
      */
     private static final int CLASSIFY_WINDOW_MS = 100;
+    /**
+     * 协议头已经开始到达之后，最多再等多久读齐剩下的字节。
+     *
+     * <p>协议头一共就 4 个字节（"HFXC"），正常连接是毫秒级到齐的。但「有没有说话」
+     * 和「说完了没有」是两件事：电脑端连着写「协议头 + 版本号」两次，中间隔着几个系统
+     * 调用；这条 TCP 又可能经 adb forward / 蓝牙 / USB 网络共享中转。系统一忙
+     * （Wi-Fi 正在切换、刚断线重连那一两秒），4 字节完全可能拆成两段、隔几十毫秒才到齐。
+     */
+    private static final int HEADER_COMPLETE_MS = 2000;
+    /** 读到一半之后，连续这么久没有新字节，才认定这条连接坏了 */
+    private static final int HEADER_STALL_MS = 500;
     private static final int ACCEPT_POLL_MS = 20;
     /** 暂存的控制通道上限：超出说明有人在反复重连，直接关掉避免堆积 */
     private static final int MAX_STASHED = 8;
@@ -337,11 +348,31 @@ public class ServerListener implements AutoCloseable {
      */
     private int classify(SocketChannel socket) throws IOException {
         headerBuffer.clear();
-        long deadline = System.currentTimeMillis() + CLASSIFY_WINDOW_MS;
+        long start = System.currentTimeMillis();
+        // 「一字节都没来」只有 100ms；「已经来了但没读齐」另给一段。
+        // 这两件事必须分开计时 —— 以前共用一个 100ms 的 deadline，于是
+        // 「头读到了 1~3 个字节、剩下几个字节晚了几十毫秒」会被判成 KIND_INVALID，
+        // 这条明明正常的控制通道被 closeQuietly 掉，电脑端在读「版本是否匹配」那一步
+        // 直接读到 EOF，报 failed to fill whole buffer，然后每 10 秒重试一次、
+        // 全部失败，用户只能去手机上 force-stop 应用才能连回来（实测日志里连续 4 次）。
+        long quietDeadline = start + CLASSIFY_WINDOW_MS;
+        long headerDeadline = start + HEADER_COMPLETE_MS;
+        long lastRead = start;
         boolean closed = false;
         socket.configureBlocking(false);
         try {
-            while (headerBuffer.position() < 4 && System.currentTimeMillis() < deadline) {
+            while (headerBuffer.position() < 4) {
+                long now = System.currentTimeMillis();
+                if (headerBuffer.position() == 0) {
+                    if (now >= quietDeadline) {
+                        break;
+                    }
+                } else {
+                    // 已经开始说话了：只要还在陆续到达就一直等，最多 HEADER_COMPLETE_MS
+                    if (now >= headerDeadline || now - lastRead >= HEADER_STALL_MS) {
+                        break;
+                    }
+                }
                 int read;
                 try {
                     read = socket.read(headerBuffer);
@@ -359,6 +390,8 @@ public class ServerListener implements AutoCloseable {
                         Thread.currentThread().interrupt();
                         throw new IOException("interrupted while classifying", e);
                     }
+                } else {
+                    lastRead = System.currentTimeMillis();
                 }
             }
         } finally {
@@ -374,7 +407,12 @@ public class ServerListener implements AutoCloseable {
         if (closed) {
             return KIND_CLOSED;
         }
-        return headerBuffer.position() == 0 ? KIND_TRANSFER : KIND_INVALID;
+        if (headerBuffer.position() == 0) {
+            return KIND_TRANSFER;
+        }
+        // 说了话却没在 HEADER_COMPLETE_MS 内说完 4 个字节：头是定长 ASCII，
+        // 这么久的半截头只可能是对端有问题，照旧当坏连接关掉。
+        return KIND_INVALID;
     }
 
     private static void closeQuietly(SocketChannel socket) {

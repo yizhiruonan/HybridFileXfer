@@ -11,6 +11,11 @@ import android.content.Intent;
 import android.content.ServiceConnection;
 import android.content.pm.PackageManager;
 import android.content.pm.ServiceInfo;
+import android.net.ConnectivityManager;
+import android.net.LinkProperties;
+import android.net.Network;
+import android.net.NetworkCapabilities;
+import android.net.NetworkRequest;
 import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
@@ -53,6 +58,9 @@ import top.weixiansen574.hybridfilexfer.droidcore.callback.StartServerCallback;
 public class ServerService extends Service implements ServiceConnection {
 
     private static final String TAG = "ServerService";
+
+    /** 网卡变化的压抖窗口：一次 WiFi 切换会连来好几条回调，等系统状态稳下来再处理 */
+    private static final long NETWORK_REFRESH_DELAY_MS = 800;
 
     public static final String ACTION_START = "top.weixiansen574.hybridfilexfer.action.START_SERVER";
     public static final String ACTION_STOP = "top.weixiansen574.hybridfilexfer.action.STOP_SERVER";
@@ -149,6 +157,14 @@ public class ServerService extends Service implements ServiceConnection {
 
     private Config config;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
+
+    // ---- 网卡集合变化监听（见 registerNetworkWatcher） ----
+    /** 系统网卡变化回调；null = 没注册成功（老系统 / 权限异常），退回只靠界面轮询 */
+    private ConnectivityManager.NetworkCallback networkCallback;
+    /** 传输中撞上网卡变化：先记下来，等这一轮传完再按新网卡列表重开监听 */
+    private volatile boolean interfaceRefreshPending;
+    /** 上一次「想重开监听但被传输挡住」的时刻，避免每 2 秒空转刷日志 */
+    private volatile long lastInterfaceRefreshTry;
     private GlobalProgress globalProgress;
 
     /** 通知栏点回来时要求重新弹出接收进度窗口（Activity 在 onNewIntent/onCreate 里置位） */
@@ -789,6 +805,34 @@ public class ServerService extends Service implements ServiceConnection {
     }
 
     /**
+     * 一张网卡开几条传输通道。
+     *
+     * <p>以前这里是写死的「wlan/wifi 4 条、其它 2 条」，用户设置里的
+     * {@link Config#getChannelsPerInterface()}（1~4）<b>一个地方都没读</b>，于是设置怎么改都不生效。
+     * 现在：设过（1~4）就按设置来，没设过（0）走自动规则：<b>wlan / wifi / eth → 4 条，其它 → 2 条</b>
+     * （USB 数据线、USB 网络共享 rndis0、蓝牙共享网络 bt-pan 都落在「其它」这一支）。
+     *
+     * <p>和改动前相比<b>唯一的差别</b>是真以太网 {@code eth0}：老代码只认 wlan/wifi，eth0 走的是
+     * 「其它 → 2」；现在按有线网卡该有的样子给 4 条。{@code "rndis0".contains("eth")} 是 false，
+     * 所以 USB 网络共享仍然是 2 条，手机上的 12 条通道构成（USB_ADB×2 + wlan0×4 + rndis0×2 +
+     * wlan2×4）不受影响；手机没有以太网口，绝大多数用户看不到变化。
+     * 界面上「预计通道数」（主页 / 连接页）也走这个函数，免得两边口径不一致。
+     *
+     * <p><b>故意不做设置界面</b>（评审已确认）：这个旋钮是给调试 / 特殊网络环境用的，
+     * 默认的 4 / 2 已经能把链路榨满；摆进设置页只会让普通用户困惑，而对外讲的就是
+     * 「自动榨干所有通道」。所以它只能由预置值或代码调
+     * {@link Config#setChannelsPerInterface(int)} 写进去 —— 这不是漏了 UI。
+     */
+    public static int channelsPerInterface(Context context, String interfaceName) {
+        int configured = Config.getInstance(context).getChannelsPerInterface();
+        if (configured >= 1 && configured <= 4) {
+            return configured;
+        }
+        String lower = interfaceName == null ? "" : interfaceName.toLowerCase(java.util.Locale.ROOT);
+        return (lower.contains("wlan") || lower.contains("wifi") || lower.contains("eth")) ? 4 : 2;
+    }
+
+    /**
      * 启动（或用新的网卡列表重启）后台接收服务。
      */
     public static void startServer(Context context, int mode, List<ServerNetInterface> serverInterfaces,
@@ -798,10 +842,10 @@ public class ServerService extends Service implements ServiceConnection {
         intent.putExtra(EXTRA_MODE, mode);
         java.util.ArrayList<ServerNetInterface> expanded = new java.util.ArrayList<>();
         for (ServerNetInterface netInterface : serverInterfaces) {
-            // 自动配置：WIFI 链路带宽高，多开几条通道；USB/蓝牙通道开 2 条足够
-            // （蓝牙默认不勾选，见 NetInterfaces.applySaved；勾了才走到这里）
-            String lower = netInterface.name == null ? "" : netInterface.name.toLowerCase(java.util.Locale.ROOT);
-            int channelsPerInterface = (lower.contains("wlan") || lower.contains("wifi") || lower.contains("wlan0")) ? 4 : 2;
+            // 每张网卡开几条通道：用户在设置里选过（1~4）就按设置来，没设过按自动规则
+            // （WIFI/以太网 4 条，USB/蓝牙 2 条）。蓝牙共享网络（bt-pan）没有特殊处理，
+            // 和别的网卡一样按保存的勾选状态走（这里原来写着「默认不勾选」，其实没有任何过滤）。
+            int channelsPerInterface = channelsPerInterface(context, netInterface.name);
             java.util.Set<String> disabled = Config.getInstance(context).getDisabledChannels();
             for (int i = 0; i < channelsPerInterface; i++) {
                 String name = i == 0 ? netInterface.name : netInterface.name + "#" + (i + 1);
@@ -1008,6 +1052,8 @@ public class ServerService extends Service implements ServiceConnection {
         // 局域网广播：让电脑不用 adb、不用手动输 IP 也能发现手机
         discoveryBeacon = new DiscoveryBeacon(this, config.getServerPort());
         discoveryBeacon.start();
+        // 盯住网卡集合变化（换 WiFi / 开关蓝牙 / 开关 USB 共享之后要重算通道）
+        registerNetworkWatcher();
         // 全局接收进度（悬浮窗 + 通知栏）
     }
 
@@ -1122,6 +1168,9 @@ public class ServerService extends Service implements ServiceConnection {
         }
         interfaceNames = names;
         active = true;
+        // 刚按新列表开过监听，之前那条「等传输结束再重开」的待办已经兑现
+        interfaceRefreshPending = false;
+        mainHandler.removeCallbacks(networkRefresher);
         setState(STATE_STARTING);
         // 全局悬浮窗 / 通知栏进度的 tick 从这里起（之前只写在 onBindingDied 里，
         // 正常启动时根本不会跑，所以应用外的进度弹窗一直不出现）
@@ -1758,10 +1807,183 @@ public class ServerService extends Service implements ServiceConnection {
             discoveryBeacon.stop();
             discoveryBeacon = null;
         }
+        unregisterNetworkWatcher();
+        mainHandler.removeCallbacks(networkRefresher);
         stopEverything();
         super.onDestroy();
     }
 
+    // ------------------------------------------------------------------
+    // 网卡集合变化 → 重开监听（僵尸通道的手机端修法）
+    // ------------------------------------------------------------------
+
+    /**
+     * 盯住系统网卡集合的变化。
+     *
+     * <p>为什么必须有这一步：{@link #interfaces} 只在 {@link #begin} 里赋值一次，之后
+     * 谁都不再动它。用 `svc wifi disable` / 开关蓝牙 / 开关 USB 网络共享换过网卡之后，
+     * 电脑端看到的还是**开机时那批通道**，其中已经不存在的那些是哑的（写进去没反应、
+     * 又不会报错），界面却还照旧显示「6 条通道」。用户实测到的现象就是：速度只剩一两条
+     * 通道的水平，非要 `am force-stop` 杀掉应用、让电脑端重新拉一次才恢复。
+     *
+     * <p>以前唯一的兜底是 Compose 界面里那圈轮询（HfxApp.kt 的 `interfaces` 比较），
+     * 它有两个致命缺口：一是**只在「服务在跑但没连上电脑」时才重启**（已经连上就不动），
+     * 二是它调的是 {@link #restartSession}，那条路只带 EXTRA_FRESH、**不带网卡列表**，
+     * `onStartCommand` 里 requested 为空时什么都不做 —— 通道集合根本不会重算。
+     * 所以这里直接走「带完整网卡列表的 startServer」（即 {@link #startAuto}），
+     * 那条路才会真的重新规划通道。
+     *
+     * <p>传输中不改通道列表（会把正在跑的传输打断），只记一个待办，等这一轮结束再办。
+     */
+    private void registerNetworkWatcher() {
+        if (networkCallback != null) {
+            return;
+        }
+        try {
+            ConnectivityManager cm =
+                    (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+            if (cm == null) {
+                return;
+            }
+            // 空 Request = 所有网络都要（WiFi / 双 WiFi / 以太网 / USB 共享 / 蓝牙 PAN 都会报），
+            // 不能加 NET_CAPABILITY_INTERNET 过滤：蓝牙 PAN、刚起来的 rndis 在拿到 IP 之前
+            // 没有 INTERNET 能力，加了就完全收不到它们的回调。
+            NetworkRequest request = new NetworkRequest.Builder().build();
+            ConnectivityManager.NetworkCallback callback =
+                    new ConnectivityManager.NetworkCallback() {
+                        @Override
+                        public void onAvailable(Network network) {
+                            noteInterfacesMayHaveChanged("network available");
+                        }
+
+                        @Override
+                        public void onLost(Network network) {
+                            noteInterfacesMayHaveChanged("network lost");
+                        }
+
+                        @Override
+                        public void onLinkPropertiesChanged(Network network, LinkProperties lp) {
+                            // 同一张网卡换了 IP（WiFi 重连拿到新地址）只走这条，不报 onAvailable
+                            noteInterfacesMayHaveChanged("link properties changed");
+                        }
+                    };
+            cm.registerNetworkCallback(request, callback);
+            networkCallback = callback;
+            top.weixiansen574.hybridfilexfer.core.HFXLog.d("已开始监听网卡变化");
+        } catch (Throwable e) {
+            // 注册不上不影响原有功能（界面轮询仍在），只是响应慢一点
+            networkCallback = null;
+            Log.w(TAG, "registerNetworkCallback failed", e);
+        }
+    }
+
+    private void unregisterNetworkWatcher() {
+        ConnectivityManager.NetworkCallback callback = networkCallback;
+        networkCallback = null;
+        if (callback == null) {
+            return;
+        }
+        try {
+            ConnectivityManager cm =
+                    (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+            if (cm != null) {
+                cm.unregisterNetworkCallback(callback);
+            }
+        } catch (Throwable e) {
+            Log.w(TAG, "unregisterNetworkCallback failed", e);
+        }
+    }
+
+    /**
+     * 系统说网卡变了。
+     *
+     * <p>一次 WiFi 切换会连着来好几条回调（lost → available → linkProperties），
+     * 所以先压 800ms 再统一处理；那时 {@code NetInterfaces.enumerate} 才能读到稳定的状态。
+     */
+    private void noteInterfacesMayHaveChanged(String reason) {
+        if (!active) {
+            return;
+        }
+        top.weixiansen574.hybridfilexfer.core.HFXLog.d("网卡变化（" + reason + "），稍后重算通道");
+        mainHandler.postDelayed(networkRefresher, NETWORK_REFRESH_DELAY_MS);
+    }
+
+    /** 网卡变化后的统一处理：集合/地址真变了就按新列表重开监听 */
+    private final Runnable networkRefresher = new Runnable() {
+        @Override
+        public void run() {
+            if (!active) {
+                interfaceRefreshPending = false;
+                return;
+            }
+            List<ServerNetInterface> wanted;
+            try {
+                wanted = NetInterfaces.forAutoConnect(appContext != null ? appContext : ServerService.this);
+            } catch (Throwable e) {
+                Log.w(TAG, "enumerate interfaces failed", e);
+                return;
+            }
+            if (wanted.isEmpty()) {
+                // 用户一张网卡都没勾：保持现状，别把监听停掉
+                interfaceRefreshPending = false;
+                return;
+            }
+            if (sameInterfaceSet(wanted)) {
+                interfaceRefreshPending = false;
+                return;
+            }
+            if (isBusy()) {
+                // 传输中：记下来，等这一轮结束（下面 2 秒后自己再看一眼）
+                if (!interfaceRefreshPending) {
+                    interfaceRefreshPending = true;
+                    lastInterfaceRefreshTry = SystemClock.elapsedRealtime();
+                    top.weixiansen574.hybridfilexfer.core.HFXLog.d(
+                            "网卡变了但正在传输，等这一轮结束再重开通道");
+                }
+                mainHandler.removeCallbacks(this);
+                mainHandler.postDelayed(this, 2000);
+                return;
+            }
+            interfaceRefreshPending = false;
+            lastInterfaceRefreshTry = SystemClock.elapsedRealtime();
+            top.weixiansen574.hybridfilexfer.core.HFXLog.d(
+                    "网卡集合变了，按新列表重开监听（" + wanted.size() + " 张网卡）");
+            Log.i(TAG, "interfaces changed, restarting listener with " + wanted.size() + " interfaces");
+            debugFile("interfaces changed -> restart listener, " + wanted.size());
+            // 走「带完整网卡列表的 startServer」这条路（= startAuto 内部做的事）：
+            // restartSession 只带 EXTRA_FRESH，不会重算通道集合。
+            startAuto(ServerService.this);
+        }
+    };
+
+    /** 当前正在用的网卡集合（含 IP）是否等于 wanted —— 名字和地址都得对上 */
+    private boolean sameInterfaceSet(List<ServerNetInterface> wanted) {
+        return interfaceKeys(interfaces).equals(interfaceKeys(wanted));
+    }
+
+    /**
+     * 把网卡列表压成可比较的 key 集合。
+     *
+     * <p>{@link #interfaces} 是**展开过**的（wlan0 / wlan0#2 / wlan0#3 / wlan0#4），
+     * wanted 是每张网卡一条，所以先把 "#n" 后缀去掉再比；地址也带上 ——
+     * WiFi 重连后名字可能还是 wlan0，但 IP 从 .117 变成 .120，那条也得重开。
+     */
+    private static java.util.Set<String> interfaceKeys(List<ServerNetInterface> list) {
+        java.util.Set<String> keys = new java.util.TreeSet<>();
+        for (ServerNetInterface item : list) {
+            if (item == null || item.name == null) {
+                continue;
+            }
+            String name = item.name;
+            int hash = name.indexOf('#');
+            if (hash > 0) {
+                name = name.substring(0, hash);
+            }
+            String address = item.address == null ? "" : item.address.getHostAddress();
+            keys.add(name + "@" + address);
+        }
+        return keys;
+    }
     @Override
     public IBinder onBind(Intent intent) {
         return null;

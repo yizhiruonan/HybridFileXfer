@@ -92,9 +92,7 @@ public class Config {
         return preferences.getFloat("ui_scale", 1.0f);
     }
 
-    /** 电脑接收文件夹的子目录（可选），留空表示用电脑端设置的接收文件夹 */
     /** 手机端浏览电脑后选定的绝对接收目录，空表示用电脑端默认目录 */
-    /** 每张网卡开几条传输通道（1-4），越大越能压满带宽 */
     /** 被单独关闭的传输通道名（如 wlan0#3），逗号分隔 */
     public java.util.Set<String> getDisabledChannels() {
         java.util.Set<String> set = new java.util.LinkedHashSet<>();
@@ -150,8 +148,18 @@ public class Config {
         preferences.edit().putInt("speed_limit_mbps", Math.max(0, Math.min(1000, mbps))).apply();
     }
 
+    /**
+     * 每张网卡开几条传输通道（1~4，越大越能压满带宽）。
+     *
+     * <p><b>0 = 没设过</b>：由 {@code ServerService#channelsPerInterface} 按自动规则决定
+     * （Wi-Fi / 以太网 4 条，USB、蓝牙 2 条），保持老版本的行为不变。
+     *
+     * <p>顺带记一笔：这个存取函数以前<b>没有任何调用者</b> —— 通道数是写死在
+     * {@code ServerService.startServer} 里的，所以这里改了设置完全不生效。
+     */
     public int getChannelsPerInterface() {
-        return preferences.getInt("channels_per_interface", 2);
+        int count = preferences.getInt("channels_per_interface", 0);
+        return count >= 1 && count <= 4 ? count : 0;
     }
 
     public void setChannelsPerInterface(int count) {
