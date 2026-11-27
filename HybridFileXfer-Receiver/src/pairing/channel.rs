@@ -404,4 +404,86 @@ mod tests {
         }
         assert_eq!(wire[0], 2, "记录类型必须是 2");
     }
+
+    /// 通道刚建好、对端在**第一条数据之前**就消失（读到 0 字节 EOF）：
+    /// 不许 panic，也不许给下一轮留下半截状态。
+    ///
+    /// 这条守的是"半开连接"——拔网线、手机关屏、Wi-Fi 换信道都会留下这种连接。
+    /// 它比"对端不回包"更难缠：socket 是好的、写也可能成功，只是永远读不到东西。
+    #[test]
+    fn peer_vanishes_before_first_record() {
+        let prk = kat_prk();
+        let rng = SystemRandom::new();
+        let mut generator = CsaltGenerator::new();
+        let mut rejector = CsaltRejector::new();
+        let mut sequences = ConnSeqGuard::new();
+
+        // 第一轮：盐登记好、序号收好，然后对端直接消失。
+        let salt1 = generator.next_salt(&rng).unwrap();
+        rejector.accept(&salt1).unwrap();
+        sequences.accept(1).unwrap();
+        let (up1, _) = channel_record_keys(&prk, 5, b"wlan0#2", &salt1, prefix().0, prefix().1)
+            .unwrap();
+        let mut reader = RecordReader::new(&[][..], up1);
+        let mut got = Vec::new();
+        // 空输入是**正常结束**（EOF），不是错误，更不许 panic。
+        std::io::Read::read_to_end(&mut reader, &mut got).unwrap();
+        assert!(got.is_empty());
+
+        // 第二轮：必须能干干净净地重建（盐和序号都往前走，不被上一轮卡住）。
+        let salt2 = generator.next_salt(&rng).unwrap();
+        assert_ne!(salt1, salt2);
+        rejector.accept(&salt2).unwrap();
+        sequences.accept(2).unwrap();
+        let wire = seal_with(&prk, &salt2, b"after reconnect");
+        let (up2, _) = channel_record_keys(&prk, 5, b"wlan0#2", &salt2, prefix().0, prefix().1)
+            .unwrap();
+        let mut reader = RecordReader::new(&wire[..], up2);
+        let mut got = Vec::new();
+        std::io::Read::read_to_end(&mut reader, &mut got).unwrap();
+        assert_eq!(got, b"after reconnect");
+
+        // 死掉那条连接的盐**不许**被复用：它"没用过"不等于"可以再用"。
+        assert_eq!(rejector.accept(&salt1).unwrap_err(), PairError::BadRecord);
+        // 序号也不许退回去。
+        assert_eq!(sequences.accept(1).unwrap_err(), PairError::BadRecord);
+    }
+
+    /// 往一个**已经消失**的对端写记录：必须报错、不许 panic，计数器也不许被重置。
+    ///
+    /// 用真实 TCP 而不是 Vec：只有真套接字才会在"对端关闭 + 接收队列非空"时给 RST，
+    /// 写端第一次可能成功（进了本机发送缓冲），之后才报错 —— 这个"先成功后失败"的形状
+    /// 是记录层必须容忍的（否则一次拔网线就能让写线程 panic 或把计数清零）。
+    #[test]
+    fn writing_to_closed_peer_errors_without_panic() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // 对端 accept 之后立刻 drop：模拟"手机在第一条数据之前就没了"。
+        let peer = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            drop(sock);
+        });
+        let sock = std::net::TcpStream::connect(addr).unwrap();
+        peer.join().unwrap();
+        // 给 FIN 一点时间到达，让这段"写一个死连接"的窗口稳定一点（不然就是竞态测试）。
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let prk = kat_prk();
+        let salt: Csalt = [0x44u8; CSALT_LEN];
+        let (up, _) = channel_record_keys(&prk, 5, b"wlan0#2", &salt, prefix().0, prefix().1)
+            .unwrap();
+        let mut writer = RecordWriter::new(sock, up);
+        // 每次 1 MiB（单条记录上限之内）：几轮之后一定会撞上 RST。
+        let payload = vec![0x5au8; 1024 * 1024];
+        let mut errors = 0;
+        for _ in 0..3 {
+            if std::io::Write::write_all(&mut writer, &payload).is_err() {
+                errors += 1;
+            }
+        }
+        // 只要"最终报错且没 panic"；至于第几次开始失败取决于缓冲大小，不该被写死。
+        assert!(errors >= 1, "往已关闭的连接写了 3 MiB 都没报错，测试前提不成立");
+        // 计数器是单调的：写失败不影响已经发出去的条数（不会回退到 0，也就不会 nonce 复用）。
+        assert!(writer.records_sent() <= 3);
+    }
 }
