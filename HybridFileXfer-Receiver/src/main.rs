@@ -54,11 +54,9 @@ fn run() -> i32 {
 
     let config_path = config::config_path(&exe_dir);
     let mut cfg = Config::load(&config_path);
-    // 307：命令行版本同样要参与限速协商 —— 握手时把自己的上限报给手机。
-    // 不灌的话 configured_mb() 永远是 0，CLI 跑起来就变成「本机不限速」，
-    // 会把手机那边配的限制在协商里压掉一半语义（手机报 5、电脑报 0 → 仍是 5，
-    // 但电脑自己那条发送路径完全不限 —— 和图形版行为不一致）。
-    hfx_receiver::ratelimit::set_configured_mb(cfg.speed_limit_mb as i64);
+    // 限速的运行期状态**不能**在这里灌：命令行参数在下面才覆盖 cfg，提前灌读到的是
+    // 配置文件里的旧值（首次运行时配置文件不存在，load 出来就是默认 0 = 不限速）。
+    // 灌值那一步移到了参数处理之后，见下面 set_configured_mb 那一段。
     let lang = args.lang.or(cfg.lang).unwrap_or_else(detect_lang);
     i18n::set_lang(lang);
 
@@ -92,6 +90,19 @@ fn run() -> i32 {
         must_save = true;
     }
 
+    // 307：命令行版本同样要参与限速协商 —— 握手时把自己的上限报给手机。不灌的话
+    // configured_mb() 永远是 0，CLI 跑起来就变成「本机不限速」，电脑自己那条发送
+    // 路径完全不限，和图形版行为不一致。
+    //
+    // 位置很关键：必须在命令行参数**覆盖完 cfg 之后**才灌。以前这一句紧跟
+    // Config::load，而 --speed-limit 是后面才写进 cfg 的，于是首次运行（配置文件
+    // 还不存在、load 出来是默认 0 = 不限速）灌进去的就是 0：命令行那个值只进了
+    // cfg 和配置文件，运行期一直不限速，要等第二次运行从文件里读到才生效。
+    // 用户报的「--speed-limit 首次不生效、第二次才生效」就是这个顺序问题。
+    hfx_receiver::ratelimit::set_configured_mb(cfg.speed_limit_mb as i64);
+    // 限速「以为设了其实没设」是这个参数最容易踩的坑，来源要跟着值一起打出去
+    let limit_from_cli = args.speed_limit_mb.is_some();
+
     cfg.receive_dir = absolute(&cfg.receive_dir);
     if let Err(e) = std::fs::create_dir_all(&cfg.receive_dir) {
         eprintln!(
@@ -122,7 +133,7 @@ fn run() -> i32 {
     log::init(Some(exe_dir.join("receiver.log")), args.verbose);
     // 命令行版虽然能看见 stderr，但开机脚本里那点输出没人看；落盘才查得到
     log::install_panic_hook();
-    print_banner(&cfg, &config_path, &exe_dir, args.ip);
+    print_banner(&cfg, &config_path, &exe_dir, args.ip, limit_from_cli);
 
     let mode = if args.discover {
         ConnectMode::Discovery
@@ -152,7 +163,13 @@ fn absolute(path: &Path) -> PathBuf {
     }
 }
 
-fn print_banner(cfg: &Config, config_path: &Path, exe_dir: &Path, ip: Option<IpAddr>) {
+fn print_banner(
+    cfg: &Config,
+    config_path: &Path,
+    exe_dir: &Path,
+    ip: Option<IpAddr>,
+    limit_from_cli: bool,
+) {
     let separator = "=".repeat(64);
     println!("{}", separator);
     println!(
@@ -190,6 +207,26 @@ fn print_banner(cfg: &Config, config_path: &Path, exe_dir: &Path, ip: Option<IpA
             )
         ),
     }
+    // 限速值放在最后一行：它是「设了没生效」最爱出问题的一项，紧挨着分隔线最好找。
+    // 顺手写进日志 —— 来源（命令行 / 配置文件）比数值本身更关键：
+    // 「--speed-limit 首次运行不生效」那类问题看这一行就能定位。
+    let limit_text = if cfg.speed_limit_mb == 0 {
+        i18n::tr("不限速", "unlimited").to_string()
+    } else {
+        format!("{} MB/s", cfg.speed_limit_mb)
+    };
+    let limit_line = format!(
+        "{}{}（{}）",
+        i18n::tr("限速：", "speed limit: "),
+        limit_text,
+        if limit_from_cli {
+            i18n::tr("来自命令行", "from command line")
+        } else {
+            i18n::tr("来自配置文件", "from config file")
+        }
+    );
+    log::info(&limit_line);
+    println!(" {}", limit_line);
     println!("{}", separator);
     println!();
 }
