@@ -60,7 +60,10 @@ HybridFileXfer-Receiver-cli.exe -v              输出调试信息
 
 ## 编译
 
-需要 **Rust 1.85 或更新版本**（GUI 依赖 eframe，新版依赖要求 edition 2024）。
+需要 **Rust 1.85 或更新版本**：`Cargo.lock` 里的依赖（hashbrown 0.17 / icu_* 等）已经
+用了 **edition 2024**，1.83 的 cargo 连依赖都读不进来，报的是
+``feature `edition2024` is required``（看着像解析失败，其实只是工具链太旧）。
+实测 1.95 可以正常编译；`build.bat` 会先自检版本并给出这句话。
 
 双击 `build.bat`，或手动：
 
