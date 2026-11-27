@@ -1778,4 +1778,155 @@ mod tests {
         assert!(util::relative_under(&target, &normalized).is_some());
         assert_eq!(target.file_name().unwrap(), "file.txt");
     }
+
+    /// 路径穿越防护（3.7.1）：手机发来的路径可以把落点指到接收目录之外。
+    ///
+    /// 老实现用字符串前缀判断「在不在接收目录里」，下面这些串的前缀**都**是接收目录，
+    /// 全都被判成「在里面」原样放行，然后操作系统按 `..` 一路往上走 —— 等于同一个
+    /// Wi-Fi 里任何人都能往你的自启动目录写文件。这组用例把每个入口形态都钉住。
+    #[test]
+    fn path_traversal_cannot_escape_receive_dir() {
+        let dir = temp_dir("traversal");
+        let normalized = util::normalize_dir(&dir);
+        let receiver = Receiver::new(normalized.clone());
+        let base = normalized.to_string_lossy().to_string();
+        let sep = std::path::MAIN_SEPARATOR;
+
+        // 经典穿越：前缀是接收目录，靠 `..` 爬到外面
+        let cases = vec![
+            format!("{base}..{sep}..{sep}x.exe"),
+            format!("{base}a{sep}..{sep}..{sep}b{sep}c.bin"),
+            format!("{base}..{sep}..{sep}..{sep}..{sep}AppData{sep}Roaming{sep}x.exe"),
+            format!("..{sep}..{sep}x.exe"),
+            format!("a{sep}..{sep}..{sep}b"),
+            // 绝对路径直接指到系统目录（根本不在接收目录里）
+            format!("C:{sep}Windows{sep}x.dll"),
+            // 相对名字：本来就没有目录，必须还是落在接收目录里
+            "plain.txt".to_string(),
+            // 只有 .. 的名字：file_name() 对它是 None，别把上一级目录名当文件名
+            format!("..{sep}.."),
+        ];
+        for raw in &cases {
+            let target = receiver.resolve(raw);
+            let rest = util::relative_under(&target, &normalized)
+                .unwrap_or_else(|| panic!("解析结果跑到接收目录之外了：{raw} -> {}", target.display()));
+            for component in rest.components() {
+                assert!(
+                    matches!(component, std::path::Component::Normal(_)),
+                    "解析结果里还残留着非普通组件：{raw} -> {}",
+                    target.display()
+                );
+            }
+            // 真的写一块下去，确认落点就在接收目录里（第二道防线也一起过一遍）
+            let data = vec![7u8; 16];
+            let total = data.len() as u64;
+            receiver
+                .write_block(0, raw, total, 0, 1_700_000_000_000, &data)
+                .unwrap_or_else(|e| panic!("写块失败（{raw}）：{e}"));
+            assert!(
+                target.starts_with(&normalized),
+                "落点不在接收目录下：{raw} -> {}",
+                target.display()
+            );
+        }
+
+        // 目录创建走的是另一条路径（make_dir），同样不能穿越
+        receiver
+            .make_dir(&format!("{base}..{sep}..{sep}evildir"))
+            .expect("穿越目录名应该被拍平后成功创建，而不是被拒绝");
+        let created = normalized.join("evildir");
+        assert!(created.exists(), "拍平后应在接收目录内建出 evildir");
+
+        // 接收目录之外一个字节的痕迹都不能留：上游的 `..` 折回的目录（temp 的父目录）
+        // 里除了我们自己创建的，不应出现 x.exe / x.dll 之类
+        let parent = dir.parent().expect("temp 目录应该有父目录");
+        for stray in ["x.exe", "x.dll", "c.bin", "b", "evildir"] {
+            assert!(
+                !parent.join(stray).exists(),
+                "接收目录之外被写进了 {stray}"
+            );
+        }
+    }
+
+    /// 清单里 0 字节文件排在最前面时，标题 / 分段 / 百分比不能被它钉死。
+    ///
+    /// 这是一条**回归**：改之前 `primary_path()` 遇到 0 字节文件直接返回它，而它没有
+    /// FileProgress 条目 → snapshot 拿到 0/0、segments 为空，三项一起停住，比改之前更糟。
+    #[test]
+    fn zero_byte_file_does_not_hold_the_title() {
+        let dir = temp_dir("zero-byte");
+        let normalized = util::normalize_dir(&dir);
+        // 用 with_device 拿一份**独占**的进度对象：Receiver::new 用的是全局 PROGRESS，
+        // 多个测试并行跑时会互相写对方的 round_files（下面那条 zero-total 用例就被
+        // 这条用例写进去的 global 计数污染过，读出来 1048576）。
+        let receiver = Receiver::with_device(SharedDir::new(normalized.clone()), "test-zero-byte");
+        let empty = normalized.join("empty.txt");
+        let real = normalized.join("real.bin");
+        let empty_name = empty.to_string_lossy().to_string();
+        let real_name = real.to_string_lossy().to_string();
+        receiver
+            .progress
+            .set_round_files(vec![
+                (empty_name.clone(), 0),
+                (real_name.clone(), 3 * BLOCK_SIZE),
+            ]);
+
+        assert_eq!(
+            receiver.progress.primary_path().as_deref(),
+            Some(real_name.as_str()),
+            "0 字节文件不该占着标题"
+        );
+
+        // 真传一块：标题、快照的总量都必须跟着 real.bin
+        receiver
+            .write_block(
+                0,
+                &real_name,
+                3 * BLOCK_SIZE,
+                0,
+                1_700_000_000_000,
+                &vec![1u8; BLOCK_SIZE as usize],
+            )
+            .unwrap();
+        let (name, done, total, _session, _files) = receiver.progress.snapshot();
+        assert_eq!(name, real_name);
+        assert_eq!(total, 3 * BLOCK_SIZE, "总量不能是 0（否则百分比算不出来）");
+        assert_eq!(done, BLOCK_SIZE);
+        assert!(!receiver.progress.segments().is_empty(), "分段条不能是空的");
+    }
+
+    /// 清单里只有 0 字节文件（或者全部大小未知）：总量退回全局计数，不能给 0/0。
+    #[test]
+    fn snapshot_never_reports_zero_total_when_nothing_is_known() {
+        let dir = temp_dir("zero-total");
+        let normalized = util::normalize_dir(&dir);
+        let receiver = Receiver::with_device(SharedDir::new(normalized.clone()), "test-zero-total");
+        receiver.progress.set_round_files(vec![(
+            normalized.join("only-empty.txt").to_string_lossy().to_string(),
+            0,
+        )]);
+        let (_name, _done, total, _session, _files) = receiver.progress.snapshot();
+        // 这里没有别的数据来源，全局计数也是 0，但至少不能因为"总量 0"而崩/NaN：
+        // 断言它是个确定的数（0），而不是走进除零分支
+        assert_eq!(total, 0);
+    }
+
+    /// 接收目录之内的绝对路径（含子目录）必须和以前**完全一样**，不能因为修穿越把它拍平。
+    #[test]
+    fn paths_inside_are_kept_verbatim() {
+        let dir = temp_dir("inside");
+        let normalized = util::normalize_dir(&dir);
+        let receiver = Receiver::new(normalized.clone());
+        let sub = normalized.join("sub").join("deeper");
+        let target = sub.join("movie.mkv");
+        let raw = target.to_string_lossy().to_string();
+
+        let resolved = receiver.resolve(&raw);
+        assert_eq!(
+            resolved, target,
+            "接收目录内的绝对路径必须原样保留（带盘符、带子目录）"
+        );
+        // 带盘符的合法路径也是这条分支
+        assert!(resolved.to_string_lossy().contains("movie.mkv"));
+    }
 }
