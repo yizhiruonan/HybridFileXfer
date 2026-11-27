@@ -175,6 +175,62 @@ impl Adb {
         Ok((ok, text))
     }
 
+    /// 把手机上的 App 拉到前台（等价于用户自己点一下图标）。
+    ///
+    /// 为什么需要它：`am start-foreground-service` 不一定拉得起来。真机实测
+    /// （小米平板 7 Pro，App 被系统收掉之后）am 直接回
+    /// `Starting service: ... Error: Not found; no service started.`，之后每 2~3 秒重试一次
+    /// 全是同一个失败，界面就一直停在「等待手机连接」，日志里只剩每 10 秒一行的
+    /// `adb 连接没成功（稍后重试）` —— 用户根本不知道要去手机上点一下。
+    /// 而 `am start <launcher activity>` 在同一种状态下是能起来的（实测 5 秒内自动连上），
+    /// 所以服务拉不起来时退到这一招。只在「这一轮还没连上过」时调用，不会打断正在传的任务。
+    pub fn launch_app(&self, serial: &str, package: &str) -> io::Result<(bool, String)> {
+        let activity = self
+            .launcher_activity(serial, package)
+            .unwrap_or_else(|| format!("{}/.compose.MiuixMainActivity", package));
+        let mut cmd = self.command();
+        cmd.arg("-s")
+            .arg(serial)
+            .arg("shell")
+            .arg("am")
+            .arg("start")
+            .arg("-n")
+            .arg(&activity);
+        let out = run(&mut cmd, Duration::from_secs(20))?;
+        let text = format!("{}{}", out.stdout.trim(), out.stderr.trim());
+        let ok = out.success && !text.contains("Error:") && !text.contains("Exception");
+        Ok((ok, text))
+    }
+
+    /// 问系统要 App 的入口 Activity（`包名/activity` 这种形式）。
+    /// 问不到（老系统没有 `cmd package`）就返回 None，调用方用写死的组件名兜底 ——
+    /// 写死的那一个以后被改名也不会让整个兜底路径失效，因为有这一层现问现用。
+    fn launcher_activity(&self, serial: &str, package: &str) -> Option<String> {
+        let mut cmd = self.command();
+        cmd.arg("-s")
+            .arg(serial)
+            .arg("shell")
+            .arg("cmd")
+            .arg("package")
+            .arg("resolve-activity")
+            .arg("--brief")
+            .arg("-c")
+            .arg("android.intent.category.LAUNCHER")
+            .arg(package);
+        let out = run(&mut cmd, Duration::from_secs(8)).ok()?;
+        if !out.success {
+            return None;
+        }
+        // --brief 只打一行 `包名/activity`；带上别的行（例如优先级）就认最后一行能用的
+        let line = out
+            .stdout
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.contains('/') && !l.contains(' '))
+            .last()?;
+        Some(line.to_string())
+    }
+
     /// 手机的名字：优先「市场名」（`ro.product.marketname`，例如「Xiaomi Pad 7 Pro」），
     /// 其次 `ro.product.model`（「24091RPADC」这种型号代码）。
     ///

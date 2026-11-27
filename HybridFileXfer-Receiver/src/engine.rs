@@ -75,6 +75,8 @@ pub fn run_multi(
     let limit = max_devices.clamp(1, 8);
     let mut running: std::collections::HashMap<String, thread::JoinHandle<()>> =
         std::collections::HashMap::new();
+    // 这一轮里已经起过会话线程的设备：再起就只是重连，不再打 info（见下）
+    let mut spawned: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     while !stop.load(Ordering::Relaxed) {
         // 清掉已经结束的会话
@@ -100,7 +102,18 @@ pub fn run_multi(
                         Arc::new(move |state: EngineState| on_state(&serial, state))
                             as StateSink
                     };
-                    log::info(&format!("{} {}", tr("开始连接设备", "connecting device"), serial));
+                    if spawned.contains(&serial) {
+                        // 线程掉了又起来（设备在 adb 列表里闪、上一次 pick 失败等）：
+                        // 原来每次都是 info，真机上见过 20 秒里刷 21 行，日志全被它占了。
+                        log::debug(&format!(
+                            "{} {}",
+                            tr("重新连接设备", "reconnecting device"),
+                            serial
+                        ));
+                    } else {
+                        spawned.insert(serial.clone());
+                        log::info(&format!("{} {}", tr("开始连接设备", "connecting device"), serial));
+                    }
                     running.insert(
                         serial,
                         thread::spawn(move || {
@@ -175,6 +188,15 @@ struct AdbCycle {
     connected_once: bool,
     /// 「手机端已停止服务」这条提示已经发给界面了吗（避免每个轮次重复刷）
     stop_notice_shown: bool,
+    /// 手机端接收服务连续启动失败的次数（一旦连上就清零）。
+    /// 攒到三次还不行就不干等了 —— 退到「直接把 App 拉起来」，见 ensure_service。
+    start_fails: u32,
+    /// 上一次在手机上拉起 App 的时间。有冷却，别每轮（2~3 秒）都在用户手机上弹一次窗口。
+    last_app_launch: Option<Instant>,
+    /// 拉起 App 也失败了几次。到 3 次就不再弹了，改成在界面上告诉用户自己去点一下。
+    app_launch_fails: u32,
+    /// 「请在手机上打开 App」这句提示已经发给界面了吗（避免每 10 秒重刷一遍）
+    app_hint_shown: bool,
 }
 
 impl AdbCycle {
@@ -188,7 +210,71 @@ impl AdbCycle {
             last_fail_log: Instant::now() - Duration::from_secs(60),
             connected_once: false,
             stop_notice_shown: false,
+            start_fails: 0,
+            last_app_launch: None,
+            app_launch_fails: 0,
+            app_hint_shown: false,
         }
+    }
+
+    /// 把手机端接收服务拉起来。拉不起来就退一步把 App 自己拉起来。
+    ///
+    /// 真机上遇到过：`am start-foreground-service` 回
+    /// `Error: Not found; no service started.`（App 被系统收掉之后），之后每 2~3 秒
+    /// 重试一次全是同一个失败，界面永远停在「等待手机连接」。用户手动点一下图标就正常，
+    /// 所以这里替用户点那一下：第二次失败开始尝试 `am start`，15 秒冷却，最多 3 次。
+    ///
+    /// 返回 true 表示这次 am 明确说服务起来了。
+    fn ensure_service(&mut self, adb: &Adb, serial: &str, component: &str, fresh: bool) -> bool {
+        let (ok, text) = adb
+            .start_service(serial, component, fresh)
+            .unwrap_or_else(|e| (false, e.to_string()));
+        if ok {
+            self.start_fails = 0;
+            self.app_launch_fails = 0;
+            return true;
+        }
+        self.start_fails += 1;
+        if self.start_fails == 1 {
+            log::warn(&format!(
+                "{} {} {}",
+                tr("无法启动手机端接收服务：", "cannot start the phone service:"),
+                component,
+                text.lines().next().unwrap_or("")
+            ));
+        }
+        let cooled = self
+            .last_app_launch
+            .map(|t| t.elapsed() >= Duration::from_secs(15))
+            .unwrap_or(true);
+        // 连续三次（≈6~9 秒）都拉不起来才动手：这条 am 偶发失败一两次、下一轮自己就好了，
+        // 没必要为了一次抖动就在用户手机上弹窗口。
+        if self.start_fails >= 3 && cooled && self.app_launch_fails < 3 {
+            let package = component.split('/').next().unwrap_or(component);
+            match adb.launch_app(serial, package) {
+                Ok((true, _)) => {
+                    log::info(tr(
+                        "手机端接收服务起不来，改为在手机上打开 App",
+                        "cannot start the phone service, opening the app on the phone instead",
+                    ));
+                    self.start_fails = 0;
+                }
+                other => {
+                    let reason = match other {
+                        Ok((_, text)) => text.lines().next().unwrap_or("").to_string(),
+                        Err(e) => e.to_string(),
+                    };
+                    self.app_launch_fails += 1;
+                    log::warn(&format!(
+                        "{} {}",
+                        tr("在手机上打开 App 也失败了：", "cannot open the app on the phone:"),
+                        reason
+                    ));
+                }
+            }
+            self.last_app_launch = Some(Instant::now());
+        }
+        false
     }
 
     fn attempt(
@@ -245,29 +331,14 @@ impl AdbCycle {
 
         let new_device = self.fresh_sent_for.as_deref() != Some(device.serial.as_str());
         if new_device {
+            self.app_hint_shown = false;
             log::info(&format!("{} {}", tr("检测到手机", "detected phone"), device.serial));
             on_state(EngineState::Waiting(format!(
                 "{} {}",
                 tr("检测到手机", "detected phone"),
                 device.serial
             )));
-            let started = match adb.start_service(&device.serial, &options.component, true) {
-                Ok((true, _)) => true,
-                Ok((false, text)) => {
-                    log::warn(&format!(
-                        "{} {} {}",
-                        tr("无法启动手机端接收服务：", "cannot start the phone service:"),
-                        options.component,
-                        text.lines().next().unwrap_or("")
-                    ));
-                    false
-                }
-                Err(e) => {
-                    log::warn(&format!("am start-foreground-service: {}", e));
-                    false
-                }
-            };
-            self.last_start_ok = started;
+            self.last_start_ok = self.ensure_service(adb, &device.serial, &options.component, true);
             self.fresh_sent_for = Some(device.serial.clone());
             self.last_ensure = Instant::now();
             // 手机端从「服务被拉起」到「开始监听」还有一两百毫秒，刚插上线时更长。
@@ -297,10 +368,8 @@ impl AdbCycle {
                 Duration::from_secs(2)
             };
             if self.last_ensure.elapsed() >= interval {
-                self.last_start_ok = adb
-                    .start_service(&device.serial, &options.component, false)
-                    .map(|(ok, _)| ok)
-                    .unwrap_or(false);
+                self.last_start_ok =
+                    self.ensure_service(adb, &device.serial, &options.component, false);
                 self.last_ensure = Instant::now();
             }
         }
@@ -320,6 +389,9 @@ impl AdbCycle {
                     session.device = device.serial.clone();
                     self.connected_once = true;
                     self.stop_notice_shown = false;
+                    self.start_fails = 0;
+                    self.app_launch_fails = 0;
+                    self.app_hint_shown = false;
                     report_connected(&session, on_state);
                     let end = run_session(&mut session, options, stop);
                     // 断开后立刻把界面切成「等手机点启动服务」：不能一直显示「已连接」，
@@ -357,6 +429,21 @@ impl AdbCycle {
                 last_error.unwrap_or_else(|| "timeout".to_string())
             ));
             self.last_fail_log = Instant::now();
+        }
+        // 一直连不上、手机上 App 也打不开：把真实原因说到界面上去。
+        // 原来这里只有每 10 秒一行的日志，用户看到的是「检测到手机 … 等待中」一动不动，
+        // 内容还是「adb 连接没成功」，既看不懂也不知道该做什么。
+        if !self.connected_once && self.app_launch_fails >= 1 && !self.app_hint_shown {
+            self.app_hint_shown = true;
+            // 不写串号：界面上副标题是「手机名：<这句>」，一行放不下就被截成
+            // 「请在手机…」，正好把该做的事截掉。手机名本来就已经显示了。
+            let message = tr(
+                "手机端没在运行，请在手机上打开「多轨快传」",
+                "the phone app is not running, open it on the phone",
+            )
+            .to_string();
+            log::info(&message);
+            on_state(EngineState::Waiting(message));
         }
         Attempt::Retry
     }
