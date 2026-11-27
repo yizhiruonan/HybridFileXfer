@@ -17,6 +17,7 @@ pub mod identity;
 pub mod kdf;
 pub mod message;
 pub mod record;
+pub mod trust;
 
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
