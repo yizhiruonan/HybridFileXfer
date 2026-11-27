@@ -12,6 +12,7 @@
 //!    关闭时协议行为与 3.7.1（`VERSION_CODE = 309`）完全一致，
 //!    这样真机上一旦出问题，改配置就能退回，不用回滚代码。
 
+pub mod channel;
 pub mod ecdh;
 pub mod handshake;
 pub mod identity;
@@ -128,6 +129,10 @@ impl From<std::io::Error> for PairError {
     fn from(e: std::io::Error) -> Self {
         match e.kind() {
             std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => PairError::Timeout,
+            // 记录层用 InvalidData 表示"这条记录解不开"（被篡改、密钥不对、计数器回退），
+            // 那必须报 PE_BAD_RECORD 让手机知道"连接已被判定为被篡改"，
+            // 而不是"本机读写错误"——后者会让人去查磁盘，方向完全错。
+            std::io::ErrorKind::InvalidData => PairError::BadRecord,
             _ => PairError::Io,
         }
     }
