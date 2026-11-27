@@ -4,7 +4,7 @@
 //! may arrive interleaved from several channels: each block is written at
 //! `index * 1 MiB` with a positional write, no ordering required.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -842,6 +842,64 @@ pub fn clear_failure() {
     }
 }
 
+/// 手机报来的路径里**值得记一笔**的越界形态；不是可疑形态就返回 None。
+///
+/// 为什么要挑：把路径映射进接收目录时，正常传输也会走到「拍平」那条分支 ——
+/// 手机发的是它自己的绝对路径（`/sdcard/Download/x.bin`），在 Windows 上当然不在
+/// 接收目录里，拍平到 `接收目录\x.bin` 才是最对的落点。所以「不在接收目录里」
+/// 本身不是可疑信号，只有这几种才是：
+///  - 带 `..` 段（想往上爬，跨平台都是这个写法）；
+///  - 本地盘符绝对路径（`C:\Windows\x.dll`，手机端永远发不出这种路径）；
+///  - UNC 路径（`\\server\share\x.dll`，同样不是手机会发的东西）。
+fn suspicious_raw_path(raw: &str) -> Option<&'static str> {
+    if raw.split(['/', '\\']).any(|seg| seg == "..") {
+        return Some("含 .. 段");
+    }
+    let bytes = raw.as_bytes();
+    if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+        return Some("本地盘符绝对路径");
+    }
+    if raw.starts_with(r"\\") {
+        return Some("UNC 路径");
+    }
+    None
+}
+
+/// 已经记过的可疑原始路径。一个文件有多少块就要 `resolve` 多少次，不能按块刷屏，
+/// 只想知道「谁试图写出去、被规范化到了哪」。
+static FLATTEN_NOTE_SEEN: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// 越界路径被规范化时留一行日志（同一个原始路径只记一次）。
+///
+/// 拍平是**静默**的：不报错、也不改结果，只是换个落点。用户真遇到「文件跑到别的
+/// 目录去了」时，以前没有任何线索可查 —— 这一行就是那条线索。
+fn note_flattened_path(raw: &str, flattened: &Path) {
+    let Some(kind) = suspicious_raw_path(raw) else {
+        return;
+    };
+    // 去重；顺手封顶，别让常驻进程攒满内存（清空后最多再记这么多条）
+    const MAX_REMEMBERED: usize = 256;
+    let first_time = {
+        let mut seen = match FLATTEN_NOTE_SEEN.lock() {
+            Ok(seen) => seen,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if seen.len() >= MAX_REMEMBERED {
+            seen.clear();
+        }
+        seen.insert(raw.to_string())
+    };
+    if first_time {
+        crate::log::info(&format!(
+            "路径越界（{}），已规范化到接收目录内：原始 {} → 落点 {}",
+            kind,
+            raw,
+            flattened.display()
+        ));
+    }
+}
+
 pub struct Receiver {
     /// 本设备独立的进度（多设备并行）
     pub progress: Arc<ProgressState>,
@@ -940,14 +998,17 @@ impl Receiver {
         // file_name() 对 `a\..` 会返回 `a`（因为末尾是 ..），这里要的是「没有名字」。
         let name = util::last_normal_name(&normalized).unwrap_or_else(|| "received".into());
         let flattened = base.join(name);
-        if self.ensure_inside(&flattened).is_ok() {
+        let target = if self.ensure_inside(&flattened).is_ok() {
             flattened
         } else {
             // 万一连「拍平到接收目录」都被第二道防线拒了（软链接把接收目录本身指走），
             // 至少别 panic：给一个固定名字，still 在 base 下面。真正的错误会在
             // state_for 里再报一次并让这一块失败，上层照常按错误处理。
             base.join("received")
-        }
+        };
+        // 越界路径是「规范化到接收目录内」，不是「拒绝」——所以要留一行日志当线索。
+        note_flattened_path(raw, &target);
+        target
     }
 
     /// 第二道防线：真的动磁盘之前，再确认一次目标路径就在接收目录里。
@@ -1460,6 +1521,21 @@ pub fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 只有「手机端不可能发出来」的形态才值得记日志；正常传输用的是手机自己的
+    /// 绝对路径（/sdcard/...），那种不该刷日志。
+    #[test]
+    fn only_suspicious_paths_are_worth_a_log_line() {
+        assert_eq!(suspicious_raw_path(r"..\..\x.exe"), Some("含 .. 段"));
+        assert_eq!(suspicious_raw_path(r"C:\接收\..\..\x.exe"), Some("含 .. 段"));
+        assert_eq!(suspicious_raw_path("../a/b"), Some("含 .. 段"));
+        assert_eq!(suspicious_raw_path(r"C:\Windows\x.dll"), Some("本地盘符绝对路径"));
+        assert_eq!(suspicious_raw_path(r"\\server\share\x.dll"), Some("UNC 路径"));
+        // 正常传输：手机自己的绝对路径、纯文件名、接收目录内的相对路径
+        assert_eq!(suspicious_raw_path("/sdcard/Download/hfx-1g.bin"), None);
+        assert_eq!(suspicious_raw_path("Download/sub/a.bin"), None);
+        assert_eq!(suspicious_raw_path("plain-ok.txt"), None);
+    }
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir()
