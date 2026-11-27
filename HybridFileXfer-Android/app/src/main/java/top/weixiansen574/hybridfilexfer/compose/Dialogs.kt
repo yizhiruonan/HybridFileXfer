@@ -543,15 +543,25 @@ internal fun ReceiveProgressPanel(
             // 底色用深一点的灰，没传到的部分也能看出进度条的总长度。
             SegmentedProgressBar(
                 segments = state.xferSegments,
-                fallback = if (state.xferTotal > 0) state.xferDone.toFloat() / state.xferTotal else 0f,
+                // 夹在 0..1：账算错时进度条也不许画出格子（真机出现过超过 100% 的「4.94 GB / 2.47 GB」）
+                fallback = if (state.xferTotal > 0) {
+                    (state.xferDone.toFloat() / state.xferTotal).coerceIn(0f, 1f)
+                } else 0f,
                 color = colorScheme.primary,
                 track = colorScheme.onSurface.copy(alpha = 0.16f),
                 // 分段竖线：细、显眼（参考 IDM 的分段红线）
                 divider = Color(0xFFE53935),
             )
             Spacer(Modifier.height(10.dp))
+            // 兜底夹紧：任何一条账算错都不许把「已传」画成超过总量
+            // （真机出现过归档发送显示「4.94 GB / 2.47 GB」，正好两倍）
+            val shownDone = if (state.xferTotal > 0) {
+                animatedDone.toLong().coerceIn(0L, state.xferTotal)
+            } else {
+                animatedDone.toLong()
+            }
             Text(
-                humanSize(animatedDone.toLong()) + " / " + humanSize(state.xferTotal) +
+                humanSize(shownDone) + " / " + humanSize(state.xferTotal) +
                     "   ·   " + when {
                     state.xferPaused -> "已暂停"
                     // 数据已经发完、电脑在算整文件 SHA-256：这里必须有个说法，

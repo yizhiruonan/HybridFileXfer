@@ -147,6 +147,15 @@ public abstract class ReadFileCall implements Callable<Void> {
      */
     private volatile BlockProgress progress;
 
+    /**
+     * 这一批的字节账本（界面 done 用），由 HFXService.sendFiles 注入。
+     *
+     * <p>和 {@link #progress} 同一个写入点（块真正发出去以后），但<b>跨文件累计、按块去重</b>：
+     * progress 换文件就清零，只能画当前文件的分段；多文件/文件夹的总完成量必须另有一本账，
+     * 否则界面只能退回"各通道原始字节相加"（那是错的，见 {@link TransferLedger} 的注释）。
+     */
+    private volatile TransferLedger ledger;
+
     /** 这次传输已经被取消 / 通道出错：读文件的线程必须自己停下来 */
     private volatile boolean shutdown;
     /** 读文件线程已经把该产出的块都产完了 */
@@ -205,6 +214,11 @@ public abstract class ReadFileCall implements Callable<Void> {
         this.progress = progress;
     }
 
+    /** 这一批的按块去重字节账本（发送方向），由 HFXService.sendFiles 注入 */
+    public void setLedger(TransferLedger ledger) {
+        this.ledger = ledger;
+    }
+
     /**
      * 这一块已经真正写到通道上了（SendFileCall 写完数据后回调）。
      * 进度条只认这个真值：投递进队列的那一刻还不算，队列里可能压着几百 MB。
@@ -213,6 +227,11 @@ public abstract class ReadFileCall implements Callable<Void> {
         BlockProgress tracker = progress;
         if (tracker != null) {
             tracker.onBlock(owner, path, index, totalSize);
+        }
+        // 这一批的字节账本：只认"块真的发出去了"，而且同一块只算一次
+        TransferLedger book = ledger;
+        if (book != null) {
+            book.onBlock(path, index, totalSize);
         }
     }
 

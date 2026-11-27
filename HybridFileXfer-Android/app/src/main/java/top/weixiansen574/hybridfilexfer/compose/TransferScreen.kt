@@ -779,6 +779,8 @@ internal fun TransferScreen(
         val smoothedSpeed = HashMap<String, Long>()
         var previousAt = android.os.SystemClock.elapsedRealtime()
         var lastDone = 0L
+        // 「老口径算出来的 done 比总量还大」这条日志上一次打的时刻（限流，别每 50ms 刷一行）
+        var rawOverflowLoggedAt = 0L
         while (busy) {
             kotlinx.coroutines.delay(50)
             // delay 期间传输可能已经收尾了，这时候不能再拿旧快照覆盖收尾补满的进度
@@ -832,12 +834,34 @@ internal fun TransferScreen(
             // 多文件/文件夹没有跨文件的块空间，退回整条连续进度（老代码按通道等分画的是假分段）。
             val singleFile = xferPopupSingleFile && blockProgress != null &&
                 blockProgress.totalSize > 0 && blockProgress.doneBlocks > 0
-            val done = when {
-                // 单文件：已完成字节也取按块真值（含续传时跳过的块），和分段条是同一份数据，
-                // 不会出现"进度条满了但数字还差一截"或者反过来
-                singleFile -> maxOf(blockProgress!!.doneBytes, xferPopupResumeBase)
-                    .let { if (xferPopupTotal > 0) it.coerceAtMost(xferPopupTotal) else it }
-                else -> xferPopupResumeBase + sum
+            // done 的唯一真相源：这一批的「按块去重」字节账本（TransferLedger）。
+            //
+            // 以前多文件走的是"各通道原始线上字节相加"，那是错的，也是「4 GB / 2 GB」的根：
+            //   · 同一个块被重投 / 在两条通道上各写一遍，原始字节记两次；
+            //   · 取消 → 电脑端重建传输通道之后，connections 里还能用的旧通道是原对象，
+            //     累计值里带着上一笔传输的字节，界面一累加就凭空多出几百 MB；
+            //   · 单文件读 blockProgress（文件级）、多文件读通道字节（全局），两条路口径还不一样。
+            // 现在两个分支都用同一本批次账本：跨文件累计、同一 (文件, 块号) 只算一次。
+            val ledgerBytes = try {
+                server.progressLedger.doneBytes()
+            } catch (e: Throwable) {
+                0L
+            }
+            // 续传基线照旧单独加：它记的是"对端/本机已经有"的块，那些块一个字节都没上网，
+            // 账本里没有它们 —— 续传从 62% 起跳靠的就是这一项，语义不变。
+            val cap = if (xferPopupTotal > 0) xferPopupTotal else Long.MAX_VALUE
+            // 老口径（各通道原始字节相加），只留着做对照日志，不再参与显示
+            val rawDone = xferPopupResumeBase + sum
+            val done = minOf(xferPopupResumeBase + ledgerBytes, cap)
+            if (xferPopupTotal > 0 && rawDone > xferPopupTotal && now - rawOverflowLoggedAt >= 2000L) {
+                // 防御性日志：老口径超过总量时留一行证据（显示层现在已经夹紧，界面上看不出来了）
+                rawOverflowLoggedAt = now
+                top.weixiansen574.hybridfilexfer.core.HFXLog.d("进度 done>total：原始口径 " + rawDone
+                    + "（续传基线 " + xferPopupResumeBase + " + 各通道合计 " + sum + "）> 总量 "
+                    + xferPopupTotal + "；按块账本 " + ledgerBytes + "（" + server.progressLedger.fileCount()
+                    + " 个文件）→ 夹紧后 " + done + "；通道 " + snapshot.joinToString(" ") {
+                        it.name + "=" + (if (xferPopupSending) it.uploaded else it.downloaded)
+                    })
             }
             // 数据发完要**两条**都成立：
             //   ① 按块真值追平总字节（done >= xferPopupTotal）；
@@ -871,9 +895,10 @@ internal fun TransferScreen(
                 verifying -> verifyDone
                 // 数据发完、正在等电脑端算完：钉在 total 上，别被不再增长的真值拉回去
                 xferPopupWaiting && xferPopupTotal > 0 -> xferPopupTotal
-                // 真值偶发回退（重建换掉 connections、每块计数器重新开始）时不回跳，等它追上来
-                done < lastDone -> lastDone
-                else -> done
+                // 真值偶发回退（重建换掉 connections、每块计数器重新开始）时不回跳，等它追上来；
+                // 但"不回跳"不能变成"超量的旧值赖在上面"：和 done 一样一律夹到总量，
+                // 否则一次超量（4 GB / 2 GB）会永久停在那个数上（lastDone 是自己上一帧的显示值）。
+                else -> minOf(maxOf(done, lastDone), cap)
             }
             lastDone = shown
             val shownTotal = if (verifying) verifyTotal else xferPopupTotal

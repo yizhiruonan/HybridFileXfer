@@ -1024,6 +1024,10 @@ public class HFXServer extends HFXService {
                 + discardPartial, new Exception("abortTransfer caller"));
         transferCancelled = true;
         needsRebuild = true;
+        // 这一批作废了：字节账本立刻清空（和 shutdownTransferChannels 对称）。
+        // 不清的话，用户取消后马上重传，面板会先画着上一批的「已传」，
+        // 而面板的补间只增不减，那串数字就被钉在新任务上了。
+        progressLedger.reset();
         // 取消时把暂停闸门也放开：不放开的话 isTransferPaused() 一直是 true，
         // 会话线程会一直向电脑端上报"手机暂停了"，电脑端就停在暂停里（界面也停在
         // 已暂停）。下一次传输虽然会换新的闸门，但在这之前两边状态是不一致的。

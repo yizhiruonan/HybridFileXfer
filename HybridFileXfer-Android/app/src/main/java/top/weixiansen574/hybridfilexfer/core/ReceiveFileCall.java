@@ -18,6 +18,13 @@ public class ReceiveFileCall implements Callable<Void> {
     private final TransferPause pause;
     /** 分块进度账本（接收方向），由 HFXService.receiveFiles 注入 */
     private final BlockProgress progress;
+    /**
+     * 这一批的按块去重字节账本（界面 done 用），由 HFXService.receiveFiles 注入。
+     *
+     * <p>progress 只记当前这个文件的分段，换文件就清零；批次的完成字节要跨文件累计，
+     * 而且必须按块号去重（同一块被重投两次、两条通道各收一次都只算一次）。
+     */
+    private volatile TransferLedger ledger;
 
     public ReceiveFileCall(int tIndex, TransferConnection connection, WriteFileCall writeFileCall,
                            TransferFileCallback callback, TransferPause pause, BlockProgress progress) {
@@ -31,6 +38,11 @@ public class ReceiveFileCall implements Callable<Void> {
         iName = connection.iName;
         connection.resetTotalTrafficInfo();
         //this.dis = dataInputStream;
+    }
+
+    /** 这一批的按块去重字节账本（接收方向），由 HFXService.receiveFiles 注入 */
+    public void setLedger(TransferLedger ledger) {
+        this.ledger = ledger;
     }
 
     @Override
@@ -86,6 +98,11 @@ public class ReceiveFileCall implements Callable<Void> {
                         if (progress != null) {
                             // 这一块已经完整收到（校验通过、交给写盘线程）：进度条按块记真值
                             progress.onBlock(iName, path, index, totalSize);
+                        }
+                        // 批次账本同理，但它跨文件累计、按块号去重（重投/双通道重复收到的块只算一次）
+                        TransferLedger book = ledger;
+                        if (book != null) {
+                            book.onBlock(path, index, totalSize);
                         }
                         break;
                     }

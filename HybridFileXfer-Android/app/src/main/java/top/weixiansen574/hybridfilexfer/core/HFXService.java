@@ -194,6 +194,22 @@ public abstract class HFXService {
     public final BlockProgress sendProgress = new BlockProgress();
 
     /**
+     * 这一批传输的<b>按块去重字节账本</b>（界面 done 的唯一真相源）。
+     *
+     * <p>两个方向共用一本，每批在 {@code sendFiles} / {@code receiveFiles} 开头 reset：
+     * 一次传输只会是发送或接收其中一个方向，reset 之后账本里只会有这一批的块。
+     *
+     * <p>另外<b>一批被取消 / 出错时也清</b>（{@link #shutdownTransferChannels}、
+     * {@code HFXServer#abortTransfer}）：只靠「下一批开头 reset」会让上一批的数字活到下一批
+     * 真正开始之前，界面就先把旧进度画出来了。正常传完的那一批不清 —— 收尾校验时数字要停在 100%。
+     *
+     * <p>为什么界面不能再自己把"各通道累计字节"加起来：那是线上原始字节，块重投/双通道
+     * 重复写会重复计，取消/重建之后留在 {@code connections} 里的旧通道还带着上一笔的字节，
+     * 加起来就会出现「完成 4 GB / 总量 2 GB」。细节见 {@link TransferLedger}。
+     */
+    public final TransferLedger progressLedger = new TransferLedger();
+
+    /**
      * 收尾校验（整文件 SHA-256）的进度：已算字节 / 这一轮要算的总字节。
      *
      * <p>校验这一步以前在界面上是"没有进度的等待"（大文件实测一动不动两分钟，被当成卡死）。
@@ -434,6 +450,11 @@ public abstract class HFXService {
      * 一开始就写失败 —— 用户报的"再取消一次手机端报错"）。
      */
     protected int shutdownTransferChannels(String reason) {
+        // 这一轮到此为止：字节账本跟着清空。以前只在下一批的 sendFiles/receiveFiles 开头清，
+        // 比通道计数晚一整段 —— 取消后立刻重传时，面板会先画出上一批的「已传」，
+        // 而面板「只增不减」的补间又把它钉住（新任务一开就跑在 60%）。成功的那一批不经过这里，
+        // 所以「等待电脑校验」阶段数字照旧停在 100%。
+        progressLedger.reset();
         List<TransferConnection> list = connections;
         if (list == null || list.isEmpty()) {
             return 0;
@@ -545,7 +566,10 @@ public abstract class HFXService {
         this.currentReadFileCall = readFileCall;
         // 分块进度换成本次传输的新账本（上一轮的对象可能还有线程在写，别 reset 复用）
         sendProgress.reset();
+        // 字节账本跟着这一批重建：上一批的块绝不能带进来（否则进度条一开跑就比总量还大）
+        progressLedger.reset();
         readFileCall.setProgress(sendProgress);
+        readFileCall.setLedger(progressLedger);
         readFileCall.setPause(pauseGate);
         FutureTask<Void> readFileTask = new FutureTask<>(readFileCall);
         Thread readThread = new Thread(readFileTask);
@@ -690,6 +714,7 @@ public abstract class HFXService {
         long startTime = System.currentTimeMillis();
         // 分块进度换成本次传输的新账本（和发送方向同一套口径，见 blockProgress 的注释）
         blockProgress.reset();
+        progressLedger.reset();
         // 306：手机本地已经有的块也要先记进来。不记的话续传时进度条从 0 开始涨——
         // 实测 3.25 GB 的文件已有 3.0 GB，浮层却显示「324 MB / 3.25 GB」。
         // 归属记空串（和发送方向"电脑已收到的块"同一个口径），真实通道的块到了再按通道分段。
@@ -700,6 +725,9 @@ public abstract class HFXService {
                 }
                 for (int i = entry.getValue().nextSetBit(0); i >= 0; i = entry.getValue().nextSetBit(i + 1)) {
                     blockProgress.onBlock("", entry.getKey(), i, 0);
+                    // 批次账本同样要把"本地已经有"的块算进去（大小还不知道，传 0；
+                    // 界面最后会把 done 夹到总量上，不会因为末块估算而超出去）
+                    progressLedger.onBlock(entry.getKey(), i, 0);
                 }
             }
         }
@@ -711,7 +739,9 @@ public abstract class HFXService {
         List<FutureTask<Void>> transferTasks = new ArrayList<>(connections.size());
         for (int i = 0; i < connections.size(); i++) {
             TransferConnection connection = connections.get(i);
-            FutureTask<Void> task = new FutureTask<>(new ReceiveFileCall(i, connection, writeFileCall, callback, pauseGate, blockProgress));
+            ReceiveFileCall receiveCall = new ReceiveFileCall(i, connection, writeFileCall, callback, pauseGate, blockProgress);
+            receiveCall.setLedger(progressLedger);
+            FutureTask<Void> task = new FutureTask<>(receiveCall);
             transferTasks.add(task);
             Thread thread = new Thread(task);
             thread.setName("DL_" + connection.iName);
