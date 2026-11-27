@@ -788,8 +788,22 @@ impl Receiver {
         }
     }
 
-    /// Map a path sent by the phone into the receive directory. Paths outside of
-    /// it (should never happen) are flattened into the directory.
+    /// 把手机报来的路径映射成落盘路径。**防御点，改之前先读 util::relative_under 的注释。**
+    ///
+    /// 手机发来的路径是不可信输入：接收端零认证、同一个 Wi-Fi 里谁都能连上来推文件，
+    /// 所以这条路径等于「陌生人能指定往哪写」。老实现用字符串前缀判断「在不在接收目录里」，
+    /// `C:\接收\..\..\..\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\x.exe`
+    /// 前缀就是接收目录，判成「在里面」原样放行，操作系统落盘时才按 `..` 往上爬到目录外
+    /// —— 陌生人就能往你的自启动目录塞程序，开机即执行。
+    ///
+    /// 现在两道防线，这里是**第一道**（第二道见 `ensure_inside`，在真正写盘前）：
+    ///  1. 在接收目录里（按组件比，含子目录）→ 只允许普通名字段，拼回 base 下，
+    ///     结果和以前完全一样，正常的子目录传输不受影响；
+    ///  2. 不在里面、或者带 `..` 想绕出去 → 保留原来「拍平到 base/文件名」的行为，
+    ///     `..` 直接变成文件名的一部分被丢掉（`..` 结尾没有名字就给 received）。
+    ///
+    /// 关键点：两个分支返回的路径都是 `base` 下面**词法上**拼出来的，路径组件里不可能
+    /// 残留 `..`，所以不存在「靠操作系统去解析 ..」的空间。
     pub fn resolve(&self, raw: &str) -> PathBuf {
         let normalized = if std::path::MAIN_SEPARATOR == '\\' {
             PathBuf::from(raw.replace('/', "\\"))
@@ -797,14 +811,86 @@ impl Receiver {
             PathBuf::from(raw)
         };
         let base = self.dir.get();
-        if util::path_starts_with(&normalized, &base) {
-            normalized
+        if let Some(rest) = util::relative_under(&normalized, &base) {
+            // 在接收目录里：行为和以前一致（原来直接返回 normalized，这里只是
+            // 用 base + 普通名字段重新拼一遍，两者指向同一个路径）
+            if rest.as_os_str().is_empty() {
+                // 路径正好等于接收目录本身（或者 `base\..` 这种绕一圈又回来的），
+                // 那是目录不是文件，落到下面拍平分支去
+            } else {
+                return base.join(rest);
+            }
+        }
+        // 不在接收目录里（正常不会发生），或者想用 `..` 绕出去：拍平到接收目录，
+        // 和改之前一样，只是取名从 file_name() 换成「最后一段普通名字」——
+        // file_name() 对 `a\..` 会返回 `a`（因为末尾是 ..），这里要的是「没有名字」。
+        let name = util::last_normal_name(&normalized).unwrap_or_else(|| "received".into());
+        let flattened = base.join(name);
+        if self.ensure_inside(&flattened).is_ok() {
+            flattened
         } else {
-            let name = normalized
-                .file_name()
-                .map(|n| n.to_owned())
-                .unwrap_or_else(|| "received".into());
-            base.join(name)
+            // 万一连「拍平到接收目录」都被第二道防线拒了（软链接把接收目录本身指走），
+            // 至少别 panic：给一个固定名字，still 在 base 下面。真正的错误会在
+            // state_for 里再报一次并让这一块失败，上层照常按错误处理。
+            base.join("received")
+        }
+    }
+
+    /// 第二道防线：真的动磁盘之前，再确认一次目标路径就在接收目录里。
+    ///
+    /// 第一道防线（`resolve`）已经把路径拆成组件重拼过了，理论上不可能跑出去；
+    /// 这里再查一次是**故意的冗余**，别删：
+    ///  - `resolve` 是人写的，将来谁改一处忘了保持约定，这里能挡住；
+    ///  - 微软那套「盘符相对路径」（`C:foo`）、`\\?\` 前缀、8.3 短名这些边角形态，
+    ///    拆组件时看着像普通名字，实际落点和字面不一样；
+    ///  - 接收目录本身可能是别人建的软链接 / 目录联接，组件看着在目录里，
+    ///    真实落点在外面 —— 这种情况只有 `canonicalize` 能看出来。
+    ///
+    /// 已存在的部分用 `canonicalize`（它会解析软链接和 `..`），还不存在的部分
+    /// 只能做词法校验（按组件比，且不许有 `..`）—— 两边都过了才放行。
+    fn ensure_inside(&self, target: &Path) -> io::Result<()> {
+        let base = self.dir.get();
+        // 词法校验：目标必须在 base 下，且相对段里没有 ParentDir
+        let rest = util::relative_under(target, &base).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("路径不在接收目录内：{}", target.display()),
+            )
+        })?;
+        for component in rest.components() {
+            debug_assert!(
+                matches!(component, std::path::Component::Normal(_)),
+                "resolve 返回的相对路径里混进了非普通组件"
+            );
+        }
+        // 物理校验：最深的一个**已存在**的祖先 canonicalize 之后仍要在 base（也 canonicalize）里。
+        // 目标自己可能还没创建（首块落盘前），那就逐级往上找一个存在的。
+        let real_base = match std::fs::canonicalize(&base) {
+            Ok(path) => path,
+            // base 还没建出来（极少见）：词法校验已经是全部能做的了
+            Err(_) => return Ok(()),
+        };
+        let mut probe = target.to_path_buf();
+        loop {
+            match std::fs::canonicalize(&probe) {
+                Ok(real) => {
+                    if !real.starts_with(&real_base) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            format!(
+                                "路径的真实落点在接收目录之外（可能是软链接）：{} -> {}",
+                                target.display(),
+                                real.display()
+                            ),
+                        ));
+                    }
+                    return Ok(());
+                }
+                Err(_) => match probe.parent() {
+                    Some(parent) if parent != probe.as_path() => probe = parent.to_path_buf(),
+                    _ => return Ok(()),
+                },
+            }
         }
     }
 
@@ -939,11 +1025,17 @@ impl Receiver {
 
     pub fn make_dir(&self, raw_path: &str) -> io::Result<()> {
         let target = self.resolve(raw_path);
+        // 第二道防线（见 ensure_inside 的注释）：建目录同样会落在磁盘上，
+        // 一个软链接就能把 create_dir_all 引到接收目录外面去，所以这里也要过
+        self.ensure_inside(&target)?;
         fs::create_dir_all(target)?;
         Ok(())
     }
 
     fn state_for(&self, target: &Path, total_size: u64, modified_ms: i64) -> io::Result<Arc<FileState>> {
+        // 第二道防线（见 ensure_inside 的注释）：这里是所有「落盘」的唯一入口
+        // （写块、续传登记都走它），所以检查放这里最省事也最难绕过。
+        self.ensure_inside(target)?;
         {
             let entries = self
                 .entries
@@ -1569,7 +1661,7 @@ mod tests {
         let normalized = util::normalize_dir(&dir);
         let receiver = Receiver::new(normalized.clone());
         let target = receiver.resolve("/etc/elsewhere/file.txt");
-        assert!(util::path_starts_with(&target, &normalized));
+        assert!(util::relative_under(&target, &normalized).is_some());
         assert_eq!(target.file_name().unwrap(), "file.txt");
     }
 }
