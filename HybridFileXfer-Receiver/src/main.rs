@@ -120,6 +120,8 @@ fn run() -> i32 {
     }
 
     log::init(Some(exe_dir.join("receiver.log")), args.verbose);
+    // 命令行版虽然能看见 stderr，但开机脚本里那点输出没人看；落盘才查得到
+    log::install_panic_hook();
     print_banner(&cfg, &config_path, &exe_dir, args.ip);
 
     let mode = if args.discover {

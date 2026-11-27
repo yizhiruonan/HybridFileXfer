@@ -2111,6 +2111,8 @@ fn main() -> Result<(), slint::PlatformError> {
     let verbose = std::env::args().any(|a| a == "-v" || a == "--verbose");
     log::init(Some(exe_dir.join("receiver.log")), verbose);
     log::set_console(false);
+    // 必须先装钩子：GUI 没有控制台，panic 默认连一句提示都不留就成了「程序自己关了」
+    log::install_panic_hook();
     log::info(&format!(
         "GUI build={} pid={} exe={}",
         env!("CARGO_PKG_VERSION"),
@@ -4460,7 +4462,15 @@ fn main() -> Result<(), slint::PlatformError> {
         ui.invoke_start_clicked();
     }
 
-    ui.run()
+    // 事件循环退出后必须留一行日志。用户报的「传着传着程序自己没了」有两种可能：
+    // panic（有钩子会记）和「事件循环正常返回、main 直接 Ok(()) 退出」（默认什么都不留，
+    // 日志断在最后一句中途，看起来就像被杀掉）。有这一行就能区分开。
+    let result = ui.run();
+    log::warn(&format!(
+        "事件循环退出，进程即将结束（result={:?}）",
+        result.as_ref().err()
+    ));
+    result
 }
 
 // ---------------- 更新：检查 / 下载 / 自我替换 ----------------
