@@ -158,6 +158,7 @@
     <string name="share_no_file">No file to send</string>
     <string name="share_failed">Failed: %1$s</string>
     <string name="share_pc_not_connected">The computer is not connected. Please run the receiver on the PC first.</string>
+    <string name="share_pc_connected_no_channel">The computer connected, but no transfer channel could be established (often the USB-debug channel is taken by another program, or a firewall blocks the LAN).</string>
     <string name="share_sending">Sending: %1$s</string>
     <string name="share_complete">Sent to the computer: %1$s</string>
     <string name="share_busy">A transfer is running, please wait…</string>

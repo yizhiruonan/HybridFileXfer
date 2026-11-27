@@ -157,6 +157,9 @@
     <string name="share_no_file">没有可发送的文件</string>
     <string name="share_failed">发送失败：%1$s</string>
     <string name="share_pc_not_connected">没有连接到电脑，请先在电脑上运行接收器</string>
+    <!-- 电脑的控制通道连上了、传输通道却一条都没建起来（USB_ADB 被占用 / 防火墙拦了局域网都会这样）。
+         这时不能说「请先运行接收器」—— 那正是用户已经做对的事。 -->
+    <string name="share_pc_connected_no_channel">电脑连上了，但传输通道没建起来（常见原因：USB 调试通道被别的程序占用，或防火墙拦了局域网通道）</string>
     <string name="share_sending">正在发送：%1$s</string>
     <string name="share_complete">已发送到电脑：%1$s</string>
     <string name="share_busy">正在传输，请稍候…</string>

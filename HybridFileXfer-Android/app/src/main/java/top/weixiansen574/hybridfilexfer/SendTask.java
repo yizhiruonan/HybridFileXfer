@@ -9,6 +9,7 @@ import android.os.Build;
 import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.provider.DocumentsContract;
 import android.provider.MediaStore;
 import android.provider.OpenableColumns;
@@ -592,13 +593,13 @@ public final class SendTask {
             }
             if (!ensureConnected()) {
                 if (!isAbandoned()) {
-                    fail(appContext.getString(R.string.share_pc_not_connected));
+                    fail(connectFailureText());
                 }
                 return;
             }
             HFXServer srv = server;
             if (srv == null) {
-                fail(appContext.getString(R.string.share_pc_not_connected));
+                fail(connectFailureText());
                 return;
             }
             // 这条连接的发送通道：同一时刻只放一个任务进去（另一个任务正在传就在这里排队）
@@ -1324,6 +1325,24 @@ public final class SendTask {
             path = path.substring(1);
         }
         return path.replace(File.separatorChar, '/');
+    }
+
+    /**
+     * 等不到连接时的文案：分「电脑没在运行」和「电脑连上了、传输通道却没建起来」两种。
+     *
+     * <p>为什么值得分开：实测最常见的失败不是电脑没开，而是控制通道连上之后传输通道一条都没
+     * 建立（USB_ADB 通道被占用、防火墙拦了局域网通道，都会这样，见 HFXServer 里那段等待预算的
+     * 注释）。这时面板却说「请先在电脑上运行接收器」——用户被指去检查一件他已经做对的事，
+     * 真正的原因只在 hfx_core.log 里。判断依据是 ServerService 记下的「上次握手中止时刻」：
+     * 只要在我们刚等过的这段时间里发生过，就说明电脑确实来过。
+     */
+    private String connectFailureText() {
+        long abortedAt = ServerService.getLastHandshakeAbortAt();
+        boolean cameAndFailed = abortedAt > 0
+                && SystemClock.elapsedRealtime() - abortedAt <= CONNECT_TIMEOUT_MS + 5_000L;
+        return appContext.getString(cameAndFailed
+                ? R.string.share_pc_connected_no_channel
+                : R.string.share_pc_not_connected);
     }
 
     private boolean ensureConnected() {

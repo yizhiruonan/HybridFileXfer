@@ -260,6 +260,20 @@ public class ServerService extends Service implements ServiceConnection {
         return HFXServer.count() > 0;
     }
 
+    /**
+     * 最近一次「电脑的控制通道到了、握手却没走完」的时刻（{@link android.os.SystemClock#elapsedRealtime()}，0 = 从没有过）。
+     *
+     * <p>为什么要有它：分享面板等不到连接时只会说「请先在电脑上运行接收器」，而实测最常见的失败
+     * 根本不是电脑没运行 —— 是控制通道连上了、传输通道一条都没建起来（USB_ADB 通道被占用、
+     * 防火墙拦了局域网通道，都会这样）。那时用户被指去检查一件已经做对的事，日志却在另一个地方。
+     * 这里只记时刻，文案由面板自己按「多久以前」判断，免得两边各存一份状态。
+     */
+    private static volatile long lastHandshakeAbortAt;
+
+    public static long getLastHandshakeAbortAt() {
+        return lastHandshakeAbortAt;
+    }
+
     /** 只看有没有连接的地方用（分享面板等旧界面）；多台电脑时取第一台。 */
     public static HFXServer getServer() {
         return HFXServer.getAny();
@@ -1326,6 +1340,10 @@ public class ServerService extends Service implements ServiceConnection {
                     Thread session = new Thread(() -> sessionLoop(server, gen), "HFX-Session-" + server.getId());
                     session.start();
                 } else {
+                    // 走到这里说明「电脑的控制通道已经到了，但握手没走完」—— 记下时刻，
+                    // 分享面板据此把「没连电脑」改成「连上了、通道没建起来」，别再让用户
+                    // 去检查一个他明明做对了的动作（详见 getLastHandshakeAbortAt 的注释）。
+                    lastHandshakeAbortAt = SystemClock.elapsedRealtime();
                     try {
                         server.disconnect();
                     } catch (Throwable ignored) {
