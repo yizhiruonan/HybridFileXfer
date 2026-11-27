@@ -14,6 +14,7 @@
 
 pub mod ecdh;
 pub mod kdf;
+pub mod message;
 pub mod record;
 
 use std::fmt;
