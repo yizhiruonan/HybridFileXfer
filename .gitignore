@@ -51,6 +51,9 @@ tools/wgc-capture/shots/
 tools/wgc-capture/wgc_capture.exe
 # ================= 开发记录 / 调试工具（只留本地，不进公开仓库）=================
 # 排查过程、待办清单、交接文档：都在本地 _worklog\，仓库里只留 README
+# 整目录忽略：视频母版/样片/基准日志/截图都在里面，本机已到 3+ GB，
+# 少这一行就会在 `git add -A` 时被整包带走（2026-11-27 补）
+/_worklog/
 /BUGS.md
 /NEXT-TODO.md
 /TRANSFER-WINDOW.md
