@@ -651,7 +651,11 @@ export component AppWindow inherits Window {
                         width: 110px;
                         spacing: 3px;
                         Text { text: "端口"; font-size: 11px; color: #8A8A8A; }
-                        LineEdit { text <=> root.port-text; }
+                        // fluent 样式的 LineEdit 自带 `min-width: 160px`：放进 110px 宽的栏里
+                        // 它不会缩，而是往右溢出 51px —— 被后面的「连接方式」下拉框压住，
+                        // 看起来就是「端口输入框的底板和连接方式重叠了」。这里显式覆盖掉
+                        // 这个最小宽度（端口号就四位数，110px 足够），底板才不会再外溢。
+                        LineEdit { min-width: 110px; text <=> root.port-text; }
                     }
 
                     VerticalLayout {
