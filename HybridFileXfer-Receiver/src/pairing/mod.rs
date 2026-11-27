@@ -13,6 +13,7 @@
 //!    这样真机上一旦出问题，改配置就能退回，不用回滚代码。
 
 pub mod ecdh;
+pub mod identity;
 pub mod kdf;
 pub mod message;
 pub mod record;
