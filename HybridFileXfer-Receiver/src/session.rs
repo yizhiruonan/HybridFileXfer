@@ -70,6 +70,30 @@ pub struct PeerInterface {
     pub bind: Option<IpAddr>,
 }
 
+/// 会话持有的「5742 来源白名单」凭证；Drop 时逐条撤销。
+struct WebGrant {
+    ips: Vec<IpAddr>,
+}
+
+impl WebGrant {
+    fn new(mut ips: Vec<IpAddr>) -> WebGrant {
+        ips.sort();
+        ips.dedup();
+        for ip in &ips {
+            crate::webserve::allow_peer(*ip);
+        }
+        WebGrant { ips }
+    }
+}
+
+impl Drop for WebGrant {
+    fn drop(&mut self) {
+        for ip in &self.ips {
+            crate::webserve::forget_peer(*ip);
+        }
+    }
+}
+
 pub struct Session {
     /// 本会话对应的手机串号（多设备时用于对待发送队列分流）
     pub device: String,
@@ -97,6 +121,18 @@ pub struct Session {
     /// 那一帧已经消费掉了，再读会一直等到读超时。
     pending_resume: Option<Vec<(String, u64, i64)>>,
     pub interfaces: Vec<PeerInterface>,
+    /// 本会话给 5742 文件夹浏览接口开的来源白名单，会话销毁时自动撤销。
+    ///
+    /// 为什么是一串而不是一个：电脑是**主动连接**手机的那一方，拨号用的是手机
+    /// 报来的某一个网卡地址；手机反过来访问 5742 时，源地址由它自己的路由决定，
+    /// 可能是另一张网卡。把手机报来的所有网卡地址都登记上，才不会出现
+    /// 「连着能用、换个网卡就 403」。这些地址全都是这台手机的，不扩大权限面。
+    ///
+    /// 用「带 Drop 的守卫」而不是给 Session 自己写 Drop：Session 有几处是部分移动
+    /// （把 transfers / reader 单独取走），一旦类型自己实现了 Drop 就编不过。
+    /// 前导下划线是给编译器看的：这个字段本来就只是「活着的时候有效」，
+    /// 没有任何代码需要读它。
+    _web_grant: WebGrant,
     /// 手机监听的端口（非回环网卡上的传输通道重连要用）
     port: u16,
     /// adb 转发给这台手机的本地端口（回环通道重连要用）
@@ -404,6 +440,13 @@ impl Session {
         reader.set_read_timeout(Some(IDLE_TIMEOUT))?;
         reader.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
 
+        // 握手成功 = 这台手机确实是刚才连上来的那一台，此时才给它的地址开 5742 的口子。
+        // 顺带把控制连接的对端地址也算上：手机报的网卡清单可能漏掉它正在用的那一张。
+        let mut web_ips: Vec<IpAddr> = interfaces.iter().map(|i| i.address).collect();
+        if let Ok(peer) = reader.peer_addr() {
+            web_ips.push(peer.ip());
+        }
+
         Ok(Session {
             device: String::new(),
             reader,
@@ -414,6 +457,7 @@ impl Session {
             pending_resume: None,
             limit_epoch: crate::ratelimit::configured_epoch(),
             interfaces,
+            _web_grant: WebGrant::new(web_ips),
             port,
             local_port,
             stop: None,
