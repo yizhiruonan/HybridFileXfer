@@ -37,6 +37,15 @@ const TRANSFER_TIMEOUT: Duration = Duration::from_secs(60);
 /// CANCEL 只有 2 字节，只要 socket 发送缓冲还有一点空就瞬间写完 ——
 /// 正常路径上这个超时一次也用不上，它只是把「可能永远等」变成「最多等半秒」。
 const CANCEL_FRAME_TIMEOUT: Duration = Duration::from_millis(500);
+/// 收尾时等手机端结论帧（RESULT）的总上限。
+///
+/// 不能用「socket 读超时」当保险：手机在收尾期间每 250ms 发一帧 PAUSE_STATE，
+/// 每次读都能读满，读超时永远不触发，那个循环就能一直转下去。用户报的
+/// 「双方互等」（手机停在等待电脑校验、电脑显示收满却不出接收完成）就是这种僵持。
+/// 给一个总上限，超时按失败收尾 —— 两边都能拿到结论，而不是一起沉默。
+/// 数值给得宽：手机要在这段时间里算完整个文件的 SHA-256（4.9 GB 实测 20~40 秒，
+/// 慢机上更久），不能按 socket 那个尺度算。
+const RESULT_WAIT_TIMEOUT: Duration = Duration::from_secs(300);
 /// 取消 / 停止之后，还留给传输线程多久自己退出（整段合计，不是每条通道各算）。
 ///
 /// 会话线程**不能**无条件 join 它们：暂停态下那些线程正停在「等手机发下一块」
@@ -1044,10 +1053,53 @@ impl Session {
     /// 303：读一帧结论（含对端产出的文件指纹）。期间遇到手机发来的 PAUSE_STATE /
     /// PING 就地处理 —— 收尾时手机端的暂停同步还在飞，不处理就会把结论读串。
     fn read_result(&mut self) -> io::Result<PeerResult> {
+        // 用户报过「双方互等」：手机停在「等待电脑校验」，电脑显示收满了却一直不出
+        // 「接收完成」，两边日志都像没事发生。这个循环就是最可能待着的地方 ——
+        // 手机每 250ms 发一帧 PAUSE_STATE，本端就地应答，每一帧读都能读满，
+        // **socket 读超时永远不会触发**，于是光靠读超时兜不住，循环可以无限转下去。
+        //
+        // 两件事一起补：每 20 秒记一条 warn（等了多久 / 收到多少帧 / 最后一条是什么，
+        // 僵持时日志里终于有东西可看）；再加一个硬上限，超时按失败收尾，让两边都拿到
+        // 结论，而不是一起沉默。
+        //
+        // 注意上限的检测粒度受读超时约束：这里读帧头仍用长超时（短超时会读断帧头、
+        // 把控制通道错位一拍，见 rebuild 里那段注释），所以最长要等
+        // RESULT_WAIT_TIMEOUT + 一次读超时才被发现。
+        let deadline = Instant::now() + RESULT_WAIT_TIMEOUT;
+        let started = Instant::now();
+        let mut frames = 0u64;
+        let mut last_report = Instant::now();
+        let mut last_id = -1i16;
         loop {
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "{}（等了 {:.0} 秒，收到 {} 帧，最后一帧 {}）",
+                        crate::i18n::tr(
+                            "等手机端结论帧超时",
+                            "timed out waiting for the phone's RESULT"
+                        ),
+                        started.elapsed().as_secs_f64(),
+                        frames,
+                        last_id
+                    ),
+                ));
+            }
             // 这里在等结论帧，但手机可能先插一帧队列快照进来（用户随时能改队列）。
             // 由辅助函数就地吞掉，别的帧照原样返回。
             let id = self.read_control_frame_skipping_queue()?;
+            frames += 1;
+            last_id = id;
+            if last_report.elapsed() >= Duration::from_secs(20) {
+                last_report = Instant::now();
+                log::warn(&format!(
+                    "还在等手机端结论：已等 {:.1} 秒，期间收到 {} 帧（最后一帧 {}）",
+                    started.elapsed().as_secs_f64(),
+                    frames,
+                    id
+                ));
+            }
             log::debug(&format!("waiting phone RESULT: frame {}", id));
             match id {
                 controller::RESULT => {
@@ -2439,7 +2491,33 @@ impl Session {
             "收尾：结论帧已写出，正在等手机端",
             "RESULT sent, waiting for the phone",
         ));
-        let peer = self.read_result()?;
+        // 收尾确认超时**不等于传输失败**：数据早就收齐了（上面块账本对过、盘上也落了），
+        // 这一步只是等手机端把它复算的指纹结论发回来。以前这里用 `?` 直接冒泡，
+        // 于是超时被当成「连接错误」收场 —— 解档不执行（.hfx.zip 就留在那），
+        // 用户看到的是「传输失败」，而文件其实是好的。实测过一次：数据全对，
+        // 界面报错、归档没解、用户白传 1.46GB。
+        //
+        // 所以这里降级：等不到结论就记一条 warn、按「数据已经收完」继续往下走
+        // （清续传记录、解档都照做），只是明确告诉用户校验结论没拿到，让他自己复核。
+        let peer = match self.read_result() {
+            Ok(peer) => peer,
+            Err(e) => {
+                let reason = crate::i18n::tr(
+                    "数据已经收完，但没等到手机端的校验结论",
+                    "data is complete, but the phone's verification result did not arrive",
+                );
+                log::warn(&format!("{reason}：{e}"));
+                // 界面要如实显示：既不能报「接收完成」（校验结论没拿到），
+                // 也不能报「传输失败」（文件是好的）—— 用失败提示位挂一条中性说明，
+                // 用户点掉窗口就消失，不影响已经落盘的文件。
+                crate::receiver::set_failure(&format!("{reason}（{}）", e));
+                // 数据确认收完：续传记录清掉，归档照解（否则用户还得自己解压）
+                let received = receiver.received_files();
+                clear_resume_journals(&received);
+                extract_archives(&received);
+                return Ok(());
+            }
+        };
         log::info(crate::i18n::tr(
             "收尾：收到手机端结论",
             "got the phone's RESULT",
