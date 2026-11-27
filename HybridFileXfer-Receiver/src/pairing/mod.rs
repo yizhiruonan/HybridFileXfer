@@ -13,6 +13,7 @@
 //!    这样真机上一旦出问题，改配置就能退回，不用回滚代码。
 
 pub mod ecdh;
+pub mod handshake;
 pub mod identity;
 pub mod kdf;
 pub mod message;
@@ -113,8 +114,22 @@ impl fmt::Display for PairError {
 impl std::error::Error for PairError {}
 
 impl From<std::io::Error> for PairError {
-    fn from(_: std::io::Error) -> Self {
-        PairError::Io
+    /// 读/写超时必须映射成 [`PairError::Timeout`]，不能一律变成 [`PairError::Io`]。
+    ///
+    /// 三种失败对用户和对重试策略的意义完全不同：
+    /// - 超时（`WouldBlock`/`TimedOut`）= 对端不吭声，可能是用户走开、网络半死 —— 可以报
+    ///   "配对超时，请重新连接"，并且**不能**自动重试打对端；
+    /// - 对端关闭（`UnexpectedEof` 等）= 对端主动放弃，多半是它那边判定失败；
+    /// - 本机 IO 错 = 磁盘/句柄问题。
+    ///
+    /// 全都塞进 `Io` 的话，日志上只有一句"本机读写错误"，而 §5.14.3 的三种超时
+    /// 一条都验证不了。Windows 的超时读通常是 `WouldBlock`，其它平台可能是 `TimedOut`，
+    /// 两个都收。
+    fn from(e: std::io::Error) -> Self {
+        match e.kind() {
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => PairError::Timeout,
+            _ => PairError::Io,
+        }
     }
 }
 
