@@ -145,6 +145,8 @@
     <string name="share_preparing">Preparing…</string>
     <string name="share_folder_title">Folder: %1$s</string>
     <string name="share_folder_archive">Send as one archive (unpacked on the PC)</string>
+    <string name="share_folder_hint_big">Big files, few of them — sending directly is faster</string>
+    <string name="share_folder_hint_small">Many small files — packing them first is faster</string>
     <string name="share_folder_ask">Waiting: archive %1$s?</string>
     <string name="share_packing">Packing %1$s… %2$d%%</string>
     <string name="share_send">Send</string>

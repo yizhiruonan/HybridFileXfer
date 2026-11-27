@@ -11,7 +11,8 @@ import android.os.SystemClock;
 import android.util.Log;
 import android.view.MotionEvent;
 import android.widget.CheckBox;
-import android.widget.FrameLayout;
+import android.widget.LinearLayout;
+import android.widget.TextView;
 import android.view.ViewGroup;
 import android.view.WindowManager;
 
@@ -317,18 +318,33 @@ public class ShareActivity extends AppCompatActivity {
         }
     }
 
-    /** 分享文件夹时的勾选框：打不打包成归档文件发（默认勾上） */
+    /**
+     * 分享文件夹时的勾选框：打不打包成归档文件发。
+     *
+     * <p>默认值不再是写死的「勾上」，而是任务按目录特征算出来的
+     * （{@link SendTask#getArchiveSuggestedDefault()}：少而大的目录默认不打包，
+     * 小文件多的目录默认打包），下面再补一行说明为什么。
+     */
     private void showArchiveChoice(SendTask target, String folderName) {
         archiveDialogShown = true;
         HFXLog.d("share: 分享的是文件夹 " + folderName + "，弹勾选框");
         CheckBox box = new CheckBox(this);
         box.setText(R.string.share_folder_archive);
-        box.setChecked(true);
+        box.setChecked(target.getArchiveSuggestedDefault());
         float density = getResources().getDisplayMetrics().density;
         int pad = (int) (density * 20f);
-        FrameLayout wrap = new FrameLayout(this);
+        LinearLayout wrap = new LinearLayout(this);
+        wrap.setOrientation(LinearLayout.VERTICAL);
         wrap.setPadding(pad, (int) (density * 4f), pad, 0);
         wrap.addView(box);
+        String hint = target.getArchiveHint();
+        if (hint != null && !hint.isEmpty()) {
+            TextView hintView = new TextView(this);
+            hintView.setText(hint);
+            hintView.setTextSize(12f);
+            hintView.setPadding(0, (int) (density * 2f), 0, 0);
+            wrap.addView(hintView);
+        }
         new AlertDialog.Builder(this)
                 .setTitle(getString(R.string.share_folder_title, folderName))
                 .setView(wrap)

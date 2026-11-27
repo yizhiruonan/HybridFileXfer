@@ -165,8 +165,25 @@ public final class SendTask {
     private String ledgerFilePath;
     private long ledgerFileSize;
     private final Object ledgerLock = new Object();
-    /** 这一轮由「断点续传」跳过的字节（电脑上已经有了，不在 sendProgress 的账本里） */
+    /**
+     * 这一轮由「断点续传」跳过的字节（电脑上已经有了）。
+     *
+     * <p><b>只作说明用，不再参与进度求和</b>：块账本 {@code sendProgress} 已经把跳过的块记成
+     * 完成了（{@code ReadFileCall#readToDeque} 里 skipTracker.onBlock(""…)}），再把它加上去
+     * 就是同一批字节算两遍（「300 MB 显示 589 MB」那条老账就是这么来的）。
+     */
     private volatile long resumeSkipped;
+    /**
+     * 打包阶段的已处理字节：<b>只在 {@link #packing} 期间有效</b>。
+     *
+     * <p>它和 {@link #completedBytes} 必须是两个字段。以前打包直接往 completedBytes 里写，
+     * 打完不归零，紧接着的传输又往上加了一遍 —— 真机实测归档发送显示
+     * 「4.94 GB / 2.47 GB」（打包 2.47 GB + 传输 2.47 GB，正好两倍）。
+     * 打包和传输是两个阶段，各有一本账。
+     */
+    private volatile long packDoneBytes;
+    /** 正在打归档（准备阶段）：这段时间读到的进度是打包，不是传输 */
+    private volatile boolean packing;
     private volatile long currentGroupTotal;
     /** 已经并进 completedBytes 的那个账本属于哪个文件：识别「陈旧快照」，别把一组算两遍 */
     private volatile String accountedLedgerPath;
@@ -181,6 +198,17 @@ public final class SendTask {
     private volatile Boolean archiveChoice;
     /** 正在等答案的那个文件夹的名字；null = 没在等。面板靠它决定要不要弹勾选框。 */
     private volatile String awaitingArchiveName;
+    /**
+     * 「打包成归档发送」那个勾选框的<b>默认值</b>，按目录特征算出来；等待开始时就算好。
+     *
+     * <p>以前一律默认勾上。实测「少而大」的目录（5 个 .img 共 2.5 GB）打包纯亏：
+     * 打包 45~50 秒 + 传输 36 秒 ≈ 86 秒，直接按文件夹传只要 33 秒（76.88 MB/s），
+     * 而 zip/原文件 = 1.00015（{@link #packFolder} 用的是 NO_COMPRESSION，一点都压不动）。
+     * 所以平均文件大的目录默认<b>不</b>打包；小文件多 / 中间地带保持原来的默认（打包）。
+     */
+    private volatile boolean archiveSuggested = true;
+    /** 上面那个默认值对应的说明文案（给面板显示，空串 = 不用说明） */
+    private volatile String archiveHint = "";
     private final Object archiveLock = new Object();
     /** 没人回答时的兜底上限：面板一定会问，等这么久还没人理就按默认（打包）走 */
     private static final long ARCHIVE_CHOICE_TIMEOUT_MS = 30_000L;
@@ -1015,6 +1043,19 @@ public final class SendTask {
                 resolved.clear();
                 resolved.add(zip);
                 total = zip.length();
+                // 打包 → 传输：换阶段就换一本账。打包时 totalBytes 被填成原目录的字节数、
+                // 打包进度也写进了 packDoneBytes；这里全部归零，传输从 0 开始记。
+                // 以前不归零，于是「已传」从打包的字节起跳，收尾正好是两倍（4.94 / 2.47）。
+                packDoneBytes = 0L;
+                completedBytes = 0L;
+                resumeSkipped = 0L;
+                synchronized (ledgerLock) {
+                    groupFilesDone = 0L;
+                    ledgerFilePath = null;
+                    ledgerFileSize = 0L;
+                }
+                HFXLog.d("task " + taskId + ": 打包结束，进入传输阶段（归档 " + total
+                        + " 字节，传输进度从 0 记）");
             }
         }
         files.clear();
@@ -1073,6 +1114,7 @@ public final class SendTask {
      * 之后按「打包」这个默认值走 —— 用户要求的就是默认勾选。
      */
     private boolean awaitArchiveChoice(File dir) {
+        computeArchiveSuggestion(dir);
         awaitingArchiveName = dir.getName();
         HFXLog.d("task " + taskId + ": 分享的是文件夹 " + dir.getName() + "，等用户勾要不要打包");
         synchronized (archiveLock) {
@@ -1088,12 +1130,66 @@ public final class SendTask {
                 }
             }
             if (archiveChoice == null) {
-                HFXLog.d("task " + taskId + ": 没人回答要不要打包，按默认（打包）走");
-                archiveChoice = Boolean.TRUE;
+                HFXLog.d("task " + taskId + ": 没人回答要不要打包，按默认走（"
+                        + (archiveSuggested ? "打包" : "不打包") + "）");
+                archiveChoice = archiveSuggested;
             }
             awaitingArchiveName = null;
             return archiveChoice;
         }
+    }
+
+    /**
+     * 按目录特征算出「打包成归档」的默认值（{@link #archiveSuggested}）和说明文案。
+     *
+     * <p>口径（实测数据见 {@link #archiveSuggested}）：
+     * <ul>
+     *   <li>平均每个文件 &gt; 32 MB —— 少而大（备份镜像那种），打包白等一趟，默认<b>不</b>打包；</li>
+     *   <li>平均 &lt; 4 MB 或者文件数 &gt; 100 —— 小文件多，打包后省掉每文件握手和收尾校验，默认打包；</li>
+     *   <li>其余（中间地带）—— 保持老版本行为：默认打包。</li>
+     * </ul>
+     * 用户自己勾过就以他的选择为准（{@link #chooseArchive} 记在本任务里，不会再被覆盖）。
+     */
+    private void computeArchiveSuggestion(File dir) {
+        List<File> all = new ArrayList<>();
+        collectForPack(dir, all);
+        long totalSize = 0L;
+        for (File f : all) {
+            totalSize += f.length();
+        }
+        int count = all.size();
+        long avg = count > 0 ? totalSize / count : 0L;
+        final long MB = 1024L * 1024L;
+        boolean suggest;
+        String hint;
+        if (count == 0) {
+            suggest = true;
+            hint = "";
+        } else if (avg > 32L * MB) {
+            suggest = false;
+            hint = appContext.getString(R.string.share_folder_hint_big);
+        } else if (avg < 4L * MB || count > 100) {
+            suggest = true;
+            hint = appContext.getString(R.string.share_folder_hint_small);
+        } else {
+            suggest = true;
+            hint = "";
+        }
+        archiveSuggested = suggest;
+        archiveHint = hint;
+        HFXLog.d("task " + taskId + ": 目录 " + dir.getName() + " 共 " + count + " 个文件 "
+                + totalSize + " 字节（平均 " + avg + "）→ 默认"
+                + (suggest ? "打包" : "不打包"));
+    }
+
+    /** 面板弹勾选框时用的默认值（按目录特征算，见 {@link #computeArchiveSuggestion}） */
+    public boolean getArchiveSuggestedDefault() {
+        return archiveSuggested;
+    }
+
+    /** 勾选框下面那行说明（空串 = 不用显示） */
+    public String getArchiveHint() {
+        return archiveHint;
     }
 
     /** 面板上那个勾选框的落点：这个文件夹打不打包发（默认 true） */
@@ -1139,9 +1235,11 @@ public final class SendTask {
             packTotal += f.length();
         }
         totalBytes = packTotal;
-        completedBytes = 0L;
+        packing = true;
+        packDoneBytes = 0L;
         long done = 0L;
         byte[] buf = new byte[1 << 20];
+        boolean packed = false;
         try {
             try (ZipOutputStream out = new ZipOutputStream(new FileOutputStream(zip))) {
                 out.setLevel(Deflater.NO_COMPRESSION);
@@ -1162,7 +1260,8 @@ public final class SendTask {
                             }
                             out.write(buf, 0, n);
                             done += n;
-                            completedBytes = done;
+                            // 只记打包这一段的账，别碰传输那本（见 packDoneBytes 的注释）
+                            packDoneBytes = done;
                             statusText = appContext.getString(R.string.share_packing, name,
                                     packTotal > 0L ? (int) (done * 100L / packTotal) : 0);
                         }
@@ -1171,6 +1270,7 @@ public final class SendTask {
                 }
                 out.finish();
             }
+            packed = true;
         } catch (IOException e) {
             HFXLog.d("task " + taskId + ": 打包失败 " + e);
             // 半截归档留着有害（下次同名会当缓存命中），删掉
@@ -1178,6 +1278,17 @@ public final class SendTask {
                 HFXLog.d("task " + taskId + ": 半截归档删不掉 " + zip);
             }
             return null;
+        } finally {
+            // 打包这一段到此结束：**成功失败都要复位**。以前只有成功路径走 packing=false，
+            // 失败时 packing 还是 true、packDoneBytes 停在半截、totalBytes 还是原目录大小，
+            // 界面就成了「打包失败」+ 一串假数字。复位做在这里，将来加「打包失败就按原文件发」
+            // 也不会变成完整的 200%（打包 N + 传输 N）。
+            packing = false;
+            packDoneBytes = 0L;
+            if (!packed) {
+                // 失败时不留半截总量：0 / 0 比「78% 卡在那儿」诚实
+                totalBytes = 0L;
+            }
         }
         if (isAbandoned()) {
             return null;
@@ -1513,7 +1624,9 @@ public final class SendTask {
      */
     public long getDoneBytes() {
         // + groupFilesDone：本组里已经整份发完的文件（见字段注释，换文件时进度不能往回跳）
-        long done = completedBytes + resumeSkipped + groupFilesDone;
+        // 打包阶段读 packDoneBytes（那本账只有打包在用），传输阶段读 completedBytes。
+        // resumeSkipped 不往里加：块账本里那些跳过块已经算过一遍了（见字段注释）。
+        long done = (packing ? packDoneBytes : completedBytes) + groupFilesDone;
         HFXServer srv = server;
         if (srv != null) {
             try {
@@ -1542,7 +1655,7 @@ public final class SendTask {
         if (current == STATE_SENDING || current == STATE_PAUSED) {
             return getDoneBytes();
         }
-        return completedBytes + resumeSkipped + groupFilesDone;
+        return (packing ? packDoneBytes : completedBytes) + groupFilesDone;
     }
 
     /** 队列 / 通知要的文件名：正在传的那个，还没开传就用准备阶段记下的第一个 */
