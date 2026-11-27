@@ -1,0 +1,3 @@
+# .bat 必须是 CRLF：cmd.exe 读 LF 行尾的批处理会错位执行（片段被当成命令）。
+# 这里钉死行尾，别人 clone 时不管 core.autocrlf 怎么设都拿得到 CRLF。
+*.bat text eol=crlf
