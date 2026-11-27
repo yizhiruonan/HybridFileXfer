@@ -85,6 +85,18 @@ public class HFXServer extends HFXService {
      * 超过就把剩下的回绝掉，先连上再说话。
      */
     private static final int TRANSFER_WAIT_TOTAL_MS = 6000;
+    /**
+     * 总预算已经被前面的通道用光之后，剩下每条通道仍然保底拿到的取通道时间。
+     *
+     * <p>为什么必须有保底：{@link #TRANSFER_WAIT_TOTAL_MS} 是**整次握手共用**的一笔预算，
+     * 排到后面几条时算出来的剩余时间可能已经是 0。而"等 0 毫秒"和"真超时"在日志里长得
+     * 一模一样（实测：USB_ADB 等满 3008ms，紧接着 8 条 wlan 通道全部"等超时，等了 6ms"），
+     * 后果还越过了容错设计 —— 明明每条只回绝自己、其余照常，但**每条都分到 0 秒**时，
+     * 就变成"一条都没建起来"，整次握手白做（{@code connections.isEmpty()} → 断开会话 →
+     * 分享面板空等 30 秒）。已经到的那条通道其实就躺在 accept 队列里，取一下只要 1ms，
+     * 给一条不依赖总预算的保底时间就够。
+     */
+    private static final int TRANSFER_MIN_GRACE_MS = 300;
 
     protected final IIOService ioService;
     protected int remoteFileSystem;
@@ -329,7 +341,17 @@ public class HFXServer extends HFXService {
                 top.weixiansen574.hybridfilexfer.core.HFXLog.d("握手：" + name + (succeed ? " 已连" : " 不通"));
                 if (succeed) {
                     //从共享套接字上取一条传输通道（别的电脑的控制通道会被暂存，不会认错）
-                    long left = Math.min(TRANSFER_WAIT_MS, transferBudgetEnd - System.currentTimeMillis());
+                    //
+                    // 预算按「剩余条数」均分，而不是 min(3 秒, 剩余预算)：后者让**先失败的通道
+                    // 吃掉别人的配额** —— 实测 USB_ADB 等满 3008ms、第二条又 2914ms，剩下 78ms，
+                    // 后面 8 条已连上的 wlan 通道全部 left<=0，于是"每条都能独立容错"的设计失效，
+                    // 变成一条都没有。均分的意义是**总时长可控**：每条通道的 3 秒不能各自独立
+                    // （8 条一起卡住就是 24 秒，用户会以为程序死机），所以整体仍压在
+                    // TRANSFER_WAIT_TOTAL_MS 里，只在快用光时给每条留 TRANSFER_MIN_GRACE_MS。
+                    long budgetLeft = transferBudgetEnd - System.currentTimeMillis();
+                    int remainingChannels = Math.max(1, interfaceList.size() - i);
+                    long left = Math.min(TRANSFER_WAIT_MS,
+                            Math.max(budgetLeft / remainingChannels, TRANSFER_MIN_GRACE_MS));
                     // 按网段认人：电脑并行连的，先到的未必就是这一条（否则界面上的名字和速率对不上）
                     SocketChannel socket = left <= 0 ? null
                             : listener.takeTransferFor(interfaceList.get(i).address, left);
@@ -342,8 +364,12 @@ public class HFXServer extends HFXService {
                         top.weixiansen574.hybridfilexfer.core.HFXLog.d("握手：" + name + " 传输通道 已到（远端 "
                                 + remote + "，等了 " + (System.currentTimeMillis() - nameAt) + "ms）");
                     } else {
+                        // 把"为什么没等到"写清楚：这一条是分到了很短的时间（预算被前面的通道吃掉），
+                        // 还是真等满了 3 秒（电脑说连上、socket 却始终没落到监听器上）。
+                        // 这两种在旧日志里都是同一句"等超时"，只能靠数时间戳去猜。
                         top.weixiansen574.hybridfilexfer.core.HFXLog.d("握手：" + name + " 传输通道 等超时，等了 "
-                                + (System.currentTimeMillis() - nameAt) + "ms");
+                                + (System.currentTimeMillis() - nameAt) + "ms（这一条分到 " + left
+                                + "ms，总预算剩 " + Math.max(0, budgetLeft) + "ms）");
                     }
                     if (socket == null) {
                         // 只回绝这一条，别把整次握手带崩：走蓝牙时经常有一条通道卡住，
