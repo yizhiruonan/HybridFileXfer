@@ -35,6 +35,13 @@ pub struct Config {
     /// （本机非 0 用本机的，本机 0 才用对端的，见 `ratelimit::shared_value`）。
     /// 语义要点：0 是「不限速」，不是「限速到 0」。
     pub speed_limit_mb: u32,
+    /// 安全配对（PAIR）总开关，默认**关闭**。
+    ///
+    /// 关闭时握手与 3.7.1（VERSION_CODE 309）逐字节一致：不插 PAIR 消息、不加密，
+    /// 所以任何一个 KAT 不过、或真机上出现回归，改这一行就能整条链路退回，
+    /// 不用回滚代码。打开后要求两端都是 319 且都开着，否则按版本不匹配拒绝
+    /// （见 _worklog/dev-docs/PAIRING-PLAN.md 的 §6 兼容矩阵）。
+    pub secure_pairing: bool,
     /// 独立传输窗口上次被用户拖到的位置（物理像素，窗口左上角）。
     /// None = 还没摆过 / 用户没拖过，第一次出现时自己贴到工作区右下角。
     /// 两个坐标都必须有：文件被手改坏、只剩半行时当作没存过。
@@ -54,6 +61,8 @@ impl Default for Config {
             max_devices: 3,
             sendto: false,
             speed_limit_mb: 0,
+            // 默认关闭：这个开关是新协议的"安全绳"，不许默认打开。
+            secure_pairing: false,
             xfer_win_pos: None,
         }
     }
@@ -148,6 +157,11 @@ impl Config {
                         cfg.speed_limit_mb = mb.min(1000);
                     }
                 }
+                // 1 = 打开（默认关闭）。写法与 minimize_to_tray / sendto 一致，
+                // 免得同一份文件里出现两种布尔解析规则。
+                "secure_pairing" | "pairing" => {
+                    cfg.secure_pairing = !(value == "0" || value.eq_ignore_ascii_case("false"));
+                }
                 "xfer_win_x" => {
                     win_x = value.parse::<i32>().ok();
                 }
@@ -190,7 +204,9 @@ impl Config {
              # 独立传输窗口上次的位置（物理像素，窗口左上角；留空 = 自动贴工作区右下角）\n\
              # 用户拖过就记住；拔掉副屏 / 改分辨率后位置落到屏幕外会自动回落右下角\n\
              xfer_win_x = {}\n\
-             xfer_win_y = {}\n",
+             xfer_win_y = {}\n\
+             # 安全配对（1 开启 / 0 关闭）。关闭时与旧版逐字节一致；开启要求两端都支持配对\n\
+             secure_pairing = {}\n",
             self.receive_dir.display(),
             self.port,
             self.adb_path
@@ -213,7 +229,8 @@ impl Config {
                 .unwrap_or_default(),
             self.xfer_win_pos
                 .map(|(_, y)| y.to_string())
-                .unwrap_or_default()
+                .unwrap_or_default(),
+            if self.secure_pairing { "1" } else { "0" }
         );
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
