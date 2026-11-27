@@ -64,8 +64,25 @@ const TRANSFER_POLL: Duration = Duration::from_millis(50);
 /// 以前这个数是 socket 上一次读的超时，现在是「累计没有任何进展」的上限：
 /// 每读一段都回去看一眼取消标志，所以取消不必等这个数。
 const TRANSFER_STALL: Duration = Duration::from_secs(120);
-/// 连不上的通道地址缓存两分钟：重连/拔插时直接跳过，不用每条再等 2 秒超时
-const UNREACHABLE_TTL: Duration = Duration::from_secs(120);
+/// 连不上的通道地址记多久：这段时间里重连/拔插直接跳过，不用每条再等 1.5 秒超时。
+///
+/// 原来是 120 秒，实际是个陷阱：手机切换网卡（svc wifi disable/enable、开关蓝牙、
+/// USB 网络共享）时，电脑恰好会在「Wi-Fi 还没回来」的那两秒里重握手一次，于是
+/// **新老地址**都被判成不可达并记两分钟 —— 之后 Wi-Fi 明明回来了，每次重连还是直接
+/// 跳过它，界面显示 6 条、实际只有 2 条在跑（用户报的就是这个）。
+///
+/// 和重连节拍的关系（代码审查提的「8 秒 TTL 撞 10 秒重连」）：
+///  - 引擎失败后的重连间隔是 3 秒（engine.rs 的 sleep_unless_stopped），**小于** TTL，
+///    所以缓存确实能省掉中间那两次白等的 1.5 秒超时；
+///  - 手机那边重新开始监听通常要十几秒，比 TTL 长，所以网卡回来之后一定能重新试到；
+///  - 即便节拍反过来（TTL < 间隔），后果也只是「每轮都真去连一次」，那是**多花 1.5 秒**，
+///    不是"反复建链断链"：连接失败不会建出任何链路，也不会让已有会话断开；
+///    并行连接的总耗时按最慢那条算，所以给整体握手加的上限就是 1.5 秒。
+/// 另外成功连上就会立刻把这条地址从缓存里删掉（见 connect 成功那条路），
+/// 所以它不会把「某张网卡不通」记成长期结论。
+const UNREACHABLE_TTL: Duration = Duration::from_secs(8);
+/// 空闲时多久探一次传输通道（见 prune_dead_transfers）。
+const CHANNEL_PROBE_INTERVAL: Duration = Duration::from_secs(1);
 
 fn unreachable_channels() -> &'static Mutex<HashMap<IpAddr, Instant>> {
     static CACHE: OnceLock<Mutex<HashMap<IpAddr, Instant>>> = OnceLock::new();
@@ -149,6 +166,14 @@ pub struct Session {
     /// 上一次把限速值推给手机时的代次（见 ratelimit::configured_epoch）。
     /// 轮询里发现代次变了就补发一帧 SPEED_LIMIT。
     limit_epoch: i64,
+    /// 通道集合发生变化时的回调（发动机用它把界面上的通道数改对）。
+    ///
+    /// 为什么需要它：手机切换网卡之后，握手那一刻的报告是过时的，只有真连上的那几条
+    /// 才是通道。空闲时探活发现某条死了，也必须当场把界面上的通道数改小 —— 否则
+    /// 用户看到「6 条通道」，实际只有 2 条在跑（本次修的缺陷）。
+    channels_sink: Option<ChannelSink>,
+    /// 上一次探活传输通道的时间（见 prune_dead_transfers）
+    last_channel_probe: Instant,
     /// 用户点的「停止」标志，run() 时存进来一份。
     ///
     /// 传输循环（等通道 / 重建握手 / 等结论）原来都不读它 —— 只有主循环顶部读，
@@ -156,6 +181,9 @@ pub struct Session {
     /// 期间用户再点一次「开始接收」，就又建了一条会话（手机上凑成两台电脑）。
     stop: Option<Arc<AtomicBool>>,
 }
+
+/// 通道集合变了就回调一次（界面上「N 条通道」只该反映真连上的那几条）。
+pub type ChannelSink = Arc<dyn Fn(&[String]) + Send + Sync>;
 
 pub enum SessionEnd {
     /// The phone asked us to stop.
@@ -446,6 +474,16 @@ impl Session {
         proto::write_i32(&mut cw, current_file_system())?;
         proto::write_utf(&mut cw, home_dir)?;
 
+        // 一条通道都没连上就没有会话可言：以前这里照样返回 Session，界面显示
+        // 「已连接、6 条通道」，第一次点击传文件才发现「没有可用的传输通道」。
+        // 手机端在握手时也会因为 connections.isEmpty() 放弃这次连接，两端口径一致。
+        if transfers.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "no transfer channel could be established",
+            ));
+        }
+
         reader.set_read_timeout(Some(IDLE_TIMEOUT))?;
         reader.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
 
@@ -469,8 +507,86 @@ impl Session {
             _web_grant: WebGrant::new(web_ips),
             port,
             local_port,
+            channels_sink: None,
+            last_channel_probe: Instant::now(),
             stop: None,
         })
+    }
+
+    /// 真连上的传输通道名（界面上的「N 条通道」只认这个）。
+    ///
+    /// 和 interfaces（手机广播的网卡计划）故意分开：手机报 6 条、电脑只连上 2 条时，
+    /// 界面上就该显示 2 条。以前报告用的是 interfaces，于是「显示 6 条、速度 2 条」
+    /// 这个现象在用户眼里根本没有线索可查。
+    pub fn channel_names(&self) -> Vec<String> {
+        self.transfers.iter().map(|(name, _)| name.clone()).collect()
+    }
+
+    /// 挂上通道变化的回调（引擎用来刷新界面上的通道列表）
+    pub fn set_channels_sink(&mut self, sink: ChannelSink) {
+        self.channels_sink = Some(sink);
+    }
+
+    /// 通道集合变了：回调一次（顺序由调用方保证只在真的变化时调）。
+    fn notify_channels(&self) {
+        if let Some(sink) = &self.channels_sink {
+            sink(&self.channel_names());
+        }
+    }
+
+    /// 空闲时探活：把已经死掉的传输通道踢出去，并把新的通道列表报给界面。
+    ///
+    /// 为什么必须有这一步：控制通道有 12 秒心跳，但**传输通道是哑的** —— 空闲时电脑端
+    /// 既不读也不探，一条已经断掉的 TCP 连接可以静静地挂很久。手机切换网卡之后正是
+    /// 这个状态：界面「已连接、6 条通道」，实际只有 2 条能写，用户看到的是「速度只有
+    /// 2 条的水平，非要杀掉 App 才好」。
+    ///
+    /// 探法照抄手机端 hasDeadChannel()（droidcore/HFXServer.java）：先用 1ms 超时的
+    /// peek 看一眼有没有数据在队，没有就非阻塞读 1 字节判 EOF —— peek/读到的这个字节
+    /// 会原样留在流里，不会吃掉块头（传输中本来也不调用这个方法）。
+    fn prune_dead_transfers(&mut self) {
+        // 传输期间**一律不探**。理由不是"偷字节"（peek 不消费数据），而是
+        // peer_closed 会临时把 socket 切成非阻塞：非阻塞标志是**整条连接**的属性，
+        // 而传输线程拿的是 try_clone 出来的同一个 socket —— 探活那一瞬如果传输线程
+        // 正在读写同一 fd，它会拿到 WouldBlock，被当成传输错误（真机表现是偶发
+        // "通道异常"、甚至整单失败，且只在空闲探活的节拍上出现，极难复现）。
+        // 主循环在传输入口里本来就不会走到这里，这个判断是给"取消后传输线程还没退干净"
+        // 那一小段窗口兜底的。
+        if crate::control::receiving() || crate::control::sending() {
+            return;
+        }
+        if self.last_channel_probe.elapsed() < CHANNEL_PROBE_INTERVAL {
+            return;
+        }
+        self.last_channel_probe = Instant::now();
+        let mut alive: Vec<(String, TcpStream)> = Vec::with_capacity(self.transfers.len());
+        let mut dead: Vec<String> = Vec::new();
+        for (name, stream) in std::mem::take(&mut self.transfers) {
+            if peer_closed(&stream) {
+                dead.push(name);
+                // 关掉它：手机端那边下一次写会立刻失败，就不用等我们自己发现
+                crate::netif::abort(&stream);
+            } else {
+                alive.push((name, stream));
+            }
+        }
+        self.transfers = alive;
+        if dead.is_empty() {
+            return;
+        }
+        log::warn(&format!(
+            "{} {}",
+            crate::i18n::tr("剔除已断开的传输通道：", "removed dead transfer channels:"),
+            dead.join(", ")
+        ));
+        self.notify_channels();
+        if self.transfers.is_empty() {
+            // 一条都不剩：留着会话只会显示「已连接」却一传就失败，交给上层断线重连
+            log::warn(crate::i18n::tr(
+                "所有传输通道都已断开，交给上层重连",
+                "all transfer channels are gone; reconnecting",
+            ));
+        }
     }
 
     pub fn interface_names(&self) -> String {
@@ -495,6 +611,21 @@ impl Session {
         loop {
             if stop.load(Ordering::Relaxed) {
                 return SessionEnd::Stopped;
+            }
+            // 空闲时探一次传输通道：手机切换网卡之后，那些 TCP 连接早就死了，
+            // 而控制通道（走 adb / 另一张网卡）还是好的 —— 不探的话界面会一直
+            // 显示「已连接、N 条通道」，实际只有少数几条能写。
+            //
+            // 放在主循环顶部：这一圈本来就是 500ms 读超时轮询，加一次 peek 是微秒级；
+            // 传输入口（handle_receive / handle_send）内部不经过这里，所以不会在
+            // 传输中把块头偷走。
+            self.prune_dead_transfers();
+            if self.transfers.is_empty() {
+                // 一条可用通道都不剩：报断开，让引擎重连（重连会重新握手、重新报通道，
+                // 界面的通道数也跟着变成新的）
+                return SessionEnd::Disconnected(
+                    "all transfer channels are gone".to_string(),
+                );
             }
             // 空闲时也要把「本机改了限速」推过去：这时主循环在 500ms 的读超时里转，
             // 不推的话用户改完设置要等下一次握手才同步（手机上会一直显示旧值）。
@@ -545,6 +676,9 @@ impl Session {
                     }
                 },
             };
+            // -v 时把每一帧控制指令记下来：空闲时「控制通道有没有在转」只能从
+            // 这里看出来（排查 30 秒一整圈断线时靠它定位到主循环被探活按住了）。
+            log::debug(&format!("控制帧: {}", id));
             // 处理指令期间用长一点的超时（手机端处理大文件需要时间）
             let _ = self
                 .reader
@@ -913,6 +1047,9 @@ impl Session {
         }
         let count = rebuilt.len();
         self.transfers = rebuilt;
+        // 重建只收回一部分通道时，界面上的通道数要跟着掉（否则又是「显示 N 条、
+        // 实际更少」）。名字顺序可能和原来不同，但界面只关心条数和名字集合。
+        self.notify_channels();
         // 回到主循环前把轮询用的超时恢复过来
         let _ = self
             .reader
@@ -3212,6 +3349,43 @@ fn ip_from_bytes(bytes: &[u8]) -> io::Result<IpAddr> {
             format!("invalid IP address length {}", bytes.len()),
         )),
     }
+}
+
+/// 这条 TCP 连接的对端还在不在（空闲探活用）。
+///
+/// 只做「非阻塞地看一眼」，绝不吃掉数据：先看有没有字节在队（有 = 活着，而且此刻
+/// 去读就会把块头偷走 1 字节，传输整条错位），没有才用非阻塞读判 EOF。
+/// 读完把 socket 恢复成阻塞 + 原来的读超时，调用方接着用。
+///
+/// 判定口径和手机端 hasDeadChannel() 一致：读返回 -1（对端 FIN）或任何异常都当已断。
+/// 注意 TCP 的半开状态（对端掉电、RST 还没到）这里看不出来 —— 那要靠控制通道的
+/// 12 秒心跳来兜，两者合起来才覆盖完整。
+fn peer_closed(stream: &TcpStream) -> bool {
+    // 用「非阻塞 + peek」而不是「1ms 读超时 + peek」。
+    //
+    // 为什么：Windows 上 SO_RCVTIMEO 对某些连接不生效 —— 真机实测
+    // set_read_timeout(1ms) 返回 Ok，紧接着的 peek 却阻塞了 **30299ms**
+    //（一直卡到手机端 30 秒控制通道超时、主动关掉连接才返回 Ok(0)）。
+    // 这一卡把整个控制循环按住了，手机那边的暂停同步跟着超时，于是每 30 秒
+    // 断一次、重连一次。非阻塞模式没有这个坑：peek 立刻返回 WouldBlock。
+    if stream.set_nonblocking(true).is_err() {
+        // 连模式都改不了，这条连接不能信了
+        return true;
+    }
+    let mut probe = [0u8; 1];
+    let closed = match stream.peek(&mut probe) {
+        // 有数据在队：通道活着（数据没被消费，留给传输线程）
+        Ok(n) if n > 0 => false,
+        // peek 返回 0 = 对端已经关了（FIN 到了）
+        Ok(_) => true,
+        // WouldBlock = 连接还在、只是没数据
+        Err(ref e) if is_timeout(e) => false,
+        // 其它错误（reset / 管道断 / 已关闭）一律当成断了
+        Err(_) => true,
+    };
+    // 恢复阻塞模式：后续传输线程按阻塞语义（+ TRANSFER_TIMEOUT）读写
+    let _ = stream.set_nonblocking(false);
+    closed
 }
 
 fn is_timeout(error: &io::Error) -> bool {

@@ -387,6 +387,8 @@ impl AdbCycle {
             ) {
                 Ok(mut session) => {
                     session.device = device.serial.clone();
+                    // 通道数必须跟着真连上的那几条走（见 attach_channel_sink）
+                    attach_channel_sink(&mut session, on_state);
                     self.connected_once = true;
                     self.stop_notice_shown = false;
                     self.start_fails = 0;
@@ -534,6 +536,7 @@ fn try_discovery(
     on_state(EngineState::Waiting(message));
     match Session::connect(peer.ip, peer.port, &home_dir(options), 0) {
         Ok(mut session) => {
+            attach_channel_sink(&mut session, on_state);
             report_connected(&session, on_state);
             let end = run_session(&mut session, options, stop);
             if matches!(end, SessionEnd::Shutdown) {
@@ -564,6 +567,7 @@ fn run_ip(ip: IpAddr, options: &EngineOptions, stop: &Arc<AtomicBool>, on_state:
     while !stop.load(Ordering::Relaxed) {
         match Session::connect(ip, options.port, &home_dir(options), 0) {
             Ok(mut session) => {
+                attach_channel_sink(&mut session, on_state);
                 report_connected(&session, on_state);
                 if matches!(run_session(&mut session, options, stop), SessionEnd::Stopped) {
                     break;
@@ -592,8 +596,54 @@ fn run_ip(ip: IpAddr, options: &EngineOptions, stop: &Arc<AtomicBool>, on_state:
     }
 }
 
+/// 把「通道集合变了」接到界面上。
+///
+/// 为什么必须有这条回调：界面上那个「N 条通道」是用户判断「多轨有没有生效」的唯一依据。
+/// 手机切换网卡（svc wifi disable/enable、开关蓝牙、USB 网络共享）之后，原来那几条
+/// TCP 已经死了，只有当场把通道数改小，用户才不会看到「6 条通道、速度只有 2 条的
+/// 水平」。
+fn attach_channel_sink(session: &mut Session, on_state: &StateSink) {
+    let on_state = Arc::clone(on_state);
+    session.set_channels_sink(Arc::new(move |names: &[String]| {
+        let names: Vec<String> = names.to_vec();
+        if names.is_empty() {
+            return;
+        }
+        log::warn(&format!(
+            "{} {}",
+            tr("通道数已更新：", "channels updated:"),
+            names.join(", ")
+        ));
+        on_state(EngineState::Connected(names));
+    }));
+}
+
+/// 连上了：报**真连上的通道**，不是手机报的网卡计划。
+///
+/// session.interfaces 是手机在握手时报的「我有哪些网卡」，电脑连不上的那些（不在同一
+/// 网段、被防火墙挡掉、网卡刚刚已经死了）会走 skip 分支，压根没有 socket。以前这里
+/// 取的是 interfaces，于是日志和界面都是 6 条，实际只有 2 条在跑 —— 用户报的
+/// 「显示 6 条通道、速度只有 2 条的水平」就是这么来的。
 fn report_connected(session: &Session, on_state: &StateSink) {
-    let names: Vec<String> = session.interfaces.iter().map(|i| i.name.clone()).collect();
+    let names = session.channel_names();
+    let planned: Vec<String> = session.interfaces.iter().map(|i| i.name.clone()).collect();
+    if planned.len() != names.len() {
+        // 差额必须写进日志：真机上「网卡切换完只连上 2 条」全靠这一行才能一眼看出来。
+        let missing: Vec<String> = planned
+            .iter()
+            .filter(|name| !names.contains(name))
+            .cloned()
+            .collect();
+        log::warn(&format!(
+            "{} {} {} {} {}{}",
+            tr("手机报了", "the phone offered"),
+            planned.len(),
+            tr("张网卡，只连上", "interfaces but only"),
+            names.len(),
+            tr("条通道；没连上的：", "channel(s); not connected:"),
+            missing.join(", ")
+        ));
+    }
     log::info(&format!(
         "{} {}",
         tr("已连接，通道：", "connected, channels:"),
