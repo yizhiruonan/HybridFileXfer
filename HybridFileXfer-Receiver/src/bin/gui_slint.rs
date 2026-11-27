@@ -1441,13 +1441,19 @@ impl OpTrack {
 
     /// 换了一单（PROGRESS 里的路径变了）：把上一单留在身上的历史清零。
     ///
-    /// 归零的是**一条任务内部的累计量**（曲线分桶、每截速率、平滑过的速率、
-    /// 明细行缓存）；不动的只有 Slint 那几个 model 对象（换对象 = 整块重建，见
-    /// 「只建一次」那条注释）和 sent（下一帧的 op 本来就全变了）。
-    fn begin_run(&mut self, path: &str) {
+    /// 归零的是**这个文件自己的历史**（曲线分桶、每截速率、明细行缓存）；
+    /// **速率基准不归零**（见函数体里那条注释 —— 那是 4582 MB/s 的来源），
+    /// 不动的还有 Slint 那几个 model 对象（换对象 = 整块重建）和 sent。
+    fn begin_run(&mut self, path: &str, received: u64) {
         self.run_path = path.to_string();
-        self.speed = 0.0;
-        self.last_bytes = 0;
+        // 速率**不能清零**：这两个数是「本轮会话真收到的字节」（receiver::received_bytes，
+        // 一轮里只增不减、换文件也不归零）。把它清成 0，下一窗口的 delta 立刻变成
+        // 「received - 0 = 整轮已传的全部字节」，除以 0.2 秒就是用户截图里那个
+        // 「4582.4 MB/s」—— 假峰值是这么来的，不是 dt 太小（dt 有 0.2s 下限）。
+        //
+        // 正确做法：把基准对齐到「现在的 received」，这一窗口的 delta = 0，速率自然
+        // 从上一窗口的值平滑接下去（EMA 会往下带），既不出峰值也不跳回 0。
+        self.last_bytes = received;
         self.last_tick = std::time::Instant::now();
         self.seg_rate_bytes.clear();
         self.seg_rate_prev.clear();
@@ -1489,17 +1495,27 @@ impl OpTrack {
             dev_prog = hfx_receiver::receiver::progress_for(&self.serial);
             &dev_prog
         };
-        let (path, done, total_bytes, _session_bytes, _files) = prog.snapshot();
-        // 换文件 = 换了一单（队列模式下同一个窗口连着跑好几单）：先把上一单留在
-        // 这里的曲线 / 速率 / 分段历史清掉，再往下算这一单的数字。
-        // 路径还是空的那几帧不算换单 —— 那一轮还没解析出文件呢。
-        if !path.is_empty() && path != self.run_path {
-            self.begin_run(&path);
-        }
+        let (path, done_raw, total_bytes, _session_bytes, _files) = prog.snapshot();
+        // 已传字节永远不该超过总量：块账本按「收到的块」算，重复的块 / 末块补齐
+        // 都可能让它暂时越界，界面上出现「4 GB / 2 GB」这种自相矛盾的数字。
+        // 这里做最后一道夹紧（真正的去重根因在手机端账本，另有人跟进）。
+        let done = if total_bytes > 0 {
+            done_raw.min(total_bytes)
+        } else {
+            done_raw
+        };
 
         // 速率只按「这次真收到的字节」算：续传基线（磁盘上本来就有的一块）不算进去，
         // 否则续传一开始会跳出一个几 GB/s 的假峰值。
+        // 注意：`path` 现在取的是「本轮主文件」（receiver::primary_path），所以它只在
+        // 主文件真的传完时才变 —— 换名字不会再跟着「最后到达的那块」跳。
         let received = prog.received_bytes();
+        // 换文件（主文件推进到下一个）：清掉这个文件自己的曲线 / 分段历史，
+        // 但**速率基准不清零**（见 begin_run，那是 4582 MB/s 假峰值的来源）。
+        // 路径还是空的那几帧不算换单 —— 那一轮还没解析出文件呢。
+        if !path.is_empty() && path != self.run_path {
+            self.begin_run(&path, received);
+        }
         let now = std::time::Instant::now();
         let elapsed = now.duration_since(self.last_tick).as_secs_f64();
         // 0.2 秒一个窗口 = 每秒更新 5 次。以前是 0.4 秒（2.5 次/秒），
@@ -3498,6 +3514,15 @@ fn main() -> Result<(), slint::PlatformError> {
             // 否则续传一开始会跳出一个几 GB/s 的假峰值。
             let received = hfx_receiver::receiver::PROGRESS.received_bytes();
             let now = std::time::Instant::now();
+            // 新一轮开始（PROGRESS.reset）时 received 会从几 GB 掉回 0：
+            // 不重设基准的话，这一窗口的 delta 走 saturating_sub 得 0（还好），
+            // 但下一个窗口 delta = 「新收到的全部字节」，又会蹦出一个假峰值。
+            // 所以一旦变小就当场对齐基准（推送小窗那边一直是这么做的，主窗口漏了）。
+            if received < last_bytes {
+                last_bytes = received;
+                speed = 0.0;
+                last_tick = now;
+            }
             let elapsed = now.duration_since(last_tick).as_secs_f64();
             // 0.2 秒一个窗口 = 每秒更新 5 次。以前是 0.4 秒（2.5 次/秒），
             // 黑线和「速度:」那行字看着就像一秒跳两下的电子钟。
@@ -3596,8 +3621,14 @@ fn main() -> Result<(), slint::PlatformError> {
                     .unwrap_or(&path)
                     .to_string();
                 ui.set_file_name(short.clone().into());
-                ui.set_file_progress(if total > 0 { done as f32 / total as f32 } else { 0.0 });
-                ui.set_file_text(format!("{} / {}", human(done), human(total)).into());
+                // 已传字节不能超过总量（界面兜底，根因在手机端的通道账本）
+                let done_shown = if total > 0 { done.min(total) } else { done };
+                ui.set_file_progress(if total > 0 {
+                    done_shown as f32 / total as f32
+                } else {
+                    0.0
+                });
+                ui.set_file_text(format!("{} / {}", human(done_shown), human(total)).into());
                 // 手机来取文件时是"已发送"，手机推过来时才是"已接收"
                 let verb = if ui.get_send_active() { "已发送" } else { "已接收" };
                 // 暂停时速率位置显示「已暂停」（和手机端弹窗一致）

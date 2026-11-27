@@ -510,6 +510,13 @@ pub struct ProgressState {
     files: Mutex<HashMap<String, FileProgress>>,
     /// 通道名表：下标 = 通道号（USB_ADB / wlan1#2 …），明细里按段显示「谁在负责」
     channels: Mutex<Vec<String>>,
+    /// 这一轮（一次「发送 / 接收」）要传的文件清单，**按队列顺序**：(路径, 总大小)。
+    ///
+    /// 为什么必须单独存一份：`current` 是「最后收到一块的那个文件」，多文件并行时
+    /// 它一秒能被改写十几次 —— 界面的标题、分段条、进度数字全都跟着它跳（用户报的
+    /// 「文件名一秒换好几次」「分段条来回跳」）。回合身份只能按**队列顺序**认：
+    /// 主文件 = 清单里第一个还没传完的文件，传完才轮到下一个。
+    round_files: RwLock<Vec<(String, u64)>>,
 }
 
 impl ProgressState {
@@ -534,6 +541,52 @@ impl ProgressState {
         if let Ok(mut files) = self.files.lock() {
             files.clear();
         }
+        // 文件清单是本轮的东西，reset = 新一轮，必须一起清（会话层紧接着会重新登记）。
+        if let Ok(mut plan) = self.round_files.write() {
+            plan.clear();
+        }
+    }
+
+    /// 登记这一轮要传的整份文件清单（按队列顺序）。收 / 发两个方向都由会话层调用一次。
+    pub fn set_round_files(&self, files: Vec<(String, u64)>) {
+        if let Ok(mut plan) = self.round_files.write() {
+            *plan = files;
+        }
+    }
+
+    /// 当前回合的「主文件」：清单里第一个还没传完的文件（全传完就停在最后一个）。
+    ///
+    /// 这里返回 None 有两种情况：清单还没登记（老路径 / 发送方向没登记），
+    /// 调用方就退回 `current`（原来那套「最后到达的文件」）。
+    pub fn primary_path(&self) -> Option<String> {
+        let plan = match self.round_files.read() {
+            Ok(g) => g.clone(),
+            Err(_) => return None,
+        };
+        if plan.is_empty() {
+            return None;
+        }
+        // 每个文件已完成多少字节（没开始过的文件不在表里 = 0）
+        let done: HashMap<String, u64> = match self.files.lock() {
+            Ok(files) => files.iter().map(|(k, v)| (k.clone(), v.done_bytes())).collect(),
+            Err(_) => HashMap::new(),
+        };
+        for (path, total) in &plan {
+            // 0 字节文件（目录 / 空文件）没有数据要传，不该占着标题不动 —— 这里必须
+            // **跳过**它继续看下一个。以前写成了 `total == 0 || d < total` 直接返回，
+            // 于是清单里只要有一个 0 字节文件排在前面，整轮标题就钉死在这个文件上：
+            // 它自己没有 FileProgress 条目 → snapshot 拿到 0/0、segments 为空，
+            // 标题、分段进度条、百分比三项一起停住不动。
+            if *total == 0 {
+                continue;
+            }
+            let d = done.get(path).copied().unwrap_or(0);
+            if d < *total {
+                return Some(path.clone());
+            }
+        }
+        // 全都传完了：停在最后一个（收尾那几帧标题不该突然变成空的）
+        plan.last().map(|(p, _)| p.clone())
     }
 
     /// 发送方向（电脑 -> 手机）：标记一块已由某条通道发出
@@ -634,20 +687,41 @@ impl ProgressState {
 
     /// 当前文件的分段（一段 = 一条通道负责的连续块区间，算法和手机端一致，见 FileProgress::segments）
     pub fn segments(&self) -> Vec<XferSeg> {
-        let name = match self.current.read() {
-            Ok(g) => g.clone(),
+        // 和标题同一个口径：锁主文件。以前跟着 current 走，每换一次「最后到达的文件」
+        // 整组分段就被整体换掉一次 —— 界面看到的就是分段条每秒重排好几遍。
+        let name = match self.primary_path() {
+            Some(p) => p,
+            None => match self.current.read() {
+                Ok(g) => g.clone(),
+                Err(_) => return Vec::new(),
+            },
+        };
+        let name = if name.is_empty() {
+            return Vec::new();
+        } else {
+            name
+        };
+        // 主文件还没开始（清单刚登记、首块还没到）时它没有 FileProgress 条目，
+        // 分组是空的 —— 界面看到的就是「进度条整条消失」。这时候退回 current
+        // （最后真正有数据到达的那个文件）的分段，别让分段条凭空消失。
+        let files = match self.files.lock() {
+            Ok(files) => files,
             Err(_) => return Vec::new(),
         };
-        if name.is_empty() {
+        if let Some(progress) = files.get(&name) {
+            let segments = progress.segments();
+            if !segments.is_empty() {
+                return segments;
+            }
+        }
+        let fallback = match self.current.read() {
+            Ok(g) => g.clone(),
+            Err(_) => String::new(),
+        };
+        if fallback.is_empty() || fallback == name {
             return Vec::new();
         }
-        match self.files.lock() {
-            Ok(files) => files
-                .get(&name)
-                .map(|f| f.segments())
-                .unwrap_or_default(),
-            Err(_) => Vec::new(),
-        }
+        files.get(&fallback).map(|f| f.segments()).unwrap_or_default()
     }
 
     /// (文件名, 当前文件已完成字节, 当前文件总字节, 本次会话字节（含续传基线）, 文件数)
@@ -655,15 +729,55 @@ impl ProgressState {
     /// 第三个数字（已接收）和进度条同源：当前文件的字节数取自块位图，
     /// 会话字节 = 本轮真收到 + 续传基线，续传时一开始就是「480.0 MB」而不是 0。
     pub fn snapshot(&self) -> (String, u64, u64, u64, u64) {
-        let name = self.current.read().map(|g| g.clone()).unwrap_or_default();
+        // 标题取「主文件」（队列顺序里的第一个未完成项），不是「最后到达的那个」：
+        // 后者多文件并行时一秒能换十几次名（用户截图：super.img / data.img 来回跳）。
+        let name = match self.primary_path() {
+            Some(p) => p,
+            None => self
+                .current
+                .read()
+                .map(|g| g.clone())
+                .unwrap_or_default(),
+        };
         let session = self
             .session_bytes
             .load(Ordering::Relaxed)
             .saturating_add(self.resumed_bytes.load(Ordering::Relaxed));
+        // 「已完成 / 总量」必须和标题指的是同一个文件，否则数字会跟着另一个文件跳。
+        // 两个数都从块位图里按同一个文件名取；还没开始的文件用清单里的计划大小。
+        let planned_total = self
+            .round_files
+            .read()
+            .ok()
+            .and_then(|g| g.iter().find(|(p, _)| *p == name).map(|(_, t)| *t))
+            .unwrap_or(0);
+        let mut done_total: Option<(u64, u64)> = if name.is_empty() {
+            // 没有主文件（老路径还没走到登记这步）：退回原来那两个全局计数
+            None
+        } else {
+            match self.files.lock() {
+                Ok(files) => match files.get(&name) {
+                    Some(f) => Some((f.done_bytes(), f.total.max(planned_total))),
+                    None => Some((0u64, planned_total)),
+                },
+                Err(_) => Some((0u64, planned_total)),
+            }
+        };
+        // 总量是 0 时这条信息等于没有：界面拿着 0/0 算不出百分比，只能停在原地。
+        // 两种来路：清单里那个文件本来就没登记大小（0 字节 / 目录），或者这一轮还没开始。
+        // 那就退回全局计数 —— 数字可能不是「这个文件」的，但至少是活的；
+        // 以前这里直接给 0/0，标题、分段、百分比三项一起钉死（比改之前更糟）。
+        if done_total.map(|(_, total)| total == 0).unwrap_or(true) {
+            done_total = Some((
+                self.file_done.load(Ordering::Relaxed),
+                self.file_total.load(Ordering::Relaxed),
+            ));
+        }
+        let (done, total) = done_total.unwrap_or_default();
         (
             name,
-            self.file_done.load(Ordering::Relaxed),
-            self.file_total.load(Ordering::Relaxed),
+            done,
+            total,
             session,
             self.files_started.load(Ordering::Relaxed),
         )

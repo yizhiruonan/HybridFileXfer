@@ -1637,6 +1637,33 @@ impl Session {
             ));
         }
 
+        // 回合身份（发送方向）：按队列顺序登记这一单要传的文件清单。
+        // 续传里被整个跳过的文件不登记 —— 它已经在手机上了，不该占着标题不让位。
+        let mut planned: Vec<(String, u64)> = Vec::new();
+        let mut planned_seen: std::collections::HashSet<i32> = std::collections::HashSet::new();
+        for task in tasks.iter() {
+            if let SendTask::Block {
+                file_index,
+                dest,
+                total_size,
+                ..
+            } = task
+            {
+                if planned_seen.insert(*file_index) {
+                    planned.push((dest.clone(), *total_size));
+                }
+            }
+        }
+        // 部分续传的文件：跳过的那几块也算「已完成」。
+        // 不补这一下，它的完成度永远差一截，「主文件」就一直卡在它身上不往下走，
+        // 后面的文件永远轮不到做标题（多文件续传时标题会一直停在第一个文件）。
+        for (dest, bits) in &resume {
+            if let Some((_, total)) = planned.iter().find(|(p, _)| p == dest) {
+                crate::receiver::PROGRESS.mark_resumed(dest, *total, bits);
+            }
+        }
+        crate::receiver::PROGRESS.set_round_files(planned);
+
         // IDM 式动态分段：一开始按通道数把任务表切成连续区间（一条通道一段），
         // 谁先传完自己的段，就把剩余最多的一段再切一半过来。手机端的进度条
         // 按"哪个通道送了第几块"还原这些段，段数会随传输过程变化。
@@ -1920,6 +1947,16 @@ impl Session {
             }
         }
         self.writer.flush()?;
+        // 回合身份：把这一单的**整份文件清单（队列顺序）**登记给进度。
+        // 界面据此锁定「主文件」—— 第一个还没传完的。不登记的话标题 / 分段条只能跟着
+        // 「最后到达一块的那个文件」走，多文件并行时一秒跳好几次名（用户截图报的）。
+        // 两台设备各一份进度，两份都要登记。
+        let planned: Vec<(String, u64)> = entries
+            .iter()
+            .map(|(path, size, _)| (path.clone(), *size))
+            .collect();
+        crate::receiver::PROGRESS.set_round_files(planned.clone());
+        receiver.progress.set_round_files(planned);
         log::info(&format!(
             "{} {}/{}",
             crate::i18n::tr("续传：可续传的文件", "resumable files"),
